@@ -412,7 +412,10 @@ export const projectSection = (section: WireTurnSection): TurnSection => {
 
     const projected: TurnSection = {
         id: section.id,
-        role: section.role,
+        // The section's authority LABEL is its rank, never a role (../shared/turn-display.ts:1048).
+        // It rides the projection unchanged so the compiled transcript paints the same ladder the
+        // server recorded.
+        rank: section.rank,
         agent: section.agent,
         agentLabel: section.agentLabel,
         state: section.state,

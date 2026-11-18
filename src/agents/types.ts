@@ -10,7 +10,8 @@
 //
 //   - the catalogue can expose `AgentDescriptor` metadata (name/title/description/
 //     instruction/guidelines) without building a harness or a transport;
-//   - the server can validate a user-selected primary/subagent against a stable
+//   - the server can validate the agent ids a harness configures — its `entry` and every
+//     key of its `ranks` map, whatever rank each of them carries — against a stable
 //     registry of known ids;
 //   - a preset and a user-created harness build the SAME agent from the SAME
 //     definition, so they cannot drift in wording.

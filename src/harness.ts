@@ -80,8 +80,9 @@
 // result's `alreadyAvailable` lists those tools (metadata only) so the model does
 // not conclude "no match" for something it can call directly, and such a tag is not
 // reported in `unmatchedTags`. Nothing is enabled for them and the searchable
-// bound is untouched. The list is the caller's own view: a subagent never sees
-// delegate there, and a harness without subagents never has it to report.
+// bound is untouched. The list is the caller's own view: an agent with no
+// rank-below peer never sees delegate there, and a harness whose roster spans a
+// single rank never has it to report.
 //
 // Harness-owned names sit outside that scheme:
 //   - toolRequest  — discovery, described above.     (every agent, core)
@@ -94,7 +95,7 @@
 //   - locationManage — session places/settings.      (every agent, core)
 //   - agentManage  — list agents and result previews.(every agent, core)
 //   - agentResult  — read one completed result.       (every agent, core)
-//   - delegate — hand a task to a subagent.     (primary agent only, core)
+//   - delegate — hand a task to a lower-ranked agent. (delegation rosters, core)
 //   - threadSend   — post a message into another thread. (every agent, core,
 //                    registered once this session owns an independent thread)
 //   - threadList   — list this session's live conversations and ids. (same
@@ -144,9 +145,9 @@
 // shell preset. See core/creation.ts for the validated bounds.
 //
 // Tool creation is additionally bounded by policy and budget (R12):
-//   - `toolCreation` is 'all' (default), 'primary' (the tool is not declared to
-//     subagents and a guessed call is rejected), or false (no model-facing tool at
-//     all; the host's `harness.createTool` still works);
+//   - `toolCreation` is 'all' (default), a rank letter such as 'B' (the tool is not
+//     declared to agents at or below that rank and a guessed call is rejected), or
+//     false (no model-facing tool at all; the host's `harness.createTool` still works);
 //   - `maxCreatedTools` (default 32) is a LIFETIME budget per harness: reset()
 //     does not restore it, because created tools stay registered across a reset.
 //
@@ -216,9 +217,9 @@
 // call; only the harness-owned set needs session state. Discovery gates the model
 // only: an explicit user call may run a searchable tool that was never enabled.
 // Everything else still applies —
-// toolCreate keeps its guarded registration, delegate keeps its primary-only
-// check, and a tool this harness did not register (delegate without subagents)
-// is an honest error, never a fabricated implementation.
+// toolCreate keeps its guarded registration, delegate keeps its rank check, and a
+// tool this harness did not register (delegate in a single-rank roster) is an
+// honest error, never a fabricated implementation.
 //
 // task is session state, not catalogue state: a fresh list is created for
 // each harness() call, shared by every agent in that harness, and cleared by
@@ -227,14 +228,18 @@
 // chapterManage, and locationManage follow the same pattern with their own
 // closures (core/profile.ts, chapter.ts, location.ts).
 //
-// delegate is bounded delegation (R4): `primary` selects the entry agent, and
-// `subagents` is the allowlist the primary may delegate to. The tool is not
-// declared to subagents (and a guessed call is rejected), so delegation is one
-// level deep; re-entering an already-running agent is rejected by runAgent, which
-// also closes ctx.run cycles. runAgent additionally enforces MAX_RUN_DEPTH
-// centrally (R12), so a created tool that received the whole context and calls
-// `context.run` cannot widen the hierarchy either — while the primary's own
-// trusted ctx.run (textSummarize) still works at depth 2.
+// delegate is bounded delegation (R4): every agent holds a rank (A is the top of
+// the ladder, see ./types' rank model), and delegation is STRICTLY downward — an
+// agent may hand work only to an agent at a strictly lower rank. Same-rank peers
+// are excluded, so two Rank A agents coexist without being each other's targets.
+// The declared `agent` enum is projected per caller, and a guessed call that is
+// not below the caller is refused with the caller's rank and its legal targets
+// named. Nesting is bounded by the number of DISTINCT ranks the roster configures
+// (`runDepthCeiling`), because a deeper chain would have to reuse a rank;
+// re-entering an already-running agent is rejected by runAgent, which also closes
+// ctx.run cycles. runAgent enforces both limits centrally (R12), so a created tool
+// that received the whole context and calls `context.run` cannot widen the
+// hierarchy either — while a trusted ctx.run (textSummarize) still works.
 //
 // The bundled preset catalogue (./tools) is preloaded into the registry by
 // default, so a new harness gets read/write/edit/glob/grep as declared
@@ -292,6 +297,11 @@ import {
     cloneToolSourceRecord,
     supportsToolCompilation,
     createRecordEngine,
+    // T7: the cross-session knowledge engine factory. `harness()` needs it for exactly one
+    // reason — the `HarnessConfiguration.knowledge` fallback — because the ENGINE is pure
+    // library state (no fs, no timers) while durability is a SUBSCRIBER the host attaches
+    // (core/knowledge.ts header, server/knowledge-file-store.ts header).
+    createKnowledgeEngine,
     HARNESS_SNAPSHOT_VERSION,
     cloneToolCreation,
     readHarnessMessages,
@@ -574,6 +584,11 @@ import type {
     HarnessConfiguredTool,
     HarnessMemory,
     HarnessToolRuntime,
+    // T7: the knowledge seam — the union `HarnessConfiguration.knowledge` accepts and
+    // `Harness.knowledge` reports, plus the engine type the fallback builds.
+    HarnessKnowledge,
+    HarnessKnowledgeStore,
+    KnowledgeEngine,
     NestedRunPolicy,
     RecordsToolName,
     RecordStoreDelta,
@@ -585,8 +600,16 @@ import type {
     ToolCreationPolicy,
     ToolCreationResult,
     ToolMode,
-    ToolUiPanel
+    ToolUiPanel,
+    AgentRank
 } from './types';
+// The rank vocabulary's DATA half (./types owns the union). `AGENT_RANKS` is the ordering
+// and the depth ceiling, `rankIndexOf` is the one comparison, `isLowerRank` is THE
+// delegation predicate, and `isAgentRank` is the untrusted-input guard every rank boundary
+// (config, snapshot, an addAgent option) routes through. A VALUE import is required: the
+// `export type * from './types'` at the bottom of this file re-exports the types only, so
+// these three names are also re-exported explicitly there for package consumers.
+import { AGENT_RANKS, isAgentRank, isLowerRank, rankIndexOf } from './types';
 import type { PreparedTool, ToolSourceRecord } from './core';
 
 // Bound on model requests one run may make (tool rounds, pauses with pending work,
@@ -959,7 +982,15 @@ const MAX_PENDING_ACTION_REQUESTS = 4;
 // queue/actor keys, or a fork could deadlock behind the run it was forked from.
 // `actorKey` is therefore the runtime scheduling identity: the display name for a
 // registered agent, and a namespaced branch id for a branch.
-type HarnessActorRole = 'primary' | 'subagent';
+//
+// THE OLD `HarnessActorRole = 'primary' | 'subagent'` IS GONE (rank model, 2026-11-18). An
+// actor's standing is now `AgentRank` (./types): a 26-letter ladder with NO singleton top,
+// because any number of agents may hold Rank A. `rankOf` below replaces `roleOf`, and the
+// only rank-aware behaviour left in this kernel is DELEGATION (strictly downward, bounded by
+// the distinct-rank count) plus the optional `toolCreation` capability policy. Tools
+// themselves are never rank-gated — every agent has access to every registered tool — and
+// threads never consult rank at all: threading is one agent working in parallel, not a
+// delegation to another one.
 
 const cloneMessages = (messages: readonly HarnessMessage[]): HarnessMessage[] =>
     JSON.parse(JSON.stringify(messages)) as HarnessMessage[];
@@ -1206,34 +1237,62 @@ const configuredToolEntry = (name: string, entry: HarnessConfiguredTool): Config
     };
 };
 
-// Who may create tools at runtime (R12). Validated at construction so a typo
-// cannot silently disable (or widen) creation.
-const CREATION_POLICIES: readonly ToolCreationPolicy[] = ['all', 'primary', false];
-
+// Who may create tools at runtime (R12). Validated at construction so a typo cannot
+// silently disable (or widen) creation. The policy is 'all', false, or a RANK LETTER: a
+// letter means "that rank and every rank toward A", so `toolCreation: 'A'` is the faithful
+// replacement for the removed `'primary'` and `'C'` would let A, B and C create.
+// `isAgentRank` (./types) is the guard, so the accepted letters can never drift from the
+// `AgentRank` union.
 const resolveToolCreation = (value: ToolCreationPolicy | undefined): ToolCreationPolicy => {
     if (value === undefined) return 'all';
+    if (value === 'all' || value === false) return value;
 
-    if (!CREATION_POLICIES.includes(value)) {
+    if (!isAgentRank(value)) {
         throw new HarnessError(
-            `toolCreation must be one of: "all", "primary", false. Received ${String(value)}.`
+            `toolCreation must be "all", false, or a rank letter (${AGENT_RANKS.join(', ')}). Received ${String(value)}.`
         );
     }
 
     return value;
 };
 
-// How deeply agent runs may nest (R12): the entry run, plus at most ONE
-// delegation level. Enforced centrally in runAgent so every door — the model's
-// delegate tool, `ctx.run`, and a model-created tool that received the whole
-// `context` and calls `context.run` — obeys the same rule. Without this, a
-// subagent's tool (created or not) could call `run()` on a third agent and turn
-// "one level deep" into an unstated hierarchy.
+// Whether an agent of `rank` holds the `toolCreation` capability gated at `gate`. A LARGER
+// rank index is a LOWER rank, so "the gate rank and above toward A" is one `<=`. This is the
+// only copy of that comparison: the declaration filter, the launch gate, and
+// `createToolForAgent`'s defence-in-depth check all call it, because three copies of a
+// policy comparison is how a policy and its enforcement drift apart.
+const holdsCreationRank = (rank: AgentRank, gate: AgentRank): boolean =>
+    rankIndexOf(rank) <= rankIndexOf(gate);
+
+// THE untrusted-rank validator for every boundary that READS a rank: a `ranks` config value,
+// an `addAgent({ rank })` option, and (in ./core/snapshot.ts) a persisted row. `label` names
+// the exact site, so a refusal points at the key the caller wrote — the same quality as the
+// neighbouring `Agent "x" is not registered.` refusals.
+const resolveRankValue = (value: unknown, label: string): AgentRank => {
+    if (!isAgentRank(value)) {
+        throw new HarnessError(
+            `${label} must be one of: ${AGENT_RANKS.join(', ')}. Received ${String(value)}.`
+        );
+    }
+
+    return value;
+};
+
+// The HARD ceiling on how deeply agent runs may nest. The PER-HARNESS ceiling is the number
+// of DISTINCT ranks the roster actually configures (`runDepthCeiling` below); this constant
+// is the outer bound on that number: 26, one per rank letter.
 //
-// Depth 1 = the run the caller started; depth 2 = a delegated/ctx.run agent. Note
-// that a trusted PRIMARY-triggered ctx.run (the bundled textSummarize preset) is
-// depth 2 and therefore still allowed — the limit only blocks a run STARTED from
-// inside another one at the limit.
-const MAX_RUN_DEPTH = 2;
+// WHY distinct-rank COUNT is the right bound (R4/R12): delegation is strictly downward, so a
+// chain of runs visits strictly descending ranks and can never be longer than the set of
+// ranks that exist. A→B→C needs three distinct ranks; a roster of {A, A, B} nests two deep
+// and no further, because its two Rank A agents are peers rather than a ladder. The old
+// `MAX_RUN_DEPTH = 2` was that rule hard-coded for the one roster shape the removed
+// primary/subagent vocabulary could express.
+//
+// It is still enforced centrally in `runAgent`, so every door — the model's delegate tool,
+// `ctx.run`, and a model-created tool that received the whole `context` and calls
+// `context.run` — obeys the same number. Depth 1 = the run the caller started.
+const MAX_RUN_DEPTH_CEILING = AGENT_RANKS.length;
 
 // The wire-safe tool-name alphabet, identical to the shared source-contract gate.
 // Definition registrations must satisfy the same name/schema shape as compiled
@@ -1268,10 +1327,71 @@ const observeToolRejection = <T>(promise: Promise<T>): Promise<T> => {
 // already-unwrapped legacy form. The model path always unwraps the wrapper object.
 
 
+// ---------------------------------------------------------------------------
+// T7 — the `knowledge` configuration seam (one validator, one fallback)
+// ---------------------------------------------------------------------------
+//
+// WHY A VALIDATOR RATHER THAN A CAST. `HarnessConfiguration.knowledge` accepts two shapes
+// (../types `HarnessKnowledge`: a durable store, or a bare engine), and the difference is
+// load-bearing for the knowledge TOOL — presence of `flush` is the only honest durability
+// signal a tool can print (../server/knowledge-file-store.ts:444). So an argument that is
+// neither shape is a caller bug and must fail HERE, at construction, with the two names the
+// caller should have used — the same posture as `resolveToolCreation`/`resolveMaxIterations`
+// below, which refuse a bad option before a long run spends anything on it.
+//
+// THE MESSAGE NAMES THE SUBPATH TOO, and that is a contract, not decoration: a refusal that
+// points at a factory a consumer cannot import sends them to grep the package. `loadKnowledgeFileStore`
+// comes from ./server/index.ts and `createKnowledgeEngine` from the ./core re-export below
+// (near `createRecordEngine`), and ./harness.knowledge.test.ts pins that BOTH are live on the
+// published root — the day one of those exports is dropped, that test fails instead of the
+// message quietly becoming a lie.
+//
+// HOW THE TWO SHAPES ARE TOLD APART, in this order:
+//   - an ENGINE is what `createKnowledgeEngine()` returns: it owns `execute` (core/knowledge.ts
+//     `KnowledgeEngine`, ../types:2724);
+//   - a STORE wraps one: it answers `engine` (../server/knowledge-file-store.ts:444), and
+//     `flush`/`commit`/`dispose` are its durability verbs.
+// The order matters: a store-shaped object also satisfies `typeof x.engine === 'object'`, and
+// a hand-built store with no engine yet is refused rather than silently treated as an engine.
+const knowledgeSourceOf = (provided: HarnessConfiguration['knowledge']): HarnessKnowledge => {
+    // No configuration at all (`harness({})`, every library consumer): an in-memory engine,
+    // so `harness({}).knowledge` answers and the knowledge tool needs no unconfigured-host
+    // special case. This is the same posture as `agents.json`'s no-root rule
+    // (../server/persistence.ts:3285 — a durable thing that is simply absent, stated in code
+    // rather than faked with bytes), and the reason the member carries NO durability verbs:
+    // nothing here touches the filesystem, and a tool must not promise durability.
+    if (provided === undefined || provided === null) return createKnowledgeEngine();
+
+    if (typeof provided !== 'object') {
+        throw new HarnessError(
+            `HarnessConfiguration.knowledge must be a knowledge store (loadKnowledgeFileStore, ` +
+                `from '@underload/harness' or '@underload/harness/server') or a knowledge engine ` +
+                `(createKnowledgeEngine, from '@underload/harness'); received ${typeof provided}.`
+        );
+    }
+
+    const engineOfStore = (provided as HarnessKnowledgeStore).engine;
+
+    // A store: it owns an `engine`, and that engine is itself executable. `typeof === 'object'`
+    // rather than a presource helper on purpose — this file imports no `@presource/core` value
+    // anywhere, and the check is one line either way.
+    if (typeof engineOfStore === 'object' && engineOfStore !== null && typeof (engineOfStore as KnowledgeEngine).execute === 'function') {
+        return provided as HarnessKnowledgeStore;
+    }
+
+    if (typeof (provided as KnowledgeEngine).execute === 'function') return provided as KnowledgeEngine;
+
+    throw new HarnessError(
+        'HarnessConfiguration.knowledge is neither a knowledge store (it answers no `engine` with ' +
+            'an `execute`) nor a knowledge engine (it answers no `execute` of its own).'
+    );
+};
+
 export const harness = (configuration: HarnessConfiguration): Harness => {
     // Resolve the loop bound once, before anything is built, so a bad value fails
     // at construction instead of after a long run. The bound applies to every agent
-    // run in this harness (entry, ctx.run, and delegated subagents); each run gets
+    // run in this harness (the entry agent, `ctx.run`, and a delegated run at any rank);
+    // each run gets
     // its own budget because the check lives in runAgentCore's loop.
     const maxIterations = resolveMaxIterations(configuration.maxIterations);
 
@@ -1328,6 +1448,34 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         throw new HarnessError('A harness requires at least one agent.');
     }
 
+    // THE CONSTRUCTION DOOR REFUSES THE RETIRED VOCABULARY (clean break, R55).
+    //
+    // WHY THIS IS HERE AND NOT MERELY AT THE PERSISTENCE LAYER. `requireNoLegacyRosterKeys`
+    // (./server/persistence.ts) already refuses a STORED row carrying `primary`/`subagents`,
+    // but a live `HarnessConfiguration` — the shape a JS/JSON caller hands straight to
+    // `harness()` — used to pass through silently, and silently is the dangerous part: with
+    // `primary` ignored, routing fell back to `agents[0]` (`entryName` below), and with `ranks`
+    // absent, rule 1 put Rank A on that same first agent. Routing AND authority therefore both
+    // moved, one layer above the layer that already answers loudly, without a word. A TS caller
+    // cannot write these keys at all (the type dropped them); this refusal is for the caller who
+    // is not checked by the compiler.
+    //
+    // The message names the two keys that replaced the pair, in the same words the persistence
+    // guard uses, so one error text teaches the rule wherever it is hit. Presence (not
+    // truthiness) is the trigger, matching `requireNoLegacyRosterKeys`: a key that is explicitly
+    // `undefined` changes neither routing nor rank, so it is not the hazard.
+    const legacyRosterKeys = (['primary', 'subagents'] as const).filter(
+        (key) => (configuration as unknown as Record<string, unknown>)[key] !== undefined
+    );
+
+    if (legacyRosterKeys.length > 0) {
+        throw new HarnessError(
+            `HarnessConfiguration was written before the rank model and carries ${legacyRosterKeys
+                .map((key) => `\`${key}\``)
+                .join(' and ')}. This build routes with \`entry\` (the entry agent, one of \`agents\`) and ranks with \`ranks\` (agent name -> one rank letter, "A" highest to "Z" lowest), and it does not translate the old keys: name \`entry\` and \`ranks\` instead.`
+        );
+    }
+
     // Build the agent registry. The registry key is the identity: it names the
     // agent in progress events and is what `run(name, input)` addresses. The
     // agent's own `name` is overwritten so the two can never disagree.
@@ -1341,34 +1489,213 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         agents[name] = brain;
     }
 
-    // The entry point. `primary` names it explicitly; without one the first key
-    // wins, so a single-agent or naturally ordered config needs no extra field.
-    // An unknown name is a configuration bug, not a runtime surprise, so it fails
-    // here rather than at the first prompt.
-    const primaryName = configuration.primary ?? agentNames[0];
+    // THE ENTRY POINT. `entry` names it explicitly; without one the first key wins, so a
+    // single-agent or naturally ordered config needs no extra field. An unknown name is a
+    // configuration bug, not a runtime surprise, so it fails here rather than at the first
+    // prompt. It is called ENTRY rather than PRIMARY because it is a routing choice, not a
+    // rank: the entry agent may be Rank A or Rank C, and being the entry grants no capability
+    // (the removed `primary` name implied exactly that privilege, which is what this rename
+    // retires).
+    const entryName = configuration.entry ?? agentNames[0];
 
-    if (!Object.prototype.hasOwnProperty.call(configuration.agents, primaryName)) {
+    if (!Object.prototype.hasOwnProperty.call(configuration.agents, entryName)) {
         throw new HarnessError(
-            `Primary agent "${primaryName}" is not registered. Configured agents: ${agentNames.join(', ')}.`
+            `Entry agent "${entryName}" is not registered. Configured agents: ${agentNames.join(', ')}.`
         );
     }
 
-    const primary = agents[primaryName];
+    const entryAgent = agents[entryName];
 
-    // Runtime role/actor identity (N6). The registry key stays the DISPLAY name
-    // used by events and `run(name)`; a branch additionally needs a scheduling
-    // identity that is distinct from its source, so a fork never queues behind
-    // the run that created it. Both maps are WeakMaps: they add no field to the
-    // public Agent shape and disappear with the branch.
-    const actorRoles = new WeakMap<Agent, HarnessActorRole>();
+    // -----------------------------------------------------------------------
+    // THE ROSTER RANKS — resolved once, at construction (rank model)
+    // -----------------------------------------------------------------------
+    //
+    // `rankByName` is the live ranking of the roster: every registered agent name maps to
+    // exactly one rank, and `addAgent`/`removeAgent` below keep it in step with `agents`. It
+    // is keyed by NAME rather than being only a WeakMap on the brains, because a thread agent,
+    // a branch agent, and a restored conversation's agent are all FRESH Agent objects that
+    // still answer to a registry name: the WeakMap below carries a per-object override, this
+    // map carries the roster's truth.
+    const rankByName = new Map<string, AgentRank>();
+
+    // THE resolution rules, exactly as ./types' `HarnessConfiguration.ranks` states them:
+    //
+    //   1. `ranks` ABSENT → the entry agent is Rank A and every other agent is Rank B. That is
+    //      byte-for-byte the behaviour the removed `primary` + implicit `subagents` pair
+    //      produced, so an existing single-team harness needs no configuration change;
+    //   2. `ranks` PRESENT → an explicit entry wins, and every agent the map omits takes ONE
+    //      RANK BELOW the lowest rank explicitly configured anywhere in it, clamped at 'Z'.
+    //      (An explicitly EMPTY map therefore ranks every agent at that fallback: it states
+    //      "no ranking", not "use the A/B default".)
+    //
+    // An unknown key is refused rather than ignored: a silently-dropped `ranks` row would
+    // leave an agent at a rank its author never wrote, which is the same class of mistake the
+    // `Entry agent "x" is not registered.` refusal above exists to prevent.
+    const configuredRanks = configuration.ranks;
+    const defaultRank = ((): AgentRank => {
+        if (configuredRanks === undefined) return 'B';
+
+        if (typeof configuredRanks !== 'object' || configuredRanks === null) {
+            throw new HarnessError(
+                'HarnessConfiguration.ranks must be a map of agent name to rank letter.'
+            );
+        }
+
+        for (const [name, rank] of Object.entries(configuredRanks)) {
+            if (!Object.prototype.hasOwnProperty.call(agents, name)) {
+                throw new HarnessError(
+                    `HarnessConfiguration.ranks names agent "${name}", which is not registered. Configured agents: ${agentNames.join(', ')}.`
+                );
+            }
+
+            rankByName.set(name, resolveRankValue(rank, `HarnessConfiguration.ranks.${name}`));
+        }
+
+        // The lowest rank ANY author explicitly asked for. `ranks: { a: 'A' }` over four agents
+        // leaves the other three at 'B'; `ranks: { a: 'C' }` leaves them at 'D'. An explicit
+        // rank therefore lowers the fallback for every unlisted agent, which is what makes
+        // "the unlisted ones are the juniors" configurable without naming each one.
+        const explicit = [...rankByName.values()];
+        const lowest = explicit.length === 0 ? 0 : Math.max(...explicit.map(rankIndexOf));
+
+        return AGENT_RANKS[Math.min(lowest + 1, AGENT_RANKS.length - 1)];
+    })();
+
+    // Fill the roster. An unlisted agent takes the resolved default — including the ENTRY
+    // agent once `ranks` exists, because a configured ranking is authoritative and the entry
+    // point is not a rank. Only rule 1 (no `ranks` at all) puts the entry agent at Rank A.
+    for (const name of agentNames) {
+        if (rankByName.has(name)) continue;
+
+        rankByName.set(
+            name,
+            configuredRanks === undefined && name === entryName ? 'A' : defaultRank
+        );
+    }
+
+    // Names the roster REFUSES as delegation targets (`addAgent(…, { delegate: false })`).
+    // Rank decides what is LEGAL in principle; this set is the host's opt-out for a member
+    // that stays reachable (threads, `ctx.run`) without becoming a delegation target.
+    //
+    // It is enforced in BOTH places that matter, and the second one is the one that makes the
+    // first honest: `delegableNamesFor` withholds the name from every declaration and discovery
+    // card, and `delegateFor` REFUSES a call that names it anyway. The installed `delegate`
+    // schema's enum is the whole roster on purpose (a narrow enum cannot name a rank), so a
+    // name that only disappeared from the declarations would still be callable — which is
+    // exactly what used to happen: the opt-out was a visibility rule and not a refusal.
+    const nonDelegatable = new Set<string>();
+
+    // The distinct-rank count drives two numbers, both recomputed whenever the roster moves:
+    // the nesting ceiling, and whether ANY delegation door exists.
+    let distinctRankCount = new Set(rankByName.values()).size;
+    let runDepthCeiling = Math.min(distinctRankCount, MAX_RUN_DEPTH_CEILING);
+
+    const recomputeRankBounds = (): void => {
+        distinctRankCount = new Set(rankByName.values()).size;
+        runDepthCeiling = Math.min(distinctRankCount, MAX_RUN_DEPTH_CEILING);
+    };
+
+    // THE delegation target set for one caller rank: every registered agent STRICTLY below it
+    // (same-rank peers excluded by `isLowerRank`, which is exactly how two Rank A agents
+    // coexist), in registration order, so the declared `agent` enum and the refusal's target
+    // list are stable between calls.
+    const delegableNamesFor = (callerRank: AgentRank): string[] =>
+        Object.keys(agents).filter(
+            (name) =>
+                !nonDelegatable.has(name) &&
+                isLowerRank(rankByName.get(name) ?? defaultRank, callerRank)
+        );
+
+    // Whether a delegate tool exists at all, for the `delegation` activation row: delegation
+    // is possible iff SOME agent has a strictly-lower-ranked peer, i.e. the roster spans at
+    // least two distinct ranks. A one-agent harness, an all-Rank-A harness, and a roster whose
+    // members are all junior therefore register no delegate tool — the same honest absence the
+    // removed empty-allowlist rule produced.
+    const rosterHasDelegation = (): boolean => distinctRankCount >= 2;
+
+    // Runtime rank/actor identity (N6). The registry key stays the DISPLAY name used by
+    // events and `run(name)`; a branch additionally needs a scheduling identity distinct from
+    // its source, so a fork never queues behind the run that created it. Both maps are
+    // WeakMaps: they add no field to the public Agent shape and disappear with the branch.
+    const actorRanks = new WeakMap<Agent, AgentRank>();
     const actorKeys = new WeakMap<Agent, string>();
 
-    // A branch inherits the SOURCE's role (a fork of the primary keeps
-    // delegate/toolCreate; a fork of a subagent does not). Registered
-    // agents fall back to the registry comparison, so a plugin-added agent is a
-    // subagent without extra bookkeeping.
-    const roleOf = (brain: Agent): HarnessActorRole =>
-        actorRoles.get(brain) ?? (brain === primary ? 'primary' : 'subagent');
+    // THE rank of one actor. A thread/branch/fork agent INHERITS its source's rank (the
+    // WeakMap: those actors are fresh Agent objects, so the map is the only thing that can
+    // carry the fact), and a registry agent resolves through its NAME — which is why a
+    // plugin-added agent needs no extra bookkeeping, exactly as a plugin-added subagent never
+    // did before. The final fallback is the roster's default rank, for a brain that never
+    // entered the registry at all.
+    const rankOf = (brain: Agent): AgentRank =>
+        actorRanks.get(brain) ?? rankByName.get(brain.name) ?? defaultRank;
+
+    // The rank a HOST-initiated call carries: the ENTRY agent's, because a host call has
+    // always run with the entry agent's standing (`harness.executeTool('delegate', …)` and
+    // `runtime.delegate(undefined, …)` pass no caller brain). With the entry agent detached by
+    // `removeAgent`, the host falls back to Rank A — the top of the ladder — rather than to an
+    // arbitrary junior rank, so a host can still reach every agent in the roster downward.
+    const hostRank = (): AgentRank => {
+        const brain = agents[entryName];
+        return brain === undefined ? AGENT_RANKS[0] : rankOf(brain);
+    };
+
+    // THE HOST AS AN ACTOR (R54) — the object every host door passes as its caller.
+    //
+    // WHY IT EXISTS. The host is the API caller; it is NOT one of the ranked agents. What it
+    // acts with is `hostRank()` authority, and that has to be TRUE OF EVERY DOOR, so the doors
+    // cannot keep handing out a brain captured at construction: `removeAgent(entryName)` deletes
+    // the name from `rankByName`, and the stale brain then resolved through `rankOf` to
+    // `defaultRank` — a rank attributed to an agent that no longer exists, which is how a host
+    // `executeTool('delegate', …)` came to be refused with "entry holds Rank B" on a roster whose
+    // entry was Rank A. A synthetic host actor carrying Rank A makes `rankOf(hostActor())` agree
+    // with `hostRank()` by construction, in both states of the roster.
+    //
+    // WHY THE ENTRY AGENT IS STILL RETURNED WHILE IT EXISTS. It is what every host call has
+    // always acted as (its identity in records, its rank, its discovery view), and while the name
+    // is registered the two rules resolve to the same letter anyway. It is also a LIVE read, so
+    // an entry name that `removeAgent` dropped and `addAgent` re-registers is picked up again.
+    //
+    // THE IDENTITY CHOSEN FOR A HOST RUN AFTER ENTRY REMOVAL: an unregistered actor literally
+    // named `host` (below), holding Rank A. It is honest in both directions — a refusal names
+    // `host` rather than a departed agent, and an invocation record written through the host
+    // (agentManage/agentResult) reads `{ agent: 'host', rank: 'A' }`, i.e. the host's own
+    // standing, never a rank pinned to a name this roster stopped naming. `host` is not added to
+    // `agents`, `ranks`, `threads()` or `agentManage`'s roster, so no roster read grows a member
+    // the host never configured. Its one caveat: an agent literally named `host` shares this
+    // object's SCHEDULER key (`actorKeyOf` falls back to the display name), which can only make a
+    // discovery answer mention that agent's in-flight work; rank is unaffected, because
+    // `actorRanks` resolves before any name lookup.
+    let hostBrain: Agent | undefined;
+    const hostActor = (): Agent => {
+        const entry = agents[entryName];
+        if (entry !== undefined) return entry;
+
+        if (hostBrain === undefined) {
+            // A real brain, not a hollow stand-in: a tool body may legitimately read
+            // `context.agent` (name, model, transcript) and every one of those reads has to
+            // answer like an agent does. It is created ONCE per harness, lazily, and only on the
+            // first host call that arrives after the entry agent was detached.
+            hostBrain = createAgent({
+                name: 'host',
+                model: 'host',
+                // THE HOST HAS NO MODEL OF ITS OWN, and the runtime never drives one: every run a
+                // host starts NAMES a roster agent (`delegate` and `ctx.run` resolve
+                // `agents[name]`), so this brain's own transport is decoration for the Agent
+                // shape `createAgent` requires. If anything ever does drive it, it gets this
+                // error rather than an empty turn that would read like an answer.
+                stream: async function* hostTransport() {
+                    throw new HarnessError(
+                        'The host has no model: a run started through the host actor names one of this harness agents.'
+                    );
+                }
+            });
+            // THE authority, pinned per object rather than per name: this is the one rank the
+            // host holds, and it matches `hostRank()`'s fallback (`AGENT_RANKS[0]`) exactly.
+            actorRanks.set(hostBrain, AGENT_RANKS[0]);
+        }
+
+        return hostBrain;
+    };
 
     // Scheduler/mailbox/turn-queue identity. `branch:${branchId}` cannot collide
     // with a display name (branch ids are runtime-generated and reserved).
@@ -1380,41 +1707,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return branch === undefined ? brain.name : `branch:${branch.branchId}`;
     };
 
-    // Resolve the delegation allowlist once, at construction. `agents` order is no
-    // longer the routing decision when one is given explicitly.
-    const subagentNames = ((): string[] => {
-        const requested = configuration.subagents;
+    // THERE IS NO DELEGATION ALLOWLIST ANY MORE. The removed `subagents` list named targets
+    // by hand; targets are now PURELY rank-derived, through `delegableNamesFor` above, so the
+    // roster and the delegation surface cannot drift apart and a host that wants a different
+    // set changes RANKS instead of maintaining a second list. The one roster-level exception
+    // is `addAgent(…, { delegate: false })`, which lands in `nonDelegatable`.
+    //
+    // What the handle exposes instead is the RESOLVED rank map: complete (every registered
+    // agent has an entry, whether configured, added at runtime, or defaulted) and a frozen
+    // defensive copy, so a caller can neither reorder the roster nor promote itself through
+    // the handle.
+    const ranksView = (): Record<string, AgentRank> => {
+        const resolved: Record<string, AgentRank> = {};
 
-        // Default: every agent except the primary. A one-agent harness therefore
-        // has no subagents and gets no delegate tool at all.
-        if (requested === undefined) return agentNames.filter((name) => name !== primaryName);
-
-        const resolved: string[] = [];
-
-        for (const name of requested) {
-            if (name === primaryName) {
-                throw new HarnessError(
-                    `Subagent "${name}" is the primary agent "${primaryName}"; the primary cannot delegate to itself.`
-                );
-            }
-
-            if (!Object.prototype.hasOwnProperty.call(agents, name)) {
-                throw new HarnessError(
-                    `Subagent "${name}" is not registered. Configured agents: ${agentNames.join(', ')}.`
-                );
-            }
-
-            // Deduplicate so the allowlist is also the exact tool description.
-            if (!resolved.includes(name)) resolved.push(name);
+        for (const name of Object.keys(agents)) {
+            resolved[name] = rankByName.get(name) ?? defaultRank;
         }
 
-        return resolved;
-    })();
-
-    // The allowlisted agents, exposed on the handle so a host can inspect who the
-    // primary is allowed to reach.
-    const subagents: Record<string, Agent> = {};
-    for (const name of subagentNames) subagents[name] = agents[name];
+        return Object.freeze(resolved) as Record<string, AgentRank>;
+    };
 
     // -----------------------------------------------------------------------
     // Descriptor discovery (T19/R8-R9): METADATA FIRST, before any compilation
@@ -1491,9 +1802,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // `toolCreation: false` registers no model-facing creation tool; the
                 // host `harness.createTool` path stays available.
                 return toolCreation !== false;
-            case 'subagents':
-                // No allowlist means nowhere to delegate: the tool would only fail.
-                return subagentNames.length > 0;
+            case 'delegation':
+                // No strictly-lower-ranked peer anywhere means nowhere to delegate: the tool
+                // would only ever answer with a rank refusal.
+                return rosterHasDelegation();
             case 'interaction':
                 // `interaction` presence is what makes an owner answer reachable.
                 return interaction !== undefined;
@@ -1510,7 +1822,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 throw new HarnessError(
                     `Tool "${descriptor.name}" declares activation ${JSON.stringify(
                         String(descriptor.activation)
-                    )}, which this harness does not understand. Use always, creation, subagents, interaction, forks, threads, websearch, or webfetch.`
+                    )}, which this harness does not understand. Use always, creation, delegation, interaction, forks, threads, websearch, or webfetch.`
                 );
         }
     });
@@ -1572,11 +1884,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
-    // Definitions whose declaration/execution is role-gated or runtime-special.
-    // Keyed by the DEFINITION, not by name: replacing the definition drops the
-    // gate, which is what makes built-in/module-facing controls genuinely
-    // replaceable instead of bypassing the registry by wire name.
-    const primaryOnlyDefinitions = new WeakSet<Tool>();
+    // Definitions whose declaration is rank-aware, or whose execution is runtime-special.
+    // Keyed by the DEFINITION, not by name: replacing the definition drops the marker, which
+    // is what makes built-in/module-facing controls genuinely replaceable instead of bypassing
+    // the registry by wire name.
+    //
+    // `rankProjectedDefinitions` is the baseline `delegate` row. It is NOT an access gate —
+    // every agent may call `delegate`, and no rank removes it from the pool. The marker says
+    // two things: this entry's target list is CALLER-specific (so the declaration is projected
+    // per caller in `offerDeclarations`), and it is withheld from a caller with no lower-ranked
+    // target at all, because an empty enum is a control the model could only guess against.
+    const rankProjectedDefinitions = new WeakSet<Tool>();
+    // `creationGatedDefinitions` carries the rank CEILING of the optional `toolCreation`
+    // capability policy (a letter means that rank and above toward A). The value is a letter
+    // rather than a boolean because the policy itself is now a rank: `toolCreation: 'C'` gates
+    // at C, `'A'` gates at A. Replacing toolCreate drops it, exactly as the removed
+    // `primaryOnlyDefinitions` did.
+    const creationGatedDefinitions = new WeakMap<Tool, AgentRank>();
     const runtimeControlDefinitions = new WeakMap<Tool, 'toolCancel' | 'threadFork' | 'actionRequest'>();
     const pendingOnlyDefinitions = new WeakSet<Tool>();
     // T2/R1 answer extraction belongs to the BASELINE delegate definition.
@@ -2316,12 +2640,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         notifyStateChange('tool_create', { tool: switchable });
     };
 
-    // The core tools a given agent may actually see: every 'core' definition, minus
-    // the primary-only ones for every other agent, minus every name THIS conversation
-    // has switched off. ONE rule, shared by the request declaration below and by
-    // toolRequest's `alreadyAvailable` report, so a tool cannot be declared to a
-    // subagent and omitted from discovery (or advertised to an agent that never receives
-    // it, or hidden from one that does).
+    // The core tools a given agent may actually see: every 'core' definition, MINUS the two arms
+    // this function knows (a `toolCreation` ceiling the caller's rank does not reach, and the
+    // `delegate` control for a caller with no strictly-lower-ranked peer — there is NO ROLE GATE:
+    // rank never decides which TOOLS an agent may use), minus every name THIS conversation has
+    // switched off. ONE rule, shared by the request declaration below and by toolRequest's
+    // `alreadyAvailable` report, so a tool cannot be declared to one agent and hidden from another.
     //
     // THE SESSION SWITCH (withheld set). "Core" used to mean "cannot be turned off", and
     // that is no longer true: the user of a conversation switches a core name off by
@@ -2331,7 +2655,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // the NEXT model turn of the same live thread with no rebuild.
     const visibleCoreTools = (brain: Agent): Tool[] => {
         const core: Tool[] = [];
-        const role = roleOf(brain);
+        const rank = rankOf(brain);
+        // Resolved ONCE per call: the delegate arm below would otherwise re-filter the roster
+        // for every registered definition.
+        let delegateTargets: string[] | undefined;
 
         for (const definition of Object.values(tools)) {
             if (definition.visibility !== 'core') continue;
@@ -2341,14 +2668,60 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // Runtime controls (toolCancel) are declared separately and only while
             // actionable; they are still ordinary replaceable registry entries.
             if (pendingOnlyDefinitions.has(definition)) continue;
-            // Primary-only definitions are marked by object, NOT by wire name, so
-            // replacing delegate/toolCreate drops the gate unless the
-            // replacement itself declares it.
-            if (primaryOnlyDefinitions.has(definition) && role !== 'primary') continue;
+            // NO ROLE GATE ANYWHERE: tools are not rank-gated, and every agent has access to
+            // every registered tool. The two arms below are not tool-access gates either. One
+            // is the operator's OPTIONAL `toolCreation` capability policy — the single
+            // rank-shaped privilege a model can be denied — and it is keyed by definition, not
+            // by wire name, so replacing toolCreate drops it. The other withholds a delegation
+            // control from an agent that has nothing to delegate TO.
+            const creationGate = creationGatedDefinitions.get(definition);
+            if (creationGate !== undefined && !holdsCreationRank(rank, creationGate)) continue;
+
+            if (rankProjectedDefinitions.has(definition)) {
+                delegateTargets ??= delegableNamesFor(rank);
+                if (delegateTargets.length === 0) continue;
+            }
+
             core.push(definition);
         }
 
         return core;
+    };
+
+    // The `agent` enum of a `delegate` schema, widened to EVERY registered name (registration
+    // order). The parameters object is COPIED rather than mutated: one projected metadata
+    // object feeds the installed definition, `toolList`, and the declaration list, and a
+    // shared mutable array would let those three disagree.
+    const widenDelegateEnum = (parameters: Record<string, unknown>): Record<string, unknown> => {
+        const properties = (parameters.properties ?? {}) as Record<string, unknown>;
+        const agentProperty = (properties.agent ?? {}) as Record<string, unknown>;
+
+        return {
+            ...parameters,
+            properties: {
+                ...properties,
+                agent: { ...agentProperty, enum: Object.keys(agents) }
+            }
+        };
+    };
+
+    // THE per-caller declaration of `delegate`: the DESCRIPTION is the caller's legal set, so
+    // what a Rank B model is TOLD (Rank C and below) is exactly what it may CALL, and two
+    // agents of different ranks never see the same prose. The SCHEMA enum stays the whole
+    // roster — deliberately permissive, because a narrow enum answers a wrong guess with
+    // `$.agent must be one of: "editor"`, which cannot name a RANK: the model learns which
+    // names exist but not why its choice was wrong. A permissive enum lets the guess reach
+    // `delegateFor`, which refuses it by naming the caller's rank, the target's rank, and the
+    // legal targets. The declared list is a hint; the rank rule is the single authority.
+    const delegateDeclarationFor = (
+        brain: Agent
+    ): { description: string; parameters: Record<string, unknown> } => {
+        const projected = agentDelegateMetadata(delegableNamesFor(rankOf(brain)));
+
+        return {
+            description: projected.description,
+            parameters: widenDelegateEnum(projected.parameters)
+        };
     };
 
     // T28: the set toolRequest reports as `alreadyAvailable`. It is the standing core
@@ -2359,6 +2732,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // discovery answer: a confident "no" about a capability the caller already has.
     const declaredForDiscovery = (brain: Agent, selfCallId?: string): Tool[] => {
         const declared = visibleCoreTools(brain);
+        // The `delegate` CARD must read exactly like the DECLARATION that agent already
+        // sees. `visibleCoreTools` hands out the registered definition, whose description
+        // is the whole-roster capability envelope (the schema enum is the whole roster on
+        // purpose); the declaration narrows it to the caller's legal targets. Reporting the
+        // envelope here would tell a Rank B agent it may delegate to agents it is refused
+        // for, which is the exact kind of confident-but-wrong discovery answer T28 exists
+        // to prevent. A shallow copy keeps the registry entry itself untouched.
+        const delegateIndex = declared.findIndex((definition) => rankProjectedDefinitions.has(definition));
+        if (delegateIndex >= 0) {
+            // `as Tool`: the spread widens `visibility` back to the union's field type
+            // (`Tool` is a discriminated union over it), and nothing else about the entry
+            // changes — one model-facing string is replaced.
+            declared[delegateIndex] = {
+                ...declared[delegateIndex],
+                description: delegateDeclarationFor(brain).description
+            } as Tool;
+        }
         const pendingCancel = tools[TOOL_CANCEL];
 
         if (
@@ -3452,7 +3842,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // carries behaviour.
     //
     // FLAGS are bound by descriptor, not by wire name:
-    //   - `primaryOnly`  -> primaryOnlyDefinitions (role gate + declaration filter)
+    //   - `activation: 'delegation'` -> rankProjectedDefinitions (the per-caller
+    //     `delegate` enum, projected onto each agent's own legal targets)
     //   - `answerExtraction` -> delegateAnswerDefinitions (owner-answer parsing)
     //   - `control`      -> runtimeControlDefinitions (cancel/fork/action dispatch)
     //   - `pendingOnly`  -> pendingOnlyDefinitions (declared only while actionable)
@@ -3586,14 +3977,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // `registerBaselineDescriptors()` at the bottom of the startup sequence.
     const registerBaselineDescriptors = (): void => {
         for (const descriptor of activeDescriptors) {
-            // Per-harness declaration override for the delegation allowlist: the
-            // enum IS the session's subagent list, so the installed declaration is
-            // projected from the discovered baseline literal (core/metadata.ts is
-            // data-only) at registration time. Nothing else overrides a literal.
+            // Per-harness declaration override for the delegation row: the installed
+            // declaration is projected from the discovered baseline literal
+            // (core/metadata.ts is data-only) at registration time, because the roster —
+            // and not the generic literal — is what the `agent` enum must name. Nothing
+            // else overrides a literal.
+            // The installed delegate row is the CAPABILITY ENVELOPE: every registered agent
+            // name is its `agent` enum, because rank decides per CALLER which of them is
+            // legal, and that narrowing happens per model request in `offerDeclarations`.
             const overrides =
-                descriptor.name === delegateDescriptorName && subagentNames.length > 0
+                descriptor.name === delegateDescriptorName && rosterHasDelegation()
                     ? (() => {
-                          const projected = agentDelegateMetadata(subagentNames);
+                          const projected = agentDelegateMetadata(Object.keys(agents));
                           return {
                               description: projected.description,
                               tags: projected.tags,
@@ -3629,7 +4024,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // `toolList`/details honest.
             if (descriptor.pendingOnly === true) definition.visibility = 'searchable';
 
-            if (descriptor.primaryOnly === true) primaryOnlyDefinitions.add(definition);
+            // The delegation row is the ONLY rank-projected entry: its target list is read
+            // from the CALLER's rank at declaration time. There is no `primaryOnly` flag any
+            // more — the gate it implemented (one role may use this tool, the others may not)
+            // is gone with the role vocabulary.
+            if (descriptor.activation === 'delegation') rankProjectedDefinitions.add(definition);
             if (descriptor.answerExtraction === true) delegateAnswerDefinitions.add(definition);
             if (descriptor.pendingOnly === true) pendingOnlyDefinitions.add(definition);
 
@@ -3637,12 +4036,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             if (marker !== undefined) runtimeControlDefinitions.set(definition, marker);
         }
 
-        // The 'primary' creation policy is a property of the REGISTERED toolCreate
+        // A rank-limited `toolCreation` policy is a property of the REGISTERED toolCreate
         // DEFINITION, not its wire name, so a replacement inherits no gate.
-        if (toolCreation === 'primary') {
+        if (toolCreation !== 'all' && toolCreation !== false) {
             const createName = descriptorOf('toolCreate')?.name;
             if (createName !== undefined && tools[createName] !== undefined) {
-                primaryOnlyDefinitions.add(tools[createName]);
+                creationGatedDefinitions.set(tools[createName], toolCreation);
             }
         }
     };
@@ -3733,7 +4132,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // not exist, even though the tool was declared on that very request. Reporting
         // it through `alreadyAvailable` is the honest channel: it is a report, not a
         // grant, so nothing is enabled and no cap slot is spent.
-        const declared = declaredForDiscovery(caller ?? primary, selfCallId);
+        //
+        // A HOST discovery call (`runtime.requestTools(undefined, …)`, or a manual
+        // `executeTool('toolRequest', …)`) has no brain of its own, so it answers for
+        // `hostActor()` — the entry agent while it is registered, the Rank A host identity after
+        // `removeAgent` detaches it. That is the actor whose `delegate` card this re-projects
+        // below, so the host's discovery view and the host's delegation calls can never disagree
+        // about the host's rank (they used to: this line resolved through the stale construction
+        // brain while `delegateFor` resolved through `hostRank()`).
+        const declared = declaredForDiscovery(caller ?? hostActor(), selfCallId);
         const selection = selectTools(catalogue, query, { declared });
 
         // T11 SCOPE SPLIT — filter candidate matches with the SAME predicate the
@@ -3908,12 +4315,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         caller: Agent | undefined,
         configuration: ToolCreation
     ): ToolCreationResult => {
-        // 'primary' policy: the tool is also not DECLARED to subagents, so this is
-        // the defence-in-depth check for a guessed name.
-        if (toolCreation === 'primary' && roleOf(caller ?? primary) !== 'primary') {
-            throw new HarnessError(
-                `Only the primary agent "${primaryName}" can create tools; "${caller?.name ?? 'a host'}" cannot.`
-            );
+        // A rank-limited policy also withholds the DECLARATION, so this is the defence-in-depth
+        // check for a guessed name. The refusal states the ceiling and the caller's own rank,
+        // because "Rank C may not create under a Rank A ceiling" is the fact the host
+        // configured. A caller with no brain of its own is THE HOST, and it acts with
+        // `hostActor()` — the entry agent while it is registered, and the Rank A host identity
+        // once `removeAgent` detaches it — which is the same actor every other host door runs as
+        // (`delegateFor`, `executeTool`, `toolRequest`'s discovery view above), so the creation
+        // ceiling and the delegation ladder can never disagree about who the host is.
+        if (toolCreation !== 'all' && toolCreation !== false) {
+            const rank = rankOf(caller ?? hostActor());
+
+            if (!holdsCreationRank(rank, toolCreation)) {
+                throw new HarnessError(
+                    `Tool creation is limited to Rank ${toolCreation} and above in this harness; "${caller?.name ?? 'a host'}" holds Rank ${rank}.`
+                );
+            }
         }
 
         // Throwing is the error path the harness turns into a readable tool result:
@@ -3933,26 +4350,50 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return result;
     };
 
-    // The 'primary' creation policy is a property of the REGISTERED toolCreate
+    // A rank-limited `toolCreation` policy is a property of the REGISTERED toolCreate
     // DEFINITION, not its wire name. The descriptor loop registered the row (its
     // `activation: 'creation'` row is present whenever `toolCreation !== false`);
-    // this binds the policy gate to that published object, so replacing toolCreate
+    // this binds the policy CEILING to that published object, so replacing toolCreate
     // publishes a new definition that inherits no gate.
-    if (toolCreation === 'primary') {
+    if (toolCreation !== 'all' && toolCreation !== false) {
         const createName = descriptorOf('toolCreate')?.name;
         if (createName !== undefined && tools[createName] !== undefined) {
-            primaryOnlyDefinitions.add(tools[createName]);
+            creationGatedDefinitions.set(tools[createName], toolCreation);
         }
     }
 
     // THE session store (records-engine T3). One engine instance per harness, so two
     // harnesses (and therefore two server sessions) can never share records, and every
-    // agent in this harness — primary or subagent, on any thread — writes the same
+    // agent in this harness — at any rank, on any thread — writes the same
     // collections. It owns `tasks`, `chapters`, `profiles` and `locations` plus anything
     // an agent `define`s, with ONE id counter across all of them (F3: a profile id and
     // a chapter id can no longer both be "1" without colliding). reset() below clears it
     // with the conversation, and snapshot()/restore() persist it as ONE `records` map.
     const recordEngine = createRecordEngine();
+
+    // THE knowledge seam (T7). One object per harness, resolved ONCE at construction, and it
+    // is the same object a tool sees: `context.harness.knowledge` (the handle member below),
+    // which is how the `knowledge` tool and any wrapper over it (a future `recipes`) reach the
+    // base — the same role `runtime.executeRecords` plays for `tasks` (core/records.ts).
+    //
+    // WHY NOTHING ELSE IS WIRED HERE:
+    //   - NO SNAPSHOT/RESTORE. `snapshot()` is PER-SESSION state and knowledge is
+    //     DEPLOYMENT state at `<databaseRoot>/harness/knowledge/` (../server/knowledge-file-store.ts
+    //     header). Folding it in would make one session's restart rewrite the base every other
+    //     session is reading — and a session deleted with its `sessions/<id>/` directory would
+    //     take the articles with it, which is exactly the guarantee the user asked to keep.
+    //     That is also why the server adds no snapshot field and no HTTP endpoint for it (T7).
+    //   - NO `reset()`. A reset clears the conversation and the SESSION record stores (the
+    //     `recordEngine.reset()` in `reset()` below); the knowledge base outlives the
+    //     conversation by design, so it stays untouched.
+    //   - NO dispose hook on `harness.dispose`. Whatever is here was either created by the
+    //     HOST (a store: the process owner flushes and disposes it exactly once,
+    //     ../server/start.ts `close()` — one session's harness teardown must not unsubscribe
+    //     the base every other session is writing) or by THIS harness (the in-memory engine
+    //     fallback, which holds no timer, no subscription and no file handle, so it has
+    //     nothing to release and dies with the harness). `harness.dispose` therefore touches
+    //     knowledge in neither case; `HarnessKnowledgeStore.dispose` stays a host verb.
+    const knowledge = knowledgeSourceOf(configuration.knowledge);
 
     // Per-harness network closures. They are populated during startup from the
     // `websearch`/`webfetch` configuration and carry the credentials; the compiled
@@ -4061,7 +4502,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // observable" and omits the derived keys rather than inventing an age of 0.
         startedAt?: number;
         agent: string;
-        role: 'primary' | 'subagent';
+        // The agent's RANK at the time the run was registered. It replaces the removed
+        // `role: 'primary' | 'subagent'` and is what `agentManage`, the snapshot ledger, and
+        // the archive seam all report (../types `HarnessAgentResultSnapshot.rank`).
+        rank: AgentRank;
         kind: AgentInvocationKind;
         status: AgentInvocationStatus;
         // Completed answer text only. Empty for running/failed/cancelled.
@@ -4260,7 +4704,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             invocationId,
             sequence: run.id,
             agent: run.agent.name,
-            role: roleOf(run.agent),
+            rank: rankOf(run.agent),
             kind: invocationKindOf(run),
             status: 'running',
             content: '',
@@ -4558,7 +5002,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                 return {
                     name,
-                    role: roleOf(brain),
+                    // RANK, not role: `agentManage` is the model's own view of the roster, and
+                    // the rank is the fact that decides what each listed agent may delegate to.
+                    rank: rankOf(brain),
                     model: brain.model(),
                     invocationCount: recent.length,
                     results: visible.map(invocationPreviewOf)
@@ -5101,10 +5547,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return owned;
     };
 
-    // Bounded delegation (R4). Registered only when there is somewhere to
-    // delegate: a tool that can only fail would cost context on every request.
-    // Subagents never receive it (see declared()), and launchToolCall rejects a
-    // guessed call, so delegation is exactly one level deep. runAgent rejects
+    // Bounded delegation (R4). Registered only when SOME agent has a lower-ranked peer
+    // (`rosterHasDelegation`): a tool that could only fail would cost context on every
+    // request. An agent nobody is ranked below never RECEIVES it (see `visibleCoreTools`),
+    // and `delegateFor` refuses any target that is not strictly below the caller, so a
+    // chain is exactly as deep as the roster's distinct-rank span. runAgent rejects
     // re-entering an agent that is already running, which closes the ctx.run
     // cycle as well.
     //
@@ -5153,30 +5600,81 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // the pair is what identifies the child exactly.
         selfScope?: string
     ): Promise<HarnessDelegationResult> => {
-        // Defence in depth: the tool is not DECLARED to subagents, but a model can
-        // guess a name, so the caller is checked here too.
-        if (roleOf(caller ?? primary) !== 'primary') {
-            throw new HarnessError(
-                `Only the primary agent "${primaryName}" can delegate; "${caller?.name ?? 'a host'}" cannot.`
-            );
-        }
-
-        // Delegation is a top-level capability. A primary reached as a subagent of
-        // another run must not recurse outward. `runDepth` is the calling run's
-        // depth (1 = top level), carried on the context so this rule survives
-        // concurrent runs without a global run stack.
-        if ((runDepth ?? 1) > 1) {
-            throw new HarnessError(
-                'Delegation is only available from the primary agent\'s own run, not from inside another agent.'
-            );
-        }
-
-        // Two schema properties, so `parameters` is the parsed arguments object.
+        // -----------------------------------------------------------------------
+        // THE RANK RULE (R2). One comparison replaces the two removed throws (the
+        // caller-role check and the `runDepth > 1` check): the caller may delegate only to
+        // a REGISTERED agent whose rank is STRICTLY LOWER than its own.
+        //
+        //   - A→A and B→B are refused: a same-rank peer is not a subordinate, which is what
+        //     lets two Rank A agents coexist without either being the other's junior;
+        //   - upward targets (B→A) are refused for the same reason in the other direction;
+        //   - a nested caller is NOT refused. A Rank B agent at depth 2 may delegate to
+        //     Rank C, so chains (A→B→C) run; THIS rule is what bounds such a chain (a fourth
+        //     level would need a fourth letter — a same or senior rank is refused right here,
+        //     so A→B→A never reaches the cycle guard). The cycle guard and the nesting
+        //     ceiling in `runAgent` are what stop the shapes rank cannot see: re-entering a
+        //     running agent through `ctx.run` (threading is never rank-gated) and a chain
+        //     deeper than the roster's distinct-rank span.
+        //
+        // A host call carries the HOST's standing: `runtime.delegate(undefined, …)` has no caller
+        // brain at all and resolves through `hostRank()`, and `harness.executeTool('delegate', …)`
+        // arrives with `hostActor()` as its caller, whose pinned rank is the same letter. Both
+        // doors therefore agree, including after `removeAgent` detaches the entry agent — the case
+        // where the stale construction-time brain used to resolve to `defaultRank` instead.
+        const callerRank = caller === undefined ? hostRank() : rankOf(caller);
+        const legalTargets = delegableNamesFor(callerRank);
         const target = parameters?.agent;
 
-        if (typeof target !== 'string' || !subagentNames.includes(target)) {
+        // Names ranked STRICTLY BELOW the caller WHETHER OR NOT they opted out. `legalTargets`
+        // excludes the `nonDelegatable` names, so `legalTargets.length === 0` on its own cannot
+        // tell "nobody is junior" from "every junior was registered with `delegate: false`" — and
+        // only the first of those makes the `No agent in this harness is ranked below Rank X`
+        // sentence below TRUE.
+        const lowerRankedNames = Object.keys(agents).filter(
+            (name) => isLowerRank(rankByName.get(name) ?? defaultRank, callerRank)
+        );
+
+        // The refusal wording is part of the contract (R2): it names the CALLER'S RANK and
+        // the legal targets, so a model that guessed a name learns which names exist instead
+        // of learning that some unnamed agent is privileged.
+        if (typeof target !== 'string' || !Object.prototype.hasOwnProperty.call(agents, target)) {
             throw new HarnessError(
-                `Agent "${String(target)}" is not a configured subagent. Allowed: ${subagentNames.join(', ')}.`
+                `Agent "${String(target)}" is not registered in this harness. Registered agents: ${Object.keys(agents).join(', ')}.`
+            );
+        }
+
+        const targetRank = rankByName.get(target) ?? defaultRank;
+
+        if (!isLowerRank(targetRank, callerRank)) {
+            throw new HarnessError(
+                // The subject is the caller's OWN name, and for a host call the HOST identity —
+                // never `entryName`, which after `removeAgent` would name an agent this roster no
+                // longer holds (and would attribute the rank to it). While the entry agent exists
+                // `hostActor()` returns it, so this text is byte-identical to what it was.
+                `${caller?.name ?? hostActor().name} holds Rank ${callerRank} and cannot delegate to "${target}" (Rank ${targetRank}): delegation is strictly downward. ` +
+                    (legalTargets.length === 0
+                        ? lowerRankedNames.length === 0
+                            ? `No agent in this harness is ranked below Rank ${callerRank}, so a Rank ${callerRank} agent cannot delegate at all.`
+                            // The opt-out, not the ladder, is why this call has no target; saying
+                            // "nothing is ranked below" here would blame the ranks for a decision
+                            // the host itself made in `addAgent`.
+                            : `Every agent ranked below Rank ${callerRank} (${lowerRankedNames.join(', ')}) is registered with \`addAgent(…, { delegate: false })\`, so this call has no legal target.`
+                        : `The legal targets are Rank ${AGENT_RANKS[Math.min(rankIndexOf(callerRank) + 1, AGENT_RANKS.length - 1)]} and below: ${legalTargets.join(', ')}.`)
+            );
+        }
+
+        // THE HOST'S OPT-OUT IS ENFORCED AT THE REFUSAL SITE TOO (R53). `nonDelegatable` used to
+        // be read ONLY by `delegableNamesFor` — the DECLARATION path — while this door checked
+        // registration and rank and nothing else. A `delegate: false` member is lower-ranked, so
+        // the rank check above passed and the call RAN, which made the declaration's honest
+        // absence a lie: hiding a name is not refusing it, because the installed `delegate`
+        // schema deliberately carries the whole roster so a wrong guess reaches THIS function and
+        // gets a real reason. Ordering matters: the rank refusal stays first (a same-rank or
+        // senior target keeps its existing wording even when it also opted out), and both checks
+        // land before the child runs, so a refused target starts nothing.
+        if (nonDelegatable.has(target)) {
+            throw new HarnessError(
+                `Agent "${target}" is not a delegation target: it was registered with \`addAgent(…, { delegate: false })\`. Rank ${targetRank} is below Rank ${callerRank}, so the target is legal on rank alone and the host's opt-out is what refuses it; it stays reachable through threads and \`ctx.run\`.`
             );
         }
 
@@ -5428,7 +5926,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             if (trace !== undefined) delegateCallTraces.delete(callTraceKey(trace.scope, trace.callId));
         }
 
-        // Only the answer crosses back: the subagent keeps its own transcript and
+        // Only the answer crosses back: the delegated agent keeps its own transcript and
         // instructions. The identity comes from the run that produced it, so the
         // caller can page the rest with agentResult or address the conversation with
         // threadSend/threadRead.
@@ -5470,11 +5968,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         };
     };
 
-    // Delegation's per-harness allowlist schema was applied to the registered
-    // delegate declaration by the descriptor loop above. The primary-only and
-    // answer-extraction flags are descriptor-driven too (`primaryOnly: true`,
-    // `answerExtraction: true` on the entry), so a replacement under the same wire
-    // name inherits neither.
+    // Delegation's target schema is per-CALLER: the installed declaration names the whole
+    // roster as the capability envelope, and `offerDeclarations` projects the CALLER's legal
+    // subset onto every request. The answer-extraction flag stays descriptor-driven
+    // (`answerExtraction: true` on the entry), so a replacement under the same wire name
+    // inherits neither marker.
 
     // N6 branch controls (threadFork / actionRequest) and the pending-only
     // toolCancel control are all registered by the descriptor loop above: their
@@ -5648,10 +6146,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // configured search, and the harness-owned set), then everything discovered
     // so far. Everything else stays out of the context window on purpose.
     //
-    // delegate is core for the primary only: it is skipped for every other
-    // agent, so a subagent cannot even see the delegation control. toolCreate is
-    // the same under the 'primary' creation policy (R12). That rule lives in
-    // visibleCoreTools, which toolRequest also reads — one source for both.
+    // Two declarations are rank-aware, and neither is an ACCESS gate (R3): `delegate` is
+    // withheld from an agent that has no lower-ranked target, and toolCreate is withheld
+    // below a configured `toolCreation` rank ceiling. Every other registered core tool is
+    // declared to EVERY agent — the role gate that used to sit here is gone. Both rules live
+    // in visibleCoreTools, which toolRequest also reads — one source for both.
     const declared = (brain: Agent, scope?: readonly string[]): Tool[] => {
         // "At the model-turn boundary" is exactly here: every request rebuilds this
         // list from the SAME capped enabled set authorization reads. Core tools are
@@ -5689,8 +6188,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // Declarations handed to every request. Rebuilt per run so a plugin that
     // registers tools mid-flight is picked up on the next call, and so a toolRequest
-    // round shows up in the very next request. Per-brain because delegate is a
-    // primary-only declaration.
+    // round shows up in the very next request. Per-brain because the `delegate`
+    // declaration is PROJECTED per caller: its prose and its target set are the caller's rank.
     //
     // toolCancel is appended ONLY while this agent's ACTOR has background work
     // pending: that is the only moment it can succeed, and keeping it off ordinary
@@ -5716,11 +6215,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const list: HarnessStreamTool[] = [];
 
         for (const definition of definitions) {
+            // The EXECUTABLE entry stays the installed definition (its envelope accepts every
+            // registered agent, so a rank refusal is reported by `delegateFor`, naming the
+            // caller's rank, rather than by a schema rejection); only the DECLARED schema is
+            // projected per caller. Rank-gating a declaration is a context-window decision,
+            // never a capability one.
+            const declared = rankProjectedDefinitions.has(definition)
+                ? delegateDeclarationFor(run.agent)
+                : undefined;
+
             offered.set(definition.name, definition);
             list.push({
                 name: definition.name,
-                description: definition.description,
-                parameters: definition.parameters
+                description: declared?.description ?? definition.description,
+                parameters: declared?.parameters ?? definition.parameters
             });
         }
 
@@ -5797,7 +6305,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         actorKey: string;
         // Delegation depth (1 = a top-level run). A branch run starts at 1 again:
         // fork nesting is bounded by forkDepth (core/branch.ts), NOT by
-        // MAX_RUN_DEPTH, so a normal fork may fork itself.
+        // the rank-derived nesting ceiling, so a normal fork may fork itself.
         depth: number;
         // True for an autoanswer owner branch: no tools, exactly one model
         // request, and any tool call is an invalid directive answer.
@@ -5812,7 +6320,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // text, tool_call/result, usage, done, error) carries the same id.
         thread?: HarnessThread;
         // R2: the PERSISTENT thread this run executes in. Every ordinary run has
-        // one (root = the primary's default conversation, delegation = the
+        // one (root = the acting agent's own default conversation, delegation = the
         // child's default conversation, host call = the created thread); a
         // fork/autoanswer branch owns an ephemeral transcript instead and has
         // none.
@@ -5882,7 +6390,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // Root-prompt attachments (T3). Validated once at runAgent entry and
         // consumed by runAgentCore when it appends the user message. Always
         // empty for delegated/ctx.run children: the root's bytes are never
-        // re-sent with an unrelated subagent prompt.
+        // re-sent with an unrelated child prompt.
         attachments: HarnessAttachment[];
         // True when new work (a completion or a wake) arrived and the loop should
         // take another turn instead of waiting/returning.
@@ -6330,11 +6838,30 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         // SENDER IDENTITY (R4): derived from the runtime context, never from a
-        // tool argument. A manual executeTool call has no `threadId` and runs as
-        // the primary agent (an operator action).
+        // tool argument. A manual executeTool call has no `threadId` and runs as the HOST
+        // actor — the entry agent while it is registered (an operator action).
+        //
+        // THE HOST FALLBACK IS `hostActor()`, NOT `entryName` (R70, 2026-11-18). A host call
+        // with no caller brain (`runtime.threadSend(undefined, …)` — a plugin outside any
+        // conversation, ../server/workers/lane-authority.ts `thread:send`) used to stamp
+        // `entryName`, the CONFIGURED entry name. `removeAgent(entryName)` is legal here (the
+        // "THE ENTRY AGENT IS REMOVABLE" note in `removeAgent` below), so after a detach that
+        // wrote the message `from agent "entry"` — the ghost identity already removed at the
+        // other host doors (`hostActor`, `:1669`; the rank refusal in `delegateFor`, `:5654`;
+        // the `{ agent: 'host', rank: 'A' }` invocation record), attributing a message to an
+        // agent this roster had stopped naming. `hostActor()` answers with the entry brain
+        // WHILE it is registered — and the construction loop and `addAgent` both force
+        // `brain.name = key` (`:1488` and `addAgent` below), so its name IS `entryName` and the
+        // normal case stays byte-identical — and with the unregistered Rank A `host` identity
+        // once the entry is detached, i.e. the same actor a host `delegate` runs as.
+        // `postThreadMessage` reads this field in three places: the delivered attribution line,
+        // the receipt's `sender`, and its `ownDefault` refusal ("agent X's own conversation and
+        // is idle"). After a detach the host is not any agent's default conversation, so that
+        // refusal correctly stops firing for the departed name — the same honesty the host
+        // refusals already carry.
         return postThreadMessage(
             {
-                agent: caller?.name ?? primaryName,
+                agent: caller?.name ?? hostActor().name,
                 ...(threadId === undefined ? {} : { threadId })
             },
             target,
@@ -6836,10 +7363,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const source = agents[agentName];
         const threadAgent = createThreadAgent(source);
 
-        // Scheduling identity and role travel with the fresh Agent, so a thread of
-        // the primary keeps primary tools while never queueing behind the default
-        // conversation (and vice versa).
-        actorRoles.set(threadAgent, roleOf(source));
+        // Scheduling identity travels with the fresh Agent, so a host thread never
+        // queues behind the owner's default conversation (and vice versa). The RANK is
+        // inherited from the owner for LINEAGE ONLY: rank decides what the agent that
+        // runs this thread may do (delegation, tool creation), never which threads
+        // exist or who can see and write them.
+        actorRanks.set(threadAgent, rankOf(source));
         actorKeys.set(threadAgent, `thread:${id}`);
 
         const state: ThreadState = {
@@ -8496,7 +9025,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             epoch: archivedEpoch,
             sequence: input.sequence,
             agent: input.agent,
-            role: input.role,
+            rank: input.rank,
             kind: input.kind,
             status,
             content: status === 'completed' ? input.content ?? '' : '',
@@ -8531,7 +9060,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 sequence: archived.sequence,
                 completedOrder: archived.completedOrder,
                 agent: archived.agent,
-                role: archived.role,
+                rank: archived.rank,
                 kind: archived.kind,
                 status,
                 content: archived.content,
@@ -8701,8 +9230,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // What is refused (only the members that START a conversation run on this instance):
     //   - the callable itself — `context.harness(input)` / `ctx(...)`;
     //   - `sendThreadInput` — runs a turn in another conversation;
-    //   - `agents` / `subagents` — the guarded brain view, so `.turn()` / `.stream()` are refused
-    //     at the read that would capture them (same rule as `context.agents`).
+    //   - `agents` — the guarded brain view, so `.turn()` / `.stream()` are refused
+    //     at the read that would capture them (same rule as `context.agents`);
+    //   - `ranks` — the resolved rank map, answered as a fresh frozen copy so a tool body
+    //     can neither mutate the roster nor cache its way to a promotion.
     // Everything else passes through untouched, which is what the toolbox actually uses:
     // `runtime.*` (the routed cross-thread and shared-state operations), `memory`, `tools`,
     // `commands`, `agent`, `executeTool`, `callTool`, `registerTool`, `threads()` /
@@ -8733,8 +9264,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                 // Sibling brains go through the guarded view, so `context.harness.agents.x.turn()`
                 // cannot reach an unguarded `turn` either, and `steerThread`/`stopThread`/reads on
-                // the same object keep working.
-                if (property === 'agents' || property === 'subagents') return toolAgentsView();
+                // the same object keep working. `ranks` is the resolved rank map (rank model),
+                // replacing the removed `subagents` allowlist; a fresh frozen copy either way.
+                if (property === 'ranks') return ranksView();
+                if (property === 'agents') return toolAgentsView();
 
                 return Reflect.get(target, property);
             }
@@ -10387,8 +10920,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // T28 SCOPE GATE. A scoped run (a delegation with `scope.tools`) may only call
         // what its allowlist names. The declaration filter already hides the rest, so
         // this is the defence-in-depth half for a model that GUESSES a name — the same
-        // shape as the primary-only gate below, and it answers with a readable result
-        // instead of failing the run.
+        // shape as the global-disable gate below (it answers with a readable tool RESULT
+        // instead of failing the run). It used to point at a "primary-only gate" further
+        // down as well; that gate is deleted (see "THERE IS NO ROLE GATE HERE ANY MORE"
+        // below), so this sentence names only the two gates that still exist.
         //
         // The ONE exemption is `toolRequest` (see `isScopeEscapeHatch`): the discovery
         // door stays open so a restricted child can report what it needs instead of
@@ -10450,15 +10985,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // a call that has no task to wait for.
         const syncGroup = effectiveToolMode(definition) === 'sync' ? batch : undefined;
 
-        // Roles/content policies are attached to the baseline DEFINITION objects,
-        // not to names. A replacement under delegate/toolCreate is an ordinary
-        // tool and does not inherit the old gate.
-        if (primaryOnlyDefinitions.has(definition) && roleOf(brain) !== 'primary') {
-            await fail(
-                `Tool "${call.name}" is only available to the primary agent "${primaryName}".`
-            );
-            return;
-        }
+        // THERE IS NO ROLE GATE HERE ANY MORE (rank model). The removed gate keyed
+        // on a `primaryOnly` definition set plus `role === 'primary'`, which could
+        // not express a roster where two agents hold Rank A and a third holds Rank
+        // B. Both rank-gated capabilities are enforced where the rule actually
+        // lives: `delegateFor` proves the strictly-downward rule for `delegate`
+        // (and names the caller's rank and its legal targets when it fails), and
+        // the `toolCreation` ceiling is checked against the CALLER's rank when the
+        // tool is declared (visibleCoreTools) and when it is registered
+        // (createToolForAgent). A declaration list is a hint, not a permission —
+        // so removing this duplicate cannot let anything through that the two
+        // authoritative checks would miss.
 
         // toolCancel is a HARNESS control only while the resolved definition is the
         // baseline control object. A replacement executes through the ordinary path.
@@ -11127,16 +11664,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
-        // A branch is a separate actor with the SAME role as its source, so a fork
-        // of the primary keeps delegate/toolCreate and a fork of a subagent
-        // does not gain them.
-        actorRoles.set(branch, roleOf(run.agent));
+        // A branch is a separate actor with the SAME rank as its source, so a fork
+        // of a Rank A agent keeps its delegation reach and a fork of a junior agent
+        // does not gain any. Rank never decides which threads a branch can see.
+        actorRanks.set(branch, rankOf(run.agent));
 
         const summary: HarnessBranchSummary = {
             branchId: metadata.branchId,
             kind: 'fork',
             agent: run.agent.name,
-            role: roleOf(run.agent),
+            rank: rankOf(run.agent),
             ...(metadata.sourceBranchId !== undefined
                 ? { sourceBranchId: metadata.sourceBranchId }
                 : {}),
@@ -11447,13 +11984,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     autoBranch.messages.push(message);
                 }
 
-                actorRoles.set(autoBranch, roleOf(ownerRun.agent));
+                actorRanks.set(autoBranch, rankOf(ownerRun.agent));
 
                 const summary: HarnessBranchSummary = {
                     branchId: created.branchId,
                     kind: 'autoanswer',
                     agent: ownerRun.agent.name,
-                    role: roleOf(ownerRun.agent),
+                    rank: rankOf(ownerRun.agent),
                     ...(created.sourceBranchId !== undefined
                         ? { sourceBranchId: created.sourceBranchId }
                         : {}),
@@ -13843,7 +14380,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // turnQueues, but a run appends a user message and a transcript; two runs of
     // the same agent interleaving those appends would show each other's prompts.
     // Queuing the whole run is what makes repeated delegation/follow-ups to the
-    // same subagent sequential. Independent agents still run concurrently, and
+    // same agent sequential. Independent agents still run concurrently, and
     // tools within a run are concurrent.
     const agentQueues = new Map<string, Promise<void>>();
 
@@ -14172,9 +14709,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // more precise message.
         const depth = branchRun !== undefined ? 1 : (parent?.depth ?? 0) + 1;
 
-        if (depth > MAX_RUN_DEPTH) {
+        // THE NESTING CEILING is the number of DISTINCT ranks the roster configures
+        // (capped at the 26 letters), not the old hard-coded 2: with ranks A, B and C
+        // configured, A→B→C is legal at depth 3, while a fourth level would have to
+        // place two agents on the same rank — which the strictly-downward rule in
+        // `delegateFor` already refuses. A roster that spans one rank gets a ceiling of
+        // 1, i.e. no nesting at all, which is the honest shape of "nobody is below
+        // anybody". Recomputed on every roster change (see `recomputeRankBounds`).
+        if (depth > runDepthCeiling) {
             throw new HarnessError(
-                `Agent "${brain.name}" cannot run: runs nest at most ${MAX_RUN_DEPTH} deep, and "${ancestors[ancestors.length - 1].name}" is already running.`
+                `Agent "${brain.name}" cannot run: this harness configures ${distinctRankCount} `
+                + `distinct rank${distinctRankCount === 1 ? '' : 's'}, so runs nest at most `
+                + `${runDepthCeiling} level${runDepthCeiling === 1 ? '' : 's'} deep, and `
+                + `"${ancestors[ancestors.length - 1].name}" is already running at that depth.`
             );
         }
 
@@ -14193,7 +14740,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         //     R4 "linked subagents" real instead of inheriting the agent's default
         //     conversation;
         //   - the target agent's DEFAULT conversation for a legacy/root delegation;
-        //   - the primary's default conversation for the callable root.
+        //   - the ENTRY agent's default conversation (`agent:<entry>`) for the
+        //     callable root — `entry` is routing only, so the root run simply lands
+        //     in the entry agent's own conversation and gains no authority from it.
         const resolvedThread = ((): ThreadState | undefined => {
             if (branchRun !== undefined) return undefined;
             if (threadState !== undefined) return threadState;
@@ -14808,7 +15357,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 sequence: record.sequence,
                 completedOrder: record.completedOrder,
                 agent: record.agent,
-                role: record.role,
+                rank: record.rank,
                 kind: record.kind,
                 status: record.status as 'completed' | 'failed' | 'cancelled',
                 content: record.content,
@@ -15028,14 +15577,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // T27: exactly one name is exempt from the collision rule — the delegation row.
         //
         // Whether `delegate` exists at all is a property of the ROSTER: its descriptor is gated on
-        // `activation: 'subagents'`, so a harness built without a subagent never registers it and a
-        // harness built with one always does. A roster is now mutable at session scope
-        // (`addAgent`/`removeAgent` above, driven by `POST`/`DELETE /sessions/{id}/agents`), so a
-        // snapshot taken AFTER the first subagent joined records a `delegate` registration that the
+        // `activation: 'delegation'` + `rosterHasDelegation()`, so a roster that spans one rank
+        // never registers it and a roster that spans two always does. A roster is now mutable at
+        // session scope (`addAgent`/`removeAgent` above, driven by
+        // `POST`/`DELETE /sessions/{id}/agents`), so a snapshot taken AFTER the roster gained its
+        // second rank records a `delegate` registration that the
         // same build performs from its own startup loop when it rebuilds that session. Refusing the
         // collision would make every later restore of that session fail on a name both sides
         // compiled from the same descriptor row, which is a worse outcome than replacing an entry
-        // whose projected allowlist the target regenerates from its own roster anyway.
+        // whose projected target list the target regenerates from its own roster anyway.
         //
         // Nothing else is exempt: `harness.snapshot.test.ts:767` pins the refusal for a genuinely
         // created tool, where a collision really does mean the snapshot came from another harness.
@@ -15123,7 +15673,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // above; a factory failure aborts the restore with nothing replaced.
         const restoredThreads = (next.threads ?? []).map((entry) => {
             const threadAgent = createThreadAgent(agents[entry.agent]);
-            actorRoles.set(threadAgent, roleOf(agents[entry.agent]));
+            // A restored thread's backing agent carries the owner's rank for
+            // lineage; visibility of the thread itself never depends on it.
+            actorRanks.set(threadAgent, rankOf(agents[entry.agent]));
             actorKeys.set(threadAgent, `thread:${entry.id}`);
             return { entry, threadAgent };
         });
@@ -15240,7 +15792,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 sequence: result.sequence,
                 completedOrder: result.completedOrder,
                 agent: result.agent,
-                role: result.role,
+                rank: result.rank,
                 kind: result.kind,
                 status: result.status,
                 content: result.content,
@@ -15792,7 +16344,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const executeToolInternal = async (name: string, parameters: unknown): Promise<unknown> => {
         const definition = tools[name];
 
-        // The session owns which tools exist: a harness without subagents has no
+        // The session owns which tools exist: a single-rank harness has no
         // delegate, so an operator asking for one gets an honest error here (the
         // server maps it to 404) instead of a fabricated implementation. The same is
         // true of toolCreate under `toolCreation: false`.
@@ -15817,18 +16369,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // shipped `textSummarize` reached its nested child in the T13 repro.
         const context: ToolContext = {
             parameters: resolved,
-            // An explicit host call acts as the session's entry agent: delegate
-            // therefore stays primary-only, and ctx.run cycles and the depth rule are
-            // still enforced by runAgent.
-            agent: primary,
+            // A HOST call acts as `hostActor()`: the session's ENTRY agent while it is
+            // registered, and the Rank A host identity once `removeAgent` detaches it. Passing
+            // the construction-time brain instead made this door the odd one out — after an entry
+            // removal the stale object resolved through `rankOf` to `defaultRank`, so a host
+            // `executeTool('delegate', …)` was refused with a rank attributed to a departed agent
+            // while `runtime.delegate(undefined, …)` (which resolves through `hostRank()`) was
+            // allowed the same call. Every host door now carries the same actor. ctx.run cycles
+            // and the nesting rule are still enforced by runAgent.
+            agent: hostActor(),
             // T14: guarded sibling view (see the model path above).
             agents: toolAgentsView(),
             // Manual/nested calls receive the same harness reference the model path does: the LIVE
             // handle inline, the guarded view on a REFUSING lane replica (`toolHandleView`). A tool
             // is never handed a clone or a state snapshot as a substitute.
             harness: toolHandleView(),
+            // A nested call from a manual host call is the SAME actor one level down: a tool
+            // that reaches a capability through `context.callTool` must not gain or lose rank on
+            // the way (see the `agent` field above for why this is `hostActor()`).
             callTool: (nestedName: string, nestedParameters: unknown) =>
-                callToolInternal(nestedName, nestedParameters, { agent: primary, runDepth: 1 }),
+                callToolInternal(nestedName, nestedParameters, { agent: hostActor(), runDepth: 1 }),
             // A manual call is a top-level action (depth 1), exactly like a
             // harness invocation; delegation and the depth rule see it that
             // way.
@@ -15947,16 +16507,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
-    // Keep the installed `delegate` declaration honest about the CURRENT allowlist.
+    // Keep the installed `delegate` definition honest about the CURRENT roster.
     //
-    // A harness built with no subagents never registered the tool at all (its descriptor
-    // row is gated on `activation: 'subagents'`), so the first added subagent has to
-    // install it through the same baseline kernel the startup loop uses — including the
-    // per-definition policy markers, because `answerExtraction` and `primaryOnly` are read
-    // off the DEFINITION object, not the name. Once installed the tool stays (dropping it
-    // between two model turns would tear the declaration list); with an empty allowlist
-    // `delegateFor` refuses every target, which is the pre-existing behavior for a
-    // harness whose last subagent was removed.
+    // The INSTALLED object is the shared envelope, and its projection uses the HOST's
+    // legal targets (`delegableNamesFor(hostRank())`) — the same actor an explicit
+    // `harness.executeTool('delegate', …)` or `runtime.delegate(…)` call runs as. Each
+    // agent's own DECLARATION is re-projected onto its own targets when it is offered
+    // (see `delegateDeclarationFor` and `visibleCoreTools`), so what a model sees is
+    // always its own legal set while the envelope stays wide enough for a wrong guess to
+    // reach `delegateFor` and get the rank error rather than a schema rejection.
+    //
+    // A roster that spans a single rank has NO delegation door at all (its descriptor row
+    // is gated on `activation: 'delegation'` and `rosterHasDelegation()` is false), so the
+    // first roster change that spans two ranks has to install the tool through the same
+    // baseline kernel the startup loop uses — including the per-definition policy markers,
+    // because `answerExtraction` and the `rankProjected` marker are read off the DEFINITION
+    // object, not the name. Once installed the tool stays (dropping it between two model
+    // turns would tear the declaration list); with no rank-below target `delegateFor`
+    // refuses every call, which is the pre-existing behaviour for a roster whose last
+    // junior was removed.
     const syncDelegateDeclaration = (): void => {
         const descriptor = toolDescriptors.find((row) => row.name === delegateDescriptorName);
 
@@ -15965,7 +16534,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
-        const projected = agentDelegateMetadata(subagentNames);
+        // The INSTALLED definition is the capability envelope, exactly like the startup
+        // registration path (see `registerBaselineDescriptors`): the WHOLE roster is its
+        // `agent` enum and its description, because rank narrows per CALLER, per model
+        // request, in `offerDeclarations`. Keeping the two paths on the same projection is
+        // what makes a roster change and a fresh harness agree byte-for-byte.
+        const projected = agentDelegateMetadata(Object.keys(agents));
         const overrides = {
             description: projected.description,
             tags: projected.tags,
@@ -15973,6 +16547,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         };
 
         const installed = tools[descriptor.name];
+
+        if (installed === undefined && !rosterHasDelegation()) {
+            // Nothing in this roster can delegate yet, and the tool has never been
+            // installed: keep the HONEST ABSENCE (no tool, no declaration) instead of
+            // registering a door that `delegateFor` would refuse on every call. The
+            // first roster change that spans two ranks comes back through here and
+            // installs it.
+            return;
+        }
 
         if (installed !== undefined) {
             // Re-project IN PLACE: the same definition object is what the declaration
@@ -16004,7 +16587,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const definition = prepared.tool;
 
         if (descriptor.pendingOnly === true) definition.visibility = 'searchable';
-        if (descriptor.primaryOnly === true) primaryOnlyDefinitions.add(definition);
+        // The `delegation` activation row is the rank-projected one (per-caller enum).
+        if (descriptor.activation === 'delegation') rankProjectedDefinitions.add(definition);
         if (descriptor.answerExtraction === true) delegateAnswerDefinitions.add(definition);
         if (descriptor.pendingOnly === true) pendingOnlyDefinitions.add(definition);
 
@@ -16020,7 +16604,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const addAgent = (
         name: string,
         configuration: AgentConfiguration,
-        options: { delegate?: boolean } = {}
+        options: { delegate?: boolean; rank?: AgentRank } = {}
     ): Agent => {
         assertRosterIdle('change the agent roster');
 
@@ -16039,6 +16623,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         if (configuration === undefined || configuration === null) {
             throw new HarnessError(`Agent "${key}" requires an agent configuration.`);
+        }
+
+        // THE RETIRED VOCABULARY IS REFUSED HERE TOO (clean break, R55) — the roster-mutation
+        // twin of the `primary`/`subagents` refusal at the construction door above. `role` is the
+        // name the pre-rank model used for this option, and the hazard is the same one
+        // `resolveRankValue` already refuses for a bad letter: a silently-dropped key would put
+        // the new member at the roster's DEFAULT rank, which is a privilege its author never
+        // wrote (and, for `role: 'primary'`, the exact opposite one). Checked before the brain is
+        // built, so a refused call leaves the roster exactly as it was.
+        if ((options as Record<string, unknown>).role !== undefined) {
+            throw new HarnessError(
+                `addAgent("${key}") options were written before the rank model and carry \`role\`. This build takes \`rank\` (one letter, "A" highest to "Z" lowest), and it does not translate the old key.`
+            );
         }
 
         const brain = createAgent({ ...configuration, name: key });
@@ -16063,15 +16660,31 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             generation: 0
         });
 
-        // The primary is never its own delegate (`roleOf` and the construction allowlist
-        // both enforce that), so a brain added under the primary's name — impossible
-        // while it is registered, and `delegate: false` is the explicit opt-out for a
-        // host that wants a reachable-but-not-delegatable member — stays out of the list.
-        if (options.delegate !== false && key !== primaryName) {
-            if (!subagentNames.includes(key)) subagentNames.push(key);
-            subagents[key] = brain;
-            syncDelegateDeclaration();
+        // RANK, not an allowlist, decides delegation now: the new brain takes
+        // `options.rank` when given (validated exactly like a configured rank) and
+        // otherwise the roster's resolved default rank, so `addAgent` cannot invent a
+        // privilege the configuration did not. There is no "never its own delegate"
+        // rule left to apply — a same-rank peer is excluded by `isLowerRank` on its own.
+        //
+        // `delegate: false` remains the host's opt-out from being a TARGET: the agent
+        // stays registered and reachable through threads and `ctx.run`, it simply never
+        // appears in a `delegate` enum and is refused by `delegateFor`.
+        rankByName.set(
+            key,
+            options.rank === undefined
+                ? defaultRank
+                : resolveRankValue(options.rank, `addAgent("${key}") options.rank`)
+        );
+
+        if (options.delegate === false) {
+            nonDelegatable.add(key);
         }
+
+        // The ceiling and the existence of the door both depend on the distinct-rank
+        // count, so a roster that gains its second rank through this call has to
+        // recompute them and install the tool it previously had no reason to register.
+        recomputeRankBounds();
+        syncDelegateDeclaration();
 
         return brain;
     };
@@ -16090,15 +16703,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             );
         }
 
-        // The entry point is structural, not a binding: removing it would leave a harness
-        // whose callable root and `handle.name` point at a brain that is gone. That is a
-        // redefinition (`PATCH /harnesses/{name}` with a new primary), never a detach.
-        if (key === primaryName) {
-            throw new HarnessError(
-                `Agent "${key}" is the primary agent and cannot be removed; change the harness definition instead.`
-            );
-        }
-
+        // THE ENTRY AGENT IS REMOVABLE (rank model). The old guard treated the entry
+        // point as a structural singleton; in the rank model it is an ordinary agent
+        // that merely names a default target, so a host may detach it and `run()`
+        // fails with a clear error (or a later `addAgent` re-registers the name). The
+        // rank bookkeeping below drops it from the roster like any other member.
         const defaultThread = threadStates.get(defaultThreadIdOf(key));
 
         if (defaultThread !== undefined) {
@@ -16132,10 +16741,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         delete agents[key];
-        delete subagents[key];
+        rankByName.delete(key);
+        nonDelegatable.delete(key);
 
-        const index = subagentNames.indexOf(key);
-        if (index !== -1) subagentNames.splice(index, 1);
+        // The roster may have lost its only junior, or its only distinct rank, so the
+        // ceiling and the delegation door are recomputed here too. The installed tool
+        // is kept (its declaration list is live); `delegateFor` refuses every target
+        // when nothing is ranked below the caller.
+        recomputeRankBounds();
+        syncDelegateDeclaration();
 
         // The default conversation is the agent's transcript: it goes with the agent. Its
         // sequence number is NOT reused (the counter is monotonic, like thread ids).
@@ -16205,27 +16819,99 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         else history.splice(0, replace, { role: 'system', content: text });
     };
 
+    // The brain a root call runs on. Resolved at CALL time rather than captured at
+    // construction, because the entry agent is now detachable (`removeAgent`): a stale
+    // reference would run a brain that is no longer in the roster, with a rank the
+    // roster no longer contains.
+    const entryAgentForRun = (): Agent => {
+        const brain = agents[entryName];
+
+        if (brain === undefined) {
+            throw new HarnessError(
+                `Entry agent "${entryName}" is not registered. Configured agents: ${Object.keys(agents).join(', ')}.`
+            );
+        }
+
+        return brain;
+    };
+
+    // THE EFFECTIVE ENTRY (R62) — the ONE rule behind `handle.name` and `handle.agent`, so the
+    // two readers cannot disagree about which agent the callable runs.
+    //
+    // WHY IT EXISTS. `handle.agent` used to be the brain captured at CONSTRUCTION (`entryAgent`,
+    // `:1507`) and `handle.name` the configured `entryName` written as a frozen `value:` on the
+    // callable. Both were written exactly once, which was sound while the entry point was a
+    // structural singleton and is unsound now that the rank model makes it removable
+    // ("THE ENTRY AGENT IS REMOVABLE", `:16706`): after `removeAgent(entryName)` the two readers
+    // kept naming a brain this roster stopped naming — `harness.name` reported a member the rank
+    // map no longer lists, and `harness.agent` handed back a transcript and model nobody can
+    // address any more.
+    //
+    // THE FALLBACK, AND WHY THIS ONE. While the agent named by `entry` is REGISTERED the entry
+    // IS that agent. Once it is detached, the effective entry is the FIRST CURRENTLY-REGISTERED
+    // agent — the same rule construction uses when `entry` is absent (`entryName =
+    // configuration.entry ?? agentNames[0]`, `:1499`, documented as the `entry?` default in
+    // ./types), so the handle describes the roster with a rule the configuration already states
+    // instead of inventing a second one. `agents` is insertion-ordered, so "first registered" is
+    // the roster's own first key, and it is a LIVE read: `addAgent(entryName, …)` re-registers
+    // the configured name and the handle resolves back to it, exactly like `hostActor()` (`:1669`)
+    // does.
+    //
+    // WHAT IT DELIBERATELY DOES NOT MOVE. This is the HANDLE's answer, not an authority rule:
+    //   - every HOST DOOR still runs as `hostActor()` (`:1669`) — the entry brain while it is
+    //     registered, the unregistered Rank A identity literally named `host` after the detach —
+    //     so host authority and the `{ agent: 'host', rank: 'A' }` invocation record are
+    //     unchanged, and no rank or refusal sentence attributes anything to the detached agent;
+    //   - `run()` still REFUSES rather than silently re-routing (`entryAgentForRun` above): a
+    //     root prompt that names no agent has to mean the one the host configured, and pointing
+    //     it at a different brain than the configuration names would be a routing change nobody
+    //     asked for. `removeAgent` documents that refusal ("`run()` fails with a clear error").
+    //
+    // THE DEGENERATE CASE: a roster emptied by `removeAgent` has no first member, so there is no
+    // live agent to fall back to. Both readers then keep the CONSTRUCTION answer (`entryName` /
+    // `entryAgent`) — the members are typed `string`/`Agent`, so `undefined` would be a lie of a
+    // different shape, and with an empty roster neither answer can attribute anything to a member.
+    const effectiveEntryName = (): string => {
+        if (Object.prototype.hasOwnProperty.call(agents, entryName)) return entryName;
+
+        const names = Object.keys(agents);
+
+        return names.length === 0 ? entryName : names[0];
+    };
+
+    const effectiveEntryAgent = (): Agent => {
+        const name = effectiveEntryName();
+
+        // `agents` is a plain record, so a detached name reads back as `undefined` even when the
+        // fallback rule chose it (the emptied-roster case above); the construction brain is the
+        // only honest answer left in that state.
+        return Object.prototype.hasOwnProperty.call(agents, name) ? agents[name] : entryAgent;
+    };
+
     // The harness is a function you call. Properties ride on it so a CLI has
     // everything in one handle without a second lookup object.
     const run = (input: string, options?: HarnessRunOptions) =>
         // `attachments` is the FINAL argument and is intentionally absent from
         // every nested runAgent call: only the root prompt may carry media.
-        runAgent(primary, input, options?.signal, undefined, undefined, undefined, options?.attachments);
+        runAgent(entryAgentForRun(), input, options?.signal, undefined, undefined, undefined, options?.attachments);
 
-    // Every Harness field except `name`, `commands`, `discoveredTools`, and
-    // `withheldTools` is assigned here. Those four are defineProperty'd below: `name` is a
-    // built-in function property that cannot be assigned, and `commands`/
+    // Every Harness field except `name`, `agent`, `ranks`, `commands`, `discoveredTools`,
+    // `withheldTools`, and `knowledge` is assigned here. Those seven are defineProperty'd
+    // below: `name` is a
+    // built-in function property that cannot be assigned, and `name`/`agent` are GETTERS so both
+    // answer with the CURRENT effective entry agent rather than the one captured at construction
+    // (see `effectiveEntryName`/`effectiveEntryAgent` above — `Object.assign` would flatten a
+    // literal getter into one value), `commands`/
     // `discoveredTools`/`withheldTools` must be GETTERS so a caller can never mutate the
     // live registry, the enabled set, or the session's switch set through the handle (and
-    // so a literal getter would not be flattened into one value by `Object.assign`). The
+    // so a literal getter would not be flattened into one value by `Object.assign`), and
+    // `knowledge` must be one so the shared base cannot be replaced through the handle. The
     // `unknown`-mediated cast is therefore describing exactly that: a complete handle
     // assembled from two sources. Keep this list in step with the Harness type — an omitted
     // accessor typechecks as `never` here and the cast would silently hide it.
     let handle!: Harness;
     handle = Object.assign(run, {
-        agent: primary,
         agents,
-        subagents,
         tools,
         plugins: pluginNames,
         // R2/R3: the declared catalogue behind those names (title, description,
@@ -16467,6 +17153,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             withheldTools.clear();
             discoveryOffsets.clear();
             recordEngine.reset();
+            // T7: knowledge is deliberately NOT reset here, and this line is the whole
+            // statement of that rule. The SESSION record stores (tasks/chapters/profiles/
+            // locations) belong to the conversation and go back to empty; the knowledge base
+            // is deployment state — one shared engine/store for every session of the process,
+            // durable at `<databaseRoot>/harness/knowledge/` when the host attached one
+            // (`HarnessConfiguration.knowledge`). Clearing it on a reset would let one
+            // conversation's `/reset` delete articles another conversation wrote — the same
+            // reason deleting a session must not touch the store's directory
+            // (../server/knowledge-session.test.ts pins both).
             invocationRecords.clear();
             // Issue 0019: same rule as `restore()` above — a reset session starts with no
             // outstanding promise to any caller.
@@ -16507,9 +17202,33 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     }) as unknown as Harness;
 
     // `name` is a built-in, read-only property of every function, so it must be
-    // defined rather than assigned. The entry agent's name is the harness name.
+    // defined rather than assigned. The entry agent's name is the harness name — and
+    // it is resolved per READ (R62), because `removeAgent` can detach the agent `entry`
+    // names; `effectiveEntryName()` then falls back to the roster's first registered
+    // member, and `handle.agent` below resolves through the SAME rule so the two
+    // readers can never name different agents (or a detached one).
     Object.defineProperty(handle, 'name', {
-        value: primary.name,
+        get: effectiveEntryName,
+        enumerable: true,
+        configurable: true
+    });
+
+    // THE ENTRY AGENT (`Harness.agent`) — the same LIVE resolution as `name` above, mounted as a
+    // getter for the same reason: the construction-time brain (`entryAgent`) is the right answer
+    // only while the roster still holds it, and a caller reading `harness.agent` after a detach
+    // must not be handed a transcript and model the roster no longer addresses.
+    Object.defineProperty(handle, 'agent', {
+        get: effectiveEntryAgent,
+        enumerable: true,
+        configurable: true
+    });
+
+    // THE RESOLVED RANK MAP (`Harness.ranks`) — a getter, not a snapshot, because the
+    // roster is live: `addAgent`/`removeAgent` change it, and `ranksView()` freezes a
+    // fresh copy on every read so a caller can neither mutate nor cache its way to a
+    // promotion. It replaces the removed `harness.subagents` allowlist.
+    Object.defineProperty(handle, 'ranks', {
+        get: () => ranksView(),
         enumerable: true,
         configurable: true
     });
@@ -16547,6 +17266,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // a caller can never add, delete, or swap an entry through the handle.
     Object.defineProperty(handle, 'commands', {
         get: () => Object.freeze({ ...commandRegistry }),
+        enumerable: true,
+        configurable: true
+    });
+
+    // THE knowledge base (`Harness.knowledge`, T7) — a getter for the same reason
+    // `discoveredTools` is one: `Object.assign` would make the member writable, and a caller
+    // could then detach a harness from its base by assignment (`harness.knowledge =
+    // somethingElse`), which for a SHARED durable store means silently detaching one session
+    // from the deployment's articles. The identity returned never changes: it is the object
+    // resolved at construction (`knowledgeSourceOf` above), so
+    // `sessionA.harness.knowledge === sessionB.harness.knowledge` holds for one store and a
+    // tool may memoise it (the T15 guarded lane view forwards this very member through
+    // `Reflect.get`, so a lane's tool gets the same object too).
+    Object.defineProperty(handle, 'knowledge', {
+        get: () => knowledge,
         enumerable: true,
         configurable: true
     });
@@ -16691,6 +17425,13 @@ export type {
 // mirror the core/index.ts exports; task's factory stays internal to keep
 // this change scoped.
 export { createRecordEngine } from './core';
+// T15 / F1: the knowledge engine's factory, on the SAME surface its sibling
+// `createRecordEngine` already occupies. This is not symmetry for its own sake:
+// `knowledgeSourceOf` (./harness.ts:1315-1321) refuses a bad `HarnessConfiguration.knowledge` by
+// naming BOTH factories, and advice a caller cannot import is not advice. `loadKnowledgeFileStore`,
+// the other half, is published by ./server/index.ts; the root barrel re-exports that barrel, so
+// both names are reachable from `@underload/harness` (and the store's own subpath) from here.
+export { createKnowledgeEngine } from './core';
 // R4 cross-thread chat descriptor. The tool is registered CONDITIONALLY (once a
 // session owns an independent thread), so a server catalogue can quote the same
 // name/description/schema the runtime uses without advertising it up front.
@@ -16828,5 +17569,13 @@ export type {
     CommandRunResult
 } from './tools';
 export { HarnessError } from './util';
+
+// THE RANK VOCABULARY IS VALUE-LEVEL PUBLIC API (rank model). Worker and server code
+// builds rank-aware configuration (`ranks: { writer: 'A' }`), compares ranks, and
+// validates letters it read from JSON, so the values must be re-exported: the
+// `export type *` below carries the TYPES only, and `AgentRank` alone would leave a
+// consumer importing from ./types directly and drifting from this entry point.
+export { AGENT_RANKS, isAgentRank, isLowerRank, rankIndexOf } from './types';
+
 export type * from './types';
 

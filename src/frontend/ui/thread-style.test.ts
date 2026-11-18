@@ -222,8 +222,8 @@ it('shares the tile header metadata, body and prompt scale with the nested block
     // F3: the root code is in the COMPACT header, so the expanded primary section
     // head (the same code again) is hidden. Flat legacy subagent heads stay visible
     // because they name DIFFERENT agents.
-    expect(blockOf(".tile-flow > .agent[data-role='primary'] .agent-head {")).toContain('display: none');
-    expect(css).not.toContain(".tile-flow > .agent[data-role='subagent'] .agent-head");
+    expect(blockOf(".tile-flow > .agent[data-root='true'] .agent-head {")).toContain('display: none');
+    expect(css).not.toContain(".tile-flow > .agent:not([data-root='true']) .agent-head");
 });
 
 it('styles the per-invocation outcome and keeps it readable at depth', () => {
@@ -235,11 +235,11 @@ it('styles the per-invocation outcome and keeps it readable at depth', () => {
     );
 });
 
-it('outlines a flat legacy subagent section without double-outlining the primary', () => {
+it('outlines a flat legacy section without double-outlining the root', () => {
     // R3: a second, unattributable agent section inside the tile flow is an
-    // agent-owned block, so it gets its own colour outline; the primary section IS
+    // agent-owned block, so it gets its own colour outline; the ROOT section IS
     // the tile content and is excluded by the selector.
-    const flat = blockOf(".tile-flow > .agent[data-role='subagent'] {");
+    const flat = blockOf(".tile-flow > .agent:not([data-root='true']) {");
 
     expect(flat).toContain('border: 1px solid var(--border)');
     expect(flat).toContain('border-radius: var(--radius)');
@@ -247,8 +247,8 @@ it('outlines a flat legacy subagent section without double-outlining the primary
     expect(flat).toContain('outline-offset: -2px');
     expect(flat).not.toContain('padding-top');
 
-    // The primary section is never OUTLINED (no second frame around the main content);
+    // The ROOT section is never OUTLINED (no second frame around the main content);
     // F3 only hides its redundant head, which is a different rule.
-    expect(rules).not.toContain(".tile-flow > .agent[data-role='primary'] {");
+    expect(rules).not.toContain(".tile-flow > .agent[data-root='true'] {");
     expect(rules).not.toContain('.tile-flow > .agent {');
 });

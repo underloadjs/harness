@@ -45,8 +45,13 @@ const presetOf = (template?: 'live' | 'flaky' | 'scripted', name = 'instruct'): 
     title: 'Instruction',
     description: 'a team harness',
     requiresEndpoint: true,
-    primary: name,
-    subagents: ['research'],
+    // The rank-model roster of a preset: `entry` names the routing agent (position-independent) and
+    // `ranks` states each member's authority letter. The retired `primary`/`subagents` pair is gone
+    // from `HarnessPreset` (../../types/index.ts), and there is no delegation ALLOWLIST any more —
+    // `research` is reachable because ranks give every agent the same tools (../harness.ts:1617), so
+    // what this fixture decides is only which letter the capability gate reads per member.
+    entry: name,
+    ranks: { [name]: 'A', research: 'B' },
     agents: [name, 'research'],
     tools: ['read', 'tasks'],
     builtin: true,
@@ -518,7 +523,7 @@ describe('reachesNestedRunDoors', () => {
         expect(viaHandle.reasons[0].message).toContain('threadExecution "inline"');
 
         // A door the core refuses stays lane-local: refusing it outright would take the whole
-        // toolbox out of worker mode because one shipped tool summarises through a subagent.
+        // toolbox out of worker mode because one shipped tool summarises through a delegated agent.
         const nestedRunTool = assessWorkerToolSurface({ name: 'textSummarize', source: 'export const execute = async ({ parameters: notes, run, agents, nestedRuns }) => (!run || summarizer === undefined || nestedRuns === "refuse") ? condense(notes) : (await run("summarizer", notes)).content;' });
 
         expect(nestedRunTool.placement).toBe('lane-local');

@@ -3,7 +3,7 @@
 // PRODUCT RULE
 // ------------
 // ONE strip of clickable tabs lists the agents THIS conversation/harness actually has
-// — the team members, primary first, exactly as the server reports them. Selecting a
+// — the team members, ENTRY agent first, exactly as the server reports them. Selecting a
 // tab shows THAT agent's configuration: ONE editable instruction box holding the FULL
 // effective instruction (R4: no read-only "preset" block and no revert control — the
 // box is the whole truth) and ONE model dropdown. Nothing else is listed: an agent the
@@ -11,9 +11,12 @@
 // the `[+]` control instead — and in a session (`allowCustom`) the reader can also type
 // a brand-new agent name (R7) and get a tab the same way.
 //
-// Selecting a tab is a VIEW change. It never promotes and never writes: making an
-// agent the primary is an explicit control (`Make primary`) inside its own panel, so
-// reading a teammate's prompt cannot arm a promotion nobody asked for.
+// Selecting a tab is a VIEW change: it never writes and changes neither the team nor
+// any rank. R20 replaced the single "make it the leader" press with TWO independent
+// controls inside the member's own panel — `Assign rank` (raise/lower THAT member,
+// which any number of members can share) and `Set as entry` (make THAT member the
+// agent a new conversation starts with). Reading a teammate's prompt therefore
+// cannot arm a rank change or move the entry role onto somebody else.
 //
 // The bottom-right action is the only thing that writes to the server. X / backdrop /
 // Escape / a programmatic `close()` therefore discard everything by construction —
@@ -23,8 +26,8 @@
 // DRAFTS
 // ------
 // `state.drafts` is a per-agent map of what the reader actually changed,
-// `state.selected` is the active tab and `state.promote` is the armed promotion. All
-// three live in this closure, so:
+// `state.selected` is the active tab and `state.entry` is the armed entry-agent
+// change. All three live in this closure, so:
 //   - a live refresh (`update()` from a chrome rebuild) repaints from the newest
 //     server answer WITHOUT clobbering a touched field: an untouched agent follows
 //     the server, a touched one keeps its draft;
@@ -74,19 +77,23 @@
 // HONEST RESTRICTIONS
 // -------------------
 // `editable` is the TEAM lock (an in-flight run, a session being created). It gates
-// `[+]`, `Make primary`, `Remove from team` and the instruction editor. Models keep
-// their own flag inside `models` (a saved session edits its live model map), so the
-// dialog offers model editing exactly where the server does.
+// `[+]`, the rank stepper, `Set as entry`, `Remove from team` and the instruction
+// editor. Models keep their own flag inside `models` (a saved session edits its live
+// model map), so the dialog offers model editing exactly where the server does.
 //
 // `scope` says WHERE a save lands — 'session' edits this conversation's own agents and
 // instructions, 'harness' edits the template new sessions start from (R5). It changes
-// the copy only: the shell owns which route a save takes. `canPromote: false` (a saved
-// conversation's entry agent is fixed) disables `Make primary` AND makes an armed
-// promotion impossible, so the action can never promise "Save & set primary" somewhere
-// that cannot promote. `threadAgents` names the agents a conversation in this session
-// already runs, and one of those cannot be removed (R6): its control is disabled WITH
-// the reason, and the reason is repeated as a visible note under the actions because a
-// tooltip on a disabled control is not reachable.
+// the copy only: the shell owns which route a save takes. Two capability flags state
+// what the two NEWER controls may do at all, because the server's answer differs per
+// scope: `canSetEntry: false` (a saved conversation's ENTRY agent is fixed) disables
+// `Set as entry` and makes an armed entry change impossible, and `canAssignRanks:
+// false` (a saved conversation inherits the ranks its harness template defines; the
+// roster route states no rank write for an existing member) disables the stepper. The
+// action label is derived from the SAME flags, so it can never promise "Save & set
+// entry" somewhere that cannot set it. `threadAgents` names the agents a conversation
+// in this session already runs, and one of those cannot be removed (R6): its control
+// is disabled WITH the reason, and the reason is repeated as a visible note under the
+// actions because a tooltip on a disabled control is not reachable.
 //
 // R3 removed the lock EXPLANATION paragraph: the restriction is stated where it
 // bites — the footer's one short line says what Save can actually do here, and every
@@ -117,7 +124,10 @@
 //   - src/frontend/ui/dialog.ts        modal stack/focus/scroll lock
 //   - src/frontend/ui/agent-dialog.css `.agent-dialog*`
 
+import type { AgentRank } from '../../types';
 import type { AgentDescriptor } from '../../server/protocol';
+// One source for rank wording, validation and stepping (R20) — see contract.ts.
+import { HIGHEST_RANK, LOWEST_RANK, isAgentRank, rankLabelOf, stepRank } from '../contract';
 import {
     UNKNOWN_MODEL_LABEL,
     agentDefaultInstructionOf,
@@ -131,19 +141,25 @@ import { paintAgentColor } from './agent-color';
 import { openDialog } from './dialog';
 import type { DialogHandle } from './dialog';
 
-// What ONE explicit apply sends to main.ts. Everything is a DELTA plus the resulting
-// promotion; main.ts is the only module that knows whether a write goes to
-// PATCH /harnesses/:name or PATCH /sessions/:id, and it owns merging these deltas
-// onto the server's current state (the effective-vs-override distinction).
+// What ONE explicit apply sends to main.ts. Everything is a DELTA plus the entry-agent
+// change and the rank assignments it represents; main.ts is the only module that knows
+// whether a write goes to PATCH /harnesses/:name or PATCH /sessions/:id, and it owns
+// merging these deltas onto the server's current state (the effective-vs-override
+// distinction).
 //
-// R3 changed WHICH control produces `primary` (an explicit `Make primary`, not the
-// tab selection) and `add` (the `[+]` picker, not "viewing an outside agent"), but the
-// shape is exactly the one main.ts already merges onto the stored team.
+// R20 replaced the single lead-agent field with the two independent facts the wire now
+// carries: `entry` (routing) is present ONLY when the action moves the entry role, and
+// `ranks` (one letter per member) carries ONLY the ranks the reader actually touched.
+// The two are never derived from each other.
 export type AgentConfigurationApply = {
     // The agent the reader was configuring (the active tab).
     agent: string;
-    // Present ONLY when the action also promotes: the agent to make primary.
-    primary?: string;
+    // Present ONLY when the action also moves the entry role: the agent to make the
+    // entry agent for a new conversation.
+    entry?: string;
+    // R20: rank assignments the reader touched, agent id → letter. A member absent
+    // here keeps the rank the server reports.
+    ranks?: Record<string, AgentRank>;
     // Model choices the reader touched: agent id → model id, or '' for "use the
     // resolved default" (delete the override).
     models: Record<string, string>;
@@ -153,7 +169,7 @@ export type AgentConfigurationApply = {
     instructions: Record<string, string>;
     // Explicit membership changes. `add` comes from `[+]` (a catalogue pick or a name
     // typed in a session), `remove` from `Remove from team`; `add` never removes
-    // anyone, and a promoted agent is never in `remove`.
+    // anyone, and an agent becoming the entry agent is never in `remove`.
     add: string[];
     remove: string[];
 };
@@ -168,7 +184,11 @@ export type AgentApplyResult = {
 // Everything the dialog paints. main.ts derives it once per chrome paint.
 export type AgentDialogOptions = {
     members: readonly string[];
-    primary: string;
+    // R20: the routing/seed agent for a new conversation. Independent of rank.
+    entry: string;
+    // R20: the rank configured per member (a member the map omits states none). The
+    // stepper paints from this and from its own draft, never from tab order.
+    ranks: Readonly<Record<string, AgentRank>>;
     // The trusted agent library from GET /agents (or the boot fallback), with each
     // row's default-instruction text filled in by the identified profile read — see
     // the header note for why the page alone is not enough.
@@ -189,10 +209,14 @@ export type AgentDialogOptions = {
     // agent the catalogue never advertised. False (the default) keeps the picker
     // catalogue-only, which is what a harness template needs.
     allowCustom?: boolean;
-    // Whether `Make primary` may be armed at all. A saved conversation's entry agent is
-    // fixed, so its shell passes false and the action can never offer a promotion the
+    // Whether `Set as entry` may be armed at all. A saved conversation's ENTRY agent is
+    // fixed, so its shell passes false and the action can never offer a move the
     // session cannot perform. Defaults to true.
-    canPromote?: boolean;
+    canSetEntry?: boolean;
+    // R20: whether the rank stepper may be armed at all. A saved conversation runs the
+    // ranks its harness template defines, so its shell passes false; a harness template
+    // owns them. Defaults to true.
+    canAssignRanks?: boolean;
     // R6: agents a conversation in this session already runs. Each of those keeps its
     // tab but cannot be removed, and the control says why. Defaults to empty, so a
     // harness (which has no threads) is unaffected.
@@ -245,18 +269,23 @@ type AgentDraft = {
     instruction?: string;
     // Explicit membership: true adds the agent, false removes it.
     member?: boolean;
+    // R20: the RANK the reader assigned to THIS member. Independent of every other
+    // member's rank, so a team can hold several Rank A agents at once.
+    rank?: AgentRank;
 };
 
 // The dialog's local layer, owned by `openAgentDialog` and read by every paint.
 // `paint` is assigned once the modal handle exists, so the body's own handlers
-// (tab click/arrow, add picker, membership, apply) can rebuild in place.
+// (tab click/arrow, add picker, rank/entry/membership, apply) can rebuild in place.
 type DialogState = {
     drafts: Map<string, AgentDraft>;
     selected: string;
-    // The agent armed as the next primary by `Make primary`. Cleared when that agent
-    // leaves the roster, when the promotion is re-armed onto another agent, on a
-    // successful save and on dismissal.
-    promote?: string;
+    // R20: the agent armed as the next ENTRY agent by `Set as entry`. Cleared when
+    // that agent leaves the roster, when the change is re-armed onto another agent, on
+    // a successful save and on dismissal. Ranks are NOT here: each one lives on its
+    // own member's draft, because ranks are per-member assignments, not a race for one
+    // slot.
+    entry?: string;
     // Is the `[+]` picker open? Local view state only: opening it sends nothing and
     // adds nobody.
     adding: boolean;
@@ -306,11 +335,15 @@ const isSessionScope = (options: AgentDialogOptions): boolean => options.scope =
 // R7: a session may gain an agent the catalogue never advertised.
 const allowsCustomAgent = (options: AgentDialogOptions): boolean => options.allowCustom === true;
 
-// R6/R5: a saved conversation's entry agent is fixed; everything else may promote.
-const mayPromote = (options: AgentDialogOptions): boolean => options.canPromote !== false;
+// R6/R5: a saved conversation's ENTRY agent is fixed; a harness template may move it.
+const maySetEntry = (options: AgentDialogOptions): boolean => options.canSetEntry !== false;
+
+// R20: a saved conversation inherits the ranks its harness template defines (the
+// roster route states no rank write for an existing member), so its stepper is inert.
+const mayAssignRanks = (options: AgentDialogOptions): boolean => options.canAssignRanks !== false;
 
 // R6: an agent some conversation in this session already runs. Ids compare exactly,
-// because the roster, `primary` and `threadAgents` are all server-side agent ids.
+// because the roster, `entry` and `threadAgents` are all server-side agent ids.
 const usedByThread = (options: AgentDialogOptions, name: string): boolean =>
     (options.threadAgents ?? []).includes(name);
 
@@ -388,19 +421,54 @@ const baselineInstructionOf = (options: AgentDialogOptions, name: string): strin
         : agentDefaultInstructionOf(agentDetailsOf(options.agents, name));
 };
 
-// The promotion this dialog's action represents: the agent armed by `Make primary`,
-// and only while the team is editable AND the scope can promote at all (R5/R6: a saved
-// conversation's entry agent is fixed). `undefined` means "no promotion" — the tab
-// selection itself never promotes (R3).
-const promotionOf = (options: AgentDialogOptions, state: DialogState): string | undefined =>
-    options.editable && mayPromote(options) ? state.promote : undefined;
+// The rank THIS dialog shows for one member (R20): the reader's drafted assignment
+// wins while it exists, otherwise the rank the server reports. `undefined` means no
+// rank is stated anywhere, and the UI says "rank not stated" rather than inventing one.
+const shownRankOf = (
+    options: AgentDialogOptions,
+    state: DialogState,
+    name: string
+): AgentRank | undefined => {
+    const drafted = state.drafts.get(name)?.rank;
+    if (isAgentRank(drafted)) return drafted;
+
+    return isAgentRank(options.ranks[name]) ? options.ranks[name] : undefined;
+};
+
+// The entry change this dialog's action represents: the agent armed by `Set as entry`,
+// and only while the team is editable AND the scope can move the entry role at all
+// (R5/R6: a saved conversation's entry agent is fixed). `undefined` means "no move" —
+// the tab selection itself never moves it (R3).
+const entryTargetOf = (options: AgentDialogOptions, state: DialogState): string | undefined =>
+    options.editable && maySetEntry(options) ? state.entry : undefined;
+
+// The rank deltas the action would write (R20): ONLY the members whose rank the reader
+// actually moved, and ONLY while they are on the roster the save would produce (the
+// server validates every rank key against the FINAL member set, so a leaving agent's
+// rank would be a 400).
+const rankDeltasOf = (
+    options: AgentDialogOptions,
+    state: DialogState
+): Record<string, AgentRank> => {
+    const ranks: Record<string, AgentRank> = {};
+
+    for (const [name, draft] of state.drafts) {
+        if (!isAgentRank(draft.rank)) continue;
+        if (!onRoster(options, state, name)) continue;
+        if (draft.member === false) continue;
+        ranks[name] = draft.rank;
+    }
+
+    return ranks;
+};
 
 // Is there anything worth sending? Computed from the DELTA the action would actually
-// produce (plus an armed promotion), so "pending" can never disagree with the request:
-// a cancelled add or a re-cleared promotion leaves an empty delta and a DISABLED
-// action, and a disabled button can never falsely claim a save.
+// produce (plus an armed entry change and any rank assignment), so "pending" can never
+// disagree with the request: a cancelled add or a re-armed entry change leaves an empty
+// delta and a DISABLED action, and a disabled button can never falsely claim a save.
 const changesPending = (options: AgentDialogOptions, state: DialogState): boolean => {
-    if (promotionOf(options, state) !== undefined) return true;
+    if (entryTargetOf(options, state) !== undefined) return true;
+    if (Object.keys(rankDeltasOf(options, state)).length > 0) return true;
 
     const changes = changesOf(options, state);
 
@@ -413,16 +481,16 @@ const changesPending = (options: AgentDialogOptions, state: DialogState): boolea
 };
 
 // Build the request the action represents: only the deltas the reader made. A drafted
-// removal carries no model/instruction delta (the server validates map keys against
-// the FINAL member set, so a leaving agent's edit would be a 400), and a promoted
-// agent is never listed as removed.
+// removal carries no model/instruction/rank delta (the server validates map keys against
+// the FINAL member set, so a leaving agent's edit would be a 400), and an agent armed as
+// the next entry agent is never listed as removed.
 const changesOf = (options: AgentDialogOptions, state: DialogState): AgentConfigurationApply => {
     const models: Record<string, string> = {};
     const instructions: Record<string, string> = {};
     const add: string[] = [];
     const remove: string[] = [];
 
-    const primary = promotionOf(options, state);
+    const entry = entryTargetOf(options, state);
 
     for (const [name, draft] of state.drafts) {
         // Only a rostered agent can carry a model or instruction key.
@@ -432,15 +500,15 @@ const changesOf = (options: AgentDialogOptions, state: DialogState): AgentConfig
         }
 
         if (draft.member === true && !options.members.includes(name)) add.push(name);
-        if (draft.member === false && options.members.includes(name) && name !== primary) {
+        if (draft.member === false && options.members.includes(name) && name !== entry) {
             remove.push(name);
         }
     }
 
-    // A promoted agent is a member by definition, so `[+]`-adding it is implied and
+    // The next entry agent is a member by definition, so `[+]`-adding it is implied and
     // recorded exactly once.
-    if (primary !== undefined && !options.members.includes(primary) && !add.includes(primary)) {
-        add.push(primary);
+    if (entry !== undefined && !options.members.includes(entry) && !add.includes(entry)) {
+        add.push(entry);
     }
 
     const changes: AgentConfigurationApply = {
@@ -451,7 +519,12 @@ const changesOf = (options: AgentDialogOptions, state: DialogState): AgentConfig
         remove
     };
 
-    if (primary !== undefined) changes.primary = primary;
+    if (entry !== undefined) changes.entry = entry;
+
+    // R20: the rank map goes out only when it names something, so a plain instruction
+    // save never restates ranks the reader never touched.
+    const ranks = rankDeltasOf(options, state);
+    if (Object.keys(ranks).length > 0) changes.ranks = ranks;
 
     return changes;
 };
@@ -480,17 +553,33 @@ const footerNoteOf = (options: AgentDialogOptions, state: DialogState): string =
             : 'Nothing can be changed in this conversation right now.';
     }
 
-    const promoted = promotionOf(options, state);
+    const armedEntry = entryTargetOf(options, state);
 
-    if (promoted !== undefined) {
-        // Sessions normally cannot arm a promotion (`canPromote: false`), so the
+    if (armedEntry !== undefined) {
+        // Sessions normally cannot arm an entry move (`canSetEntry: false`), so the
         // session wording is the honest fallback for a host that does allow one — it
         // must never claim a harness write the reader did not make.
         return `Saves ${isSessionScope(options) ? 'on this conversation' : 'this harness'} and makes ${memberTitleOf(
             options,
             state,
-            promoted
-        )} the primary.`;
+            armedEntry
+        )} the entry agent.`;
+    }
+
+    // A rank assignment is a separate sentence: it names the member and the rank it
+    // moves to, because that is the whole effect (no other member is demoted).
+    const ranks = rankDeltasOf(options, state);
+    const rankKeys = Object.keys(ranks);
+
+    if (rankKeys.length > 0 && armedEntry === undefined) {
+        const [first] = rankKeys;
+        const rest = rankKeys.length > 1 ? ` (+${rankKeys.length - 1} more rank${rankKeys.length - 1 === 1 ? '' : 's'})` : '';
+
+        return `Saves ${isSessionScope(options) ? 'on this conversation' : 'this harness'} and sets ${memberTitleOf(
+            options,
+            state,
+            first
+        )} to ${rankLabelOf(ranks[first])}${rest}. Every other member keeps its rank.`;
     }
 
     return isSessionScope(options)
@@ -505,16 +594,42 @@ const syncAction = (options: AgentDialogOptions, state: DialogState): void => {
     if (apply === null) return;
 
     const pending = changesPending(options, state);
-    const promoted = promotionOf(options, state);
 
     apply.disabled = state.applying || !pending;
     apply.title = state.applying
         ? 'Saving…'
         : pending
-          ? 'Save this configuration' +
-            (promoted === undefined ? '' : ` and make ${memberTitleOf(options, state, promoted)} the primary`) +
-            '. Closing the dialog saves nothing.'
+          ? `Save this configuration${applySuffix(options, state)}. Closing the dialog saves nothing.`
           : 'Nothing has changed yet.';
+};
+
+// The clause the apply button's tooltip adds for what the draft also writes. ONE
+// writer, so the label above and the tooltip beside it cannot disagree, and R20's two
+// independent effects (entry move / rank assignment) each state their own.
+const applySuffix = (options: AgentDialogOptions, state: DialogState): string => {
+    const armedEntry = entryTargetOf(options, state);
+
+    if (armedEntry !== undefined) {
+        return ` and make ${memberTitleOf(options, state, armedEntry)} the entry agent`;
+    }
+
+    const ranks = rankDeltasOf(options, state);
+    const rankKeys = Object.keys(ranks);
+
+    if (rankKeys.length === 0) return '';
+
+    const [first] = rankKeys;
+
+    return ` and set ${memberTitleOf(options, state, first)} to ${rankLabelOf(ranks[first])}`;
+};
+
+// The apply button's label: the base wording, or the entry/rank variant that names what
+// the press will write. R20: `Save & set entry` is about ROUTING, and a rank assignment
+// reads `Save & set rank` — two different promises, never blended.
+const applyLabelOf = (options: AgentDialogOptions, state: DialogState): string => {
+    if (entryTargetOf(options, state) !== undefined) return 'Save & set entry';
+
+    return Object.keys(rankDeltasOf(options, state)).length > 0 ? 'Save & set rank' : 'Save configuration';
 };
 
 // Focus the tab the reader is on: after a rebuild the old node is gone, and a
@@ -531,8 +646,9 @@ const focusTab = (root: HTMLElement, name = ''): void => {
     tab?.focus();
 };
 
-// Move the view onto one agent. Selection is a VIEW change: nothing is sent and nobody
-// is promoted (R3), which is also what makes it the right moment to ask for that
+// Move the view onto one agent. Selection is a VIEW change: nothing is sent, no rank
+// moves and the entry role does not either (R3), which is also what makes it the right
+// moment to ask for that
 // agent's default instruction text — the reader chose it explicitly, so the read is paid
 // for by a click or an arrow key, never by a render. `onRequestPreset` is a no-op for an
 // agent whose library row already carries text, so re-selecting a tab is free.
@@ -602,8 +718,8 @@ const RESERVED_AGENT_NAME = 'unknown';
 // the panel must not scold a form the reader has not filled in yet. Agent ids are
 // case-sensitive on the server, but a name that differs from an existing one only by
 // case would still read as the same word (and the pattern already rejects capitals), so
-// the collision check folds case against the roster AND the primary, which a drafted
-// removal may have just taken off the strip.
+// the collision check folds case against the roster AND the entry agent, which a
+// drafted removal may have just taken off the strip.
 const customAgentNameError = (
     options: AgentDialogOptions,
     state: DialogState,
@@ -621,7 +737,7 @@ const customAgentNameError = (
         return '"unknown" is the reserved name for an agent the server cannot identify.';
     }
 
-    const taken = [...rosterOf(options, state), options.primary].some(
+    const taken = [...rosterOf(options, state), options.entry].some(
         (member) => member.toLowerCase() === name.toLowerCase()
     );
 
@@ -752,66 +868,155 @@ const createAddPicker = (options: AgentDialogOptions, state: DialogState): HTMLE
 };
 
 // R6: an agent some conversation in this session already runs cannot be taken off the
-// team (its transcript names it). The primary is exempt because its own, stronger
-// reason already disables the control, and a locked team is already fully explained by
-// the lock hint — so this says exactly when the THREAD reason is the reason, and the
-// disabled control's tooltip and the visible note below can never disagree.
+// team (its transcript names it). The ENTRY agent is exempt because its own, stronger
+// reason already disables the control (R20: the entry agent is the one member a session
+// can never detach), and a locked team is already fully explained by the lock hint — so
+// this says exactly when the THREAD reason is the reason, and the disabled control's
+// tooltip and the visible note below can never disagree.
 const isRemovalBlockedByThread = (
     options: AgentDialogOptions,
     name: string,
-    isPrimary: boolean
-): boolean => options.editable && !isPrimary && usedByThread(options, name);
+    isEntry: boolean
+): boolean => options.editable && !isEntry && usedByThread(options, name);
+
+// The explicit rank control inside the selected agent's panel (R20). It assigns ONE
+// member's rank and nothing else: no other member moves, no member becomes "the"
+// leader, and any number of members may end up on the same letter. The two presses are
+// deliberately separate (rather than a single cycling button) because the reader must be
+// able to state which way a rank moves before pressing it.
+const createRankActions = (
+    options: AgentDialogOptions,
+    state: DialogState,
+    name: string,
+    label: string
+): HTMLElement => {
+    const row = el('div', 'agent-dialog-rank');
+    const current = shownRankOf(options, state, name);
+    // `data-rank` is the same hook the deck's tiles and the create form carry, so an
+    // inspector reads one member's rank the same way from any surface. Absent, not
+    // guessed, when neither the server nor a draft states one.
+    if (current !== undefined) row.dataset.rank = current;
+
+    row.append(el('p', 'agent-dialog-label agent-dialog-rank-label', rankLabelOf(current ?? HIGHEST_RANK)));
+
+    const raise = el('button', 'agent-dialog-action agent-dialog-rank-raise', '−');
+    raise.type = 'button';
+    raise.dataset.action = 'rank-raise';
+    raise.dataset.agent = name;
+
+    const lower = el('button', 'agent-dialog-action agent-dialog-rank-lower', '+');
+    lower.type = 'button';
+    lower.dataset.action = 'rank-lower';
+    lower.dataset.agent = name;
+
+    const next = stepRank(current, -1);
+    const prev = stepRank(current, 1);
+    const atTop = current === HIGHEST_RANK;
+    const atBottom = current === LOWEST_RANK;
+    const assignable = options.editable && mayAssignRanks(options);
+
+    // A press writes a DRAFT rank on this member only; the footer states what the
+    // action will save, and no PATCH happens until then (R3's transactional rule).
+    raise.setAttribute('aria-label', `Raise ${label} to ${rankLabelOf(next)}`);
+    lower.setAttribute('aria-label', `Lower ${label} to ${rankLabelOf(prev)}`);
+    raise.title = !options.editable
+        ? (options.hint ?? 'The agent team is locked here.')
+        : !assignable
+          ? // R20: a saved conversation runs the ranks its harness template defines, so
+            // the control has nothing to do here — and it says so instead of arming a
+            // draft that cannot be written.
+            'A saved conversation keeps the ranks its harness template defines.'
+          : atTop
+            ? `${rankLabelOf(HIGHEST_RANK)} is the highest rank.`
+            : `Move ${label} one step up in authority, to ${rankLabelOf(next)}. Only this agent changes.`;
+    lower.title = !options.editable
+        ? (options.hint ?? 'The agent team is locked here.')
+        : !assignable
+          ? 'A saved conversation keeps the ranks its harness template defines.'
+          : atBottom
+            ? `${rankLabelOf(LOWEST_RANK)} is the lowest rank.`
+            : `Move ${label} one step down in authority, to ${rankLabelOf(prev)}. Only this agent changes.`;
+    raise.disabled = !assignable || atTop;
+    lower.disabled = !assignable || atBottom;
+
+    // `focusKey` names the exact step that was pressed, so the rebuild puts the caret
+    // back on the control the reader is working with (a rank change repaints the panel).
+    const assign = (rank: AgentRank, focusKey: string): void => {
+        if (!assignable) return;
+
+        editDraft(state, name, (draft) => {
+            draft.rank = rank;
+        });
+        syncAction(options, state);
+        state.paint(focusKey);
+    };
+
+    raise.addEventListener('click', () => {
+        if (raise.disabled) return;
+        assign(next, 'action:rank-raise');
+    });
+    lower.addEventListener('click', () => {
+        if (lower.disabled) return;
+        assign(prev, 'action:rank-lower');
+    });
+
+    row.append(raise, lower);
+
+    return row;
+};
 
 // The two explicit membership controls inside the selected agent's panel. R3: the
 // tab strip selects WHAT you view; these change WHO is on the team, and each one
 // states its effect instead of leaving a disabled control unexplained.
 //
 // R5/R6 add two more reasons the reader must be told about, in the order the reason
-// actually applies: a saved conversation's entry agent is fixed (`canPromote: false`),
+// actually applies: a saved conversation's entry agent is fixed (`canSetEntry: false`),
 // and an agent some conversation already runs cannot be removed at all (`threadAgents`).
 const createMembershipActions = (
     options: AgentDialogOptions,
     state: DialogState,
     name: string,
     label: string,
-    isPrimary: boolean,
+    isEntry: boolean,
     isMember: boolean
 ): HTMLElement => {
     const row = el('div', 'agent-dialog-membership');
 
-    const promote = el('button', 'agent-dialog-action agent-dialog-promote');
-    promote.type = 'button';
-    promote.dataset.action = 'promote';
-    promote.dataset.agent = name;
+    const entry = el('button', 'agent-dialog-action agent-dialog-entry');
+    entry.type = 'button';
+    entry.dataset.action = 'entry';
+    entry.dataset.agent = name;
 
-    const armed = promotionOf(options, state) === name;
-    const promotable = options.editable && mayPromote(options) && !isPrimary;
+    const armed = entryTargetOf(options, state) === name;
+    const movable = options.editable && maySetEntry(options) && !isEntry;
 
     // A toggle keeps ONE name and changes state: screen readers announce
-    // "Make primary, pressed", the accent paints the same fact, and the action's label
-    // (`Save & set primary`) states what the press will write.
-    promote.textContent = 'Make primary';
-    promote.disabled = !promotable;
-    // `aria-pressed` is the honest state of a toggle, so the pending promotion is
+    // "Set as entry, pressed", the accent paints the same fact, and the action's label
+    // (`Save & set entry`) states what the press will write.
+    entry.textContent = 'Set as entry';
+    entry.disabled = !movable;
+    // `aria-pressed` is the honest state of a toggle, so the pending entry move is
     // visible without a sentence about it.
-    promote.setAttribute('aria-pressed', armed ? 'true' : 'false');
-    promote.title = !options.editable
+    entry.setAttribute('aria-pressed', armed ? 'true' : 'false');
+    entry.title = !options.editable
         ? (options.hint ?? 'The agent team is locked here.')
-        : !mayPromote(options)
+        : !maySetEntry(options)
           ? // R5: a saved conversation keeps the entry agent it started with, so the
             // control is not merely busy — it has nothing to do here.
-            'The primary agent is fixed for a saved conversation.'
-          : isPrimary
-            ? 'The primary agent is already the primary.'
+            'The entry agent is fixed for a saved conversation.'
+          : isEntry
+            ? `${label} is already the entry agent.`
             : armed
-              ? `Cancel the promotion, so ${label} stays a team member without leading the team.`
-              : `Make ${label} the primary agent when you save.`;
-    promote.addEventListener('click', () => {
-        if (!promotable) return;
+              ? // Cancelling must say what the reader gets back: the previous entry
+                // agent stays where it was, and nobody's rank moved.
+              `Cancel the entry-agent change, so ${label} stays a team member without starting new conversations.`
+              : `Make ${label} the entry agent when you save, so a new conversation starts with it. No rank changes, and this does not make it the highest-ranked agent.`;
+    entry.addEventListener('click', () => {
+        if (!movable) return;
 
-        state.promote = armed ? undefined : name;
+        state.entry = armed ? undefined : name;
         state.result = undefined;
-        state.paint('action:promote');
+        state.paint('action:entry');
     });
 
     const remove = el('button', 'agent-dialog-action agent-dialog-remove');
@@ -821,16 +1026,17 @@ const createMembershipActions = (
     remove.textContent = 'Remove from team';
 
     // R6: the exact condition the note below repeats (see `isRemovalBlockedByThread`).
-    const blockedByThread = isRemovalBlockedByThread(options, name, isPrimary);
+    const blockedByThread = isRemovalBlockedByThread(options, name, isEntry);
 
-    // The primary always stays, so its control is disabled WITH the reason instead of
-    // silently missing. For a drafted addition the label is the same and the effect
-    // cancels the add.
-    remove.disabled = !options.editable || isPrimary || blockedByThread;
+    // R20: the ENTRY agent always stays (the one member a session cannot detach), so
+    // its control is disabled WITH the reason instead of silently missing. For a
+    // drafted addition the label is the same and the effect cancels the add. Note that
+    // this is a ROUTING rule: a Rank A agent that is not the entry agent is removable.
+    remove.disabled = !options.editable || isEntry || blockedByThread;
     remove.title = !options.editable
         ? (options.hint ?? 'The agent team is locked here.')
-        : isPrimary
-          ? 'The primary agent is always part of the team.'
+        : isEntry
+          ? 'The entry agent is always part of the team: every harness needs an entry point.'
           : blockedByThread
             ? // The action the reader has to take lives outside this dialog, and it is NOT
               // "delete the conversation": a delete is only a MARK (server
@@ -853,12 +1059,12 @@ const createMembershipActions = (
 
         // The agent no longer has a tab, so the view moves to a rostered agent rather
         // than configuring an agent the save would drop.
-        if (state.promote === name) state.promote = undefined;
-        state.selected = options.primary;
+        if (state.entry === name) state.entry = undefined;
+        state.selected = options.entry;
         state.paint('roster');
     });
 
-    row.append(promote, remove);
+    row.append(entry, remove);
 
     return row;
 };
@@ -872,13 +1078,16 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     const roster = rosterOf(options, state);
 
     // A drafted removal (or a server refresh) can leave the viewed agent with no tab.
-    // Fall back to the primary, then to whatever the roster does hold.
+    // Fall back to the entry agent, then to whatever the roster does hold.
     const selected = roster.includes(state.selected)
         ? state.selected
-        : (roster.includes(options.primary) ? options.primary : (roster[0] ?? options.primary));
+        : (roster.includes(options.entry) ? options.entry : (roster[0] ?? options.entry));
     state.selected = selected;
 
-    if (state.promote !== undefined && !roster.includes(state.promote)) state.promote = undefined;
+    // R20: an armed entry move onto an agent that just left the roster is dropped, and
+    // so is a rank draft on a leaving agent (`rankDeltasOf` filters to the roster, so
+    // the request can never name a non-member).
+    if (state.entry !== undefined && !roster.includes(state.entry)) state.entry = undefined;
 
     // The viewed agent's visible name: the library title when the catalogue describes it, and the
     // name the reader typed for a member this conversation invented (T7b, `memberTitleOf`). The
@@ -886,7 +1095,10 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     // the editor can never name two different owners for one configuration.
     const label = memberTitleOf(options, state, selected);
     const isMember = options.members.includes(selected);
-    const isPrimary = selected === options.primary;
+    // R20: ENTRY is routing (which agent a new conversation starts with) and says
+    // nothing about authority. The rank of this member is a separate figure.
+    const isEntry = selected === options.entry;
+    const selectedRank = shownRankOf(options, state, selected);
     const isAdded = isDraftedAddition(options, state, selected);
     const draft = state.drafts.get(selected) ?? {};
 
@@ -925,14 +1137,23 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
         // channel for selection and ACTIVITY — identity colour and state colour must stay
         // readable as two different facts.
         //
-        // `data-agent`/`data-role` are the same team facts the deck and the old rows
-        // exposed, so a test/inspector reads the roster the same way from any host, and
-        // ui/activity.ts keeps painting these nodes (`paintAgentColor` writes the same
-        // canonical id).
+        // `data-agent`/`data-rank`/`data-entry` are the same team facts the deck's tiles
+        // and the create form expose, so a test/inspector reads the roster the same way
+        // from any host, and ui/activity.ts keeps painting these nodes
+        // (`paintAgentColor` writes the same canonical id). R20: `data-rank` carries the
+        // letter (absent when no rank is stated) and `data-entry` marks the one routing
+        // agent — several tabs may read `data-rank="A"` at the same time.
+        const memberRank = shownRankOf(options, state, member);
+        const memberRankText = memberRank === undefined ? 'rank not stated' : rankLabelOf(memberRank);
+
         paintAgentColor(tab, member);
-        tab.dataset.role = member === options.primary ? 'primary' : 'secondary';
+        if (memberRank !== undefined) tab.dataset.rank = memberRank;
+        if (member === options.entry) tab.dataset.entry = 'true';
         if (isDraftedAddition(options, state, member)) tab.dataset.added = 'true';
-        tab.setAttribute('aria-label', `Configure ${title} · ${member === options.primary ? 'primary agent' : 'subagent'}`);
+        tab.setAttribute(
+            'aria-label',
+            `Configure ${title} · ${memberRankText}${member === options.entry ? ' · entry agent' : ''}`
+        );
         tab.title = `View and edit ${title}’s model and instruction.`;
 
         // `data-activity`/`aria-busy` are what ui/activity.ts `paintActivity` writes on
@@ -947,9 +1168,14 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
         // the editor can never disagree.
         const model = options.models.models[member] ?? (options.models.fallbackModel?.trim() ?? '');
 
+        // The badge states the member's RANK (R20) instead of a structural role word,
+        // and the entry role is flagged separately because it is a different fact:
+        // `entry · Rank A` and `entry · Rank C` are both legal, and so are two badges
+        // that both read `Rank A`.
         tab.append(
             el('span', 'agent-dialog-agent-name', title),
-            el('span', 'agent-dialog-agent-role', member === options.primary ? 'primary' : 'subagent'),
+            el('span', 'agent-dialog-agent-rank', memberRankText),
+            ...(member === options.entry ? [el('span', 'agent-dialog-agent-entry', 'entry')] : []),
             el('span', 'agent-dialog-agent-model', model.length > 0 ? model : UNKNOWN_MODEL_LABEL)
         );
 
@@ -959,7 +1185,7 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
         }
 
         tab.addEventListener('click', () => {
-            // A tab switch is a VIEW change: nothing is sent and nobody is promoted.
+            // A tab switch is a VIEW change: nothing is sent, no rank moves, no entry move.
             selectMemberTab(options, state, member);
         });
 
@@ -1080,15 +1306,22 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     config.append(instruction);
 
     // Membership ------------------------------------------------------------
-    // R3: no checkbox and no prose. `[+]` adds, this row removes, and a promotion is
-    // armed explicitly. Conservative by construction: viewing a tab never changes the
-    // team, and the primary can never be removed.
-    config.append(createMembershipActions(options, state, selected, label, isPrimary, isMember));
+    // R3: no checkbox and no prose. `[+]` adds, this row removes.
+    //
+    // R20 adds the two rank-era controls, each scoped to THIS member:
+    //   - the rank stepper assigns one letter to one member (nobody else moves, and
+    //     any number of members may end up on the same letter), and
+    //   - `Set as entry` moves the routing role, which is a separate fact from rank.
+    // Conservative by construction: viewing a tab never changes the team, and the ENTRY
+    // agent (the routing agent, whatever its rank) can never be removed.
+    config.append(createRankActions(options, state, selected, label));
+
+    config.append(createMembershipActions(options, state, selected, label, isEntry, isMember));
 
     // R6: the thread reason repeated where it is visible. A disabled button's `title` is
     // not reachable by keyboard or by a screen reader in reading order, so the panel
     // states the block itself — and names the action that lifts it.
-    if (isRemovalBlockedByThread(options, selected, isPrimary)) {
+    if (isRemovalBlockedByThread(options, selected, isEntry)) {
         config.append(
             el(
                 'p',
@@ -1105,6 +1338,23 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
             el('p', 'agent-dialog-field-note', `${label} joins the team when you save · nothing is sent yet.`)
         );
     }
+
+    // R20: the rank a member holds is stated plainly, including when nothing states
+    // one, so the panel never implies a hierarchy the definition does not carry. A
+    // drafted change says so too, because nothing is sent until the action.
+    const rankDraft = state.drafts.get(selected)?.rank;
+
+    config.append(
+        el(
+            'p',
+            'agent-dialog-field-note agent-dialog-rank-note',
+            isAgentRank(rankDraft)
+                ? `${label} is set to ${rankLabelOf(rankDraft)} · ${rankDraft === options.ranks[selected] ? 'unchanged from the team' : 'not saved yet'}. Other members keep their own ranks.`
+                : selectedRank === undefined
+                  ? `${label} has no rank stated. Use the steps above to assign one; an agent with no rank has nothing to delegate from.`
+                  : `${label} holds ${rankLabelOf(selectedRank)}. Assigning a rank to another member does not change this one.`
+        )
+    );
 
     root.append(config);
 
@@ -1129,16 +1379,15 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     const apply = el('button', 'agent-dialog-apply button primary');
     apply.type = 'button';
     apply.dataset.agent = selected;
-    apply.textContent = promotionOf(options, state) === undefined ? 'Save configuration' : 'Save & set primary';
+    // R20: the label names which of the two independent effects the press writes
+    // (an entry move, a rank assignment, or neither), so no wording ever claims a
+    // promotion of a single lead agent.
+    apply.textContent = applyLabelOf(options, state);
     apply.disabled = state.applying || !changesPending(options, state);
     apply.title = state.applying
         ? 'Saving…'
         : changesPending(options, state)
-          ? 'Save this configuration' +
-            (promotionOf(options, state) === undefined
-                ? ''
-                : ` and make ${memberTitleOf(options, state, promotionOf(options, state) as string)} the primary`) +
-            '. Closing the dialog saves nothing.'
+          ? `Save this configuration${applySuffix(options, state)}. Closing the dialog saves nothing.`
           : 'Nothing has changed yet.';
 
     apply.addEventListener('click', () => {
@@ -1187,7 +1436,7 @@ const submit = async (options: AgentDialogOptions, state: DialogState): Promise<
             // Confirmed: the drafts fold into the baseline main.ts delivers through
             // `update()`, so clearing them here leaves the truthful text on screen.
             state.drafts.clear();
-            state.promote = undefined;
+            state.entry = undefined;
             state.adding = false;
             state.result = { applied: true, message: result.message ?? 'Saved.' };
         } else {
@@ -1360,16 +1609,24 @@ const focusByKey = (root: HTMLElement, key: string): void => {
 
 // Open one agent dialog. main.ts keeps the returned handle, updates it on chrome
 // rebuilds (`update`) and closes it on a lifecycle change (`close`).
+// `AgentDialogOptions.ranks` is required — the shell always passes the map it read from the card,
+// empty when the definition states no rank — and the dialog reads it on EVERY paint. Normalising it
+// once per options object (at open and on each `update`) means a caller that states no ranks still
+// gets an honest dialog: each rank readout says "rank not stated" instead of the body throwing on
+// `undefined[name]`. No rank is inferred — an unstated letter stays unstated.
+const optionsWithRanks = (options: AgentDialogOptions): AgentDialogOptions =>
+    options.ranks === undefined ? { ...options, ranks: {} } : options;
+
 export const openAgentDialog = (initial: AgentDialogOptions): AgentDialog => {
     // The live options: `update()` replaces them, and the body's own handlers always
     // read the newest server state.
-    let options = initial;
+    let options = optionsWithRanks(initial);
 
     const state: DialogState = {
         drafts: new Map<string, AgentDraft>(),
-        // The primary is the agent the reader is most likely here to look at.
-        selected: initial.primary,
-        promote: undefined,
+        // The entry agent is the agent the reader is most likely here to look at.
+        selected: initial.entry,
+        entry: undefined,
         adding: false,
         applying: false,
         // Replaced by the first paint below.
@@ -1381,7 +1638,7 @@ export const openAgentDialog = (initial: AgentDialogOptions): AgentDialog => {
     let handle: DialogHandle | undefined;
 
     // The lifecycle callback is OPEN-time wiring: `update()` replaces the paint
-    // options (members/primary/models/instructions/onApply) with a fresh object from
+    // options (members/entry/ranks/models/instructions/onApply) with a fresh object from
     // main.ts that carries no `onClose`, so the dismissal handler must be captured
     // here or a refresh while the dialog is open would silently drop the host's
     // handle-clearing and focus-return logic.
@@ -1413,7 +1670,7 @@ export const openAgentDialog = (initial: AgentDialogOptions): AgentDialog => {
             // Dismissal discards every draft: nothing was ever sent, so there is
             // nothing to roll back.
             state.drafts.clear();
-            state.promote = undefined;
+            state.entry = undefined;
             state.adding = false;
             state.applying = false;
             state.result = undefined;
@@ -1433,14 +1690,14 @@ export const openAgentDialog = (initial: AgentDialogOptions): AgentDialog => {
         update(next: AgentDialogOptions): void {
             if (!open) return;
 
-            options = next;
+            options = optionsWithRanks(next);
 
             // The selected agent may have left the roster or the catalogue. Fall back
-            // to the primary rather than configuring an agent the server can no
+            // to the entry agent rather than configuring an agent the server can no
             // longer reach.
-            if (!rosterOf(next, state).includes(state.selected)) state.selected = next.primary;
-            if (state.promote !== undefined && !rosterOf(next, state).includes(state.promote)) {
-                state.promote = undefined;
+            if (!rosterOf(next, state).includes(state.selected)) state.selected = next.entry;
+            if (state.entry !== undefined && !rosterOf(next, state).includes(state.entry)) {
+                state.entry = undefined;
             }
 
             // An open picker with nothing left to add would render an empty group — but

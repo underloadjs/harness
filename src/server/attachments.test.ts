@@ -132,8 +132,11 @@ const presetOf = (name: string, create: HarnessPreset['create']): HarnessPreset 
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: [],
+    // A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: name,
+    ranks: { [name]: 'A' },
     agents: [name],
     tools: [],
     builtin: true,
@@ -169,7 +172,7 @@ const recordingPreset = (name: string, seen: SeenTurn[]): HarnessPreset =>
                     }
                 })
             },
-            primary: name,
+            entry: name,
             presets: false,
             report: {
                 progress,
@@ -225,7 +228,7 @@ const gatedPreset = (
                     }
                 })
             },
-            primary: name,
+            entry: name,
             presets: false,
             report: {
                 progress,

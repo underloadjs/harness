@@ -57,9 +57,10 @@ export const describeAgents = (profiles: readonly AgentProfile[]): AgentDescript
 //
 // `coreTools` is the exact set this card's runs declare up front (R18): the four
 // core package file tools, a configured search, the harness-owned
-// toolRequest/toolCreate/task, and delegate when there is a subagent
-// allowlist. It is computed from the REGISTERED names, not a static "all core"
-// list, so the demo fixture (timeNow only) does not claim file tools and a keyless
+// toolRequest/toolCreate/task, and delegate when the rank map holds two or more
+// distinct ranks (someone with a strictly-lower agent to hand work to). It is
+// computed from the REGISTERED names, not a static "all core"
+// list, so the scripted fixture (timeNow only) does not claim file tools and a keyless
 // host does not claim search. A UI core dropdown can therefore trust it instead
 // of hard-coding the harness-owned names.
 //
@@ -94,11 +95,13 @@ export const describeHarness = (
         title: preset.title,
         description: preset.description,
         requiresEndpoint: preset.requiresEndpoint,
-        primary: preset.primary,
-        subagents: [...preset.subagents],
+        // The routing agent and the authority map, projected as declared. `agents`
+        // order is authoritative for the entry default; ranks are keyed by agent id.
+        entry: preset.entry,
+        ranks: { ...preset.ranks },
         agents: [...preset.agents],
         tools: registered,
-        coreTools: coreToolNames(preset.subagents, registered),
+        coreTools: coreToolNames(preset.ranks, registered),
         ...(Object.keys(preset.agentModels ?? {}).length > 0
             ? { agentModels: { ...preset.agentModels } }
             : {}),

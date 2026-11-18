@@ -32,6 +32,9 @@
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/agent-color-surfaces.test.ts
 
 import type { AgentDescriptor, HarnessEvent } from '../../server/protocol';
+// The rank vocabulary (../../types/index.ts): the dialog fixture states ranks so the surfaces
+// have real team facts to paint.
+import type { AgentRank } from '../../types';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { AGENT_PALETTE, UNKNOWN_AGENT_COLOR, configureAgentColors, resetAgentColors } from './agent-color';
 import { createAgentControl } from './agent-control';
@@ -40,7 +43,7 @@ import type { AgentDialog, AgentDialogOptions } from './agent-dialog';
 import { createTurnBoard } from './turns';
 import type { TurnHandle } from './turns';
 
-// The three identities this file puts on screen: the primary (code `IT`), one delegated
+// The three identities this file puts on screen: the entry agent (code `IT`), one delegated
 // agent (`RH`, a second tone) and one agent that only appears later (`RV`, to prove a
 // newly known identity gets its own slot without moving the existing ones).
 const agents: AgentDescriptor[] = [
@@ -91,15 +94,32 @@ const expectPaletteTone = (color: string, line: string): void => {
 };
 
 // --- surface 1: the composer's agent button (ui/agent-control.ts) --------------
-const composer = (primary: string): HTMLElement =>
-    createAgentControl({ primary, agents, onActivate: () => undefined }).element;
+// `device` and `onCycle` are required options the colour test does not exercise: the chip is
+// only ever painted here, never pressed, so both callbacks are inert.
+const composer = (agent: string): HTMLElement =>
+    createAgentControl({ agent, agents, device: 'fine', onCycle: () => undefined, onActivate: () => undefined }).element;
 
 // --- surface 2: the agent dialog's roster badges (ui/agent-dialog.ts) ----------
 let dialog: AgentDialog | undefined;
 
+// The rank map for a member list: the first member (the entry agent) at Rank A, every other
+// member at Rank B. A test that needs a shared or inverted ladder states ranks itself.
+const ranksOfMembers = (members: readonly string[]): Record<string, AgentRank> => {
+    const ranks: Record<string, AgentRank> = {};
+    members.forEach((name, index) => {
+        ranks[name] = index === 0 ? 'A' : 'B';
+    });
+
+    return ranks;
+};
+
 const dialogOptions = (members: readonly string[]): AgentDialogOptions => ({
     members,
-    primary: 'instruct',
+    // Entry (routing) + ranks (authority), derived from the members the call asks for: the first
+    // member routes at Rank A and the rest sit at Rank B — the same default the server resolves for
+    // an omitted map, stated here so the surfaces have real facts to paint.
+    entry: members[0] ?? '',
+    ranks: ranksOfMembers(members),
     agents,
     editable: true,
     models: { models: {}, catalogue: ['m1', 'm2'], fallbackModel: 'm1', editable: true },
@@ -141,7 +161,7 @@ const mount = () => {
     return board;
 };
 
-// One turn: the primary (`instruct`) runs, delegates to `research`, and `research`
+// One turn: the entry agent (`instruct`) runs, delegates to `research`, and `research`
 // starts its own invocation. Afterwards the tile, the thread row and both label hosts
 // exist.
 const stream = (board: ReturnType<typeof createTurnBoard>, prompt = 'look it up'): TurnHandle => {
@@ -183,7 +203,7 @@ const threadTile = (turn: TurnHandle, agent: string): HTMLElement | null => {
     return scope?.querySelector<HTMLElement>(`.thread-row[data-agent="${agent}"] .thread-tile`) ?? null;
 };
 
-// One full "page load": a board with a primary run that delegates, plus the dialog open on
+// One full "page load": a board with an entry-agent run that delegates, plus the dialog open on
 // the same team. Every value is the custom property a real host now carries, so the record
 // is the whole page's identity colouring in one comparable object — used to prove a reload
 // reproduces it exactly (R1). A stale query reads `''` (unpainted) or `'<missing>'`, which
@@ -196,12 +216,12 @@ const paintPage = (): Record<string, string> => {
     const row = threadHost(turn, 'research');
 
     return {
-        // The primary, on each host that names it.
-        composerPrimary: colorOn(composer('instruct')),
-        composerPrimaryLine: lineOn(composer('instruct')),
+        // The entry agent, on each host that names it.
+        composerEntry: colorOn(composer('instruct')),
+        composerEntryLine: lineOn(composer('instruct')),
         tile: colorOn(turn.element),
-        badgePrimary: colorOn(badge('instruct')),
-        badgePrimaryLine: lineOn(badge('instruct')),
+        badgeEntry: colorOn(badge('instruct')),
+        badgeEntryLine: lineOn(badge('instruct')),
 
         // The delegated agent, on each host that names it.
         composerDelegate: colorOn(composer('research')),
@@ -237,7 +257,7 @@ describe('one agent, one colour, everywhere (R4)', () => {
 
         openDialog(['instruct', 'research']);
 
-        // The primary: composer button == its dialog badge == its transcript tile.
+        // The entry agent: composer button == its dialog badge == its transcript tile.
         const control = composer('instruct');
         const controlColor = colorOn(control);
         const controlLine = lineOn(control);
@@ -247,7 +267,7 @@ describe('one agent, one colour, everywhere (R4)', () => {
         expectPaletteTone(controlColor, controlLine);
 
         // The delegated agent: its thread row (which owns the `RH1` label), its nested
-        // block and its badge all agree — and on a DIFFERENT tone than the primary,
+        // block and its badge all agree — and on a DIFFERENT tone than the entry agent,
         // because colour is the only thing separating the two blocks.
         const row = threadHost(turn, 'research');
         const rowColor = colorOn(row);
@@ -345,7 +365,7 @@ describe('one agent, one colour, everywhere (R4)', () => {
         expect(turn.element.hasAttribute('data-agent')).toBe(false);
         expect(section?.hasAttribute('data-agent')).toBe(false);
 
-        // The composer paints the same neutral tone for a primary the shell cannot name,
+        // The composer paints the same neutral tone for an agent the shell cannot name,
         // and the `unknown` placeholder is not an identity either.
         expect([colorOn(composer('')), lineOn(composer(''))]).toEqual([
             UNKNOWN_AGENT_COLOR.color,
@@ -402,11 +422,11 @@ describe('stability while the page lives', () => {
         // The vector is real before it is stable: every host names one of the two agents
         // and carries a genuine palette tone, so the comparison below cannot be won by a
         // page that painted nothing.
-        expectPaletteTone(before.composerPrimary, before.composerPrimaryLine);
+        expectPaletteTone(before.composerEntry, before.composerEntryLine);
         expectPaletteTone(before.threadRow, before.threadRowLine);
-        expect({ tile: before.tile, badgePrimary: before.badgePrimary }).toEqual({
-            tile: before.composerPrimary,
-            badgePrimary: before.composerPrimary
+        expect({ tile: before.tile, badgeEntry: before.badgeEntry }).toEqual({
+            tile: before.composerEntry,
+            badgeEntry: before.composerEntry
         });
         expect({
             composerDelegate: before.composerDelegate,
@@ -417,7 +437,7 @@ describe('stability while the page lives', () => {
             threadTile: before.threadRow,
             badgeDelegate: before.threadRow
         });
-        expect(before.threadRow).not.toBe(before.composerPrimary);
+        expect(before.threadRow).not.toBe(before.composerEntry);
 
         // The reload: module state is gone, and boot configures the same roster in the
         // same order (exactly what main.ts does on a fresh page). Under the old per-page

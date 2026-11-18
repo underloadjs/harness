@@ -71,8 +71,11 @@ const floodPreset = (name = 'flooder'): HarnessPreset => ({
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: ['helper-a', 'helper-b'],
+    // R15 — the map is the team: the entry holds Rank A and BOTH helpers are Rank B, so
+    // the roster has two distinct ranks (which is what registers `delegate`) while neither helper
+    // may delegate to the other — same-rank peers are not targets.
+    entry: name,
+    ranks: { [name]: 'A', 'helper-a': 'B', 'helper-b': 'B' },
     agents: [name, 'helper-a', 'helper-b'],
     tools: [],
     builtin: true,
@@ -102,13 +105,13 @@ const floodPreset = (name = 'flooder'): HarnessPreset => ({
                     ]),
                     tools: ['task']
                 }),
-                // Two idle subagents: each owns a default conversation (`agent:helper-a`,
+                // Two idle Rank B peers: each owns a default conversation (`agent:helper-a`,
                 // `agent:helper-b`), so the candidate roster holds MORE than one conversation and
                 // "one clone per conversation" cannot be satisfied by a single-transcript session.
                 'helper-a': agent({ model: settings.model, instruction: 'Idle helper A.', stream: async function* () {} }),
                 'helper-b': agent({ model: settings.model, instruction: 'Idle helper B.', stream: async function* () {} })
             },
-            primary: name,
+            entry: name,
             presets: false,
             report: { progress }
         })
@@ -202,7 +205,7 @@ describe('the display read clones each conversation at most once (T21)', () => {
         const turnId = turn.id;
         const route = `/v1/harness/sessions/${created.id}/turns/${turnId}/display`;
 
-        // The roster this read may probe: the primary conversation plus one default conversation
+        // The roster this read may probe: the entry conversation plus one default conversation
         // per configured agent (../harness.ts keeps `agent:<name>` rows for every agent), and the
         // bound the fix promises is in terms of THIS number, never in terms of the block count.
         const candidateIds = (store.liveSession(created.id).harness.threads() as { id: string }[]).map((thread) => thread.id);

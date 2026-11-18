@@ -58,8 +58,11 @@ const researcherPreset = (): HarnessPreset => ({
     title: 'researcher',
     description: 'researcher scripted preset',
     requiresEndpoint: false,
-    primary: 'researcher',
-    subagents: [],
+    // A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no `delegate`
+    // row — exactly what the retired `subagents: []` stated (R15).
+    entry: 'researcher',
+    ranks: { researcher: 'A' },
     agents: ['researcher'],
     tools: [],
     builtin: true,
@@ -76,7 +79,7 @@ const researcherPreset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'researcher',
+            entry: 'researcher',
             presets: false,
             report: { progress }
         })
@@ -89,8 +92,11 @@ const teamPreset = (): HarnessPreset => ({
     title: 'team',
     description: 'team scripted preset',
     requiresEndpoint: false,
-    primary: 'lead',
-    subagents: ['loaded'],
+    // R15 — `entry` is ROUTING, `ranks` is AUTHORITY. The retired `primary`/`subagents` pair is
+    // gone: the entry holds Rank A and `loaded` sits strictly below it, which is what derives the
+    // `delegate` allowlist (`isLowerRank`). A stored card states EVERY member's rank.
+    entry: 'lead',
+    ranks: { lead: 'A', loaded: 'B' },
     agents: ['lead', 'loaded'],
     tools: [],
     builtin: true,
@@ -133,24 +139,28 @@ const teamPreset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'lead',
-            subagents: ['loaded'],
+            // R1 — the rank map is what makes `loaded` a legal target for `lead` (A -> B); there is
+            // no `subagents` allowlist to declare beside the roster any more.
+            entry: 'lead',
+            ranks: { lead: 'A', loaded: 'B' },
             presets: false,
             report: { progress }
         })
 });
 
-// F8 fixture: primary `instruct` (code IT) delegates ONCE to `workspace` (code WE). Two distinct
+// F8 fixture: entry `instruct` (code IT) delegates ONCE to `workspace` (code WE). Two distinct
 // codes are the point — a mint that picks the wrong agent is then visible as the wrong LETTERS,
 // which is exactly how the live dump read `IT5`…`IT13` for `workspace`/`reviewer`/`researcher`
-// conversations (`instruct` merely being the session's primary agent).
+// conversations (`instruct` merely being the session's entry agent).
 const instructPreset = (): HarnessPreset => ({
     name: 'instruct',
     title: 'instruct',
     description: 'instruct scripted preset',
     requiresEndpoint: false,
-    primary: 'instruct',
-    subagents: ['workspace'],
+    // R15 — the map replaces the old allowlist: `instruct` routes and holds Rank A, `workspace`
+    // is Rank B, so it is its ONLY delegation target.
+    entry: 'instruct',
+    ranks: { instruct: 'A', workspace: 'B' },
     agents: ['instruct', 'workspace'],
     tools: [],
     builtin: true,
@@ -192,8 +202,8 @@ const instructPreset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'instruct',
-            subagents: ['workspace'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', workspace: 'B' },
             presets: false,
             report: { progress }
         })
@@ -270,7 +280,7 @@ describe('one canonical conversation/legacy label sequence', () => {
         const id = (await store.create('researcher')).id;
 
         // A legacy turn is a fresh one-block conversation: it consumes one ordinal
-        // of the primary agent's code even though no thread record exists.
+        // of the entry agent's code even though no thread record exists.
         await runLegacy(store, id, 'old-1');
         await runLegacy(store, id, 'old-2');
         await runLegacy(store, id, 'old-3');
@@ -518,13 +528,13 @@ describe('one canonical conversation/legacy label sequence', () => {
     // written against (`Temp/orch-plan/report.md`) held 17 conversations whose `threadLabels`
     // entries read `IT1`…`IT13` while the SAME conversations' retained runtime rows carried
     // `WE*`/`RH*`/`GL*`/`RR*` — the agents were `workspace`, `reviewer`, `gitlab`, `researcher`,
-    // and `instruct` was only the session's PRIMARY agent. Two consequences, both pinned here:
-    //   - a hint-less mint named the wrong agent, because the fallback was the primary;
+    // and `instruct` was only the session's ENTRY agent. Two consequences, both pinned here:
+    //   - a hint-less mint named the wrong agent, because the fallback was the entry agent;
     //   - the two label stores then handed the SAME name to different conversations (`WE6` twice:
     //     `threadLabels` and `core.threads[].label` disagreed, and the counter sat behind an
     //     ordinal a live row already held).
     // The rule now: live record → caller's hint → the conversation's OWN durable evidence (the
-    // retained row / a label a turn still shows / an archived run) → the preset's primary LAST
+    // retained row / a label a turn still shows / an archived run) → the preset's entry LAST
     // (./sessions.ts `ensureThreadLabel`, `threadAgentContextOf`, `threadLabelHolder`).
     it('numbers a nested child conversation from the root conversation sequence', async () => {
         const store = createStore(teamPreset());
@@ -550,11 +560,11 @@ describe('one canonical conversation/legacy label sequence', () => {
     // `IT1`…`IT13` for 17 conversations whose RETAINED rows named agents `workspace`, `reviewer`,
     // `research` and `general` (`core.threads[].label` read `WE*`/`RR*`/`RH*`/`GL*` for the same
     // ids). `instruct` was only the session's PRIMARY agent: `ensureThreadLabel` fell back to
-    // `session.preset.primary` whenever `harness.thread()` did not name the conversation — which is
+    // `session.preset.entry` whenever `harness.thread()` did not name the conversation — which is
     // the ordinary state of a soft-deleted row (R2 retains it) and of a document whose join is the
     // only evidence left. The wrong code is not cosmetic: it is written into the map, onto the turn
     // records, and into every `#` reference typed afterwards.
-    it('mints a hint-less conversation label from its own agent, not the primary', async () => {
+    it('mints a hint-less conversation label from its own agent, not the entry', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 'f8-agent-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore(instructPreset(), persistence);
@@ -563,7 +573,7 @@ describe('one canonical conversation/legacy label sequence', () => {
         const delegated = await submit(store, id, 'delegate please');
 
         // The live path HAS the hint (the recorder knows the member it delegated to), so the child
-        // conversation is `WE1` from its first step and the primary stays `IT1`.
+        // conversation is `WE1` from its first step and the entry stays `IT1`.
         const before = store.get(id);
 
         expect(delegated.label).toBe('IT1');
@@ -599,7 +609,7 @@ describe('one canonical conversation/legacy label sequence', () => {
         restored.getView(id);
 
         // The WE sequence advanced and the IT sequence did not. Before the fix the fallback was the
-        // preset's primary agent, so this figure read `{ IT: 2, WE: 1 }` and the conversation was
+        // preset's entry agent, so this figure read `{ IT: 2, WE: 1 }` and the conversation was
         // renamed `IT2` — the dump's `IT5`…`IT13`.
         expect(restored.get(id).labelHighWater).toEqual({ IT: 1, WE: 2 });
 

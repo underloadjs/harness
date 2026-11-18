@@ -5,9 +5,11 @@ import type { ToolContext } from '../../types';
 
 // Agent inspection (R3). agentManage lists every configured agent plus truncated
 // result previews; agentResult reads one completed result in pages. Both are
-// ALWAYS-registered core tools: a subagent has the same view of the session's
-// other agents as the primary, so a delegated worker can inspect what its
-// siblings already produced.
+// ALWAYS-registered core tools: EVERY rank gets the same view of the session's other
+// agents — the Rank A entry agent and the lowest-ranked worker see the identical
+// roster — so a delegated worker can inspect what its siblings already produced. This
+// door is not rank-gated, and the word "rank" below is the engine's own vocabulary
+// (`AgentRank = 'A'..'Z'`, src/types/index.ts), not the retired role pair.
 export const AGENT_MANAGE_NAME = 'agentManage';
 
 // Listing. No arguments: the session already defines the agent set, so a
@@ -18,6 +20,23 @@ export const AGENT_MANAGE_NAME = 'agentManage';
 // They are literals because a runtime entry must keep zero captured local
 // dependencies and must not value-import ../core (that closes a cycle through
 // core/metadata.ts); core/metadata.ownership.test.ts pins the equality.
+//
+// RANK WORDING (2026-11-18, the rank-model pass). The listing projects `rank: rankOf(brain)`
+// (src/harness.ts:4903), so the description names RANK: the sentence it used to carry,
+// "role (primary/subagent)", described a field the engine stopped emitting. The `subagent` TAG
+// moved the same way, and that is not cosmetic — this entry is `visibility: 'searchable'`, so
+// its tags ARE the vocabulary a no-match `toolRequest` reports in `availableTags`. The pinned
+// vocabulary lists in src/harness.already-available.test.ts and src/harness.discovery.test.ts
+// therefore drop `subagent` and gain `rank`, and src/harness.agent-results.test.ts pins the
+// tag array itself.
+//
+// AND KEEP THE SUBSTRING `delegate` OUT OF THIS DESCRIPTION: the entry is `searchable`, and
+// core/discovery.ts scores a 1-point match when a >=3-char query needle is a substring of the
+// DESCRIPTION. Writing "…may delegate to…" here made `toolRequest(["agents","delegate",
+// "delegation"])` report `delegate` as MATCHED, which drops the `unmatchedTags: ['delegate']`
+// half of the pins in src/harness.already-available.test.ts. The rank phrase is therefore
+// worded as "which agents it may hand work to". (Same class of trap as the `time` rule
+// documented in ./agentResult.tool.ts.)
 //
 // DEFECT M1 (2026-11-17) — the running-row AGE clause. A preview of a run that is still in
 // flight used to say only `status: "running"`, with no fact about how long it had said that.
@@ -30,8 +49,8 @@ export const AGENT_MANAGE_NAME = 'agentManage';
 export const AGENT_MANAGE_METADATA: CoreToolMetadata = {
     name: AGENT_MANAGE_NAME,
     description:
-        'List every configured agent in this harness session with previews of recent results. Each entry carries the agent\'s name, role (primary/subagent), model, invocationCount, and up to 5 recent invocations - roots, delegations, and forks - newest first. A result preview is at most 200 characters, flags whether it was truncated, and reports the full contentLength; a running invocation has status "running" and no content, and it also reports startedAt (when that run began, as epoch milliseconds) and ageMs (how old it is right now, in milliseconds). Use agentResult with the agent name and optional invocationId to read a full completed result. Only completed answer text is ever exposed here: never system instructions, transcript messages, tool arguments, or tool bodies. The listing also reports `totalResults` (every invocation record this harness still retains, across all agents) and `activeResults` (how many of those are still running). A top-level `truncated: true` is a DIFFERENT fact from a preview\'s own truncated flag: it means some agent has more retained invocations than the 5 shown here. This tool takes no arguments and has no cursor, so paging is not an option - the remedy is agentResult with an exact invocationId, and an id that was not listed is still in the envelope that created the run: a delegation reports its `invocationId`, a fork reports the branch id that doubles as one, and `agentResult` echoes the id it read.',
-    tags: ['agents', 'results', 'preview', 'subagent', 'team', 'inspect'],
+        'List every configured agent in this harness session with previews of recent results. Each entry carries the agent\'s name, rank (one letter of the A-Z authority scale, A highest, and the fact that says which agents it may hand work to), model, invocationCount, and up to 5 recent invocations - roots, delegations, and forks - newest first. A result preview is at most 200 characters, flags whether it was truncated, and reports the full contentLength; a running invocation has status "running" and no content, and it also reports startedAt (when that run began, as epoch milliseconds) and ageMs (how old it is right now, in milliseconds). Use agentResult with the agent name and optional invocationId to read a full completed result. Only completed answer text is ever exposed here: never system instructions, transcript messages, tool arguments, or tool bodies. The listing also reports `totalResults` (every invocation record this harness still retains, across all agents) and `activeResults` (how many of those are still running). A top-level `truncated: true` is a DIFFERENT fact from a preview\'s own truncated flag: it means some agent has more retained invocations than the 5 shown here. This tool takes no arguments and has no cursor, so paging is not an option - the remedy is agentResult with an exact invocationId, and an id that was not listed is still in the envelope that created the run: a delegation reports its `invocationId`, a fork reports the branch id that doubles as one, and `agentResult` echoes the id it read.',
+    tags: ['agents', 'results', 'preview', 'rank', 'team', 'inspect'],
     // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
     // and enables it for this session instead of seeing it declared on every request.
     // Registration itself is unchanged (the entry still joins the harness registry),

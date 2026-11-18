@@ -10,7 +10,7 @@
 // next.
 //
 // The product rule is now the opposite: a harness choice changes the AGENTS
-// (instructions, primary, subagents), never the toolbox. Every live preset is
+// (instructions, entry agent, ranks), never the toolbox. Every live preset is
 // built by `createToolboxHarness` below, so the registered tool set is identical
 // by construction rather than by three hand-maintained lists that can drift.
 //
@@ -32,8 +32,9 @@
 //                        configured them (a provider key for search, the
 //                        `webfetch` flag for fetch), and the harness-owned pair
 //                        toolRequest (the discovery bootstrap) plus task (the
-//                        session plan), with delegate for a preset that declares
-//                        subagents.
+//                        session plan), with delegate for a preset whose RANK MAP
+//                        holds two or more distinct ranks (a strictly-lower target
+//                        is the only thing to delegate to).
 //                        files, the other package/app tools, and the runtime
 //                        rows R9-R11 demoted (toolRegistry/toolList/toolManage/
 //                        toolCreate/profileManage/chapterManage/locationManage/
@@ -87,6 +88,15 @@
 
 import { agent, harness, presetTools, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../harness';
 import type { Agent, AgentConfiguration, Harness, HarnessConfiguration, HarnessProgress, Tool } from '../../harness';
+// The A–Z rank union (../types/index.ts). This layer STORES and PROJECTS ranks;
+// the ordering and the delegation predicate live with the kernel.
+import type { AgentRank } from '../../types';
+// THE RANK PRIMITIVES (R1): the ladder itself and its one ordering. They are values, not
+// types, because ./registry.ts has to RESOLVE an operator's sparse map into the map the
+// harness runs with (see `resolveRosterRanks`), and the kernel's arithmetic
+// (../harness.ts:1528-1532) is written against these same two exports — so the scale and
+// the floor can never drift from what the runtime does.
+import { AGENT_RANKS, rankIndexOf } from '../../types';
 import { agentInstruction, agentProfile, isAgentProfileName } from '../../agents';
 // T19: the global agent overlay (effective profile text + the retirement error). One
 // direction only — ./agent-state.ts imports nothing from here, so there is no cycle.
@@ -181,10 +191,10 @@ export const SHARED_TOOL_FOLDERS: readonly string[] = Object.freeze([SHARED_APP_
 // The rule is the descriptor's own registration policy: a runtime entry that is
 // registered unconditionally at startup is part of the declared core set, in
 // descriptor order (the scan emits the kernel's registration order, toolRegistry
-// first). Entries that are capability-by-configuration — delegate (subagents),
-// actionRequest (owner answerer), threadFork (fork configuration), toolCancel
+// first). Entries that are capability-by-configuration — delegate (a multi-rank
+// roster), actionRequest (owner answerer), threadFork (fork configuration), toolCancel
 // (pending work), the thread pair (independent threads) — are NOT in this list and
-// are projected separately by coreToolNames() below, which is why a single-agent
+// are projected separately by coreToolNames() below, which is why a single-rank
 // preset never advertises a delegation tool it would not declare.
 //
 // N4 note preserved: actionRequest must not be promised by a static projection,
@@ -213,14 +223,83 @@ export const CORE_PRESET_TOOL_NAMES: readonly string[] = Object.freeze(
 // production preset that registers one must advertise it here as well.
 export const CORE_ENVIRONMENT_TOOL_NAMES = [WEB_SEARCH_TOOL_NAME, WEB_FETCH_TOOL_NAME] as const;
 
+// Resolve a REQUEST's rank map into the map the harness actually RUNS with: one entry
+// per roster member, in roster order, every value a letter.
+//
+// WHY THE HOST MIRRORS THE KERNEL'S FILL AT ALL. The kernel never runs a sparse map
+// (../harness.ts:1505-1545): `ranks` ABSENT ENTIRELY puts the ENTRY agent at 'A' and every
+// other member at 'B', and `ranks` PRESENT puts every agent the map omits — the entry agent
+// included — one rank BELOW the lowest rank the map states, clamped at 'Z'. A definition
+// that stored the sparse map would run a team nobody wrote down: the card would advertise
+// fewer ranks than the harness holds, `coreToolNames` would count distinct ranks in a
+// different map than the kernel's own `distinctRankCount`, and a restart could move an agent
+// whose rank was never recorded. Storing the RESOLVED map removes all three, and turns "the
+// operator named only the top" into a decision recorded ONCE instead of re-derived per start.
+//
+// THE TWO OMISSIONS ARE DIFFERENT ON PURPOSE, because the kernel makes them different:
+//   - `ranks` omitted (undefined) = "give me the ordinary team" → entry 'A', others 'B',
+//     which spans two ranks, so `delegate` IS registered;
+//   - `ranks: {}` = "nobody is ranked" → the kernel's present-but-empty branch, EVERY member
+//     (entry included) at 'B', one distinct rank, so NO delegation exists. An operator who
+//     clears every rank gets a flat team, and the card says so.
+//
+// KEEP THIS IN STEP WITH THE KERNEL. The ladder comes from the kernel's own primitives
+// (`AGENT_RANKS` ../types/index.ts:1501 and `rankIndexOf` ../types/index.ts:1532, both
+// re-exported by ../harness.ts:17272), so the scale can never drift; only the FILL rule
+// could. If the kernel ever exports its resolver, delete this mirror and call that.
+export const resolveRosterRanks = (
+    roster: readonly string[],
+    entry: string,
+    ranks?: Readonly<Record<string, AgentRank>>
+): Record<string, AgentRank> => {
+    // Rule 1 (../harness.ts:1540): no map at all — the entry point is the one actor the
+    // kernel ranks highest, and that is a DEFAULT, not a rule: pass any map, even an empty
+    // one, and the entry agent is ranked like everybody else.
+    if (ranks === undefined) {
+        return Object.fromEntries(roster.map((name) => [name, name === entry ? ('A' as AgentRank) : ('B' as AgentRank)]));
+    }
+
+    // Only the roster's own keys count. A key outside the roster is the CALLER's error, and
+    // ./registry.ts refuses it before this runs; ignoring it here keeps a stale map from
+    // lowering the floor for a member that no longer exists.
+    const explicit = roster
+        .map((name) => ranks[name])
+        .filter((rank): rank is AgentRank => rank !== undefined);
+
+    // Rule 2 (../harness.ts:1528-1532): one below the LOWEST explicit rank, clamped at 'Z'.
+    // An empty map takes the same branch with a floor index of 0, which is what lands every
+    // member on 'B' — including the entry agent.
+    const lowest = explicit.length === 0 ? 0 : Math.max(...explicit.map(rankIndexOf));
+    const floor = AGENT_RANKS[Math.min(lowest + 1, AGENT_RANKS.length - 1)];
+
+    return Object.fromEntries(roster.map((name) => [name, ranks[name] ?? floor]));
+};
+
+// Whether one RANK MAP declares a delegation surface, i.e. whether `delegate` is
+// registered and therefore whether a descriptor may advertise it.
+//
+// THE RULE: two or more DISTINCT rank letters — the kernel's own `rosterHasDelegation()`
+// (../harness.ts:1557-1561), computed on the same FILLED map `resolveRosterRanks` produces.
+// Delegation is strictly downward (../types/index.ts `isLowerRank`), so a roster whose
+// members all hold the same rank has no legal target — A→A is refused — and the kernel does
+// not register the row at all. A roster with A and B does, an A/B/C roster registers the same
+// single row and merely lets an A agent reach two levels down. Counting DISTINCT VALUES
+// (not members) is what makes this exact: seven members all at Rank B still cannot
+// delegate, and the preset card must not promise the tool.
+export const ranksDeclareDelegation = (ranks: Readonly<Record<string, AgentRank>> = {}): boolean =>
+    new Set(Object.values(ranks)).size >= 2;
+
 // Project the core set for one preset descriptor.
 //
-// `registered` is the exact tool-name set the card was built with (preset.tools
-// plus environment tools THIS host can actually run — see descriptor.ts). A core
-// name is advertised only when it is in that set, so the demo fixture (timeNow
-// only) does not claim file tools, and a keyless host does not claim search.
+// `ranks` is the preset's rank map (agent id → A–Z letter); `delegate` joins the
+// projection exactly when it holds two or more distinct ranks — see
+// `ranksDeclareDelegation`. `registered` is the exact tool-name set the card was
+// built with (preset.tools plus environment tools THIS host can actually run — see
+// descriptor.ts). A core name is advertised only when it is in that set, so the
+// scripted fixture (timeNow only) does not claim file tools, and a keyless host
+// does not claim search.
 export const coreToolNames = (
-    subagents: readonly string[] = [],
+    ranks: Readonly<Record<string, AgentRank>> = {},
     registered: readonly string[] = []
 ): string[] => {
     const available = new Set(registered);
@@ -231,13 +310,13 @@ export const coreToolNames = (
     // before file presets here too.
     return [
         ...CORE_TOOL_NAMES,
-        ...(subagents.length > 0 ? ['delegate'] : []),
+        ...(ranksDeclareDelegation(ranks) ? ['delegate'] : []),
         // R9-R11: the hardcoded `threadFork` row is gone. It promised a
         // declaration because forks register by default, but the entry now
         // declares searchable visibility, so it is discovered through
         // toolRequest like the rest of the demoted runtime set. delegate keeps
-        // its special case only because it stays core WHEN a preset declares
-        // subagents.
+        // its special case only because it stays core WHEN a preset's ranks give
+        // someone a strictly-lower agent to delegate to.
         ...CORE_PRESET_TOOL_NAMES.filter((name) => available.has(name)),
         ...CORE_ENVIRONMENT_TOOL_NAMES.filter((name) => available.has(name))
     ];
@@ -394,8 +473,9 @@ export const agentConfigurationForCustom = (
     };
 };
 
-// Build the agent registry for a selected set. Order is the caller's: primary
-// first, then the allowlist, matching the descriptor's `agents` list. `agentModels`
+// Build the agent registry for a selected set. Order is the caller's: the ENTRY
+// agent first, then the rest of the roster, matching the descriptor's `agents`
+// list (the order is what the registry's entry default falls back to). `agentModels`
 // is the validated override map from the harness registry; it is applied per agent
 // so one member can run a different model from its siblings. `agentInstructions`
 // (T3) is the parallel instruction override map, applied the same per-agent way.
@@ -452,10 +532,21 @@ export const agentsFromProfiles = (
     return agents;
 };
 
-// A live harness factory for a primary + subagent selection. Used by the built-in
-// presets and by user-created/overridden harnesses, so a harness choice can only
-// change the agents — the toolbox and the loop budget are identical by
+// A live harness factory for an ENTRY + ROSTER + RANKS selection. Used by the
+// built-in presets and by user-created/overridden harnesses, so a harness choice
+// can only change the agents — the toolbox and the loop budget are identical by
 // construction.
+//
+// THE THREE ARGUMENTS ARE THREE CONCEPTS, so none of them is derived from another:
+//   - `entry`  — routing: the agent an unfocused submit opens a conversation for;
+//   - `roster` — WHO runs, in declaration order (the roster can NEVER be recovered
+//                from `Object.keys(ranks)`: a rank map states authority, not membership,
+//                and the two are written independently);
+//   - `ranks`  — authority: agent id → A–Z letter, for EVERY member. ./registry.ts resolves
+//                and validates exactly that (every key a member, every member keyed — see
+//                `resolveRosterRanks`), and a map holding two or more DISTINCT letters is
+//                what makes `delegate` exist at all (`ranksDeclareDelegation`, which is the
+//                kernel's own `rosterHasDelegation`, ../harness.ts:1557-1561).
 //
 // The model and instruction maps are captured by the closure, not read at run
 // time: `update()` builds a NEW factory for the new maps, and a session created
@@ -466,8 +557,9 @@ export const agentsFromProfiles = (
 // a session's invented roster is part of the team the factory builds.
 export const createProfiledHarness =
     (
-        primary: string,
-        subagents: readonly string[],
+        entry: string,
+        roster: readonly string[],
+        ranks: Readonly<Record<string, AgentRank>>,
         agentModels: Readonly<Record<string, string>> = {},
         agentInstructions: Readonly<Record<string, string>> = {},
         agentColors: Readonly<Record<string, string>> = {},
@@ -476,7 +568,7 @@ export const createProfiledHarness =
         // trailing OPTIONAL argument, so every existing caller (./presets.ts, ./registry.ts, the CLI)
         // keeps the shared toolbox by construction exactly as before, and only a card that explicitly
         // asks for the tool-less posture leaves it. Kept as a separate argument rather than folded into
-        // the six map arguments because those are all AGENT configuration — mixing a toolbox field in
+        // the map arguments because those are all AGENT configuration — mixing a toolbox field in
         // there would blur the rule this module exists to protect.
         toolbox?: ProfiledHarnessToolbox
     ) =>
@@ -487,16 +579,22 @@ export const createProfiledHarness =
     ): Harness =>
         createToolboxHarness(
             {
+                // Entry FIRST, then the rest of the roster in the caller's order. The
+                // entry is already roster[0] for every preset and every registry entry,
+                // and this keeps that true for a caller that handed the roster over in
+                // some other order: the agent map's key order is what the kernel's
+                // "first key is the entry" default reads, and a projection that agrees
+                // with the explicit `entry` below cannot disagree with itself.
                 agents: agentsFromProfiles(
-                    [primary, ...subagents],
+                    [entry, ...roster.filter((name) => name !== entry)],
                     settings,
                     agentModels,
                     agentInstructions,
                     agentColors,
                     customAgents
                 ),
-                primary,
-                subagents: [...subagents],
+                entry,
+                ranks: { ...ranks },
                 ...(toolbox === undefined ? {} : toolbox)
             },
             settings,
@@ -514,19 +612,27 @@ export type ProfiledHarnessToolbox = {
     maxIterations?: number;
 };
 
-// What a live preset supplies: the agents and how they are routed. Everything
-// else is the shared toolbox, so two presets cannot end up with different tools.
+// What a live preset supplies: the agents, which one is the entry, and what each of
+// them is allowed to do. Everything else is the shared toolbox, so two presets
+// cannot end up with different tools.
 export type ToolboxHarnessConfiguration = {
     agents: Record<string, Agent>;
-    primary: string;
-    // Omitted/empty means a single-agent harness (no delegate tool).
-    subagents?: readonly string[];
+    // THE ENTRY AGENT (routing). Explicit even with one key, exactly as the old
+    // `primary` was: an unfocused submit must never depend on key order.
+    entry: string;
+    // THE RANK MAP (authority): agent id → A–Z letter, `A` highest. An empty map
+    // means NO delegation authority anywhere in this harness — there is no strictly
+    // lower target to hand work to, so `delegate` is not registered — and it is the
+    // direct replacement for the old `subagents: []`. A harness may hold any number
+    // of Rank A agents; rank, not a singleton role, is what gates delegation
+    // (../types/index.ts `isLowerRank`).
+    ranks?: Readonly<Record<string, AgentRank>>;
     // THE TOOL-LESS POSTURE (issue 0005-D): `false` registers NO catalogue tool at all — neither the
     // package presets nor the app folder (both ride `SHARED_TOOL_SOURCES`) and neither environment row
     // (search/fetch), so the harness keeps only the harness-owned rows the kernel always owns
     // (toolRegistry/toolRequest/toolList/toolManage/toolCreate/records/tasks/profiles/chapters/
-    // locations/agentManage/agentResult, plus the searchable demoted set) and, with no subagents, not
-    // even `delegate`. THAT is the gap this closes: a card whose model must never spend a tool round
+    // locations/agentManage/agentResult, plus the searchable demoted set) and, with a
+    // single-rank roster, not even `delegate`. THAT is the gap this closes: a card whose model must never spend a tool round
     // on the server host's filesystem.
     //
     // DELIBERATELY NOT THE DEFAULT. Every live preset still shares one toolbox by construction; this
@@ -588,10 +694,15 @@ export const createToolboxHarness = (
 
     const liveConfiguration: HarnessConfiguration = {
         agents: configuration.agents,
-        // Explicit routing: the entry agent is named even with one key, and the
-        // allowlist is copied so later mutation cannot change a live harness.
-        primary: configuration.primary,
-        ...(configuration.subagents === undefined ? {} : { subagents: [...configuration.subagents] }),
+        // Explicit routing: the entry agent is named even with one key, and the rank
+        // map is COPIED so a later mutation of the preset's map cannot change a live
+        // harness. A map that comes from ./registry.ts is already RESOLVED (every member
+        // keyed), so the kernel fills nothing and the harness runs the ranks its card
+        // shows. A hand-written host that passes no map gets the library's own rule
+        // (entry 'A', every other agent 'B' — ../harness.ts:1540), which is deliberate:
+        // that default is the library's, not this host's, and it is spelled in one place.
+        entry: configuration.entry,
+        ...(configuration.ranks === undefined ? {} : { ranks: { ...configuration.ranks } }),
         // ORDER (T25): the app entries come from `SHARED_APP_TOOL_SOURCES`, which
         // ./tools.ts discovers from `src/server/tools/shared` in `registration.order`
         // and labels package-relative. Registering them through `toolSources` keeps
@@ -672,6 +783,15 @@ export const createToolboxHarness = (
         // Only the reference is live; a lane is live for the set it was created with
         // (../tool-settings.ts "WORKER MODE").
         ...(observer?.toolSettings === undefined ? {} : { toolSettings: observer.toolSettings }),
+        // T7: the host's knowledge base, on the same rule as the two above (a
+        // `HarnessConfiguration` field, ../types). Absent means the library default: a private
+        // in-memory engine, and `harness.knowledge` carries NO `flush`, so a tool says "in
+        // memory" instead of promising bytes it cannot write. Presence means this session's
+        // `context.harness.knowledge` is the deployment's store — the same object every other
+        // session of this process holds (../runtime.ts resolves it once per root), which is how
+        // one session's article is another's to read and why deleting a session changes nothing
+        // about the base.
+        ...(observer?.knowledge === undefined ? {} : { knowledge: observer.knowledge }),
         // R1: the host's per-build "start with the whole switchable toolbox enabled" seed,
         // forwarded verbatim into `HarnessConfiguration.enableAllTools` (src/types/index.ts).
         // Absent means the library default — an empty enabled set — which is what a library

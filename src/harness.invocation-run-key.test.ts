@@ -71,6 +71,11 @@ const coreOf = () =>
         presets: false
     });
 
+// `rank: 'A'` is the rank of the only agent in `coreOf()` (./types rank rule 1: with no
+// `ranks` map the entry agent holds Rank A). It replaces the removed primary/subagent
+// `role` field, and snapshot v3 REFUSES a row that still carries `role`, so this helper
+// cannot stay lenient.
+//
 // The ledger generation of a process that has ALREADY ENDED. The name is arbitrary on purpose: the
 // runtime never parses an epoch, it only compares one (`./shared/run-identity.ts`).
 const DEAD_EPOCH = 'epoch-pre-restart';
@@ -84,7 +89,7 @@ const archivedRow = (
     invocationId,
     sequence,
     agent: 'writer',
-    role: 'primary',
+    rank: 'A',
     kind: 'root',
     status: 'completed',
     content,
@@ -115,7 +120,7 @@ describe('the invocation ledger is addressed by a run', () => {
                 sequence: 15,
                 completedOrder: 1,
                 agent: 'writer',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: 'pre-restart answer',
@@ -126,7 +131,7 @@ describe('the invocation ledger is addressed by a run', () => {
                 sequence: 16,
                 completedOrder: 2,
                 agent: 'writer',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: 'post-restart answer',
@@ -261,7 +266,7 @@ describe('the invocation ledger is addressed by a run', () => {
             sequence: 15,
             completedOrder: 2,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'completed',
             content: 'the finished answer',
@@ -297,7 +302,7 @@ describe('the invocation ledger is addressed by a run', () => {
                 sequence: 15,
                 completedOrder: 1,
                 agent: 'writer',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: 'legacy answer'
@@ -318,7 +323,7 @@ describe('the invocation ledger is addressed by a run', () => {
                 sequence: 15,
                 completedOrder: 1,
                 agent: 'writer',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: 'legacy answer'
@@ -329,7 +334,10 @@ describe('the invocation ledger is addressed by a run', () => {
             'sequence',
             'completedOrder',
             'agent',
-            'role',
+            // V3 put `rank` exactly where v2 kept `role`, so the key ORDER of a row is
+            // pinned too: the server persists these rows verbatim and a reorder is a
+            // shape change, not a rename.
+            'rank',
             'kind',
             'status',
             'content'
@@ -365,7 +373,7 @@ describe('the invocation ledger is addressed by a run', () => {
             sequence: 15,
             completedOrder: 1,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'completed',
             content: 'legacy answer'
@@ -375,7 +383,7 @@ describe('the invocation ledger is addressed by a run', () => {
             sequence: 15,
             completedOrder: 2,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'completed',
             content: 're-archived answer',
@@ -393,7 +401,7 @@ describe('the invocation ledger is addressed by a run', () => {
             sequence: 15,
             completedOrder: 1,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'completed',
             content: 'legacy answer'
@@ -418,7 +426,7 @@ describe('the invocation ledger is addressed by a run', () => {
             invocationId: '15',
             completedOrder: 1,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'completed'
         };
@@ -500,7 +508,7 @@ describe('the invocation ledger is addressed by a run', () => {
             sequence: 7,
             completedOrder: 7,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'completed',
             content: 'answer 7',
@@ -511,7 +519,7 @@ describe('the invocation ledger is addressed by a run', () => {
             sequence: 70,
             completedOrder: 70,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'completed',
             content: 'dead answer 64',

@@ -28,7 +28,9 @@ import type { SessionTurn } from './protocol';
 import { steerRowOf, turnRowOf, TURN_PROMPT_PREVIEW_CHARS } from './api-reads';
 import { createTurnProjector } from './turn-projector';
 
-const CONTEXT: DisplayProjectContext = { primary: 'one' };
+// R1 — the fold's context names the ENTRY agent (routing); the retired `primary` field is gone,
+// and `ranks` stays optional here because a steer row does not resolve an authority rank.
+const CONTEXT: DisplayProjectContext = { entry: 'one' };
 
 // The same minimal recorded turn the projector suite builds (./turn-projector.test.ts:31): no
 // events, so the row's steer list comes ONLY from the record's `steers` audit ring and nothing

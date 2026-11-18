@@ -122,7 +122,7 @@ const displayOf = (sections: TurnDisplay['sections']): TurnDisplay => ({ turnId:
 const section = (id: string, context: ContextBlock[] | undefined): TurnDisplay['sections'][number] =>
     ({
         id,
-        role: id === 't1:0' ? 'primary' : 'subagent',
+        rank: id === 't1:0' ? 'A' : 'B',
         agent: 'instruct',
         agentLabel: 'RR1',
         state: 'done',

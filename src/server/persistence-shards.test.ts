@@ -48,6 +48,11 @@ import { createHarnessRegistry, createToolCatalogue, createWebSearchCatalogueEnt
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 import type { HarnessDescriptor } from './protocol';
+// The snapshot version the loader asserts a session's `core` carries
+// (./persistence.ts `requireCoreSnapshotVersion` -> ../core/snapshot.ts
+// `HARNESS_SNAPSHOT_VERSION`). It is imported rather than written as a literal so this file
+// cannot silently start feeding the fixture a stale snapshot the day the kernel bumps.
+import { HARNESS_SNAPSHOT_VERSION } from '../core/snapshot';
 import {
     HARNESS_DATABASE_DIRECTORY,
     HARNESS_DATABASE_FILE,
@@ -185,18 +190,20 @@ afterEach(() => {
 // The hand-built database (no harness, no store — just the record shape)
 // ---------------------------------------------------------------------------
 //
-// A record is a `HarnessSessionRecord`; `core` is only required to be an object with a
-// numeric `version` by the loader (`readSessionRecord` hands the snapshot to
-// `harness.restore()` as-is), so a minimal core is enough to pin WHERE its thread
-// transcripts are stored — which is the whole subject of this file. The real-core version
-// of the same claim is the store describe at the bottom.
+// A record is a `HarnessSessionRecord`; `core` must carry the snapshot version THIS build
+// reads (`readSessionRecord` -> `requireCoreSnapshotVersion`, ./persistence.ts), and the
+// loader hands the rest of the snapshot to `harness.restore()` as-is, so a minimal core with
+// the right version is enough to pin WHERE its thread transcripts are stored — which is the
+// whole subject of this file. The real-core version of the same claim is the store describe at
+// the bottom; the stale-version case is its own test below ("refuses a session whose `core` is
+// an older snapshot").
 const PRESET: HarnessPresetRecord = {
     name: 'one',
     title: 'one',
     description: 'one scripted preset',
     requiresEndpoint: false,
-    primary: 'one',
-    subagents: [],
+    entry: 'one',
+    ranks: { one: 'A' },
     agents: ['one'],
     tools: [],
     builtin: true,
@@ -240,7 +247,7 @@ const sessionOf = (
         updatedAt: 1_700_000_000_001,
         turns: [],
         queue: [],
-        core: { version: 1, agents: { one: { messages: [] } }, threads }
+        core: { version: HARNESS_SNAPSHOT_VERSION, agents: { one: { messages: [] } }, threads }
     }) as unknown as HarnessSessionRecord;
 
 // Two sessions, five conversations between them, in live-map insertion order.
@@ -603,6 +610,259 @@ describe('load() reassembles the single-file graph (R3)', () => {
 
         expect((shapedFailure as Error).message).toContain('has an invalid shape or version');
         expect((shapedFailure as Error).message).toContain('sessions[1].harness must be a string.');
+    });
+
+    it('refuses a registry row still written in the retired roster vocabulary', () => {
+        // THE CLEAN BREAK, durable side. `primary` + `subagents` no longer means what this build
+        // reads: `subagents: []` claimed "no delegates" while the rank model states authority per
+        // member, and a row whose delegation model this build cannot state must fail LOUD rather
+        // than resume as a team its author never configured.
+        const root = tempRoot('legacy-roster-row');
+        const persistence = new HarnessPersistence(root);
+
+        persistence.save(fixtureOf());
+
+        // The same record, only the retired pair: the row an installation has on disk today.
+        const legacyRow: Record<string, unknown> = { ...PRESET, primary: 'one', subagents: [] };
+
+        delete legacyRow.entry;
+        delete legacyRow.ranks;
+
+        const header = readJson(indexFile(root));
+
+        header.registry = [legacyRow];
+        fs.writeFileSync(indexFile(root), JSON.stringify(header), 'utf8');
+
+        let failure: unknown;
+
+        try {
+            new HarnessPersistence(root).load();
+        } catch (error) {
+            failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(HarnessPersistenceError);
+        expect((failure as HarnessPersistenceError).file).toBe(indexFile(root));
+        // It names the keys it refused AND the shape it wants, so an operator can rewrite the row
+        // from the message alone — the refusal is the migration guide.
+        expect((failure as Error).message).toContain(
+            'registry[0] was written before the rank model and carries `primary` and `subagents`.'
+        );
+        expect((failure as Error).message).toContain(
+            'This build stores `entry` (the routing agent, one of `agents`) and `ranks` ' +
+                '(agent id -> a single rank letter, "A" highest to "Z" lowest) instead'
+        );
+        expect((failure as Error).message).toContain('does not translate the old keys');
+        // Nothing was rewritten: the bytes on disk are still the ones the operator has to fix.
+        expect(fs.readFileSync(indexFile(root), 'utf8')).toContain('"subagents":[]');
+    });
+
+    it('refuses a frozen session definition still written in the retired roster vocabulary', () => {
+        // The frozen definition is the executable contract the NEXT turn rebuilds from, so it
+        // carries the identical refusal — and it is the row a long-lived installation is most
+        // likely to still have, because a session can outlive every edit to its card.
+        const root = tempRoot('legacy-roster-definition');
+        const persistence = new HarnessPersistence(root);
+
+        persistence.save(fixtureOf());
+
+        const pristine = readJson(sessionFile(root, SESSION_A));
+        const definition: Record<string, unknown> = {
+            ...(pristine.definition as Record<string, unknown>),
+            primary: 'one',
+            subagents: []
+        };
+
+        delete definition.entry;
+        delete definition.ranks;
+
+        fs.writeFileSync(sessionFile(root, SESSION_A), JSON.stringify({ ...pristine, definition }), 'utf8');
+
+        let failure: unknown;
+
+        try {
+            new HarnessPersistence(root).load();
+        } catch (error) {
+            failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(HarnessPersistenceError);
+        // The FILE is the header, not the shard: shard bytes are only parse-checked per file,
+        // while the shape (and therefore the roster vocabulary) is validated once over the merged
+        // graph, which is the v1 all-or-nothing outcome this layer keeps on purpose. What still
+        // localises the damage is the label: the session's POSITION in `index.json` plus the field
+        // path — `ses-a` is the second row, and only its frozen definition is wrong.
+        expect((failure as HarnessPersistenceError).file).toBe(indexFile(root));
+        expect((failure as Error).message).toContain(
+            'sessions[1].definition was written before the rank model and carries `primary` and `subagents`.'
+        );
+        // The untouched sibling session is not blamed: its own shard still holds the new shape,
+        // so the refusal is about one record even though the load fails as a whole.
+        expect(readJson(sessionFile(root, SESSION_B)).definition.entry).toBe('one');
+    });
+
+    it('refuses a stored rank that is not a single letter', () => {
+        // The rank VALUE rule at the durable boundary (`readRankMap` -> `isAgentRank`,
+        // ../types/index.ts): a lower-case letter is what a hand-edited file looks like, and
+        // accepting it would store an authority this build's ordering cannot compare.
+        const root = tempRoot('legacy-rank-value');
+        const persistence = new HarnessPersistence(root);
+
+        persistence.save(fixtureOf());
+
+        const header = readJson(indexFile(root));
+
+        header.registry[0].ranks = { one: 'a' };
+        fs.writeFileSync(indexFile(root), JSON.stringify(header), 'utf8');
+
+        let failure: unknown;
+
+        try {
+            new HarnessPersistence(root).load();
+        } catch (error) {
+            failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(HarnessPersistenceError);
+        expect((failure as Error).message).toContain(
+            'registry[0].ranks.one must be a single rank letter from "A" (highest) to "Z" (lowest).'
+        );
+
+        // A `ranks` that is not an object at all is the other hand-edit, and it is refused with
+        // the reader's own sentence rather than a missing-key cascade.
+        fs.writeFileSync(
+            indexFile(root),
+            JSON.stringify({ ...header, registry: [{ ...header.registry[0], ranks: ['A'] }] }),
+            'utf8'
+        );
+
+        let shaped: unknown;
+
+        try {
+            new HarnessPersistence(root).load();
+        } catch (error) {
+            shaped = error;
+        }
+
+        expect((shaped as Error).message).toContain('registry[0].ranks must be an object.');
+    });
+
+    it('refuses a session whose `core` is an older snapshot, and keeps its shards through the next save', () => {
+        // THE HALF-ACCEPT THIS BUILD MUST NOT HAVE. `definition` is already in the rank shape, so
+        // the roster refusal above passes, and the ONLY fact marking this row as pre-rank is
+        // `core.version` — the loader used to check it was a NUMBER and hand the snapshot to
+        // `harness.restore()` unread (./persistence.ts `readSessionRecord`). The snapshot's own
+        // gate (../core/snapshot.ts:1205) then fired LATER, per session, inside ./sessions.ts
+        // `restoreSession`: the session left the live map (./sessions.ts:2189-2195, reported in
+        // `restoreErrors`), and the store's next checkpoint (./sessions.ts:3991) read that
+        // absence as "the session left the map" and DELETED its shards. Observed on a real root
+        // before this guard: `session.json` gone, `threads/` gone, `events.jsonl` and the
+        // directory kept — destructive on disk, loud only in the diagnostics.
+        const root = tempRoot('stale-core-snapshot');
+        const persistence = new HarnessPersistence(root);
+
+        persistence.save(fixtureOf());
+
+        // The journal is the store's file, not this layer's; it is here so the survivor tree
+        // shows the whole footprint the operator can still recover.
+        const journal = journalFile(root, SESSION_A);
+
+        fs.writeFileSync(journal, `{"type":"header","v":1,"sessionId":"${SESSION_A}","createdAt":1}\n`, 'utf8');
+
+        // ONE field moves — `core.version`, back to the snapshot this build replaced — and every
+        // other byte is what the writer just produced, so the refusal can only be about the
+        // snapshot the row carries. `HARNESS_SNAPSHOT_VERSION - 1` rather than a literal: the
+        // row stays "one version behind this build" whatever the kernel bumps to next.
+        const stale = readJson(sessionFile(root, SESSION_A));
+        const staleBytes = JSON.stringify({
+            ...stale,
+            core: { ...(stale.core as Record<string, unknown>), version: HARNESS_SNAPSHOT_VERSION - 1 }
+        });
+
+        fs.writeFileSync(sessionFile(root, SESSION_A), staleBytes, 'utf8');
+
+        // A FRESH instance: the reader of a RESTARTED process, which is the reader the
+        // destructive flow actually reaches (the bytes were written by an earlier one). `load()`
+        // is where the refusal belongs — fatal, like every other record-level shape failure
+        // this layer has.
+        const reader = new HarnessPersistence(root);
+        let failure: unknown;
+
+        try {
+            reader.load();
+        } catch (error) {
+            failure = error;
+        }
+
+        expect(failure).toBeInstanceOf(HarnessPersistenceError);
+        // The FILE it reports is the header that published the id (this layout's rule, see the
+        // two roster refusals above); what localises the damage is the label — `ses-a` is the
+        // second row, and only its snapshot is stale.
+        expect((failure as HarnessPersistenceError).file).toBe(indexFile(root));
+        expect((failure as Error).message).toContain(
+            `sessions[1].core is snapshot version ${HARNESS_SNAPSHOT_VERSION - 1}, and this build reads snapshot version ${HARNESS_SNAPSHOT_VERSION}.`
+        );
+        // The refusal is the migration guide: it names the shard that carries the stale
+        // snapshot, says nothing is translated, and gives the remedy the roster refusals give.
+        // The path is spelled out here rather than derived, the way this file spells its own
+        // shard paths, so the expected message cannot drift along with the module under test.
+        expect((failure as Error).message).toContain(
+            `The record that carries it is sessions/${SESSION_A}/${HARNESS_SESSION_FILE}`
+        );
+        expect((failure as Error).message).toContain('does not translate a stored snapshot');
+        expect((failure as Error).message).toContain(
+            're-save that session record in the new shape, or start from a fresh database root.'
+        );
+
+        // The bytes are still exactly the stale ones: a refusal never rewrites the record it
+        // refused, so the operator can still read what is there.
+        expect(fs.readFileSync(sessionFile(root, SESSION_A), 'utf8')).toBe(staleBytes);
+
+        const before = inodesOf(root);
+
+        // THE NEXT SAVE — the commit that used to do the deleting: the store dropped the refused
+        // session and committed the document it had left (./sessions.ts:3991). The reader that
+        // refused has NO primed footprint (the swap happens only on a successful read), so it
+        // has nothing to erase, and the refused session keeps every byte it had.
+        reader.save(fixtureOf([sessionOf(SESSION_B, EXPECTED_ROWS.map((id, index) => threadRow(id, index + 1)))]));
+
+        // The complete survivor tree, in one value: the refused record, its transcript and its
+        // journal are all still there next to the session the save did commit.
+        expect(treeOf(root)).toEqual([
+            'index.json',
+            'sessions/',
+            `sessions/${SESSION_A}/`,
+            `sessions/${SESSION_A}/events.jsonl`,
+            `sessions/${SESSION_A}/session.json`,
+            `sessions/${SESSION_A}/threads/`,
+            `sessions/${SESSION_A}/threads/thread-1.json`,
+            `sessions/${SESSION_B}/`,
+            `sessions/${SESSION_B}/session.json`,
+            `sessions/${SESSION_B}/threads/`,
+            `sessions/${SESSION_B}/threads/thread-11.json`,
+            `sessions/${SESSION_B}/threads/thread-2.json`,
+            `sessions/${SESSION_B}/threads/thread-3.json`
+        ]);
+
+        // Same INODES, so the survivors were not rewritten either — the save never opened a path
+        // under `sessions/ses-a` at all (a rewrite would replace the file and move the inode).
+        const after = inodesOf(root);
+
+        expect(after[`sessions/${SESSION_A}/${HARNESS_SESSION_FILE}`]).toBe(
+            before[`sessions/${SESSION_A}/${HARNESS_SESSION_FILE}`]
+        );
+        expect(after[`sessions/${SESSION_A}/threads/thread-1.json`]).toBe(
+            before[`sessions/${SESSION_A}/threads/thread-1.json`]
+        );
+        expect(after[`sessions/${SESSION_A}/events.jsonl`]).toBe(before[`sessions/${SESSION_A}/events.jsonl`]);
+
+        // The committed header lists ONLY the session this build accepted, while the refused
+        // record is left in place: the index is authoritative, so the store starts normally over
+        // the healthy row and the refused conversation stays on disk to recover instead of
+        // vanishing behind the diagnostics.
+        expect(readJson(indexFile(root)).sessions).toEqual([{ id: SESSION_B, ordinal: 1 }]);
+        expect(new HarnessPersistence(root).load()?.sessions.map((session) => session.id)).toEqual([SESSION_B]);
+        expect(stagingLeftovers(root)).toEqual([]);
     });
 
     it('reports a session the index still lists whose record is gone', () => {
@@ -1153,8 +1413,8 @@ const scriptedPreset = (name = 'one', text = 'an answer'): HarnessPreset => ({
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: [],
+    entry: name,
+    ranks: { [name]: 'A' } as Record<string, 'A'>,
     agents: [name],
     tools: [],
     builtin: true,
@@ -1168,7 +1428,7 @@ const scriptedPreset = (name = 'one', text = 'an answer'): HarnessPreset => ({
                     stream: answerStream(text)
                 })
             },
-            primary: name,
+            entry: name,
             presets: false,
             report: {
                 progress,

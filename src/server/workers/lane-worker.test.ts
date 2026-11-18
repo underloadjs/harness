@@ -614,7 +614,7 @@ describe('worker mode: shared state is central, not local', () => {
 
         // The id was minted by the CORE store on the coordinator, and the answer came back
         // through the lane: that is the central mutation the requirement asks for. The T1
-        // shape arrives with it - content rev 1, the primary agent as the writer (a manual
+        // shape arrives with it - content rev 1, the entry agent as the writer (a manual
         // call carries no conversation), and `storeRev` 1 for the one recorded event.
         expect(added).toEqual({
             tasks: [
@@ -940,8 +940,8 @@ describe('worker mode: an unrebuildable harness is refused, not run inline', () 
                 title: 'Closure',
                 description: 'an injected factory',
                 requiresEndpoint: false,
-                primary: 'primary',
-                subagents: [],
+                entry: 'primary',
+                ranks: { primary: 'A' },
                 agents: ['primary'],
                 tools: ['task'],
                 builtin: false,
@@ -1029,7 +1029,7 @@ export const execute = async (context) => {
 
         expect(preset?.name).toBe('research');
 
-        // The live preset: it owns a `summarizer` subagent AND the shipped `textSummarize`
+        // The live preset: it carries a Rank B `summarizer` member AND the shipped `textSummarize`
         // revision, which is the exact shape that produced T13's silently lost child.
         return preset!.create({ baseURL: 'http://localhost:9/v1', apiKey: '', model: 'demo' }, () => {});
     };
@@ -1093,8 +1093,11 @@ export const execute = async (context) => {
                     writer: agent({ model: 'test/model', stream: writerStream }),
                     summarizer: agent({ model: 'test/model', stream: summarizerStream })
                 },
-                primary: 'writer',
-                subagents: ['summarizer'],
+                entry: 'writer',
+                // Rank letters, not a role pair: `writer` routes and holds the highest authority, the
+                // summarizer is a Rank B member it may call. The tool surface is identical either way
+                // (R6 equal tool access); only the delegation gate reads these letters.
+                ranks: { writer: 'A', summarizer: 'B' },
                 toolSources: { textSummarize: SHARED_APP_TOOL_SOURCES.textSummarize },
                 presets: false
             });
@@ -1175,7 +1178,7 @@ export const execute = async (context) => {
             expect(rosterOf(replica)).toEqual(rosterBefore);
         }
 
-        // The removal list and the policy are different things. A harness with no subagents has only
+        // The removal list and the policy are different things. A one-agent roster has only
         // `threadFork` to lose (`delegate` exists only where there is somewhere to delegate), and it
         // is armed exactly like a preset that loses both — which is the reading a preset-opt-in
         // model of the lever would have got wrong.
@@ -1200,7 +1203,7 @@ export const execute = async (context) => {
     });
 
     it('refuses the child AND condenses locally on a non-instruct preset replica', async () => {
-        // 'research' — a preset that owns a `summarizer` subagent and ships the exact
+        // 'research' — a preset that carries a Rank B `summarizer` member and ships the exact
         // `textSummarize` revision T13 measured losing a child. It is NOT 'instruct', so the local
         // fallback and the refusal are shown to belong to the lane, not to one preset's tools.
         const replica = researchReplica();
@@ -1480,13 +1483,15 @@ describe('worker mode: an IN-PLACE change to the committed prefix is an operatio
 // ./lane-worker-correctness.test.ts.
 // ---------------------------------------------------------------------------
 describe('worker mode: the derived archive op carries the forensic pair of a stopped run (review #5)', () => {
-    // The terminal row a cancelled lane turn leaves on its own replica.
+    // The terminal row a cancelled lane turn leaves on its own replica. `rank: 'B'` is the delegating
+    // agent's letter on the authority scale (the retired `role` pair is gone from
+    // ../types/index.ts:4287 `HarnessAgentResultSnapshot`), and the op below must carry the same letter.
     const cancelledRow = {
         invocationId: '513',
         sequence: 3,
         completedOrder: 1,
         agent: 'research',
-        role: 'subagent',
+        rank: 'B',
         kind: 'delegation',
         status: 'cancelled',
         content: '',
@@ -1504,7 +1509,7 @@ describe('worker mode: the derived archive op carries the forensic pair of a sto
         sequence: 3,
         completedOrder: 1,
         agent: 'research',
-        role: 'subagent',
+        rank: 'B',
         kind: 'delegation',
         status: 'cancelled',
         content: '',
@@ -1521,7 +1526,7 @@ describe('worker mode: the derived archive op carries the forensic pair of a sto
         sequence: 3,
         completedOrder: 1,
         agent: 'research',
-        role: 'subagent',
+        rank: 'B',
         runKind: 'delegation',
         status: 'cancelled',
         content: '',
@@ -1579,7 +1584,7 @@ describe('worker mode: the derived archive op carries the forensic pair of a sto
             sequence: 3,
             completedOrder: 1,
             agent: 'research',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'completed',
             content: 'the finished answer',
@@ -1593,7 +1598,7 @@ describe('worker mode: the derived archive op carries the forensic pair of a sto
                 sequence: 3,
                 completedOrder: 1,
                 agent: 'research',
-                role: 'subagent',
+                rank: 'B',
                 runKind: 'delegation',
                 status: 'completed',
                 content: 'the finished answer',
@@ -1803,7 +1808,7 @@ describe('worker mode: the record route is the only door (T1/T7)', () => {
         expect((canonical?.collections.locations.items ?? []).map((item) => item.id)).toEqual(['4']);
 
         // Attribution is the coordinator's answer too: a manual call carries the session's
-        // primary and no conversation, so the record names `general` and carries no thread.
+        // the entry agent and no conversation, so the record names `general` and carries no thread.
         expect(canonical?.collections.tasks.items[0]).toMatchObject({ updatedBy: 'general' });
         expect('updatedThreadId' in (canonical?.collections.tasks.items[0] ?? {})).toBe(false);
     }, 180_000);

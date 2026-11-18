@@ -846,6 +846,93 @@ describe('thread creation and result archiving: identity comes from the authorit
         });
     });
 
+    // B3 R17 — THE LANE ARCHIVE DIGEST KEYS ON RANK, IN EXACTLY ONE PLACE.
+    //
+    // WHY THIS TEST EXISTS: a lane and the authority agree on a terminal invocation row only if they
+    // digest the SAME projection of it. The authority axis used to be the two-value `role` pair; it is
+    // now a rank ('A'–'Z', `AgentRank`), and the ONLY point where that axis enters the digest is the
+    // record projection inside `archiveDigestOf` (./lane-commit.ts, the RANK REWRITE note). Every
+    // caller hands that function a WHOLE record — the writer's `deriveOperations` input and the
+    // canonical slot the receipt is computed from are the same record shape — so there is no second
+    // site that could drift, and these assertions pin that: rank moves → digest moves; a NON-digested
+    // key moves → digest does not; the retired vocabulary digests to something else on purpose.
+    it('keys the archive digest on the record rank, and only there', () => {
+        const record: Parameters<typeof archiveDigestOf>[0] = {
+            invocationId: '513',
+            sequence: 3,
+            agent: 'instruct',
+            rank: 'B',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'the answer'
+        };
+
+        // One DIGESTED key moves → the digest moves. Two peers that disagree about the authority of
+        // the agent that ran cannot claim the same row.
+        expect(archiveDigestOf({ ...record, rank: 'A' })).not.toBe(archiveDigestOf(record));
+        expect(archiveDigestOf({ ...record, rank: 'Z' })).not.toBe(archiveDigestOf(record));
+
+        // A key the projection EXCLUDES moves → the digest is identical. `completedOrder` and
+        // `threadId` are excluded on purpose (they are placement, not content), and this assertion is
+        // what proves the rank is not also sneaking in behind one of them.
+        expect(archiveDigestOf({ ...record, threadId: 'thread-9', completedOrder: 7 })).toBe(archiveDigestOf(record));
+
+        // THE CLEAN BREAK, pinned rather than assumed: a pre-rank row carries the retired axis under
+        // its old key, so this build reads NO rank out of it and digests a different value. The
+        // documented consequence is recovery, not corruption — such a row re-archives once (idempotent
+        // on a terminal row) or sends a stale writer to re-read canonical — and it is exactly why no
+        // `role` alias was kept in the digest, which would have pinned the retired axis into the
+        // durable identity of every archived row.
+        const legacyRow = { ...record, rank: undefined, role: 'subagent' };
+
+        expect(archiveDigestOf(legacyRow as unknown as Parameters<typeof archiveDigestOf>[0])).not.toBe(
+            archiveDigestOf(record)
+        );
+
+        // The fold agrees with the function: archiving the same invocation under two ranks lands two
+        // different receipt digests on the canonical row, so a replay of the SECOND one is not
+        // silently deduplicated against the first.
+        const view = emptyCanonicalView();
+        const identity = createIdentityLedger({ invocation: 1 });
+        const leases = createWriterLeaseLedger();
+        const archiveWith = (rank: 'A' | 'B', seq: number) =>
+            applySharedMutation(
+                view,
+                {
+                    kind: 'result:archive',
+                    invocationId: '513',
+                    sequence: 3,
+                    completedOrder: 1,
+                    agent: 'instruct',
+                    rank,
+                    runKind: 'delegation',
+                    status: 'completed',
+                    content: 'the answer'
+                } as SharedMutation,
+                { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq }
+            );
+
+        const first = archiveWith('B', 1);
+        const second = archiveWith('A', 2);
+
+        expect(first.status).toBe('applied');
+        expect(second.status).toBe('applied');
+        expect(second.effect?.digest).not.toBe(first.effect?.digest);
+        // The stored row carries the rank the writer named, and the receipt is the digest of THAT
+        // row — the writer's payload and the authority's copy agree key for key.
+        expect(view.results['513']).toEqual({
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'instruct',
+            rank: 'A',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'the answer'
+        });
+        expect(second.effect?.digest).toBe(archiveDigestOf(view.results['513']));
+    });
+
     it('reproduces F2: two lanes each archive their own result, and a duplicate id is refused', () => {
         const view = emptyCanonicalView();
         const identity = createIdentityLedger({ invocation: 1 });
@@ -859,7 +946,7 @@ describe('thread creation and result archiving: identity comes from the authorit
                     sequence: Number(invocationId),
                     completedOrder: Number(invocationId),
                     agent: 'instruct',
-                    role: 'primary',
+                    rank: 'A',
                     runKind: 'root',
                     status: 'completed',
                     content
@@ -921,7 +1008,7 @@ describe('thread creation and result archiving: identity comes from the authorit
             sequence: 3,
             completedOrder: 1,
             agent: 'instruct',
-            role: 'subagent',
+            rank: 'B',
             runKind: 'delegation',
             status: 'cancelled',
             content: '',
@@ -940,7 +1027,7 @@ describe('thread creation and result archiving: identity comes from the authorit
             sequence: 3,
             completedOrder: 1,
             agent: 'instruct',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'cancelled',
             content: '',
@@ -1041,7 +1128,7 @@ describe('thread creation and result archiving: identity comes from the authorit
             sequence: 3,
             completedOrder: 1,
             agent: 'instruct',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'completed',
             content: 'the finished answer',
@@ -1066,7 +1153,7 @@ describe('thread creation and result archiving: identity comes from the authorit
                     sequence: index + 2,
                     completedOrder: index + 2,
                     agent: 'instruct',
-                    role: 'primary',
+                    rank: 'A',
                     runKind: 'root',
                     status: 'completed',
                     content: `answer ${index}`
@@ -1396,7 +1483,7 @@ describe('group rollback, canonical re-base, and the declared window (T10 M2/M3/
             sequence: 7,
             completedOrder: 1,
             agent: 'instruct',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'completed',
             content: 'answer one'

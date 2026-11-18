@@ -13,6 +13,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness } from '../harness';
 import type {
+    AgentRank,
     HarnessActionHandler,
     HarnessActionRequest,
     HarnessActionRequestContext,
@@ -57,8 +58,16 @@ const presetOf = (
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: agents[0] ?? name,
-    subagents: agents.slice(1),
+    // R15 — `entry` is ROUTING (which member an unfocused submit opens) and `ranks` is
+    // AUTHORITY. The retired `primary` + `subagents` pair said "the first agent leads, the
+    // rest are its delegation targets"; the rank map states that directly — the entry holds
+    // Rank A and every other member sits strictly below it, which is what derives the
+    // `delegate` allowlist (`isLowerRank`). A stored preset's map covers EVERY member, so
+    // this writes it complete rather than sparse (./harnesses/registry.ts `sortedRanks`).
+    entry: agents[0] ?? name,
+    ranks: Object.fromEntries(
+        agents.map((agent) => [agent, agent === (agents[0] ?? name) ? 'A' : 'B'])
+    ) as Record<string, AgentRank>,
     agents,
     tools: [],
     builtin: true,
@@ -110,7 +119,9 @@ const capturePreset = (
                         stream: options.stream ?? answerStream('done')
                     })
                 },
-                primary: 'worker',
+                // R1 — `entry` is the routing choice that replaced `primary`; a one-member
+                // harness needs no `ranks` (the kernel gives the entry Rank A).
+                entry: 'worker',
                 presets: false,
                 report: { progress }
             });
@@ -163,7 +174,7 @@ describe('SessionStore owner interaction', () => {
             })
         };
 
-        const withInteraction = createToolboxHarness({ agents, primary: 'worker' }, DEFAULTS, () => undefined, {
+        const withInteraction = createToolboxHarness({ agents, entry: 'worker' }, DEFAULTS, () => undefined, {
             interaction: { actionRequest: handler }
         });
         expect(withInteraction.tools.actionRequest.visibility).toBe('searchable');
@@ -173,7 +184,10 @@ describe('SessionStore owner interaction', () => {
         expect(withInteraction.tools.threadFork.visibility).toBe('searchable');
 
         // No interaction report -> the runtime does not register actionRequest.
-        const withoutInteraction = createToolboxHarness({ agents, primary: 'worker' }, DEFAULTS, () => undefined);
+        // R15/R6 — no `subagents` allowlist on the toolbox config any more: a single-member
+        // roster at one rank has nobody strictly below it, which is why this card registers no
+        // `delegate` row. The rank map is whatever the kernel derives from `entry` here.
+        const withoutInteraction = createToolboxHarness({ agents, entry: 'worker' }, DEFAULTS, () => undefined);
         expect(withoutInteraction.tools.actionRequest).toBeUndefined();
     });
 
@@ -231,7 +245,9 @@ describe('SessionStore owner interaction', () => {
                         stream
                     })
                 },
-                primary: 'worker',
+                // R1 — `entry` is the routing choice that replaced `primary`; a one-member
+                // harness needs no `ranks` (the kernel gives the entry Rank A).
+                entry: 'worker',
                 presets: false,
                 report: { progress },
                 ...(report?.interaction === undefined ? {} : { interaction: report.interaction })
@@ -338,7 +354,9 @@ describe('SessionStore owner interaction', () => {
                         stream
                     })
                 },
-                primary: 'worker',
+                // R1 — `entry` is the routing choice that replaced `primary`; a one-member
+                // harness needs no `ranks` (the kernel gives the entry Rank A).
+                entry: 'worker',
                 presets: false,
                 report: { progress },
                 ...(report?.interaction === undefined ? {} : { interaction: report.interaction })

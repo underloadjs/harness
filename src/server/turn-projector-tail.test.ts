@@ -51,7 +51,7 @@ const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
 // Recorded instruction evidence, so the bar mints a `system` segment for the root section
 // and the "system is never the tail" claim is about a real segment, not an absent one.
 const SOURCED: DisplayProjectContext = {
-    primary: 'one',
+    entry: 'one',
     instructionSourcesOf: () => [{ agent: 'one', instructions: ['You are the one agent.'] }]
 };
 

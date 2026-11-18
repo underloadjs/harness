@@ -168,6 +168,20 @@ import type {
     HarnessMessage,
     HarnessSnapshot
 } from '../harness';
+// THE RANK VOCABULARY (B-series). `AgentRank` is the A–Z letter union and
+// `isAgentRank` the shared untrusted-input guard (../types/index.ts); a durable
+// document carries rank letters, so this store validates them with the SAME predicate
+// the kernel and the registry use rather than re-spelling the letter set here.
+import { isAgentRank } from '../types';
+import type { AgentRank } from '../types';
+// THE SNAPSHOT VERSION GATE (`requireCoreSnapshotVersion` below). This value is IMPORTED
+// rather than re-spelled — unlike `HARNESS_THREAD_ID_PATTERN` further down, which copies a
+// grammar: a copied letter set only has to keep up with a grammar, while a copied VERSION
+// number would refuse (or accept) the wrong snapshot the moment ../core/snapshot.ts bumps,
+// and the whole point of this guard is that the durable reader and the snapshot owner can
+// never disagree about which shape they read. ../core/snapshot.ts imports nothing from ./,
+// so this cannot cycle.
+import { HARNESS_SNAPSHOT_VERSION } from '../core/snapshot';
 import type {
     HarnessDescriptor,
     SessionPluginDiagnostic,
@@ -199,6 +213,13 @@ import type { TurnInstructionSource } from '../shared/turn-display';
 // It is deliberately a BUMP, not a silent change: a version-1 reader walking this
 // directory would find an empty `sessions` list in `index.json` and report "no
 // sessions", which is exactly the silent clean slate this gate exists to refuse.
+//
+// THE RANK BREAK LEFT THIS AT 2, deliberately: the ENVELOPE did not change shape, only the
+// vocabulary inside it, and that vocabulary is refused field by field
+// (`requireNoLegacyRosterKeys`, and `requireCoreSnapshotVersion` for the session row's own
+// `core.version`). Bumping here would have made every healthy v2 root unreadable to buy a
+// gate the reader already enforces more precisely — and it would have thrown away the
+// journals of exactly the installations the refusal is telling to re-save.
 export const HARNESS_DATABASE_VERSION = 2;
 
 // Namespace below the supplied database root. The service passes DATABASE_ROOT
@@ -250,15 +271,27 @@ export const HARNESS_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 // Serializable view of one registry entry (HarnessPreset minus `create`).
 // `template`/`live` are internal replay hints; they are stored so a restart can
-// reproduce the same factory kind instead of silently promoting the scripted demo
+// reproduce the same factory kind instead of silently promoting the scripted fixture
 // to a live harness (or losing flaky's extra tool).
 export type HarnessPresetRecord = {
     name: string;
     title: string;
     description: string;
     requiresEndpoint: boolean;
-    primary: string;
-    subagents: string[];
+    // THE ENTRY AGENT (routing) — the durable replacement for `primary`. A stored row
+    // written before the rank pass carries `primary`/`subagents` instead and is
+    // REFUSED with a named error (`readPresetRecord`), not quietly translated: a
+    // silent rename would let a row whose delegation shape this build cannot express
+    // resume as a harness that claims something else.
+    entry: string;
+    // THE RANK MAP (authority): agent id → A–Z letter. Required, and stored RESOLVED —
+    // every member of `agents` is keyed, because ./harnesses/registry.ts fills the gaps
+    // with the kernel's own rule at WRITE time (./harnesses/toolbox.ts
+    // `resolveRosterRanks`). That is what makes this field part of the EXECUTABLE
+    // definition the factory is rebuilt from: an operator's rank decision survives a
+    // restart instead of being re-derived, and a stored row cannot run a team whose
+    // ranks differ from the ones its card shows.
+    ranks: Record<string, AgentRank>;
     agents: string[];
     tools: string[];
     environmentTools?: string[];
@@ -663,6 +696,113 @@ const requireStringArray = (value: unknown, label: string): string[] => {
     return [...(value as string[])];
 };
 
+// THE CLEAN-BREAK GUARD FOR THE RANK PASS (R11).
+//
+// `primary`/`subagents` are not translated at read time — they are REFUSED, with an
+// error that names the shape that replaced them. The reason is not tidiness: the old
+// pair encoded a rule this build can no longer express (exactly one primary, an
+// allowlist of everyone else), while the rank model encodes authority per agent. A
+// silent rename would let a stored row resume as a harness whose DELEGATION differs
+// from the one that produced the transcript already saved beside it — the session
+// would read back a plausible team that no longer answers the same way. Refusing is
+// the only answer that keeps the durable record honest, and it points at the fix.
+//
+// It fires on ANY of the two keys, because a half-migrated document (`entry` plus a
+// leftover `subagents`) is the same ambiguity in a different costume.
+const requireNoLegacyRosterKeys = (record: Record<string, unknown>, label: string): void => {
+    const legacy = ['primary', 'subagents'].filter((field) => record[field] !== undefined);
+
+    if (legacy.length === 0) return;
+
+    throw new TypeError(
+        `${label} was written before the rank model and carries ${legacy
+            .map((field) => `\`${field}\``)
+            .join(' and ')}. This build stores \`entry\` (the routing agent, one of \`agents\`) and \`ranks\` (agent id -> a single rank letter, "A" highest to "Z" lowest) instead, and it does not translate the old keys: re-save this harness definition in the new shape, or start from a fresh database root.`
+    );
+};
+
+// THE CLEAN-BREAK GUARD FOR THE SESSION'S OWN SNAPSHOT — the other half of the guard above,
+// and the one that used to be missing.
+//
+// WHAT THE OLD GUARD COULD NOT SEE: `core` (the session's `HarnessSnapshot`) is validated here
+// by TYPE ASSERTION only — `readSessionRecord` ends with `core as unknown as HarnessSnapshot` —
+// so the one durable fact that says which shape those bytes are in is `core.version`, and the
+// old check verified it was a NUMBER and nothing more. That left one half-accept path: a row
+// whose roster is already `entry`/`ranks` (so `requireNoLegacyRosterKeys` passes) wrapped around
+// a `core` written before the rank model. It loaded cleanly, and the snapshot's own version gate
+// (../core/snapshot.ts, the `HARNESS_SNAPSHOT_VERSION` check) ran only LATER, per session,
+// inside ./sessions.ts `restoreSession`.
+//
+// WHY A PER-SESSION REFUSAL IS THE DESTRUCTIVE ONE HERE: the dropped session leaves the store's
+// live map (./sessions.ts `restoreSession`'s per-session catch, surfaced as `restoreErrors` on
+// the result) while the `load()` that ACCEPTED the index had already counted its id as written
+// (the priming swap in `load` below). The store's next checkpoint (./sessions.ts, the
+// `persistence.save(...)` after a commit) therefore looks like "a session left the map", and
+// `eraseVanishedShards` deletes that session's `session.json` AND its whole `threads/` tree —
+// observed on a real root: checkpoint gone, `events.jsonl` and the session directory kept. Loud
+// in the diagnostics, destructive on disk, and it throws away the durable record the clean break
+// deliberately keeps the journal for.
+//
+// WHY THIS PLACEMENT CLOSES IT: throwing HERE makes the refusal fatal at the reader
+// boundary. `readSessionRecord` runs inside `readHarnessDatabase`, which `load()` calls at the
+// END of a read (and the priming swap now sits after it); ./runtime.ts and ./start.ts both let
+// that throw escape, and ./sessions.ts only restores sessions from the VALUE `load()` returned —
+// so no `SessionStore` exists and no checkpoint is ever queued. And because the swap now happens
+// after the validation, even a host that CAUGHT the load failure and called `save()` on the same
+// instance has nothing primed to erase: the refused row was never counted as written. Both facts
+// are pinned by ./persistence-shards.test.ts, which is the layer where the deletion happened. It
+// is also consistent with the layout's own rule that a record which parses but fails the merged
+// shape check aborts the whole load naming `index.json` (this file's header).
+//
+// The version is COMPARED, not bounded: a row from a NEWER build gets the same sentence,
+// because nothing here can read a future snapshot either.
+const requireCoreSnapshotVersion = (core: Record<string, unknown>, label: string, sessionId: unknown): void => {
+    // A missing or non-numeric version keeps the sentence it had before (
+    // `${label}.version must be a finite number.`): this guard ADDS the equality check, it
+    // does not re-word the shape rule.
+    const version = requireNumber(core.version, `${label}.version`);
+
+    if (version === HARNESS_SNAPSHOT_VERSION) return;
+
+    // The refusal names the FILE the operator has to open, spelled from the layout constants
+    // (`HARNESS_SESSION_DIRECTORY` / `HARNESS_SESSION_FILE` / `HARNESS_INDEX_FILE`, declared
+    // above) so it cannot drift from the writer. A hand-built record with no usable id falls
+    // back to the header, which is the file `load()` reports as its own.
+    const shard =
+        typeof sessionId === 'string' && sessionId.trim().length > 0
+            ? `${HARNESS_SESSION_DIRECTORY}/${sessionId}/${HARNESS_SESSION_FILE}`
+            : HARNESS_INDEX_FILE;
+
+    throw new TypeError(
+        `${label} is snapshot version ${version}, and this build reads snapshot version ${HARNESS_SNAPSHOT_VERSION}. The record that carries it is ${shard}, and this build does not translate a stored snapshot: re-save that session record in the new shape, or start from a fresh database root.`
+    );
+};
+
+// A stored RANK MAP: an object whose every value is a rank LETTER. The value check is
+// the shared `isAgentRank` guard, so this store, ./harnesses/registry.ts and the
+// kernel cannot disagree about what a rank is.
+//
+// The KEYS are plain agent ids and are not re-validated against the agent catalogue,
+// for the identical reason the three override maps are not: a saved row that selects a
+// profile the operator has since retired or renamed must still LOAD (its own sessions
+// keep working), and the refusal belongs to whoever tries to select it NEW.
+const readRankMap = (value: unknown, label: string): Record<string, AgentRank> => {
+    const record = requireRecord(value, label);
+    const mapped: Record<string, AgentRank> = {};
+
+    for (const [agent, rank] of Object.entries(record)) {
+        if (!isAgentRank(rank)) {
+            throw new TypeError(
+                `${label}.${agent} must be a single rank letter from "A" (highest) to "Z" (lowest).`
+            );
+        }
+
+        mapped[agent] = rank;
+    }
+
+    return mapped;
+};
+
 // A string → string map (`agentModels`, T3's `agentInstructions`, R2's `agentColors`, and R7's
 // `customAgents`). All four are agent id → text maps restored the same way, so a malformed
 // stored document reports the same shape of error whichever field is
@@ -672,6 +812,11 @@ const requireStringArray = (value: unknown, label: string): string[] => {
 // restored session and the UI rely on; agentModels/coreTools are optional.
 const readDescriptor = (value: unknown, label: string): HarnessDescriptor => {
     const record = requireRecord(value, label);
+    // A frozen session definition carries the SAME roster vocabulary as a registry row,
+    // so it gets the SAME clean-break refusal: a session cannot resume on a team whose
+    // delegation model this build reads differently.
+    requireNoLegacyRosterKeys(record, label);
+
     const agentModels =
         record.agentModels === undefined ? undefined : readStringMap(record.agentModels, `${label}.agentModels`);
     const agentInstructions =
@@ -690,8 +835,10 @@ const readDescriptor = (value: unknown, label: string): HarnessDescriptor => {
         title: requireString(record.title, `${label}.title`),
         description: requireString(record.description, `${label}.description`),
         requiresEndpoint: requireBoolean(record.requiresEndpoint, `${label}.requiresEndpoint`),
-        primary: requireString(record.primary, `${label}.primary`),
-        subagents: requireStringArray(record.subagents, `${label}.subagents`),
+        // Routing + authority, required in the new shape: a frozen definition that
+        // states neither cannot be painted honestly by a session read.
+        entry: requireString(record.entry, `${label}.entry`),
+        ranks: readRankMap(record.ranks, `${label}.ranks`),
         agents: requireStringArray(record.agents, `${label}.agents`),
         tools: requireStringArray(record.tools, `${label}.tools`),
         ...(record.coreTools === undefined
@@ -755,6 +902,12 @@ const readAgentRecord = (value: unknown, label: string): HarnessAgentRecord => {
 
 const readPresetRecord = (value: unknown, label: string): HarnessPresetRecord => {
     const record = requireRecord(value, label);
+
+    // R11: a stored harness row is refused when it still carries the pre-rank roster
+    // keys. Checked before anything else so the operator sees the ONE problem with the
+    // row, not a cascade of missing-field errors behind it.
+    requireNoLegacyRosterKeys(record, label);
+
     const template = record.template;
 
     if (template !== undefined && template !== 'live' && template !== 'scripted' && template !== 'flaky') {
@@ -803,8 +956,12 @@ const readPresetRecord = (value: unknown, label: string): HarnessPresetRecord =>
         title: requireString(record.title, `${label}.title`),
         description: requireString(record.description, `${label}.description`),
         requiresEndpoint: requireBoolean(record.requiresEndpoint, `${label}.requiresEndpoint`),
-        primary: requireString(record.primary, `${label}.primary`),
-        subagents: requireStringArray(record.subagents, `${label}.subagents`),
+        // THE RANK PAIR (R11) — the routing agent and the authority map, both required
+        // in the new shape. `ranks` must be present even when empty: a saved definition
+        // is the executable contract a factory is rebuilt from, and "no delegation
+        // authority" has to be stated, not inferred from a missing key.
+        entry: requireString(record.entry, `${label}.entry`),
+        ranks: readRankMap(record.ranks, `${label}.ranks`),
         agents: requireStringArray(record.agents, `${label}.agents`),
         tools: requireStringArray(record.tools, `${label}.tools`),
         ...(record.environmentTools === undefined
@@ -1383,7 +1540,12 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
     }
 
     const core = requireRecord(record.core, `${label}.core`);
-    requireNumber(core.version, `${label}.core.version`);
+
+    // THE CLEAN BREAK, durable side, second half: the guard above refuses a roster written in
+    // the retired vocabulary; this one refuses a NEW-shaped roster wrapped around a stale
+    // SNAPSHOT, which is the half-accept the store used to turn into a deleted checkpoint
+    // (see `requireCoreSnapshotVersion` for the whole chain).
+    requireCoreSnapshotVersion(core, `${label}.core`, record.id);
 
     const agentModels =
         record.agentModels === undefined
@@ -2964,18 +3126,32 @@ export class HarnessPersistence {
             sessions.push(sessionDocument);
         }
 
+        // One validation of one merged graph — the same call, the same messages
+        // (`sessions[<position>]...` is the position in `index.json`'s order) and the same
+        // all-or-nothing outcome the v1 document had.
+        //
+        // The priming swap sits AFTER it on purpose, which is what the note above the loop
+        // has always promised ("a load that throws leaves the previous state alone instead of
+        // half-primed"): a record that parses and then fails the merged shape check — a stale
+        // `core.version` refused by `requireCoreSnapshotVersion`, the retired roster keys, any
+        // of them — used to leave this instance convinced those shards were WRITTEN. The next
+        // `save()` then read the refused row's absence as "the session left the map" and
+        // `eraseVanishedShards` deleted the very checkpoint the refusal exists to protect
+        // (:3361-3362). Nothing may erase bytes this reader never accepted, so the footprint
+        // moves only on a successful read.
+        let database: HarnessDatabase;
+
+        try {
+            database = readHarnessDatabase({ ...harnessHeaderFieldsOf(header), sessions });
+        } catch (error) {
+            throw harnessShapeError(this.file, messageOf(error));
+        }
+
         this.shardDigests = digests;
         this.writtenSessionIds = sessionIds;
         this.writtenThreadIds = threadIds;
 
-        // One validation of one merged graph — the same call, the same messages
-        // (`sessions[<position>]...` is the position in `index.json`'s order) and the same
-        // all-or-nothing outcome the v1 document had.
-        try {
-            return readHarnessDatabase({ ...harnessHeaderFieldsOf(header), sessions });
-        } catch (error) {
-            throw harnessShapeError(this.file, messageOf(error));
-        }
+        return database;
     }
 
     // Puts every thread transcript back on the rows that index it, IN THE ORDER

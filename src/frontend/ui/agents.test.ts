@@ -12,6 +12,8 @@
 import type { AgentDescriptor } from '../../server/protocol';
 import { agentDefaultInstructionOf, agentDetailsOf, createAgentRow } from './agents';
 import type { AgentRowOptions } from './agents';
+// The rank vocabulary (../types/index.ts): a tile's letter is a data fact, asserted exactly.
+import type { AgentRank } from '../../types';
 
 const agents: AgentDescriptor[] = [
     {
@@ -30,13 +32,30 @@ const agents: AgentDescriptor[] = [
     }
 ];
 
+// The rank map a fixture gets when it states no ranks: the entry agent (the first member) at
+// Rank A and every other member at Rank B — the same default the server resolves for an omitted
+// map (../shared/harness-api.ts:756-761). A test that is ABOUT ranks states `ranks` explicitly,
+// including the honest case of two members sharing one letter.
+const ranksFor = (members: readonly string[]): Record<string, AgentRank> => {
+    const ranks: Record<string, AgentRank> = {};
+    members.forEach((name, index) => {
+        ranks[name] = index === 0 ? 'A' : 'B';
+    });
+
+    return ranks;
+};
+
 const mount = (overrides: Partial<AgentRowOptions> = {}) => {
+    // A fixture states its team; the entry agent and the rank map default to what the roster
+    // implies, and every test can override either one independently.
+    const members = overrides.members ?? ['instruct'];
     const options: AgentRowOptions = {
-        members: ['instruct'],
-        primary: 'instruct',
+        members,
+        entry: members[0],
+        ranks: ranksFor(members),
         agents,
         editable: true,
-        onSelectPrimary: vi.fn(),
+        onSetEntry: vi.fn(),
         onAdd: vi.fn(),
         onRemove: vi.fn(),
         ...overrides
@@ -53,26 +72,32 @@ const mainButtons = (element: HTMLElement): HTMLButtonElement[] => [
 const removeButtons = (element: HTMLElement): HTMLButtonElement[] => [
     ...element.querySelectorAll<HTMLButtonElement>('.agent-remove')
 ];
+// The entry control of every tile. Entry is a per-member toggle (routing, never rank), so
+// the pressed state lives HERE rather than on the name button.
+const entryButtons = (element: HTMLElement): HTMLButtonElement[] => [
+    ...element.querySelectorAll<HTMLButtonElement>('.agent-entry')
+];
 
 describe('createAgentRow', () => {
-    it('shows one human-readable name per member with role as data only', () => {
-        const { element } = mount({ members: ['instruct', 'summarizer'], primary: 'instruct' });
+    it('shows one human-readable name per member with entry and rank as data only', () => {
+        const { element } = mount({ members: ['instruct', 'summarizer'] });
 
         const tiles = [...element.querySelectorAll<HTMLElement>('.agent-tile')];
         expect(tiles.map((tile) => tile.dataset.agent)).toEqual(['instruct', 'summarizer']);
-        expect(tiles.map((tile) => tile.dataset.role)).toEqual(['primary', 'secondary']);
+        expect(tiles.map((tile) => tile.dataset.entry ?? '')).toEqual(['true', '']);
         // The preset title is the only displayed name: no duplicated slug and no
         // separate title line.
         expect(
             [...element.querySelectorAll<HTMLElement>('.agent-tile-name')].map((node) => node.textContent)
         ).toEqual(['Instruct', 'Summarizer']);
         expect(element.querySelector('.agent-tile-title')).toBeNull();
-        // Role is colour + aria-pressed, not a badge.
+        // Entry is a data hook plus a pressed toggle, never a name badge; rank is a data hook too.
         expect(element.querySelector('.agent-role')).toBeNull();
-        expect(mainButtons(element).map((button) => button.getAttribute('aria-pressed'))).toEqual([
+        expect(entryButtons(element).map((button) => button.getAttribute('aria-pressed'))).toEqual([
             'true',
             'false'
         ]);
+        expect(tiles.map((tile) => tile.dataset.rank ?? '')).toEqual(['A', 'B']);
 
         expect(removeButtons(element).map((button) => button.disabled)).toEqual([false, false]);
     });
@@ -83,18 +108,23 @@ describe('createAgentRow', () => {
         expect(removeButtons(element)[0].title).toBe('A harness needs at least one agent.');
     });
 
-    it('resolves the primary TITLE in the promotion tooltip, never the slug', () => {
-        const { element } = mount({ members: ['instruct', 'summarizer'], primary: 'instruct' });
+    it('resolves the entry agent TITLE in its own control, never the slug', () => {
+        const { element } = mount({ members: ['instruct', 'summarizer'] });
 
-        const buttons = mainButtons(element);
-        expect(buttons[1].title).toBe('Make Summarizer the primary agent; Instruct becomes a subagent.');
-        // The slug never appears: only the two one-word titles do (F4/R3).
+        const buttons = entryButtons(element);
+        // The entry control is where the "make X the entry agent" sentence lives, and it names
+        // the member by its library title (F4/R3), never by the slug.
+        expect(buttons[1].getAttribute('aria-label')).toBe('Make Summarizer the entry agent');
+        expect(buttons[1].title).toBe(
+            'Make Summarizer the entry agent, so a new conversation starts with it. Its rank does not change.'
+        );
+        // The slug never appears: only the one-word title does.
         expect(buttons[1].title).not.toContain('summarizer');
         expect(buttons[1].title).not.toContain('instruct');
     });
 
     it('labels an unknown member neutrally instead of exposing its slug', () => {
-        const { element } = mount({ members: ['ghost'], primary: 'ghost' });
+        const { element } = mount({ members: ['ghost'] });
 
         // F4/R3: a member without library details reads a neutral word; the slug is
         // still the tile's `data-agent` (internal identity).
@@ -103,14 +133,59 @@ describe('createAgentRow', () => {
         expect(element.textContent).not.toContain('ghost');
     });
 
-    it('promotes a secondary through onSelectPrimary and ignores a click on the primary', () => {
+    it('sets the entry agent through onSetEntry and never re-sets the entry agent that holds it', () => {
         const { element, options } = mount({ members: ['instruct', 'summarizer'] });
 
-        mainButtons(element)[1].click();
-        expect(options.onSelectPrimary).toHaveBeenCalledWith('summarizer');
+        // The entry press is per member; the tile that already holds the role has a disabled
+        // toggle, so a forced press there cannot fire a redundant write.
+        entryButtons(element)[1].click();
+        expect(options.onSetEntry).toHaveBeenCalledWith('summarizer');
 
-        mainButtons(element)[0].click();
-        expect(options.onSelectPrimary).toHaveBeenCalledTimes(1);
+        entryButtons(element)[0].click();
+        expect(options.onSetEntry).toHaveBeenCalledTimes(1);
+    });
+
+    it('paints two members that share Rank A as two equal tiles', () => {
+        // THE SHARED-TOP CASE. Any number of members may hold the same letter, including the
+        // entry rank, so the deck must never imply a single top agent: BOTH tiles state Rank A,
+        // and the only one-member marker in the DOM is `data-entry` (routing).
+        const { element } = mount({
+            members: ['instruct', 'summarizer'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', summarizer: 'A' }
+        });
+
+        const tiles = [...element.querySelectorAll<HTMLElement>('.agent-tile')];
+        expect(tiles.map((tile) => tile.dataset.rank ?? '')).toEqual(['A', 'A']);
+        expect(tiles.map((tile) => tile.dataset.entry ?? '')).toEqual(['true', '']);
+        expect(element.querySelectorAll('.agent-tile[data-entry="true"]')).toHaveLength(1);
+        expect(
+            [...element.querySelectorAll<HTMLElement>('.agent-rank-value')].map((node) => node.textContent)
+        ).toEqual(['Rank A', 'Rank A']);
+        expect(mainButtons(element).map((button) => button.getAttribute('aria-label'))).toEqual([
+            'Configure Instruct · Rank A',
+            'Configure Summarizer · Rank A'
+        ]);
+    });
+
+    it('states "rank not stated" for a member the rank map omits', () => {
+        // An omitted member is NOT silently given a letter: the tile carries no `data-rank`,
+        // the readout says so in words, and the accessible name says it too.
+        const { element } = mount({
+            members: ['instruct', 'summarizer'],
+            entry: 'instruct',
+            ranks: { instruct: 'A' }
+        });
+
+        const tiles = [...element.querySelectorAll<HTMLElement>('.agent-tile')];
+        expect(tiles.map((tile) => tile.dataset.rank ?? '')).toEqual(['A', '']);
+        expect(
+            [...element.querySelectorAll<HTMLElement>('.agent-rank-value')].map((node) => node.textContent)
+        ).toEqual(['Rank A', 'rank not stated']);
+        expect(mainButtons(element).map((button) => button.getAttribute('aria-label'))).toEqual([
+            'Configure Instruct · Rank A',
+            'Configure Summarizer · rank not stated'
+        ]);
     });
 
     it('opens the agent picker with the default instruction and no duplicate add', () => {
@@ -177,7 +252,7 @@ describe('createAgentRow', () => {
         expect(option?.textContent).not.toContain('mystery');
     });
 
-    it('reports a removal, including the primary tile', () => {
+    it('reports a removal, including the entry agent tile', () => {
         const { element, options } = mount({ members: ['instruct', 'summarizer'] });
 
         removeButtons(element)[0].click();
@@ -228,7 +303,7 @@ describe('createAgentRow', () => {
 // here; the stylesheet half — hidden above 860px, cards hidden until `data-open` —
 // is pinned in compact-ui.test.ts.
 describe('phone team summary', () => {
-    it('summarises the primary and starts collapsed', () => {
+    it('summarises the entry agent and starts collapsed', () => {
         const { element } = mount({ members: ['instruct', 'summarizer'] });
 
         const summary = element.querySelector<HTMLButtonElement>('.agent-summary');
@@ -496,13 +571,13 @@ describe('agent card deck', () => {
             tile.querySelector<HTMLElement>('.agent-model-select')
         ].map((node) => node?.getAttribute('tabindex') ?? null);
 
-    it('starts with the primary in front and every other edge a named button', () => {
+    it('starts with the entry agent in front and every other edge a named button', () => {
         const { element } = mount({
             members: ['instruct', 'summarizer', 'workspace'],
-            primary: 'instruct'
+            entry: 'instruct'
         });
 
-        // Exactly one front card, the primary, and it is the leftmost visually
+        // Exactly one front card, the entry agent, and it is the leftmost visually
         // (CSS `order: -1`) without reordering the list itself.
         expect(fronts(element)).toEqual(['true', undefined, undefined]);
         expect(tileList(element).map((tile) => tile.dataset.agent)).toEqual([
@@ -537,10 +612,9 @@ describe('agent card deck', () => {
         ).toBe(false);
     });
 
-    it('fronts a card from its strip without promoting it or touching the list', () => {        const onFront = vi.fn();
+    it('fronts a card from its strip without moving the entry agent or touching the list', () => {        const onFront = vi.fn();
         const { element, options } = mount({
             members: ['instruct', 'summarizer', 'workspace'],
-            primary: 'instruct',
             onFront
         });
 
@@ -549,7 +623,7 @@ describe('agent card deck', () => {
         expect(fronts(element)).toEqual([undefined, undefined, 'true']);
         expect(onFront).toHaveBeenCalledWith('workspace');
         // R2: viewing is not promotion. The team callbacks are untouched...
-        expect(options.onSelectPrimary).not.toHaveBeenCalled();
+        expect(options.onSetEntry).not.toHaveBeenCalled();
         expect(options.onRemove).not.toHaveBeenCalled();
         expect(options.onAdd).not.toHaveBeenCalled();
         // ...and the DOM/list semantics are the server's order with one primary.
@@ -558,12 +632,9 @@ describe('agent card deck', () => {
             'summarizer',
             'workspace'
         ]);
-        expect(tileList(element).map((tile) => tile.dataset.role)).toEqual([
-            'primary',
-            'secondary',
-            'secondary'
-        ]);
-        expect(mainButtons(element).map((button) => button.getAttribute('aria-pressed'))).toEqual([
+        expect(tileList(element).map((tile) => tile.dataset.entry ?? '')).toEqual(['true', '', '']);
+        expect(tileList(element).map((tile) => tile.dataset.rank ?? '')).toEqual(['A', 'B', 'B']);
+        expect(entryButtons(element).map((button) => button.getAttribute('aria-pressed'))).toEqual([
             'true',
             'false',
             'false'
@@ -571,9 +642,9 @@ describe('agent card deck', () => {
     });
 
     it('hands focus to the newly fronted card and keeps hidden controls out of the tab order', () => {
-        const { element } = mount({ members: ['instruct', 'summarizer'], primary: 'instruct' });
+        const { element } = mount({ members: ['instruct', 'summarizer'] });
 
-        // Initial state: the primary's controls are the only tab stops; the secondary
+        // Initial state: the entry agent's controls are the only tab stops; the other member
         // card is covered by the deck, so its controls are skipped.
         expect(tabStops(tileList(element)[0])).toEqual([null, null, null]);
         expect(tabStops(tileList(element)[1])).toEqual(['-1', '-1', '-1']);
@@ -674,7 +745,7 @@ describe('agent card deck', () => {
         // an earlier card's strip, and a click there would hit promotion.
         const { element } = mount({
             members: ['instruct', 'summarizer', 'workspace'],
-            primary: 'instruct'
+            entry: 'instruct'
         });
         const ranks = (): string[] =>
             tileList(element).map((tile) => tile.style.getPropertyValue('--agent-deck-z'));
@@ -699,14 +770,14 @@ describe('agent card deck', () => {
         ]);
     });
 
-    it('re-applies a remembered front card and falls back to the primary for an unknown one', () => {
+    it('re-applies a remembered front card and falls back to the entry agent for an unknown one', () => {
         // main.ts remembers the viewed card (agentFront) and re-seeds it on every
         // rebuild, so an activity frame or a model PATCH cannot yank it back.
         const remembered = mount({ members: ['instruct', 'summarizer'], front: 'summarizer' }).element;
         expect(fronts(remembered)).toEqual([undefined, 'true']);
 
         // A remembered name that is no longer a member (the agent was removed) must
-        // never blank the deck: the primary becomes front again.
+        // never blank the deck: the entry agent becomes front again.
         const stale = mount({ members: ['instruct', 'summarizer'], front: 'ghost' }).element;
         expect(fronts(stale)).toEqual(['true', undefined]);
         expect(handleList(stale)[0].hidden).toBe(true);
@@ -732,13 +803,13 @@ describe('agent card deck', () => {
         expect(tabStops(tileList(element)[1])).toEqual([null, null, null]);
     });
 
-    it('keeps promotion and removal working on a hidden card when driven directly', () => {
+    it('keeps the entry press and removal working on a hidden card when driven directly', () => {
         // The deck only covers these controls visually; their handlers are unchanged,
-        // so the existing single-PATCH promotion/removal paths still report.
+        // so the existing single-PATCH entry/removal paths still report.
         const { element, options } = mount({ members: ['instruct', 'summarizer'] });
 
-        mainButtons(element)[1].click();
-        expect(options.onSelectPrimary).toHaveBeenCalledWith('summarizer');
+        entryButtons(element)[1].click();
+        expect(options.onSetEntry).toHaveBeenCalledWith('summarizer');
 
         removeButtons(element)[1].click();
         expect(options.onRemove).toHaveBeenCalledWith('summarizer');

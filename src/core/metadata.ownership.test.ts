@@ -363,27 +363,28 @@ describe('runtime entry metadata ownership', () => {
         expect(agentDelegateEntry.AGENT_DELEGATE_NAME).toBe('delegate');
         expect(agentDelegateEntry.agentDelegateMetadata().name).toBe('delegate');
         expect(agentDelegateEntry.metadata.name).toBe('delegate');
-        // The zero-allowlist form is the entry literal, projected through the facade.
+        // The no-targets form is the entry literal, projected through the facade.
         expect(coreMetadata.AGENT_DELEGATE_NAME).toBe('delegate');
         expect(coreMetadata.agentDelegateMetadata()).toEqual({
             name: 'delegate',
             description: agentDelegateEntry.metadata.description,
-            tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
+            tags: ['agents', 'delegate', 'delegation', 'rank', 'team'],
             visibility: 'core',
             parameters: agentDelegateEntry.metadata.parameters
         });
-        // The allowlist form is the ONE set-projection function.
+        // The explicit-targets form is the ONE projection function (rank-derived
+        // targets come from the caller's rank; this pins the projection shape).
         expect(coreMetadata.agentDelegateMetadata(['alpha', 'beta'])).toEqual(
             agentDelegateEntry.agentDelegateMetadata(['alpha', 'beta'])
         );
-        // T28: the allowlist form is DERIVED from the entry's own literal, so this
+        // T28: the explicit-targets form is DERIVED from the entry's own literal, so this
         // pins the derivation rather than restating the schema by hand. Restating it
         // is what let the catalogue advertise a smaller surface than the runtime every
         // time an argument was added.
         expect(agentDelegateEntry.agentDelegateMetadata(['alpha', 'beta'])).toEqual({
             name: 'delegate',
-            description: expect.stringContaining('Subagents: alpha, beta.'),
-            tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
+            description: expect.stringContaining('Agents you may delegate to: alpha, beta.'),
+            tags: ['agents', 'delegate', 'delegation', 'rank', 'team'],
             visibility: 'core',
             parameters: {
                 type: 'object',
@@ -392,7 +393,7 @@ describe('runtime entry metadata ownership', () => {
                     agent: {
                         type: 'string',
                         enum: ['alpha', 'beta'],
-                        description: 'Subagent name, one of the configured allowlist.'
+                        description: 'Agent name, one of the lower-ranked targets listed above.'
                     }
                 },
                 required: ['agent', 'input'],
@@ -686,7 +687,7 @@ describe('T13/T12 declarative cross-contract', () => {
 
     it('describes newest-request replacement for every selector and exact omitted counts', () => {
         expect(TOOL_REQUEST_METADATA.description).toBe(
-            'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. A tool the user of THIS conversation has switched off is not listed here at all - not in `enabled`, `tools`, `alreadyAvailable`, or `forbidden` - so no query can find or re-enable it. In a scoped run (a delegation with `scope.tools`), tools outside your run scope are reported under `forbidden` with the allowed list instead of `enabled`: they cannot be enabled or called here, the answer is stable, and requesting one again will not change it - adapt to the allowed tools or report the limitation. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.'
+            'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when you have a strictly lower-ranked agent to hand work to; a capability that appears in neither list is genuinely unavailable. A tool the user of THIS conversation has switched off is not listed here at all - not in `enabled`, `tools`, `alreadyAvailable`, or `forbidden` - so no query can find or re-enable it. In a scoped run (a delegation with `scope.tools`), tools outside your run scope are reported under `forbidden` with the allowed list instead of `enabled`: they cannot be enabled or called here, the answer is stable, and requesting one again will not change it - adapt to the allowed tools or report the limitation. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.'
         );
     });
 });

@@ -242,6 +242,7 @@ const DEMOTED_RUNTIME_TOOLS = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'threadFork'
@@ -535,6 +536,7 @@ describe('tasks', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -628,6 +630,7 @@ describe('tasks', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',

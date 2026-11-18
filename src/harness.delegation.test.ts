@@ -1,18 +1,50 @@
-// Explicit primary/subagent configuration and bounded delegation (R4).
+// Explicit entry/rank configuration and bounded delegation (R4).
 //
-// Contract pinned here:
-//   - `primary` selects the entry agent; without it the first `agents` key wins;
-//   - `subagents` is an allowlist, defaulting to every agent except the primary;
-//   - the `delegate` tool is core but declared ONLY to the primary, so a subagent
-//     never sees it (and a guessed call is rejected);
-//   - delegation is one level deep: only a top-level primary run may delegate, and
-//     re-entering a running agent is refused (ctx.run cycles included);
+// Contract pinned here — THE RANK MODEL (the retired `primary`/`subagents` vocabulary names
+// none of these rules any more, and the two tests `refuses a live config still written in the
+// retired roster vocabulary` and `refuses addAgent options that still carry the retired `role`
+// key` are what keep a stale config from resuming as a silently different team):
+//   - `entry` selects the ROUTING agent only; without it the first `agents` key wins. It grants
+//     no capability and it is not a rank — an entry agent may hold Rank A or Rank C;
+//   - `ranks` maps each agent to a Rank A-Z letter (A highest) and ANY number of agents may
+//     share one rank, so several Rank A members are ordinary peers. Two resolution rules: with
+//     `ranks` ABSENT the entry agent is Rank A and every other agent Rank B; with `ranks`
+//     PRESENT an omitted member — the entry agent included — takes ONE RANK BELOW the lowest
+//     letter the map names (clamped at Z), so "the map omits it" never means "Rank B";
+//   - the `delegate` tool is core but declared ONLY to an agent that has a strictly
+//     lower-ranked peer, so every other agent never sees it (a guessed call still reaches the
+//     runtime, because the installed schema's enum is the whole roster on purpose);
+//   - delegation is strictly downward (a Rank A agent may not delegate to Rank A) and a chain is
+//     bounded BY ITS OWN RANKS — `runs an A→B chain and an A→B→C chain` below is the level the
+//     removed one-level rule refused, and the nesting ceiling is the number of DISTINCT ranks.
+//     What the rank comparison cannot see is a RE-ENTRY: an agent already running is refused by
+//     the cycle guard in `runAgent`, which is the live guard for `ctx.run` cycles;
+//   - `addAgent(…, { delegate: false })` is the host's opt-out from being a TARGET, and it is a
+//     REFUSAL, not only a declaration (`refuses a delegate:false member at the refusal site`
+//     and `blames the opt-out rather than the ladder when every junior opted out`): the member
+//     stays registered, reachable through threads and `ctx.run`, and never a `delegate` target;
+//   - A HOST CALL IS AN ACTOR, NOT A RANKED AGENT. `harness.executeTool('delegate', …)`,
+//     `context.callTool`, `runtime.delegate(undefined, …)`, `toolRequest`'s host view and the
+//     `toolCreation` ceiling all run as the same actor — the entry agent while it is registered,
+//     and the Rank A host identity after `removeAgent` detaches it (`hostActor` / `hostRank` in
+//     ./harness.ts), so the documented "a host can still reach every member downward" holds at
+//     every door and no refusal names a departed agent;
+//   - `removeAgent(entry)` is LEGAL in the library, and `harness.name` / `harness.agent` follow
+//     the CURRENT effective entry agent — the one `entry` names while it is registered, else the
+//     first currently-registered member (the same routing rule construction applies when `entry`
+//     is absent, ./harness.ts `entryName`) — while host authority, the host refusal's subject and
+//     `run()`'s refusal stay exactly as they were
+//     (`re-points \`name\` and \`agent\` at the first registered agent…` below);
+//   - threading is never rank-gated: every member owns a default conversation and its children
+//     are addressed identically whatever the letters (`never gates thread creation or visibility
+//     on rank` below);
 //   - each agent keeps its own seeded instructions and transcript; only the answer
 //     crosses back;
 //   - a delegated child's result is the last substantive tool-free answer of THAT
 //     run when its final normal turn is whitespace-only (the literal transcript
 //     and `done` stay unchanged); a truly blank child stays blank;
-//   - primary/subagent names are validated at construction, so a typo fails fast.
+//   - agent names, rank letters, and the retired `primary`/`subagents`/`role` keys are all
+//     validated at construction, so a typo or a stale document fails fast and loudly.
 //
 // Policy change 2026-11-09 (docs/tasks/2026-11-09-thread-timeout-policy.md): the
 // wall-clock DEFAULT on a delegated child is gone — an omitted `timeoutMs` arms no
@@ -47,6 +79,11 @@ import type {
 // ./harness.ts). Asserted against the constant, not a literal — it is random by design — and it
 // is exact because vitest gives one module registry per test file.
 import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
+// THE rank vocabulary (../types owns it). Every rank rule in src/harness.ts is ONE
+// comparison against these four exports, so their shape is pinned here rather than left
+// to inference: 26 letters, highest authority first, and a STRICT `isLowerRank`.
+import { AGENT_RANKS, isAgentRank, isLowerRank, rankIndexOf } from './types';
+import type { AgentRank } from './types';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,
 // src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
@@ -722,77 +759,172 @@ describe('a cancelled child reports the answer it was streaming (issue 0020 AC1)
     });
 });
 
-describe('primary and subagents', () => {
-    it('selects the primary explicitly and defaults the allowlist to the rest', () => {
+// THE ROSTER RANKS. `entry` names the entry point and `ranks` ranks the members; there is
+// no `primary` field, no `subagents` allowlist, and no single "the primary" agent any more.
+// The two resolution rules are pinned exactly (./types' `HarnessConfiguration.ranks`):
+//   rule 1 — `ranks` ABSENT: the entry agent is Rank A, every other agent is Rank B (the
+//            standing the removed `primary` + implicit-subagents pair produced);
+//   rule 2 — `ranks` PRESENT: an explicit entry wins, and every agent the map omits takes
+//            ONE rank below the LOWEST rank written anywhere in it (clamped at 'Z').
+describe('the roster ranks', () => {
+    it('names the entry agent explicitly and ranks the rest one below it', () => {
         const writer = harness({
             agents: { writer: brain(scripted([answer('w')])), researcher: brain(scripted([answer('r')])) },
-            primary: 'researcher',
+            entry: 'researcher',
             presets: false
         });
 
+        // The entry point is a ROUTING choice, not a privilege: `name` and `agent` follow
+        // it, and the ranking follows it only through rule 1.
         expect(writer.name).toBe('researcher');
         expect(writer.agent).toBe(writer.agents.researcher);
-        expect(Object.keys(writer.subagents)).toEqual(['writer']);
+        expect(writer.ranks).toEqual({ writer: 'B', researcher: 'A' });
         expect(writer.tools.delegate).toBeDefined();
     });
 
-    it('keeps the first agents key as primary when none is named', () => {
+    it('defaults the entry agent to the first agents key', () => {
         const writer = harness({
             agents: { writer: brain(scripted([answer('w')])), researcher: brain(scripted([answer('r')])) },
             presets: false
         });
 
         expect(writer.name).toBe('writer');
-        expect(Object.keys(writer.subagents)).toEqual(['researcher']);
+        expect(writer.ranks).toEqual({ writer: 'A', researcher: 'B' });
     });
 
-    it('creates no delegation surface when the allowlist is empty', () => {
+    it('registers no delegation surface for a roster that spans one rank', () => {
+        // `ranks: {}` is an explicit "no ranking": EVERY agent takes the fallback rank (one
+        // below the lowest rank written anywhere, and nothing was written), so nobody is
+        // below anybody. The old shape of this test was `subagents: []`.
         const writer = harness({
             agents: { writer: brain(scripted([answer('w')])), researcher: brain(scripted([answer('r')])) },
-            subagents: [],
+            ranks: {},
             presets: false
         });
 
-        expect(writer.subagents).toEqual({});
+        expect(writer.ranks).toEqual({ writer: 'B', researcher: 'B' });
         expect(writer.tools.delegate).toBeUndefined();
     });
 
-    it('uses an explicit allowlist and exposes it on the tool schema', () => {
+    it('honours an explicit ranking, and ranks the unlisted agents one below its lowest entry', () => {
         const writer = harness({
             agents: {
                 writer: brain(scripted([answer('w')])),
                 researcher: brain(scripted([answer('r')])),
                 editor: brain(scripted([answer('e')]))
             },
-            subagents: ['researcher'],
+            ranks: { writer: 'A', researcher: 'B' },
             presets: false
         });
 
-        expect(Object.keys(writer.subagents)).toEqual(['researcher']);
+        // Rule 2: `editor` is unlisted, so it takes one rank below the LOWEST rank written
+        // anywhere in the map ('B') — which is 'C'. The ladder is therefore A > B > C.
+        expect(writer.ranks).toEqual({ writer: 'A', researcher: 'B', editor: 'C' });
+
+        // The INSTALLED definition is the capability envelope: its enum is the WHOLE roster,
+        // because rank narrows per caller per request, and a wrong guess has to reach
+        // `delegateFor` (which names the caller's rank) instead of a schema rejection.
         expect(
             (writer.tools.delegate.parameters as Record<string, any>).properties.agent.enum
-        ).toEqual(['researcher']);
+        ).toEqual(['writer', 'researcher', 'editor']);
     });
 
-    it('validates the primary and subagent names at construction', () => {
+    it('refuses an unknown entry, an unknown ranks key, and a rank that is not a letter', () => {
         const agents = { writer: brain(scripted([answer('w')])), researcher: brain(scripted([answer('r')])) };
+        const rankLetters = 'A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z';
 
-        expect(() => harness({ agents, primary: 'ghost' })).toThrow(
-            'Primary agent "ghost" is not registered. Configured agents: writer, researcher.'
+        expect(() => harness({ agents, entry: 'ghost' })).toThrow(
+            'Entry agent "ghost" is not registered. Configured agents: writer, researcher.'
         );
 
-        expect(() => harness({ agents, subagents: ['ghost'] })).toThrow(
-            'Subagent "ghost" is not registered. Configured agents: writer, researcher.'
+        expect(() => harness({ agents, ranks: { ghost: 'A' } })).toThrow(
+            'HarnessConfiguration.ranks names agent "ghost", which is not registered. Configured agents: writer, researcher.'
         );
 
-        expect(() => harness({ agents, subagents: ['writer'] })).toThrow(
-            'Subagent "writer" is the primary agent "writer"; the primary cannot delegate to itself.'
+        expect(() => harness({ agents, ranks: { writer: 'primary' as never } })).toThrow(
+            `HarnessConfiguration.ranks.writer must be one of: ${rankLetters}. Received primary.`
         );
+    });
+
+    // THE CONSTRUCTION DOOR REFUSES THE RETIRED VOCABULARY (clean break, R55).
+    //
+    // `primary`/`subagents` are refused on a STORED row by `requireNoLegacyRosterKeys`
+    // (./server/persistence.ts), and a TS caller cannot write them at all — but a live
+    // `HarnessConfiguration` from a JS or JSON caller used to pass through SILENTLY, and the
+    // silence moved two things at once: with `primary` ignored, routing fell back to
+    // `agents[0]`, and with `ranks` absent, rule 1 put Rank A on that same first agent. So the
+    // caller's team resumed with a different entry AND a different authority, one layer above
+    // the layer that already answers loudly. A half-migrated document (`entry` beside a
+    // leftover `subagents`) is the same ambiguity in another costume, so one key is enough.
+    it('refuses a live config still written in the retired roster vocabulary', () => {
+        const agents = { writer: brain(scripted([answer('w')])), researcher: brain(scripted([answer('r')])) };
+        // The keys were dropped from `HarnessConfiguration`, so the stale shapes are typed the
+        // way the uncompiled-caller hazard arrives: an extra key on an otherwise valid config.
+        const stale = (extra: Record<string, unknown>): Parameters<typeof harness>[0] =>
+            ({ agents, presets: false, ...extra }) as unknown as Parameters<typeof harness>[0];
+        const refusal = (key: string): string =>
+            `HarnessConfiguration was written before the rank model and carries \`${key}\`. This build routes with \`entry\` (the entry agent, one of \`agents\`) and ranks with \`ranks\` (agent name -> one rank letter, "A" highest to "Z" lowest), and it does not translate the old keys: name \`entry\` and \`ranks\` instead.`;
+
+        expect(() => harness(stale({ primary: 'researcher' }))).toThrow(refusal('primary'));
+        expect(() => harness(stale({ subagents: ['researcher'] }))).toThrow(refusal('subagents'));
+
+        // Both at once, and a half-migrated config: one retired key is enough to refuse.
+        expect(() => harness(stale({ primary: 'researcher', subagents: ['writer'] }))).toThrow(
+            'carries `primary` and `subagents`'
+        );
+        expect(() => harness(stale({ entry: 'researcher', subagents: ['writer'] }))).toThrow(
+            refusal('subagents')
+        );
+
+        // THE POSITIVE CONTROL. The same intent, spelled in the current vocabulary, is accepted
+        // and says out loud what the stale shape was guessing at: `entry` for routing (grants no
+        // authority) and `ranks` for authority.
+        const migrated = harness({
+            agents,
+            entry: 'researcher',
+            ranks: { researcher: 'A', writer: 'B' },
+            presets: false
+        });
+
+        expect(migrated.name).toBe('researcher');
+        expect(migrated.ranks).toEqual({ researcher: 'A', writer: 'B' });
+    });
+
+    // The roster-mutation twin of the refusal above (R55): `role` was the pre-rank name for this
+    // option, and a silently-dropped key would put the new member at the roster's DEFAULT rank —
+    // a privilege (or a demotion) its author never wrote, the same class of mistake a bad rank
+    // LETTER already fails on.
+    it('refuses addAgent options that still carry the retired `role` key', () => {
+        const roster = harness({
+            agents: { writer: brain(scripted([answer('w')])) },
+            presets: false
+        });
+        const lateConfiguration = { model: 'merge/ds4-flash', stream: scripted([answer('late answer')]) };
+        const staleOptions = (extra: Record<string, unknown>): unknown =>
+            extra as unknown as Parameters<typeof roster.addAgent>[2];
+
+        expect(() => roster.addAgent('late', lateConfiguration, staleOptions({ role: 'B' }))).toThrow(
+            'addAgent("late") options were written before the rank model and carry `role`. This build takes `rank` (one letter, "A" highest to "Z" lowest), and it does not translate the old key.'
+        );
+
+        // Refused BEFORE the roster moved: no member was added, so no default rank was invented
+        // for one, and the ranking the host configured is untouched.
+        expect(Object.keys(roster.agents)).toEqual(['writer']);
+        expect(roster.ranks).toEqual({ writer: 'A' });
+
+        // The current spelling still works, and `delegate: false` is still a live option beside
+        // it (refused as a target by `delegateFor`, pinned above).
+        roster.addAgent('late', lateConfiguration, { rank: 'C', delegate: false });
+
+        expect(roster.ranks).toEqual({ writer: 'A', late: 'C' });
     });
 });
 
 describe('delegate', () => {
-    it('declares delegate to the primary only', async () => {
+    // The delegation control is declared to the agent that HAS juniors and withheld from
+    // the agent that has none — the rank statement of the old "primary only" rule, which
+    // keeps working for a roster with several Rank A members.
+    it('declares delegate only to the agent that has a lower-ranked peer', async () => {
         const seenWriter: HarnessStreamRequest[] = [];
         const seenResearcher: HarnessStreamRequest[] = [];
 
@@ -810,8 +942,9 @@ describe('delegate', () => {
         const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
         await writer('go');
 
-        // The primary sees the bootstrap pair plus delegate. The subagent never sees
-        // the delegation control, so its declarations are exactly the pair.
+        // The Rank A entry agent sees the bootstrap pair plus delegate. The Rank B agent
+        // has nobody ranked below it, so it never sees the delegation control and its
+        // declarations are exactly the pair.
         expect(declaredNames(seenWriter[0])).toEqual([
             'toolRequest',
             'tasks',
@@ -855,27 +988,31 @@ describe('delegate', () => {
         ]);
     });
 
-    it('refuses an agent outside the allowlist', async () => {
+    // The declared enum is the WHOLE roster (rank is a per-CALLER question, and a
+    // registered-but-illegal name must reach `delegateFor` to be answered with a rank), so
+    // the only thing the SCHEMA can refuse is a name that is not in the roster at all.
+    it('refuses a name that is not in the roster, and names the whole roster', async () => {
         const researcher = brain(scripted([answer('r')]));
         const editor = brain(scripted([answer('e')]));
         const writerAgent = brain(
-            scripted([callTool('c1', 'delegate', '{"agent":"editor","input":"edit"}'), answer('recovered')])
+            scripted([callTool('c1', 'delegate', '{"agent":"ghost","input":"edit"}'), answer('recovered')])
         );
 
         const writer = harness({
             agents: { writer: writerAgent, researcher, editor },
-            subagents: ['researcher'],
             presets: false
         });
 
         await writer('go');
 
         expect(content(writerAgent.messages[2])).toBe(
-            'Tool "delegate" received arguments that do not match its schema: $.agent must be one of: "researcher".'
+            'Tool "delegate" received arguments that do not match its schema: $.agent must be one of: "writer", "researcher", "editor".'
         );
     });
 
-    it('rejects a subagent that tries to delegate (guessed name)', async () => {
+    // A Rank B agent that guesses the control is refused BY RANK, in words that name its
+    // own rank and the rule, because the schema deliberately let the call through.
+    it('refuses a lower-ranked agent that guesses the delegation control', async () => {
         const researcher = brain(
             scripted([
                 callTool('r1', 'delegate', '{"agent":"researcher","input":"again"}'),
@@ -893,10 +1030,12 @@ describe('delegate', () => {
         const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
         await writer('go');
 
-        // The subagent's call is answered with a tool result it can read; the run
-        // does not crash and delegation stays one level deep.
+        // The Rank B agent's call is answered with a tool result it can read; the run does
+        // not crash, and the refusal teaches the rule instead of asserting a privilege.
         expect(content(researcher.messages[2])).toBe(
-            'Tool "delegate" is only available to the primary agent "writer".'
+            'Tool "delegate" failed: researcher holds Rank B and cannot delegate to "researcher" (Rank B): '
+            + 'delegation is strictly downward. No agent in this harness is ranked below Rank B, '
+            + 'so a Rank B agent cannot delegate at all.'
         );
         expect(answerOf(writerAgent.messages[2])).toEqual({
             agent: 'researcher',
@@ -1720,10 +1859,12 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
         // the same ledger, asserted whole.
         expect(await writer.executeTool('agentManage', {})).toEqual({
             agents: [
-                { name: 'writer', role: 'primary', model: 'merge/ds4-flash', invocationCount: 0, results: [] },
+                { name: 'writer', rank: 'A', model: 'merge/ds4-flash', invocationCount: 0, results: [] },
                 {
                     name: 'researcher',
-                    role: 'subagent',
+                    // The rank the roster resolved for it (rule 1: the non-entry agent of an
+                    // unranked roster is Rank B), replacing the removed `role: 'subagent'`.
+                    rank: 'B',
                     model: 'merge/ds4-flash',
                     invocationCount: 2,
                     results: [
@@ -3417,5 +3558,519 @@ describe('harness source shape (policy 2026-11-09 T5.5)', () => {
         // Exactly one read of the configuration field, and it is the line above.
         const configured = codeLines(lines, 'configuration.threadForkTimeoutMs,');
         expect(configured).toHaveLength(1);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// THE RANK LADDER, end to end. These are the four cases the removed
+// primary/subagent vocabulary could not state at all: Rank A is not a singleton
+// role, a chain is as deep as the ladder is long, a junior reaches neither up nor
+// sideways, and threads are storage — storage is rank-blind.
+// ---------------------------------------------------------------------------
+describe('delegation follows the rank ladder', () => {
+    // (1) TWO Rank A MEMBERS. The old model had exactly one primary, so a second
+    // top-rank agent was unrepresentable; here both are registered, both are
+    // addressable, and neither is the other's junior — a peer is not a subordinate.
+    it('lets two Rank A agents coexist, and refuses one as the other\'s target', async () => {
+        const alpha = brain(scripted([answer('alpha ran')]));
+        const beta = brain(scripted([answer('beta ran')]));
+        const entryAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"alpha","input":"help"}'),
+                callTool('c2', 'delegate', '{"agent":"beta","input":"help"}'),
+                answer('done')
+            ])
+        );
+
+        const roster = harness({
+            agents: { entry: entryAgent, alpha, beta },
+            ranks: { entry: 'A', alpha: 'A', beta: 'B' },
+            presets: false
+        });
+
+        // Construction accepts the pair, and the resolved map states it. Nothing collapses
+        // a second Rank A member into Rank B.
+        expect(roster.ranks).toEqual({ entry: 'A', alpha: 'A', beta: 'B' });
+        expect(roster.name).toBe('entry');
+
+        await roster('go');
+
+        // Rank A → Rank A is refused, and the refusal is a LESSON: it names the caller's
+        // rank, the target's rank, the rule, and the legal set.
+        expect(content(entryAgent.messages[2])).toBe(
+            'Tool "delegate" failed: entry holds Rank A and cannot delegate to "alpha" (Rank A): '
+            + 'delegation is strictly downward. The legal targets are Rank B and below: beta.'
+        );
+
+        // The peer call one rank down is legal and runs, so the refusal above is about the
+        // RANK, not about a rule against a second Rank A agent existing.
+        expect(answerOf(entryAgent.messages[4])).toEqual({ agent: 'beta', content: 'beta ran' });
+        // And the refused target never STARTED: the rule fires before any work, so the
+        // peer's transcript is still empty rather than half-run.
+        expect(alpha.messages).toEqual([]);
+        expect(withoutIds(beta.messages)).toEqual([
+            { role: 'user', content: 'help' },
+            { role: 'assistant', content: 'beta ran' }
+        ]);
+    });
+
+    // (2) A CHAIN. `MAX_RUN_DEPTH = 2` used to be hard-coded, which made A→B→C
+    // impossible even for a roster that legitimately spans three ranks. The ceiling
+    // is now the number of DISTINCT ranks, so a three-rank roster nests three deep.
+    it('runs an A→B chain and an A→B→C chain', async () => {
+        const editor = brain(scripted([answer('edited')]));
+        const researcher = brain(
+            scripted([
+                callTool('r1', 'delegate', '{"agent":"editor","input":"edit the brief"}'),
+                answer('summarised')
+            ])
+        );
+        const writerAgent = brain(
+            scripted([callTool('c1', 'delegate', '{"agent":"researcher","input":"research"}'), answer('done')])
+        );
+
+        const roster = harness({
+            agents: { writer: writerAgent, researcher, editor },
+            ranks: { writer: 'A', researcher: 'B', editor: 'C' },
+            presets: false
+        });
+
+        const message = await roster('go');
+
+        expect(message.content).toBe('done');
+
+        // Depth 2: Rank A → Rank B.
+        expect(answerOf(writerAgent.messages[2])).toEqual({
+            agent: 'researcher',
+            content: 'summarised'
+        });
+
+        // Depth 3: Rank B → Rank C, from INSIDE a delegated run — the level the old
+        // hard-coded ceiling refused. The child's answer rides back up the chain as data.
+        expect(delegationOf(researcher.messages[2])).toMatchObject({
+            agent: 'editor',
+            content: 'edited',
+            status: 'completed'
+        });
+        expect(withoutIds(editor.messages)).toEqual([
+            { role: 'user', content: 'edit the brief' },
+            { role: 'assistant', content: 'edited' }
+        ]);
+    });
+
+    // (3) THE FLOOR. A Rank C agent has nobody below it, so it gets no delegation
+    // declaration at all, and a guessed call is refused whether the name is a senior
+    // (upward) or a peer (sideways).
+    it('refuses a Rank C agent that reaches upward or sideways', async () => {
+        const seenEditor: HarnessStreamRequest[] = [];
+        const editor = brain(
+            scripted([
+                callTool('e1', 'delegate', '{"agent":"researcher","input":"up"}'),
+                callTool('e2', 'delegate', '{"agent":"proof","input":"sideways"}'),
+                answer('stopped')
+            ], seenEditor)
+        );
+        const proof = brain(scripted([answer('proved')]));
+        const researcher = brain(
+            scripted([callTool('r1', 'delegate', '{"agent":"editor","input":"go"}'), answer('asked')])
+        );
+        const writerAgent = brain(
+            scripted([callTool('c1', 'delegate', '{"agent":"researcher","input":"go"}'), answer('done')])
+        );
+
+        const roster = harness({
+            agents: { writer: writerAgent, researcher, editor, proof },
+            ranks: { writer: 'A', researcher: 'B', editor: 'C', proof: 'C' },
+            presets: false
+        });
+
+        await roster('go');
+
+        // Honest ABSENCE: the Rank C agent is never shown the control it cannot use.
+        expect(declaredNames(seenEditor[0])).toEqual(['toolRequest', 'tasks']);
+
+        const floor = 'delegation is strictly downward. No agent in this harness is ranked below Rank C, so a Rank C agent cannot delegate at all.';
+
+        // Upward: C → B.
+        expect(content(editor.messages[2])).toBe(
+            `Tool "delegate" failed: editor holds Rank C and cannot delegate to "researcher" (Rank B): ${floor}`
+        );
+
+        // Sideways: C → C. Two agents on the same rank are peers in both directions.
+        expect(content(editor.messages[4])).toBe(
+            `Tool "delegate" failed: editor holds Rank C and cannot delegate to "proof" (Rank C): ${floor}`
+        );
+
+        // The chain therefore STOPS at the floor: the Rank B caller gets the Rank C
+        // agent's own answer, not a re-delegated one.
+        expect(answerOf(researcher.messages[2])).toEqual({ agent: 'editor', content: 'stopped' });
+        expect(proof.messages).toEqual([]);
+    });
+
+    // (4) THREADS ARE NOT RANK-GATED. Rank decides what an agent may DO (delegate,
+    // create a tool); it never decides which conversations exist or who can read
+    // and write them. The lowest-ranked member owns a conversation, gets host
+    // threads, and its child transcripts are addressed exactly like a senior's.
+    it('never gates thread creation or visibility on rank', async () => {
+        const editor = brain(scripted([answer('edited')]));
+        const researcher = brain(scripted([answer('researched')]));
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"research"}'),
+                callTool('c2', 'delegate', '{"agent":"editor","input":"edit"}'),
+                answer('done')
+            ])
+        );
+
+        const roster = harness({
+            agents: { writer: writerAgent, researcher, editor },
+            ranks: { writer: 'A', researcher: 'B', editor: 'C' },
+            presets: false
+        });
+
+        // Every roster member owns a default conversation, whatever its rank —
+        // including the floor agent, which has no delegation rights at all.
+        expect(roster.thread('agent:writer')?.agent).toBe('writer');
+        expect(roster.thread('agent:researcher')?.agent).toBe('researcher');
+        expect(roster.thread('agent:editor')?.agent).toBe('editor');
+
+        await roster('go');
+
+        const senior = envelopeOfCall(writerAgent.messages, 'c1');
+        const junior = envelopeOfCall(writerAgent.messages, 'c2');
+
+        // Both delegations CREATED a conversation, and the Rank C child's is listed and
+        // readable by the Rank A parent exactly like the Rank B child's.
+        expect(roster.thread(senior.threadId)?.agent).toBe('researcher');
+        expect(roster.thread(junior.threadId)?.agent).toBe('editor');
+        expect(
+            roster.threadMessages(junior.threadId).map((entry) => ({
+                role: entry.role,
+                content: entry.content
+            }))
+        ).toEqual([
+            { role: 'user', content: 'edit' },
+            { role: 'assistant', content: 'edited' }
+        ]);
+
+        // And the rank-blindness is symmetric: the floor agent's default conversation is
+        // still in the roster the seniors read.
+        const listedAgents = roster.threads().map((entry) => entry.agent);
+
+        expect(listedAgents).toContain('editor');
+        expect(listedAgents.filter((name) => name === 'writer')).toEqual(['writer']);
+    });
+
+    // (5) THE `delegate: false` OPT-OUT IS A REFUSAL, NOT ONLY A VISIBILITY RULE (R53).
+    //
+    // The rank ladder decides what is LEGAL; `addAgent(…, { delegate: false })` is the host's
+    // opt-out for one member. It used to be read ONLY by `delegableNamesFor`, so it hid the name
+    // from every DECLARATION while `delegateFor` checked registration and rank alone — and an
+    // opted-out member is lower-ranked, so the call RAN. That asymmetry is not theoretical: the
+    // installed `delegate` schema deliberately carries the WHOLE roster (a narrow enum could not
+    // name a rank in its refusal), so any caller that names the call is one argument away from
+    // the door the declaration just closed. A host call is exactly that caller.
+    it('refuses a delegate:false member at the refusal site, which the schema cannot', async () => {
+        const boss = brain(scripted([answer('boss answer')]));
+        const roster = harness({
+            agents: { boss },
+            ranks: { boss: 'A' },
+            presets: false
+        });
+
+        const worker = roster.addAgent(
+            'worker',
+            { model: 'merge/ds4-flash', stream: scripted([answer('worker ran')]) },
+            { rank: 'B', delegate: false }
+        );
+
+        // Ranked below the caller, so the target is legal ON RANK — which is exactly why the
+        // rank check alone could never honour the opt-out.
+        expect(roster.ranks).toEqual({ boss: 'A', worker: 'B' });
+
+        // The schema still names it: nothing upstream of `delegateFor` can refuse this call.
+        expect(
+            (roster.tools.delegate.parameters as Record<string, any>).properties.agent.enum
+        ).toEqual(['boss', 'worker']);
+
+        // The host-forced call is REFUSED, with the reason stated as the host's own decision
+        // rather than as a rank fact.
+        await expect(
+            roster.executeTool('delegate', { agent: 'worker', input: 'go' })
+        ).rejects.toThrow(
+            'Agent "worker" is not a delegation target: it was registered with `addAgent(…, { delegate: false })`. Rank B is below Rank A, so the target is legal on rank alone and the host\'s opt-out is what refuses it; it stays reachable through threads and `ctx.run`.'
+        );
+
+        // Refused BEFORE the child ran, so the opted-out member has no transcript at all, and
+        // the refusal changed nothing about it being a roster member with a conversation.
+        expect(worker.messages).toEqual([]);
+        expect(roster.thread('agent:worker')?.agent).toBe('worker');
+    });
+
+    // (6) THE "NO LEGAL TARGET" SENTENCE HAS TWO CAUSES, AND THE REFUSAL TELLS THEM APART.
+    //
+    // `No agent in this harness is ranked below Rank A` is TRUE when the ladder really ends at
+    // the caller (and the tests above pin that wording unchanged). It is a LIE when the ladder
+    // continues and every junior was registered with `delegate: false`: the caller has juniors,
+    // the host simply declined to make any of them targets. Blaming the ranks sends a model away
+    // to reconfigure a ladder that is already correct.
+    it('blames the opt-out rather than the ladder when every junior opted out', async () => {
+        const roster = harness({
+            agents: { boss: brain(scripted([answer('boss')])), peer: brain(scripted([answer('peer')])) },
+            ranks: { boss: 'A', peer: 'A' },
+            presets: false
+        });
+
+        roster.addAgent(
+            'worker',
+            { model: 'merge/ds4-flash', stream: scripted([answer('worker ran')]) },
+            { rank: 'B', delegate: false }
+        );
+
+        // A same-rank target: the rank refusal fires (it keeps its own wording), and the second
+        // half of the sentence must describe the roster as it actually is.
+        await expect(
+            roster.executeTool('delegate', { agent: 'peer', input: 'go' })
+        ).rejects.toThrow(
+            'boss holds Rank A and cannot delegate to "peer" (Rank A): delegation is strictly downward. Every agent ranked below Rank A (worker) is registered with `addAgent(…, { delegate: false })`, so this call has no legal target.'
+        );
+
+        expect(roster.agents.peer.messages).toEqual([]);
+    });
+
+    // (7) THE HOST IS AN ACTOR, NOT A RANKED AGENT (R54).
+    //
+    // `hostRank()` documents what a host call carries: the entry agent's standing while that
+    // agent is registered, and Rank A once `removeAgent` detaches it, "so a host can still reach
+    // every agent in the roster downward". `runtime.delegate(undefined, …)` honoured that (no
+    // caller brain, so it resolved through `hostRank()`), while `harness.executeTool('delegate',
+    // …)` passed the brain captured at CONSTRUCTION — a detached name resolves through `rankOf`
+    // to the roster's DEFAULT rank, so the same host argument was refused there with a rank
+    // pinned to an agent the roster no longer held. Both doors now run as `hostActor()`.
+    it('gives a host its documented Rank A authority after the entry agent is detached, through both host doors', async () => {
+        // The host seam: `runtime.delegate` with NO caller brain, driven from a manual host
+        // call, which is how a plugin outside any conversation reaches it.
+        const hostDelegate = tool({
+            description: 'Delegate through the unvalidated host seam.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: (context) =>
+                context.harness!.runtime.delegate(
+                    undefined,
+                    { agent: 'helper', input: 'again' },
+                    context.run!,
+                    context.runDepth,
+                    context.signal,
+                    context.callId,
+                    context.runScope
+                )
+        });
+
+        const roster = harness({
+            agents: {
+                entry: brain(scripted([answer('entry ran')])),
+                worker: brain(scripted([answer('worker ran')])),
+                helper: brain(scripted([answer('helper ran')]))
+            },
+            ranks: { entry: 'A', worker: 'B', helper: 'B' },
+            tools: { hostDelegate },
+            presets: false
+        });
+
+        roster.removeAgent('entry');
+
+        // The roster stopped naming the entry agent, so nothing below may attribute a rank to it.
+        expect(roster.ranks).toEqual({ worker: 'B', helper: 'B' });
+
+        // DOOR 1 — the manual `executeTool` door. Pre-fix this rejected with
+        // `entry holds Rank C and cannot delegate to "worker" (Rank B): … No agent in this
+        // harness is ranked below Rank C…`: a rank attributed to a removed agent, and a ladder
+        // claim that was false for the host.
+        expect(await roster.executeTool('delegate', { agent: 'worker', input: 'go' })).toMatchObject({
+            agent: 'worker',
+            content: 'worker ran',
+            status: 'completed'
+        });
+
+        // DOOR 2 — the same host authority through `runtime.delegate(undefined, …)`, the door
+        // that already resolved through `hostRank()`. Asserting BOTH in one roster is the point:
+        // the two doors agreeing is the contract, and a second delegation into the SAME default
+        // conversation would queue rather than answer, so this one goes to `helper`.
+        expect(await roster.executeTool('hostDelegate', {})).toMatchObject({
+            agent: 'helper',
+            content: 'helper ran',
+            status: 'completed'
+        });
+
+        // Both children really ran, in their own default conversations.
+        expect(roster.agents.worker.messages.map((message) => message.role)).toEqual([
+            'user',
+            'assistant'
+        ]);
+        expect(roster.agents.helper.messages.map((message) => message.role)).toEqual([
+            'user',
+            'assistant'
+        ]);
+    });
+
+    // (8) A HOST REFUSAL AFTER ENTRY REMOVAL NAMES THE HOST (R54, the other half).
+    //
+    // The rank rule still binds a host: Rank A cannot hand work to a Rank A peer. What may not
+    // happen is the message — it used to name the detached entry agent and attribute Rank C to
+    // it, which describes nobody. The chosen identity for that actor is an unregistered host
+    // agent literally named `host` (src/harness.ts `hostActor`), so the sentence reads as the
+    // standing the host actually holds and the legal targets stay the roster's own.
+    it('names the host, never the detached entry agent, in a host refusal', async () => {
+        const roster = harness({
+            agents: {
+                entry: brain(scripted([answer('entry ran')])),
+                boss: brain(scripted([answer('boss ran')])),
+                worker: brain(scripted([answer('worker ran')]))
+            },
+            ranks: { entry: 'A', boss: 'A', worker: 'B' },
+            presets: false
+        });
+
+        roster.removeAgent('entry');
+
+        await expect(
+            roster.executeTool('delegate', { agent: 'boss', input: 'go' })
+        ).rejects.toThrow(
+            'host holds Rank A and cannot delegate to "boss" (Rank A): delegation is strictly downward. The legal targets are Rank B and below: worker.'
+        );
+
+        // The refused peer never started, and no read of the roster or of the host mentions the
+        // detached entry agent any more.
+        expect(roster.agents.boss.messages).toEqual([]);
+        expect(JSON.stringify(roster.ranks)).not.toContain('entry');
+    });
+
+    // (9) THE HANDLE'S TWO ENTRY READERS FOLLOW THE ROSTER (R62).
+    //
+    // `handle.name` used to be the frozen configured `entryName` and `handle.agent` the brain
+    // captured at construction, which was sound only while the entry point was unremovable. The
+    // rank model makes it removable (`removeAgent`, src/harness.ts "THE ENTRY AGENT IS
+    // REMOVABLE"), so after the detach those two readers named an agent this roster no longer
+    // holds — `harness.agent` handed back a transcript and model nobody could address. Both now
+    // resolve through ONE rule (`effectiveEntryName`/`effectiveEntryAgent`): the agent `entry`
+    // names while it is registered, else the FIRST CURRENTLY-REGISTERED member — the same rule
+    // construction uses when `entry` is absent (`entryName = configuration.entry ??
+    // agentNames[0]`, documented as the `entry?` default in ./types).
+    //
+    // WHAT MUST NOT MOVE WITH IT, and what this test therefore also pins: HOST IDENTITY. The
+    // fallback is the handle's routing answer, not an authority grant. Every host door still runs
+    // as `hostActor()` (`:1669`), so a host delegation still completes, and the rank refusal is
+    // still about `host` — never about the agent the handle fell back to, and never about the
+    // departed entry.
+    it('re-points `name` and `agent` at the first registered agent after the entry agent is detached, without moving host authority', async () => {
+        const roster = harness({
+            agents: {
+                entry: brain(scripted([answer('entry ran')])),
+                // A DISTINCT model per brain, so the `model()` assertion below can tell the
+                // surviving brain apart from the construction-time one it must no longer return.
+                senior: brain(scripted([answer('senior ran')]), { model: 'senior/model' }),
+                worker: brain(scripted([answer('worker ran')]))
+            },
+            ranks: { entry: 'A', senior: 'A', worker: 'B' },
+            presets: false
+        });
+
+        // BEFORE THE DETACH: both readers name the configured entry, and they agree with each
+        // other and with the roster.
+        expect(roster.name).toBe('entry');
+        expect(roster.agent).toBe(roster.agents.entry);
+
+        roster.removeAgent('entry');
+
+        // AFTER IT: the detached brain is out of the roster, and neither reader mentions it.
+        // `senior` is the first CURRENTLY-registered member, so it is the effective entry, and
+        // `name`/`agent` are the two faces of that one answer.
+        expect(roster.agents.entry).toBeUndefined();
+        expect(roster.name).toBe('senior');
+        expect(roster.agent).toBe(roster.agents.senior);
+        expect(roster.agent.model()).toBe('senior/model');
+
+        // Authority is still the roster's letters, and the detached member holds no rank there.
+        expect(roster.ranks).toEqual({ senior: 'A', worker: 'B' });
+
+        // A HOST DELEGATION STILL COMPLETES, unchanged from the accepted state: the host acts with
+        // its own Rank A standing, so the roster's top agent stays reachable downward, and the
+        // child answers in its own default conversation.
+        expect(await roster.executeTool('delegate', { agent: 'worker', input: 'go' })).toMatchObject({
+            agent: 'worker',
+            content: 'worker ran',
+            status: 'completed'
+        });
+        expect(roster.agents.worker.messages.map((message) => message.role)).toEqual([
+            'user',
+            'assistant'
+        ]);
+
+        // AND THE REFUSAL STILL NAMES `host`. This is the non-regression that the fallback had to
+        // respect: `senior` is now the effective ENTRY agent, but it did not become the host, and
+        // the detached entry never re-enters the sentence with a rank of its own.
+        await expect(roster.executeTool('delegate', { agent: 'senior', input: 'go' })).rejects.toThrow(
+            'host holds Rank A and cannot delegate to "senior" (Rank A): delegation is strictly downward. The legal targets are Rank B and below: worker.'
+        );
+        expect(roster.agents.senior.messages).toEqual([]);
+
+        // A ROOT CALL STILL REFUSES rather than silently re-routing onto the fallback brain:
+        // `entry` is a routing choice the host wrote, and re-pointing it at a different agent than
+        // the configuration named would be a change nobody asked for (`removeAgent` documents
+        // exactly this failure). The refusal is SYNCHRONOUS — `run` resolves the entry brain
+        // before it starts a run — so it is asserted as a throw, not a rejected promise.
+        expect(() => roster('go')).toThrow(
+            'Entry agent "entry" is not registered. Configured agents: senior, worker.'
+        );
+
+        // THE READ IS LIVE IN BOTH DIRECTIONS. Re-registering the configured name restores it as
+        // the effective entry even though `agents` now lists it LAST — which is what proves the
+        // rule is "the agent `entry` names, while registered" and not merely "whatever key comes
+        // first".
+        roster.addAgent('entry', { model: 'entry/model', stream: scripted([answer('entry again')]) }, { rank: 'A' });
+
+        expect(roster.name).toBe('entry');
+        expect(roster.agent).toBe(roster.agents.entry);
+        expect(roster.agent.model()).toBe('entry/model');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// THE VOCABULARY (R1). The kernel never hard-codes a rank letter; it compares these
+// values. `isLowerRank` being STRICT — false for a peer — is the single reason two
+// Rank A agents coexist instead of one being the other's junior, and `AGENT_RANKS`
+// being ordered highest-authority-first is what makes `rankIndexOf` the one ordering.
+// ---------------------------------------------------------------------------
+describe('the rank vocabulary', () => {
+    it('enumerates twenty-six letters from A upward and compares them strictly', () => {
+        // The union is enumerable at runtime, in order, so a consumer cannot invent a
+        // letter the union does not hold.
+        const letters: AgentRank[] = [...AGENT_RANKS];
+
+        expect(letters).toEqual(
+            'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('').map((letter) => letter as AgentRank)
+        );
+        expect(rankIndexOf('A')).toBe(0);
+        expect(rankIndexOf('B')).toBe(1);
+        expect(rankIndexOf('Z')).toBe(25);
+
+        // Downward is a LARGER index; equal ranks are not downward.
+        expect(isLowerRank('B', 'A')).toBe(true);
+        expect(isLowerRank('Z', 'A')).toBe(true);
+        expect(isLowerRank('A', 'B')).toBe(false);
+        expect(isLowerRank('B', 'B')).toBe(false);
+        expect(isLowerRank('A', 'A')).toBe(false);
+        expect(isLowerRank('A', 'Z')).toBe(false);
+
+        // The untrusted-input guard: only a member of the union passes, so a persisted
+        // or configured value cannot smuggle the removed vocabulary through.
+        expect(isAgentRank('A')).toBe(true);
+        expect(isAgentRank('Z')).toBe(true);
+        expect(isAgentRank('a')).toBe(false);
+        expect(isAgentRank('AA')).toBe(false);
+        expect(isAgentRank('primary')).toBe(false);
+        expect(isAgentRank('subagent')).toBe(false);
+        expect(isAgentRank(undefined)).toBe(false);
+        expect(isAgentRank(0)).toBe(false);
     });
 });

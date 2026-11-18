@@ -32,10 +32,18 @@
 // Delegation — one agent calling another — shows up as its own nested block inside
 // the same turn (each event names its agent). R3: a nested block is the SAME
 // surface as a main block (radius, header, state treatment) and differs ONLY by
-// indentation; there is no "subagent" label and no role badge. Agent identity is
-// carried by colour instead: every agent-owned surface is painted with the
-// deterministic tone from ui/agent-color.ts (name colour + block outline), so the
-// same agent keeps one colour across the whole transcript.
+// indentation; there is no rank label and no role badge. Agent identity is carried
+// by colour instead: every agent-owned surface is painted with the deterministic
+// tone from ui/agent-color.ts (name colour + block outline), so the same agent keeps
+// one colour across the whole transcript.
+//
+// RANK (R20): the old primary/subagent pair is gone. A section carries its agent's
+// RANK letter (`TurnSection.rank`, 'A'-'Z', A highest), any number of agents may
+// share one rank, and the entry agent may hold any rank — so NOTHING in this renderer
+// derives hierarchy from a rank. Hierarchy is the server's nesting
+// (`parentSectionId`) and the invocation tree; `data-rank` is a structural attribute
+// for CSS/tests only, and `data-root='true'` marks the one section that IS the tile's
+// own flow.
 //
 // Block anatomy (R1/R3): the main tile and every nested entry share ONE header and
 // body design — a compact one-line header (`agent code · preview · elapsed | tokens
@@ -154,6 +162,10 @@ import type {
     HarnessBranchSummary,
     HarnessToolOutcome
 } from '../../types';
+// The rank guard is the kernel's own (../../types/index.ts `isAgentRank`): one letter
+// A-Z or nothing. The browser never grows its own letter set, so a wire value the
+// projector did not stamp is read as "no rank" here exactly as it is server-side.
+import { isAgentRank } from '../../types';
 // The compiled display contract (T5 R1/R2/R3): the row, the tree, and the ops that
 // mutate both. TYPE-only for the tree shapes, plus the two DOM-free helpers the
 // renderer needs — nothing here pulls in a server-side fold.
@@ -161,6 +173,7 @@ import type {
     DisplayAttachmentSummary,
     DisplayNode,
     DisplayNoticeNode,
+    DisplayRank,
     DisplayReasoningNode,
     DisplayStep,
     DisplayTextNode,
@@ -387,9 +400,12 @@ export type TurnHandle = {
     // not from this sum. `undefined` only clears the figure when no usage event
     // was recorded (a record's tally can be absent on legacy turns).
     setUsage: (usage?: HarnessUsage) => void;
-    // Number of agent sections, tool cards and the primary agent name. Exposed
-    // for tests and for the tile's meta line.
-    summary: () => { agents: number; tools: number; primary?: string };
+    // Number of agent sections, tool cards, and the agent that runs the turn's ROOT
+    // flow (the first agent the data named). Exposed for tests and for the tile's meta
+    // line. R20: the field is `rootAgent`, never `entry` — a turn of a persistent child
+    // conversation runs that child's agent, which is not the harness entry agent, and
+    // calling it `primary` claimed an authority the rank model does not grant.
+    summary: () => { agents: number; tools: number; rootAgent?: string };
     // Persistent runtime thread this turn belongs to (`SessionTurn.threadId`,
     // additive). Undefined for a legacy record and for an optimistic tile that has
     // not been told a target yet. This — not the invocation ids in `blocks()` — is
@@ -546,6 +562,15 @@ export type TurnBoardOptions = {
     // `glob` tool; omitted in standalone use, where the bare name is read as typed
     // and the server's own ENOENT is what the dialog shows. See ui/file-preview.ts.
     resolveFile?: FilePreviewResolver;
+    // R20: the rank each agent holds in THIS harness (agent name -> letter), from the
+    // descriptor the shell renders (`AgentView.ranks`, main.ts). WHY THE BOARD NEEDS IT:
+    // the LIVE event fold has no rank of its own — only a `branch_start` frame stamps
+    // one — so without this map a live section carries no `data-rank` at all, while the
+    // compiled path stamps the server's own `TurnSection.rank`. A member the map omits
+    // keeps no attribute (an agent the definition never ranked has no letter here), and
+    // NOTHING in this renderer orders or nests by rank: hierarchy is `parentSectionId`
+    // and the invocation tree, so this map is a label, not a layout input.
+    ranks?: Readonly<Record<string, DisplayRank>>;
     // Focus is DERIVED from expansion (exactly one tile is expanded at a time), so
     // the board reports every change here. The shell repaints the thread strip and
     // the composer's routing line from it; nothing is sent to the server until a
@@ -1244,6 +1269,18 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
 // `collapse` must move ONLY the surface: it must not move board focus or retarget the
 // composer. That is what separates it from clicking a nested header, which focuses a
 // persistent conversation (`focusThread`).
+// What a section IS in the tile's tree, decided by the CALLER that owns the surface.
+// R20: a rank letter is data, never a hierarchy signal — several agents share one rank,
+// so `root` is the only figure that says "this block is the tile's own flow".
+type SectionStructure = {
+    // THE section that is the tile's body (mirrored as `data-root='true'`, which the
+    // stylesheet uses to hide the head the compact tile header already repeats).
+    root?: boolean;
+    // The agent's rank letter, ONLY when the data states one: server-stamped
+    // `TurnSection.rank` on the compiled path, `TurnBoardOptions.ranks` on the live one.
+    rank?: DisplayRank;
+};
+
 type SectionCollapse = {
     // 'thread' or 'conversation' — the noun in the accessible name and tooltip.
     label: string;
@@ -1598,6 +1635,23 @@ type ThreadEntry = {
      * Undefined only for a row-less legacy entry that no compiled frame has claimed.
      */
     compiledSection?: TurnSection;
+    /**
+     * R1 (the duplicate-thread-name fix): the persistent conversation this compiled row is a
+     * LATER RUN of, when this tile already shows that conversation as another row's card.
+     *
+     * The server folds ONE `TurnSection` per RUN (../server/turn-projector.ts), and a
+     * `threadSend` reply-run is recorded into its CALLER's turn as a root-shaped section, so a
+     * tile can legitimately hold two sections naming the SAME conversation (`threadId`, plus the
+     * same label through the per-run label join ../server/sessions.ts `labelJoinsOf`). One
+     * conversation is ONE card, so the later run carries this figure instead of a second visible
+     * name: its row sits directly under the card it belongs to and its name node is hidden, the
+     * same treatment an `is-continuation` exchange gives a repeated root label (:3088).
+     *
+     * `undefined` means this row IS its conversation's card, or has no provable conversation at
+     * all (which also keeps its own card). The row's identity never changes: the key stays the
+     * server's section id, so every run keeps its own strip, detail routes and `#` reference.
+     */
+    exchangeOf?: string;
 };
 
 // Root invocation key. It never collides with a runtime id because it is not a
@@ -1941,6 +1995,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // restarting at `RR1`. Cleared with the board, because the numbering is a
     // function of the recorded turn order (a reload rebuilds the same sequence).
     const labelCounters = new Map<string, number>();
+    // R20: the LIVE rank lookup, from `TurnBoardOptions.ranks`. A name the map omits —
+    // or a value that is not one of the 26 letters — states NO rank, so the section
+    // carries no `data-rank` rather than an invented 'A'. Compiled sections never ask:
+    // `paintCompiledSection` stamps the server's own `section.rank`, which is the
+    // authoritative figure for a frozen definition.
+    const rankForAgent = (agentName: string): DisplayRank | undefined => {
+        const stated = options.ranks?.[agentName];
+
+        return isAgentRank(stated) ? stated : undefined;
+    };
     // Every real block across the visible turns, oldest→newest. The composer's #
     // popup reads this on open (and on each keystroke while it stays open); the
     // list is computed live so a streaming turn's new nested block appears without
@@ -3235,6 +3299,133 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         if (headChanged) refreshActionBars();
     };
 
+    // ONE conversation code per SESSION, enforced across tiles.
+    //
+    // The tile elects its own card (`create`'s `syncCompiledConversationCards` is scoped to
+    // that tile's `compiledSections`), so a run of the SAME conversation recorded in a
+    // DIFFERENT turn — the `threadSend` reply-run case (`../harness.ts:6831` records it into
+    // its caller's CURRENT turn, so a reply sent from a later turn lands in a later tile) —
+    // printed its conversation code a second time, in its own tile. That is the same defect
+    // the user reported ("`WE7` twice"), reached through a second door the tile-scoped fix
+    // cannot see: a tile has no idea what another tile painted.
+    //
+    // DERIVED, never remembered. Tiles are lazy/windowed (`../view-api.ts:162`) and every
+    // compiled tile is torn down by `resetCompiled()` (a mode flip, a hydration, a `clear()`),
+    // so a remembered owner would strand the wrong tile's name until the next teardown. Here
+    // each paint re-derives the answer from what is on screen. Same idiom as `is-continuation`
+    // (:3234): no session-keyed map, no latched owner — the mark is recomputed from the rows
+    // that are actually in the DOM right now.
+    //
+    // THE ORDER IS THE BOARD'S TURN ARRAY, NOT THE DOM. "First" is the pair (the OWNING TURN's
+    // position in the board's `turns` ARRAY, then document order among that turn's rows, which is
+    // the order `orderThreadRows` (:5123) established), and it is deliberately NOT "first in
+    // document order overall": `reorderBoard` (:3183) re-appends the DOM in that array's own order,
+    // yet this pass also runs from `applyViewOps` (:11234) on an ops frame that has sorted nothing,
+    // and `placeTurn` (:3051) routes a continued CHILD conversation's rows inside that child's own
+    // card (`childExchangeHost`, :2926) — a subtree ranking would let that nested copy outrank the
+    // recorded-earlier card. So ownership comes from the nearest `.turn-row` ANCESTOR and is ranked
+    // by its position in the array; depth never enters. THAT ARRAY IS THE RECORDED ORDER on a
+    // snapshot frame (`reconcileView` :11054 walks `view.turns`, ../view-state.ts:57) and NOT
+    // otherwise: an ops `{ op: 'turn' }` upsert creates its tile by APPENDING it (:11206 → :10660),
+    // so until the next snapshot the recorded-later tile can rank first and the recorded-earlier
+    // card is the marked one — self-consistent (one readable copy either way), self-healing there.
+    //
+    // ONE ROW, ONE VISIT. The pass used to ask every compiled turn for the cards in its own
+    // subtree, which double-counted exactly the rows described above: the nested card appeared in
+    // its own turn's scope AND in the host tile's scope, was visited twice in one invocation, and
+    // the second visit hit `shown.has(conversation)` — which marked the only card that
+    // conversation had and left the reader with ZERO readable codes for it. Querying the board
+    // ONCE for all card rows makes each row a single element of one list, so a row can only ever
+    // lose the code to a genuinely earlier-ranked card, and never to itself.
+    //
+    // The identity comes from `data-thread-card`, which `syncCompiledConversationCards`
+    // stamps on the row it elects as a conversation's card (the value is the provable
+    // conversation id: `TurnSection.threadId`, else a UNIQUE roster claim — never a guess).
+    // Nothing else carries that marker: an optimistic/rows-only tile has no compiled tree, so
+    // it can neither own a code nor be marked, which is what R6 asks for. A row the pass does
+    // not reach keeps no mark because the pass clears every existing one before it ranks, so a
+    // demotion or a teardown can never leave a stale mark behind.
+    //
+    // A marked row loses ONLY its visible code: `styles.css` withdraws it with
+    // `visibility: hidden` (the slot-reserving device, see `styles.css:3434-3445`), and the
+    // row keeps its join (`data-persistent-thread`), its own context strip, its prose and its
+    // body/dialog/transcript routes. `row.hidden` rows — a card the server deleted (:5016) —
+    // are skipped BEFORE `shown` is written: they paint nothing, so may not spend the code.
+    const syncCompiledThreadRepeats = (): void => {
+        // The pass is the only writer of the marker, so ONE full-board query covers both of
+        // its jobs: the rows wearing a mark from the last paint (which the tile pass may have
+        // lost its card for — a demotion, a `section:remove`) and the rows that now carry a
+        // card election. Clearing exactly the marked rows is the whole cleanup.
+        const rows = Array.from(
+            element.querySelectorAll<HTMLElement>('.thread-row[data-thread-card], .thread-row[data-thread-repeat]')
+        );
+
+        const cards: HTMLElement[] = [];
+        for (const row of rows) {
+            if (row.hasAttribute('data-thread-repeat')) row.removeAttribute('data-thread-repeat');
+            if (row.dataset.threadCard !== undefined) cards.push(row);
+        }
+
+        // EARLY RETURN when the board holds no card at all: rows-only, raw and optimistic tiles
+        // publish none, and there is nothing to rank. The test is "no cards on the whole board",
+        // never `cards.length < 2` — `syncCompiledConversationCards` (:8221) dropped its
+        // `size < 2` fast path precisely so a ONE-section tile still publishes its election (the
+        // common reply-run shape), and a single-card tile must stay visible to this rule.
+        if (cards.length === 0) return;
+
+        // Turn-array order — the recorded order, except for the ops `{ op: 'turn' }` append the
+        // header above measures — keyed by the row WRAPPER (`turn.element.parentElement`, the
+        // `.turn-row` the tile sits in) so a card beside the tile is still attributed. Every turn
+        // is mapped, compiled or not: a non-compiled tile owns no card but keeps its place.
+        const rankOfWrapper = new Map<Element, number>();
+        for (let index = 0; index < turns.length; index += 1) {
+            const wrapper = turns[index].element.parentElement;
+            if (wrapper !== null) rankOfWrapper.set(wrapper, index);
+        }
+
+        // A row with no recorded turn above it (a wrapper the `turns` list no longer owns —
+        // an adopted placeholder, a row parked beside the board) ranks LAST in document order.
+        // That is the safe side to fail on: the earliest rank is the only row that can never be
+        // marked, so an unattributed copy can lose the code but can never strand a conversation
+        // at zero readable codes.
+        const UNRANKED = Number.MAX_SAFE_INTEGER;
+
+        // The owning tile is the nearest `.turn-row` ANCESTOR: the wrapper is not part of the
+        // card row's own subtree, so walking upward is what separates a tile's own rows from the
+        // rows of a turn routed inside one of its cards. A `.turn-row` that is not in the map
+        // does not end the walk — the next wrapper outward still carries a recorded position.
+        const ownerRank = (row: HTMLElement): number => {
+            for (let host = row.parentElement; host !== null; host = host.parentElement) {
+                if (!host.classList.contains('turn-row')) continue;
+
+                const rank = rankOfWrapper.get(host);
+                if (rank !== undefined) return rank;
+            }
+
+            return UNRANKED;
+        };
+
+        // (turn-array order, then in-tile order — recorded order on a snapshot frame). The in-tile
+        // position is an EXPLICIT tie-breaker rather than a reliance on sort stability: the board
+        // query returns document order, so `position` is exactly `orderThreadRows`'s order.
+        const ranked = cards
+            .map((row, position) => ({ row, position, rank: ownerRank(row) }))
+            .sort((a, b) => a.rank - b.rank || a.position - b.position);
+
+        const shown = new Set<string>();
+
+        for (const { row } of ranked) {
+            // A hidden row paints nothing, so it may neither wear the mark nor spend the code.
+            if (row.hidden) continue;
+
+            const conversation = row.dataset.threadCard;
+            if (conversation === undefined || conversation.length === 0) continue;
+
+            if (shown.has(conversation)) row.setAttribute('data-thread-repeat', '');
+            else shown.add(conversation);
+        }
+    };
+
     // Re-run the projection for EVERY turn. A nested child card only becomes
     // addressable once it is painted with its persistent id (roster join), which can
     // happen after its continuation was already placed; hydration/reconcile order must
@@ -3250,7 +3441,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     //
     // A COLLAPSED tile shows one plain-text line (`.tile-prompt`, `plainPreview(prompt,
     // 220)` at :3924) while styles.css keeps its whole body hidden
-    // (styles.css:3267 `.tile:not(.is-expanded) .tile-body { display: none }`). Until now
+    // (styles.css:3367 `.tile:not(.is-expanded) .tile-body { display: none }`). Until now
     // the hidden body still carried a PARSED Markdown prompt from the moment the row was
     // created: `renderPrompt` ran `markdownFragment` + `enhanceFileLinks` + `enhanceImages`
     // + `applyAttachmentChips` for EVERY row before the first paint — ~5 HTML
@@ -3260,7 +3451,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // A collapsed tile therefore registers its painter here and runs it the first time its
     // body is actually on screen. "On screen" is exactly what CSS states: the tile's own
     // `is-expanded` (set by `expand`, :3750) or an expanded CONVERSATION host, whose rule
-    // (styles.css:3357 `.conversation.is-expanded .tile-body { display: flex }`) opens every
+    // (styles.css:3485 `.conversation.is-expanded .tile-body { display: flex }`) opens every
     // exchange of the card at once. Two hooks cover every way this board changes that state:
     // `placeAllTurns` (the pass that creates/replaces cards, restores remembered expansions
     // and re-places the expanded turn) and `expand` (a click, a hydration reveal,
@@ -3304,6 +3495,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // remembered expansions, so it is where the followed set can MOVE without any
         // click or focus change. Cheap to ask: the report is deduped by value.
         notifyFollowedThreads();
+        // R6: every way the board gains, loses or re-orders a card runs through here, and a
+        // tile's own paint has already stamped its card by now — so this is where the
+        // session-wide "one code, one place" rule is (re)derived. See `syncCompiledThreadRepeats`.
+        syncCompiledThreadRepeats();
     };
 
     const notifyFocus = (): void => {
@@ -4123,7 +4318,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // --- per-turn state ------------------------------------------------
         let state: TurnState = 'queued';
         let detail: string | undefined;
-        let primaryAgent: string | undefined;
+        // The FIRST agent the data named for this turn — the one whose flow is the
+        // tile's root. Structural, not an authority claim (R20).
+        let firstAgentOfTurn: string | undefined;
         let toolCount = 0;
         // Server identity for this tile. Absent until `bind()` or a snapshot.
         let serverId: string | undefined;
@@ -4275,7 +4472,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         //     request's cached subset, so this is "latest prompt sent", not a sum.
         //     Emission order no longer decides it: T3 (user-reported display bug)
         //     REVERSED the old "last `usage` event of ANY section wins" rule, so a
-        //     delegated subagent's request paints its OWN nested row's figure and
+        //     delegated member's request paints its OWN nested row's figure and
         //     never becomes the tile's headline context, whichever section reported
         //     last. The raw fold enforces that at the `usage` case below (a frame a
         //     row-backed nested entry consumed is noted for the bracket only), and
@@ -4566,11 +4763,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // metadata (and no inferable delegate call) keep the old flat section so a
         // saved transcript stays readable instead of inventing ancestry.
 
-        // Build one agent content section inside `container`. `role` is a
-        // STRUCTURAL signal only (kept on `data-role` for CSS/tests/assistive
-        // context): R3 removed the visible role badge, because a nested block is
-        // the same surface as a main block and is told apart by indentation plus
-        // its agent colour, not by the word "subagent".
+        // Build one agent content section inside `container`. `structure` is
+        // STRUCTURAL information only (mirrored on data attributes for CSS/tests —
+        // R3 removed the visible role badge, because a nested block is the same
+        // surface as a main block and is told apart by indentation plus its agent
+        // colour, never by a role word):
+        //   - `root: true` marks THE one section that is the tile's own flow. The
+        //     stylesheet hides that section's head because the compact tile header
+        //     already names it; every other block keeps its head. Root-ness is
+        //     decided by the caller that owns the tile's flow (and, on the compiled
+        //     path, by "first section with no `parentSectionId`") — NEVER by a rank,
+        //     because any number of agents may hold the same rank.
+        //   - `rank` is the agent's rank letter when the data actually states one:
+        //     server-stamped `TurnSection.rank` on the compiled path, or the
+        //     `TurnBoardOptions.ranks` map on the live path. A member the map omits
+        //     gets NO attribute rather than a guessed one.
         //
         // `label` is the compact conversation-scoped agent code (`RH1`) allocated
         // once by the caller for THIS invocation: the section header shows the code,
@@ -4585,12 +4792,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const createSection = (
             container: HTMLElement,
             agentName: string,
-            role: 'primary' | 'subagent',
+            structure: SectionStructure,
             label: string,
             collapse?: SectionCollapse
         ): AgentSection => {
             const root = el('section', 'agent');
-            root.dataset.role = role;
+            // Only ever a stated rank: `data-rank` absent means "this renderer was never
+            // told", which the tests read as absence rather than as Rank A.
+            if (structure.rank !== undefined) root.dataset.rank = structure.rank;
+            if (structure.root === true) root.dataset.root = 'true';
             // Paint the section: `.agent-name` reads `--agent-color`, so a flat/legacy
             // section inside the tile flow is coloured like every other agent-owned
             // surface. The helper also mirrors the name on `data-agent` (cleared for an
@@ -4800,7 +5010,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 const name = entry.select.querySelector('.thread-name');
                 if (name !== null) name.textContent = label;
             }
-            // The section head (a flat legacy subagent) carries the same code.
+            // The section head of a section that is NOT the tile's root flow carries the same code.
             const head = entry.section.root.querySelector('.agent-name');
             if (head !== null) head.textContent = label;
         };
@@ -4822,6 +5032,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         };
 
         const paintPersistentMarkers = (): void => {
+            // R1: decide which compiled row is a conversation's CARD and which is an exchange
+            // inside it BEFORE any label or marker is painted, so the visible name, the row's
+            // position and `data-persistent-thread` all come from one pass over the same
+            // server-authored facts. This is the single point every paint path reaches: the
+            // hydration render, a whole-tree reconcile, one addressed ops frame (a late
+            // `threadId`, a `section:remove` that deletes a card) and a roster landing.
+            syncCompiledConversationCards();
+
             for (const entry of threads.values()) {
                 // The ROOT invocation has no row (its surface is the tile body), so
                 // it has nothing to mark; its label is painted separately.
@@ -5263,10 +5481,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // through by the metadata doors; a synthesized placeholder and a compiled-plane
             // row (keyed by the server's `section.id`, already unique per run) pass none.
             epoch?: string;
+            // R1: the persistent conversation this row is a LATER RUN of, when another row of
+            // this tile is that conversation's card (see `ThreadEntry.exchangeOf`). Only the
+            // compiled card builder sets it, and only from a PROVABLE conversation id.
+            exchangeOf?: string;
         }): ThreadEntry => {
             const existing = threads.get(options.key);
             if (existing !== undefined) return existing;
 
+            // R1: one conversation, one visible name. Everything else about an exchange row is
+            // the row of a run like any other (its own strip, meta, body and detail routes).
+            const exchange = options.exchangeOf !== undefined;
             const place = threadRowOf(options.parentKey);
             const bodyId = `thread-${++nextId}-body`;
 
@@ -5280,6 +5505,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // without parsing a NUL-joined attribute; nothing renders it.
             threadRow.dataset.threadId = options.key;
             if (options.epoch !== undefined) threadRow.dataset.runEpoch = options.epoch;
+            // R1: the row states, in data rather than in a repeated name, that it is a LATER
+            // EXCHANGE of another card. `data-thread-exchange` is the same figure the raw path
+            // gives a continuation turn row (:3058), so one vocabulary names "this block belongs
+            // to that conversation" across both planes, and `data-parent-thread` (written by
+            // `orderThreadRows`) names the card itself.
+            if (options.exchangeOf !== undefined) {
+                threadRow.classList.add('is-exchange');
+                threadRow.dataset.threadExchange = options.exchangeOf;
+            }
             // Same painting rule as the tile: an unnamed/placeholder agent writes NO
             // `data-agent` (not `data-agent=""`) so every block shares one neutral
             // semantics and `[data-agent]` only matches a real identity.
@@ -5321,8 +5555,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 return match === undefined ? undefined : threadNameOf(match);
             })();
             reserveConversationLabel(conversationLabel);
-            const label = conversationLabel ?? nextLabel(options.agent);
+            // R1: an exchange row consumes NO fallback number. Its conversation code is its
+            // card's, and the allocator exists for rows the reader actually reads a code from,
+            // so merging a run must never renumber the threads after it.
+            const label = conversationLabel ?? (exchange ? '' : nextLabel(options.agent));
             const name = el('span', 'thread-name', label);
+            // R1/D2: an exchange row's REPEATED code is withdrawn by the stylesheet, not by the
+            // `hidden` attribute. `[hidden] { display: none !important }` (styles.css:124)
+            // collapses the row's flex slot, and `.thread-preview` — the only flexible item of
+            // `.thread-select` (styles.css:4016) — then starts one badge width left of the card
+            // row's preview: the exact misalignment the raw plane solved with `visibility`
+            // (styles.css:3434-3445). The element keeps its text so the slot stays the card's
+            // width, and styles.css applies `visibility: hidden` from the row's own role marker
+            // (`data-thread-exchange`, set below; `data-thread-repeat` for a cross-tile repeat).
+            // The name element stays in every state so `paintEntryLabel` keeps one honest writer
+            // and a row promoted back to a card reads its code again.
             const kindTag =
                 options.kind === 'fork' || options.kind === 'autoanswer'
                     ? el('span', 'thread-kind', options.kind === 'fork' ? 'fork' : 'auto')
@@ -5430,6 +5677,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // First evidence wins and is never rewritten (the same rule the server's
                 // projector applies when it binds a row's epoch).
                 ...(options.epoch === undefined ? {} : { epoch: options.epoch }),
+                // R1: the conversation this row is an exchange of (undefined = this row is a card).
+                ...(options.exchangeOf === undefined ? {} : { exchangeOf: options.exchangeOf }),
                 kindTag,
                 started: options.started,
                 state: options.state,
@@ -5444,7 +5693,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // collapse and deliberately does NOT route through `focusThread` the way the
                 // header button does for a PERSISTENT child (see that handler): pressing the
                 // chevron moves this card's body, it never re-targets the composer.
-                section: createSection(threadFlow, options.agent, 'subagent', label, {
+                section: createSection(threadFlow, options.agent, { rank: rankForAgent(options.agent) }, label, {
                     label: 'thread',
                     controls: bodyId,
                     collapse: () => setThreadExpanded(entry, false)
@@ -5512,6 +5761,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // toggles invocation detail only, moves no focus and scrolls NOTHING —
             // BY DESIGN, an ephemeral detail card is not a position in the transcript.
             select.addEventListener('click', () => {
+                // R1: a LATER RUN of a conversation is not its own steerable surface — the card
+                // above is that conversation — so pressing an exchange row opens THIS run's
+                // detail inline and moves no focus, exactly like a threadless invocation row.
+                // Routing it through `focusThread` would open the card and leave the pressed row
+                // closed, which reads as a dead control.
+                if (entry.exchangeOf !== undefined) {
+                    setThreadExpanded(entry, !entry.expanded);
+                    return;
+                }
+
                 const persistent = persistentIdOf(entry);
                 if (persistent !== undefined) {
                     if (entry.expanded && focusedThreadId === persistent) {
@@ -5557,11 +5816,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const existing = threads.get(ROOT_KEY);
             if (existing !== undefined) return existing.section;
 
-            // The first agent to emit anything in the turn is the primary one;
-            // every other agent is a delegated subagent. Inferred from the event
-            // stream (the descriptor's agent order need not match the configured
-            // primary), and only when the data actually says so.
-            if (primaryAgent === undefined) primaryAgent = agentName;
+            // The first agent to emit anything in the turn OWNS the tile's root
+            // flow; every other agent's block is nested. Inferred from the event
+            // stream (the descriptor's agent order need not match the order events
+            // arrive in), and only when the data actually says so. R20: this is a
+            // structural fact, not an authority claim — the agent that happens to run
+            // a turn's root flow can hold any rank.
+            if (firstAgentOfTurn === undefined) firstAgentOfTurn = agentName;
 
             // R3: the MAIN block is agent-owned too, so the tile itself carries the
             // agent's outline/name colour (identical treatment to `.thread-tile`).
@@ -5593,15 +5854,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // sibling exchange inside an open CONVERSATION (T12b, styles.css
             // `.conversation.is-expanded .tile-body`): closing the conversation is what
             // actually hides what the reader is looking at.
-            const section = createSection(flow, agentName, 'primary', label, {
+            const section = createSection(flow, agentName, { root: true, rank: rankForAgent(agentName) }, label, {
                 label: 'conversation',
                 controls: `${id}-body`,
                 collapse: () => collapse()
             });
             // R1/F3: the compact root header shows the same code as a child header.
-            // The section's own `.agent-head` is hidden by CSS for the primary part
-            // (the code would otherwise appear twice); flat legacy subagent sections
-            // keep their head because they are DIFFERENT agents that need telling apart.
+            // The section's own `.agent-head` is hidden by CSS for the ROOT block
+            // (styles.css keys on `data-root='true'`; the code would otherwise appear
+            // twice); flat legacy sections keep their head because they are DIFFERENT
+            // agents that need telling apart.
             tileAgent.textContent = label;
             tileAgent.hidden = false;
             syncRootAgentVisibility();
@@ -5656,9 +5918,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const existing = threads.get(key);
             if (existing !== undefined) return existing.section;
 
-            // The first flat agent of an unknown stream with no root yet is the
-            // entry agent (the pre-thread behaviour).
-            if (threads.get(ROOT_KEY) === undefined && primaryAgent === undefined) {
+            // The first flat agent of an unknown stream with no root yet RUNS THE
+            // ROOT FLOW (the pre-thread behaviour) — which says nothing about its rank.
+            if (threads.get(ROOT_KEY) === undefined && firstAgentOfTurn === undefined) {
                 return rootSection(agentName);
             }
 
@@ -5666,7 +5928,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // invocation of that agent; the same label goes to the header and to the
             // entry (R2).
             const label = nextLabel(agentName);
-            const section = createSection(flow, agentName, 'subagent', label);
+            const section = createSection(flow, agentName, { rank: rankForAgent(agentName) }, label);
             threads.set(key, {
                 key,
                 agent: agentName,
@@ -6884,7 +7146,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // reports results without calls, or a missed tool_call): show it rather
             // than dropping information. It belongs to the root invocation when one
             // emitted, otherwise to a truthful flat section for that agent name.
-            const owner = threads.get(ROOT_KEY) ?? inlineEntry(primaryAgent ?? UNNAMED_AGENT_PLACEHOLDER);
+            const owner = threads.get(ROOT_KEY) ?? inlineEntry(firstAgentOfTurn ?? UNNAMED_AGENT_PLACEHOLDER);
             const section = owner.section;
             const card = createToolCallCard(name, '');
             card.resolve(content, outcome);
@@ -6946,7 +7208,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // Invocation rows live OUTSIDE the tile flow, so clearing the flow alone
             // would leave orphan entries after a superseding record arrives.
             threadHost.replaceChildren();
-            primaryAgent = undefined;
+            firstAgentOfTurn = undefined;
             toolCount = 0;
             appliedCount = 0;
             appliedEvents.length = 0;
@@ -7806,19 +8068,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // this are the same ones `compiledEntryOf` uses to decide which surface a section's
         // nodes land in, and they are checked in the same order, so a section can never be
         // "root" to the bar and "nested" to the flow:
-        //   - `role === 'primary'` (turn-display.ts:199, the entry agent's own flow);
-        //   - otherwise the FIRST section when it has no `parentSectionId` — the projector
-        //     allocates the turn's own flow before anything nested (turn-display.ts:445).
-        // A tree with neither (an empty or legacy document) has no root strip to paint.
-        const rootSectionOf = (display: TurnDisplay | undefined): TurnSection | undefined => {
-            const sections = sectionsOf(display);
-            const primary = sections.find((section) => section.role === 'primary');
-            if (primary !== undefined) return primary;
-
-            const first = sections[0];
-
-            return first !== undefined && first.parentSectionId === undefined ? first : undefined;
-        };
+        //   - the FIRST section with NO `parentSectionId` — the projector allocates the
+        //     turn's own flow before anything nested (turn-display.ts:445).
+        //
+        // R20: the old `role === 'primary'` shortcut is gone, and the position test is the
+        // ONLY test. A rank cannot identify a root section, because any number of sections
+        // may carry the same rank (two Rank A agents, or a Rank C entry agent whose whole
+        // team outranks it). A tree with no parentless section (an empty document, or one
+        // whose root the projector never emitted) has no root strip to paint.
+        const rootSectionOf = (display: TurnDisplay | undefined): TurnSection | undefined =>
+            sectionsOf(display).find((section) => section.parentSectionId === undefined);
 
         /**
          * Re-derive EVERY strip this tile owns from the tree it is painting (T19, R17).
@@ -7893,6 +8152,174 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             step.outcome ??
             (step.state === 'ok' ? 'completed' : step.state === 'cancelled' ? 'cancelled' : 'failed');
 
+        // --- ONE CARD PER PERSISTENT CONVERSATION (R1) ----------------------
+        //
+        // The server's fold is per RUN and stays that way: it is a tested contract
+        // (../server/turn-projector.ts:624-663, "ONE SECTION PER RUN") and the live and cold
+        // trees are identical BECAUSE of it. What the fold cannot know is that two sections of
+        // ONE turn can be two runs of ONE conversation. A `threadSend` reply-run is deliberately
+        // spawned with NO parent so it does not nest under the caller's tool call
+        // (../harness.ts:6794-6798), it is non-blocking so its frames are recorded into the
+        // CALLER's turn (../server/sessions.ts:2766-2781), and the projector's `route()` then
+        // falls through to `createChild` — which stamps the EXISTING conversation's `threadId`
+        // on a brand-new section (../server/turn-projector.ts:1402) and the same conversation
+        // LABEL, because the label join binds one entry per RUN key (../server/sessions.ts
+        // `labelJoinsOf`). The tile therefore receives two sections that read identically, and
+        // the compiled card builder keyed one card per section: the same thread name twice
+        // beside one parent, which is the reported defect.
+        //
+        // The display-side rule, mirroring what the raw path already pins
+        // (./thread-conversation.test.ts:208/:688/:1120): the FIRST section of a provable
+        // conversation owns the card, and every later section of that conversation is an
+        // ordered EXCHANGE under it — one name for the conversation, every run still its own
+        // inspectable row (its own strip, clock, flow and lazy detail routes, R3).
+        //
+        // Proof, never inference: only `TurnSection.threadId` or a UNIQUE roster claim on the
+        // section's run id counts. `rosterClaimOf` refuses an ambiguous claim, which is how the
+        // identical-sibling case (./thread-conversation.test.ts:1302) keeps two cards, and a
+        // section with no provable conversation keeps its own card. Task text is never compared,
+        // and the recycled-invocation-id pair of ./turns-compiled-run-epoch.test.ts:314 carries
+        // no `threadId` at all, so two runs of DIFFERENT threads are never over-merged (R5).
+        //
+        // The scope is the TILE, which is where the compiled plane's identity lives: runs that
+        // landed in DIFFERENT turns are different tiles, and the raw path groups those at the
+        // board level (`placeTurn`), not here.
+
+        // The persistent conversation a compiled section belongs to, or undefined when the
+        // payload does not prove one.
+        const compiledConversationOf = (section: TurnSection | undefined): string | undefined => {
+            if (section === undefined) return undefined;
+
+            // The server names the conversation on the section when it can resolve one (T18),
+            // and the cold fold fills the same field from the loaded `invocationThreads`
+            // (../server/turn-projector.ts:1433-1436) — so this is a persisted fact, available
+            // on a fresh reload with no live state at all (R2).
+            const direct = section.threadId;
+            if (direct !== undefined && direct.length > 0) return direct;
+
+            // Otherwise the roster is the only authority, and only when exactly one conversation
+            // claims this run (`invocationId` / `originInvocationId` / the historical
+            // `invocationIds`). A section's own id is deliberately NOT tried: it is a projection
+            // ordinal, never a roster key.
+            const run = section.invocationId;
+            if (run === undefined || run.length === 0) return undefined;
+
+            return rosterClaimOf(run)?.id;
+        };
+
+        // The section that owns the CARD for one conversation in this tile. `compiledSections`
+        // is inserted in the server's allocation order — the projector opens a parent before its
+        // children and a reply-run's section after the run it continues — so the FIRST match is
+        // the card and every later match is its exchange. Nothing is cached: when the card's
+        // section is dropped (`section:remove`, a deleted invocation) the next pass promotes the
+        // next run, and a `threadId` that arrives late re-keys the row that is already on screen
+        // rather than minting a copy (R4).
+        const compiledConversationCardOf = (conversation: string): ThreadEntry | undefined => {
+            for (const entry of compiledSections.values())
+                if (compiledConversationOf(entry.compiledSection) === conversation) return entry;
+
+            return undefined;
+        };
+
+        // Flip one compiled row between CARD and EXCHANGE without re-creating it: the visible
+        // name and the row's parent are the two figures that carry the role, so they move
+        // together and everything else about the row (its section id, strip, flow, clock, dialog
+        // and transcript routes) is untouched.
+        //
+        // Returns whether the row's POSITION moved, so the caller orders the rows once per pass
+        // instead of once per row.
+        const setThreadExchangeRole = (
+            entry: ThreadEntry,
+            conversation: string | undefined,
+            cardKey: string | undefined
+        ): boolean => {
+            if (entry.row === undefined) return false;
+
+            // A card hangs off the section that spawned it (`parentSectionId`, absent for a
+            // direct child of the turn's own flow); an exchange hangs off the card it belongs
+            // to. `orderThreadRows` then places it directly after that card's subtree, one level
+            // deeper, and stamps `data-parent-thread` with the card's section id — the recorded
+            // hierarchy as ORDER and IDENTITY rather than DOM nesting (R18).
+            const parentKey =
+                conversation === undefined
+                    ? entry.compiledSection?.parentSectionId ?? ROOT_KEY
+                    : cardKey ?? ROOT_KEY;
+
+            if (entry.exchangeOf === conversation && entry.parentKey === parentKey) return false;
+
+            const moved = entry.parentKey !== parentKey;
+
+            entry.exchangeOf = conversation;
+            entry.parentKey = parentKey;
+
+            // The name element keeps its single writer (`paintEntryLabel`), and its rendering is
+            // driven by the role marker below — NOT by the `hidden` attribute, whose
+            // `display: none !important` (styles.css:124) would collapse this row's flex slot and
+            // shift `.thread-preview` out of column (D2; the raw plane's `visibility` treatment at
+            // styles.css:3434-3445 is the device this mirrors). Clearing the attribute also undoes
+            // any pass that set it before this marker existed.
+            const name = entry.select?.querySelector<HTMLElement>('.thread-name');
+            if (name !== undefined && name !== null) name.hidden = false;
+
+            entry.row.classList.toggle('is-exchange', conversation !== undefined);
+            if (conversation === undefined) delete entry.row.dataset.threadExchange;
+            else entry.row.dataset.threadExchange = conversation;
+            // A row that stops being a card stops being a cross-tile card candidate, so it must
+            // not keep a repeat mark until the next board pass sees it again.
+            if (conversation !== undefined) delete entry.row.dataset.threadRepeat;
+
+            return moved;
+        };
+
+        // Re-derive the role of every compiled row this tile owns. A PASS rather than a
+        // creation-time decision, because the evidence arrives at different times: the roster can
+        // land after the rows, a `section:set` can deliver `threadId` late (the T18 patch), and a
+        // card can be removed by `section:remove` — each changes which section owns the card, and
+        // the rows on screen have to move (R4) without ever duplicating.
+        //
+        // Termination: every `parentKey` this writes points at a section EARLIER in the map's
+        // insertion order (the card of a conversation is the first section naming it, and a real
+        // `parentSectionId` is always allocated first), so the parent chain cannot cycle.
+        const syncCompiledConversationCards = (): void => {
+            // No `compiledSections.size < 2` fast path: a tile with ONE section still has to
+            // publish its card election (`data-thread-card`), and a board-wide rule keyed on that
+            // marker would otherwise miss the single-run tile — the common shape of a reply-run
+            // tile, which is exactly the case R6 closes.
+
+            let moved = false;
+
+            for (const [sectionId, entry] of compiledSections) {
+                // The turn's own flow has no row of its own (its surface is the tile body), but
+                // it still takes part above as a card: a later run of the TURN's conversation
+                // belongs inside the tile, which is what `cardKey = ROOT_KEY` places.
+                const conversation = compiledConversationOf(entry.compiledSection);
+                const card = conversation === undefined ? undefined : compiledConversationCardOf(conversation);
+                const ownsCard = conversation !== undefined && card !== undefined && card.key === sectionId;
+
+                // R6: publish the card election where the BOARD can see it. The session-wide
+                // one-code rule (`syncCompiledThreadRepeats`, :3307) is board-scoped and this
+                // tile owns the evidence, so the election is stamped on the row it elects and the
+                // board reads markers only. The value is the SAME provable id this pass derived
+                // (`TurnSection.threadId`, else a unique roster claim) — never a guess, and never
+                // the section id, which the roster does not know. Only a row that IS a card ever
+                // carries it, which is what keeps an optimistic/rows-only tile out of the rule.
+                if (entry.row !== undefined) {
+                    if (ownsCard) entry.row.dataset.threadCard = conversation as string;
+                    else delete entry.row.dataset.threadCard;
+                }
+
+                // No card, or this row IS the card: an ordinary row of its own.
+                if (conversation === undefined || card === undefined || card.key === sectionId) {
+                    if (setThreadExchangeRole(entry, undefined, undefined)) moved = true;
+                    continue;
+                }
+
+                if (setThreadExchangeRole(entry, conversation, card.key)) moved = true;
+            }
+
+            if (moved) orderThreadRows();
+        };
+
         // The entry that owns one server section, creating it on first sight.
         //
         // `display` is the compiled tree this tile is painting (the whole-tree paths have
@@ -7905,31 +8332,31 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             compiledMode = true;
 
             // The ROOT flow is the turn's own section; every other section is a nested
-            // invocation with its own row. Two server figures say this, and either wins:
-            //   - `role === 'primary'` (turn-display.ts:199, the entry agent's own flow);
-            //   - NO `parentSectionId` (turn-display.ts:397) ON THE SECTION THE TREE ORDERS
-            //     FIRST — the projector allocates the turn's own flow before anything nested
-            //     (turn-display.ts:445), so "first and parentless" IS the root.
+            // invocation with its own row. ONE server figure says this: NO
+            // `parentSectionId` (turn-display.ts:397) ON THE SECTION THE TREE ORDERS FIRST
+            // — the projector allocates the turn's own flow before anything nested
+            // (turn-display.ts:445), so "first and parentless" IS the root.
             //
-            // `role` alone is not enough: a PERSISTENT CHILD conversation owns turns of its
-            // own whose root run is that CHILD's agent, and the projector stamps that section
-            // `role: 'subagent'` (`agent === context.primary` compares against the ENTRY
-            // agent, turn-projector.ts:450). The tile is still that turn's exchange, so its
-            // flow belongs in `.tile-flow`, never in an indented `.thread-row` — the same
-            // discrimination the raw fold makes with `isConversationRoot` (turns.ts:4043) and
-            // the rule thread-conversation-shell.test.ts pins.
+            // R20: the rank is NOT consulted, and the old `role === 'primary'` shortcut is
+            // gone with the field. A rank identifies an agent's authority, never which flow
+            // a tile owns: a PERSISTENT CHILD conversation's own turns run that CHILD's
+            // agent at whatever rank the roster map gives it — possibly the same letter as
+            // the entry agent — and the tile is still THAT turn's exchange, so its flow
+            // belongs in `.tile-flow`, never in an indented `.thread-row`. That is the same
+            // discrimination the raw fold makes with `isConversationRoot` and the rule
+            // thread-conversation-shell.test.ts pins.
             //
-            // The position test matters the other way too: a branch/fork of the root ALSO has
-            // no `parentSectionId` (`HarnessThread.parentId` is "omitted for a direct child of
-            // the root", types/index.ts:1664), and only its place after the root keeps it a
-            // nested row. With no tree to order against (an ops frame that arrived without
-            // one), the honest equivalent is "this tile has no root flow yet".
+            // The position test matters the other way too: a branch/fork of the root ALSO
+            // has no `parentSectionId` (`HarnessThread.parentId` is "omitted for a direct
+            // child of the root", types/index.ts:1664), and only its place after the root
+            // keeps it a nested row. With no tree to order against (an ops frame that
+            // arrived without one), the honest equivalent is "this tile has no root flow
+            // yet", which is what the fallback below states.
             const root =
-                section.role === 'primary' ||
-                (section.parentSectionId === undefined &&
-                    (display !== undefined
-                        ? sectionsOf(display)[0]?.id === section.id
-                        : threads.get(ROOT_KEY) === undefined));
+                section.parentSectionId === undefined &&
+                (display !== undefined
+                    ? sectionsOf(display)[0]?.id === section.id
+                    : threads.get(ROOT_KEY) === undefined);
             let entry: ThreadEntry;
 
             if (root) {
@@ -7959,6 +8386,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // literal's no-op: the tile owns that surface and destroys it with the tile.
                 entry.contextBar = tileContextBar;
             } else {
+                // R1: is this run a LATER run of a conversation this tile already shows? This
+                // section is not registered in `compiledSections` yet, so a match can only be an
+                // EARLIER run of the same persistent conversation, and the id is provable server
+                // data (`threadId` / a unique roster claim) rather than a guess (R2).
+                const conversation = compiledConversationOf(section);
+                const card = conversation === undefined ? undefined : compiledConversationCardOf(conversation);
+
                 entry = createThread({
                     // The server's section id is the card's identity: stable across a
                     // restart (turn-display.ts:50) and opaque by contract, so nothing
@@ -7976,11 +8410,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     callId: undefined,
                     // A direct child of the turn's own flow has no `parentSectionId` (see above),
                     // and its parent surface is the tile body — registered under ROOT_KEY.
-                    parentKey: section.parentSectionId ?? ROOT_KEY,
+                    // R1: an EXCHANGE hangs off the card of its conversation instead, which is
+                    // what places it directly after that card, one level deeper.
+                    parentKey: card?.key ?? section.parentSectionId ?? ROOT_KEY,
                     explicitId: section.invocationId ?? section.threadId,
                     started: section.state !== 'open',
                     state: sectionThreadState(section.state),
-                    branchId: section.branchId
+                    branchId: section.branchId,
+                    // R1: the role marker (see `ThreadEntry.exchangeOf`) — set only when this run
+                    // is a later run of a conversation an earlier section already owns.
+                    ...(conversation === undefined || card === undefined ? {} : { exchangeOf: conversation })
                 });
             }
 
@@ -7999,7 +8438,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             return entry;
         };
 
-        // Paint a section's server-authored identity: label, nesting, role, thread
+        // Paint a section's server-authored identity: label, nesting, rank, thread
         // join, model, clock and token figures. Everything ARRIVES; the local label
         // allocator and the roster invocation join are the raw path's fallbacks and
         // are deliberately not consulted first.
@@ -8037,8 +8476,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (section.model !== undefined && section.model.length > 0)
                 entry.section.root.dataset.model = section.model;
 
-            // R3: only the structural role attribute; there is no visible badge.
-            entry.section.root.dataset.role = section.role;
+            // R3/R20: only the structural rank attribute; there is no visible badge. This
+            // is the server's OWN stamp (`TurnSection.rank`, resolved from the frozen
+            // definition's rank map), so it overrides whatever `TurnBoardOptions.ranks` the
+            // live fold guessed at creation — and several sections legitimately share one
+            // letter, which is exactly what the old primary/subagent pair could not express.
+            entry.section.root.dataset.rank = section.rank;
 
             // T47 (U3 parity): the ROOT entry has no `meta` of its own — its header figures
             // are the TILE's `blockMeta` (lines 5254/5268/6686 already pair the two with
@@ -8240,7 +8683,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // `durationMs` when the recorded result carried one, otherwise the span between
                 // the step's own `startedAt` and `endedAt` (the projector stamps both from the
                 // recorded `eventTimes`). This is the raw path's rule verbatim
-                // (`durationMs ?? elapsedBetween(startedAt, finishedAt)`, turns.ts:5024-5028);
+                // (`durationMs ?? elapsedBetween(tool.startedAt, finishedAt)`, turns.ts:7069);
                 // passing `undefined` here would leave the card ticking from `startedAt` to NOW,
                 // which prints an absurd elapsed time for a recorded call.
                 card.resolve(step.preview ?? '', outcome, step.durationMs ?? elapsedBetween(step.startedAt, step.endedAt));
@@ -9440,7 +9883,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // once anything has been painted; `rootSection` is the documented way to
         // create it, so an empty compiled turn still has its flow.
         const entry0Section = (): AgentSection =>
-            threads.get(ROOT_KEY)?.section ?? rootSection(primaryAgent ?? UNNAMED_AGENT_PLACEHOLDER);
+            threads.get(ROOT_KEY)?.section ?? rootSection(firstAgentOfTurn ?? UNNAMED_AGENT_PLACEHOLDER);
 
         // Drop everything this path painted. Cards own timers and dialogs, so each is
         // destroyed before its node leaves the document.
@@ -9462,7 +9905,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             settledCalls.clear();
             flow.replaceChildren();
             threadHost.replaceChildren();
-            primaryAgent = undefined;
+            firstAgentOfTurn = undefined;
             toolCount = 0;
             blockMeta.clearUsage();
             tileAgent.textContent = '';
@@ -9576,11 +10019,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         break;
                     }
 
-                    // A second agent in the same turn is a delegation. R3: only the
-                    // STRUCTURAL role attribute is updated — there is no visible
-                    // role badge to relabel, the nesting and the agent colour carry
-                    // the hierarchy.
-                    section.root.dataset.role = event.agent === primaryAgent ? 'primary' : 'subagent';
+                    // A second agent in the same turn is a delegation. R3/R20: only the
+                    // STRUCTURAL rank attribute is refreshed — there is no visible role
+                    // badge to relabel, and the nesting plus the agent colour carry the
+                    // hierarchy. A rank the map does not state is REMOVED rather than
+                    // guessed, so `data-rank` never claims more than the data says.
+                    const statedRank = rankForAgent(event.agent);
+
+                    if (statedRank === undefined) delete section.root.dataset.rank;
+                    else section.root.dataset.rank = statedRank;
                     break;
                 }
 
@@ -9821,7 +10268,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         section,
                         streamed !== undefined && streamed.length > 0 ? streamed : message.content
                     );
-                    // `done` closes one *agent* turn, which may be a subagent nested
+                    // `done` closes one *agent* turn, which may be a delegated member's flow nested
                     // inside a tool call. The user turn only settles when the stream
                     // itself ends, so the tile state is left alone.
                     //
@@ -10264,7 +10711,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             elapsed: () => blockMeta.elapsed.textContent ?? '',
             tokens: () => blockMeta.tokens.textContent ?? '',
             setUsage,
-            summary: () => ({ agents: threads.size, tools: toolCount, primary: primaryAgent }),
+            summary: () => ({ agents: threads.size, tools: toolCount, rootAgent: firstAgentOfTurn }),
             attachments: () => attachmentRecords,
             setAttachments,
             blocks,
@@ -10423,7 +10870,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
     // Rebuild one tile from the server's record. Replaying the events (rather
     // than trusting browser state) is what makes a reload render the same
-    // transcript: `events` includes subagent events the server recorded.
+    // transcript: `events` includes every member's events the server recorded.
     const adopt = (
         source: SessionTurn,
         model?: string,
@@ -10874,6 +11321,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         const display = view === undefined ? undefined : displayOfView(view, turnId);
         handle.applyOps(ops, display);
+        // R6: an ops frame changes ONE tile, and this is the only place that sees it, so the
+        // session-wide code rule is re-derived here too — otherwise a tile whose card appeared
+        // (or was removed) by a frame would keep the marks its last full projection left.
+        syncCompiledThreadRepeats();
 
         return true;
     };

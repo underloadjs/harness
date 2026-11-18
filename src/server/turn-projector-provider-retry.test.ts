@@ -56,7 +56,7 @@ const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     ...overrides
 });
 
-const CONTEXT: DisplayProjectContext = { primary: 'one' };
+const CONTEXT: DisplayProjectContext = { entry: 'one' };
 
 // One recorded event per 10 ms, so every `at` is an exact number (same rule as
 // ./turn-projector.test.ts:46, which keeps the two files' timestamps comparable).

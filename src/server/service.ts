@@ -96,7 +96,7 @@ import { bodyLimitFor, SERVICE_MOUNT } from './api';
 import type { HarnessApi, HarnessApiEmit, HarnessApiStream } from './api';
 import { isLoopbackHostname, isPagesOrigin } from '../shared/origin';
 import type { HarnessRuntime } from './runtime';
-import { getHarnessRuntime } from './runtime';
+import { getHarnessRuntime, prepareHarnessKnowledge } from './runtime';
 // T15: the update stream rides the same mount; this import is types + the route string only, so
 // the HTTP adapter does not depend on the transport implementation.
 import { HARNESS_WS_STREAM_PATH, rejectUpgrade } from './stream';
@@ -427,14 +427,22 @@ const readBoundedBody = async (context: ServiceEndpointContext, limit: number): 
     }
 };
 
+// The root THIS request's runtime belongs to: the loader's `variables.root` (DATABASE_ROOT,
+// ./service.ts:338) unless the embedder pinned one. Factored out of `resolveRuntime` so the
+// async handler can await the knowledge load for the SAME root before it builds the runtime.
+const rootForRuntime = (
+    options: HarnessServiceHandlerOptions,
+    variables: Record<string, unknown> | undefined
+): string | null | undefined =>
+    options.root === undefined ? rootFromVariables(variables) : normalizeHarnessDatabaseRoot(options.root);
+
 // Resolve the root-keyed runtime once, so the HTTP handler and the stream upgrade below can never
 // land on different stores (and therefore different epochs) for the same DATABASE_ROOT.
 const resolveRuntime = (
     options: HarnessServiceHandlerOptions,
     variables: Record<string, unknown> | undefined
 ): HarnessRuntime => {
-    const root =
-        options.root === undefined ? rootFromVariables(variables) : normalizeHarnessDatabaseRoot(options.root);
+    const root = rootForRuntime(options, variables);
 
     // T5 (R1/R3): `execution` forwards a host-configured server RUNTIME (notably
     // `threadExecution`) into the root-keyed runtime, which resolves it over
@@ -539,6 +547,17 @@ export const createHarnessServiceHandler = (
         if (Number.isFinite(declared) && declared > limit) {
             return { status: 413, response: { error: { message: bodyTooLargeMessage(limit) } } };
         }
+
+        // T7: the knowledge base is awaited BEFORE the runtime is resolved, because resolving the
+        // runtime is what restores every saved session and builds its harness — and a harness
+        // cannot await. One memoized load per root (./runtime.ts), so after the first request
+        // this line costs a microtask, and a deployment whose first request IS a WebSocket
+        // upgrade (the sync route below cannot await) still shares one engine and adopts the
+        // store when it lands. Failures are swallowed HERE on purpose: a session store answers a
+        // prompt without knowledge, and `createHarnessRuntime` prints the reason once. The
+        // standalone listener treats the same failure as fatal (./start.ts), which is the
+        // difference between an operator starting a server and a request arriving at one.
+        await prepareHarnessKnowledge(rootForRuntime(options, variables)).catch(() => undefined);
 
         // R3b: the loader's third argument is the storage boundary. The runtime is
         // selected PER ROOT, so a request for a different DATABASE_ROOT can never

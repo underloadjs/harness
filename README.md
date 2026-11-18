@@ -64,8 +64,8 @@ same way (R18): `read`, `write`, `edit`, `glob`, and `grep` are core, while
 `files`, `shell`, `gitDiff`, `syntax`, and the always-registered
 `download` are discovered through the
 core `toolRequest` tool — see [Tool discovery](#tool-discovery). The harness-owned
-`toolRequest` and `tasks` (plus `delegate` when
-subagents exist) are also declared up front and are the only session-bound core
+`toolRequest` and `tasks` (plus `delegate` while the rank map lets some agent
+delegate) are also declared up front and are the only session-bound core
 tools. Every other harness-owned row — `toolRegistry`, `toolList`, `toolManage`,
 `toolCreate`, `records`, `profiles`, `chapters`, `locations`, `agentManage`, and
 `agentResult` — stays registered so `toolRequest` can enable it, but is searchable,
@@ -103,7 +103,7 @@ The runtime has three levels, and the distinction is load-bearing:
 
 Every configured agent owns a **default conversation** with id `agent:<name>`.
 Its transcript is the registry `Agent.messages`, so delegation keeps its
-historical behaviour (a subagent accumulates its conversation across calls) and
+historical behaviour (a delegated agent accumulates its conversation across calls) and
 `sendThreadInput('agent:<name>', …)` resumes exactly that history. Run events
 keep their existing invocation identity (`HarnessThread`, keyed by run id); the
 persistent thread is a separate record, joined through
@@ -244,8 +244,8 @@ threads satisfy this automatically.
   ends the route reverts, and nothing about the woken agent's standing conversation is
   rewired for the callers that come after it.
 
-Threads persist through snapshot v2 as an optional `threads`/`threadSequence`
-pair (absent while only default conversations exist). See `src/harness.ts` and
+Threads persist in the harness snapshot as an optional `threads`/`threadSequence`
+pair (absent while only default conversations exist). The key joined the format at v2 and is carried unchanged by the current version, `HARNESS_SNAPSHOT_VERSION = 3` (`src/core/snapshot.ts:107`). See `src/harness.ts` and
 `src/types/index.ts` for the full contract.
 
 ### Layout
@@ -748,7 +748,7 @@ true`), so its tools are available with no imports at all. The five core file to
 (`read`, `write`, `edit`, `glob`, `grep`)
 plus a configured `search` (and `fetch` when the harness opted into `webfetch`) are
 declared from the first request, together with the harness-owned `toolRequest` and
-`tasks` (and `delegate` when subagents exist). Every other harness-owned row —
+`tasks` (and `delegate` while some agent may delegate under `ranks`). Every other harness-owned row —
 `toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `records`, `profiles`,
 `chapters`, `locations`, `agentManage`, and `agentResult` — plus the
 conditional `actionRequest` (`interaction` configured) and `threadFork`
@@ -788,8 +788,9 @@ the difference. `limit` narrows only the current query and is not a global cap;
 repeating an identical query is idempotent (no hidden paging cursor).
 
 Core tools the caller already has are reported separately in `alreadyAvailable`
-(metadata only). The motivating case is `delegate` in a harness with
-subagents: an exact wire-name, regex, or tag query names the tool instead of
+(metadata only). The motivating case is `delegate` in a harness whose rank map gives
+an agent a strictly-lower-ranked peer: an exact wire-name, regex, or tag query names
+the tool instead of
 claiming nothing matched. These entries are never enabled, never count against
 `maxEnabledTools`, and their tags are not reported in `unmatchedTags`.
 
@@ -797,14 +798,14 @@ claiming nothing matched. These entries are never enabled, never count against
 |---|---|
 | Query shape | `names` (exact, case-sensitive), `regex` (bare source or `/source/flags`), and `tags` are OR-ed into one union; each match appears once. An empty query enables nothing and returns the vocabulary. |
 | Tags | Trimmed, lowercased, deduplicated. Not required when `names` or `regex` is supplied. |
-| Default visibility | `'searchable'`. The declared core set is `read`/`write`/`edit`/`glob`/`grep`, the harness-owned `toolRequest`/`tasks`, a configured `search`/`fetch`, and `delegate` on a primary with subagents. Everything else is demand-discovered: `files`, `download`, `syntax`, `shell`, `gitDiff`, the app tools, and the eleven demoted harness-owned rows (`toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `actionRequest`, `threadFork`) — all still registered, so `toolRequest` can enable them (R9-R11). |
+| Default visibility | `'searchable'`. The declared core set is `read`/`write`/`edit`/`glob`/`grep`, the harness-owned `toolRequest`/`tasks`, a configured `search`/`fetch`, and `delegate` only for the agents that actually hold a strictly-lower-ranked target (the declaration is rank-projected per caller, see [Delegation](#delegation), so a junior sibling never sees it). Everything else is demand-discovered: `files`, `download`, `syntax`, `shell`, `gitDiff`, the app tools, and the eleven demoted harness-owned rows (`toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `actionRequest`, `threadFork`) — all still registered, so `toolRequest` can enable them (R9-R11). |
 | Core vs session-bound | `core` means declared on every request — unless this conversation switches the name off (the conversation-switch row below), which is the one thing `core` no longer implies. It also never spends a `maxEnabledTools` slot. Only the harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call); core file tools, `download`, `search`, and `fetch` run directly. |
 | Ranking | Exact requested names keep caller order. Name-regex hits follow, then tag matches ranked OR-style: a tool's rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties. |
 | Enabled bound | `maxEnabledTools` (default **32**) bounds the persistent SEARCHABLE enabled set at the model-turn boundary. Every selector kind (names, regex, tags) switches the set: this request's ordered matches lead, prior entries fill leftover capacity, overflow is `omitted`, and displaced prior names are `evicted`. Core tools are declared unless this conversation switched them off, and never count against the bound. |
-| Already available | Core tools the caller already has (`delegate` with subagents, `tasks`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the bound. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. A **conditionally declared** control is reported the same way while it is genuinely actionable: `toolCancel` appears in this list exactly when the caller has calls in flight AND this conversation has not switched it off, because it is declared only then — querying `cancel` must never answer "no such capability" about a tool the caller is holding, and must not promise one the conversation has hidden. |
+| Already available | Core tools the caller already has (`delegate` for a caller that can delegate, `tasks`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the bound. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. A **conditionally declared** control is reported the same way while it is genuinely actionable: `toolCancel` appears in this list exactly when the caller has calls in flight AND this conversation has not switched it off, because it is declared only then — querying `cancel` must never answer "no such capability" about a tool the caller is holding, and must not promise one the conversation has hidden. |
 | No match | when neither a searchable nor an already-available core tool matches, the result carries `unmatchedTags` and the full searchable `availableTags`, so the model retries with real vocabulary. Both are computed AFTER the withheld set is applied, so a name this conversation switched off contributes no tag and is honestly reported as unmatched. |
 | Undiscovered tool | calling one returns a tool result naming tags that would enable it — it does not run. |
-| Conversation switch (`withheldTools`) | Every REGISTERED name is switchable off and on for ONE conversation — the searchable rows, the core declarations (`toolRequest`, `tasks`, `delegate`, `read`/`write`/`edit`/`glob`/`grep`, a configured `search`/`fetch`, the thread group) and the pending-only `toolCancel` all included. The mechanism is a per-harness `withheldTools` Set (`src/harness.ts` `applyToolSwitch`, read back as `harness.withheldTools`), NOT cap-set membership: for a name with a cap slot a disable also frees that slot, and for a core or pending-only name the withheld set is the ONLY record, because such a name never had a slot to lose. It is REAL TIME — declarations, `toolRequest`'s catalogue and the launch gate read it per request and per launch, so a switch lands on a running thread's very next model request, which is why the `enabled`-only `PATCH /v1/harness/sessions/:id/tools/:toolId` has no idle gate and no `403` for a harness-owned name. It is INVISIBLE, not denied: a withheld name is absent from `tools`/`matched`/`omitted`, from `availableTags` and from `alreadyAvailable`, is never re-enabled by a match, and is not reported as `forbidden` (that field stays the delegation allowlist plus the deployment deny list). Calling it anyway answers `Tool "<name>" is switched off for this conversation by its user. Calling toolRequest will not find it and asking again will not change this answer.` (`src/harness.ts` `sessionDisableReason`). It gates the AGENTS ONLY: `harness.executeTool` / `context.callTool` (a nested call, and both execution routes) still run a switched-off name, and no other session or deployment setting moves. It PERSISTS as conversation state — the snapshot's additive `discovery.withheld`, omitted while empty, so `HARNESS_SNAPSHOT_VERSION` is still `2`, absent means empty, an unknown name is dropped leniently on restore rather than throwing — `reset()` clears it (a new conversation starts with everything on), and `src/server/sessions.ts` `pruneStaleEnabledTools` prunes a name this build no longer registers, so a stale switch is simply forgotten and a name that comes back later comes back ON. A worker lane starts from `LaneBlueprint.withheldTools` (`src/server/workers/protocol.ts`, filled by `blueprintFor`) and is kept honest on a live toggle by the one-way `sync.tools { enabled, withheld }` frame (`LaneToolStateSync`), posted by `lane-host.ts` `broadcastTools()` from `lane-authority.ts` `toolStateNow()`; the frame is additive — no `LANE_PROTOCOL_VERSION` bump — and a replica DROPS a name it cannot register instead of throwing. The hazards are the accepted cost: switching off `toolRequest` removes the model's only switching door, so recovery is user-side only; switching off `tasks`/`delegate`/the thread controls leaves the machinery running while the model loses its writer and dispatcher; switching off `toolCancel` leaves a model no way to withdraw an in-flight call; enabling a searchable name can still EVICT another enabled one through the cap; and a session can hold a name enabled while the deployment deny list still refuses it, because deployment outranks session. |
+| Conversation switch (`withheldTools`) | Every REGISTERED name is switchable off and on for ONE conversation â the searchable rows, the core declarations (`toolRequest`, `tasks`, `delegate`, `read`/`write`/`edit`/`glob`/`grep`, a configured `search`/`fetch`, the thread group) and the pending-only `toolCancel` all included. The mechanism is a per-harness `withheldTools` Set (`src/harness.ts` `applyToolSwitch`, read back as `harness.withheldTools`), NOT cap-set membership: for a name with a cap slot a disable also frees that slot, and for a core or pending-only name the withheld set is the ONLY record, because such a name never had a slot to lose. It is REAL TIME â declarations, `toolRequest`'s catalogue and the launch gate read it per request and per launch, so a switch lands on a running thread's very next model request, which is why the `enabled`-only `PATCH /v1/harness/sessions/:id/tools/:toolId` has no idle gate and no `403` for a harness-owned name. It is INVISIBLE, not denied: a withheld name is absent from `tools`/`matched`/`omitted`, from `availableTags` and from `alreadyAvailable`, is never re-enabled by a match, and is not reported as `forbidden` (that field stays the delegation allowlist plus the deployment deny list). Calling it anyway answers `Tool "<name>" is switched off for this conversation by its user. Calling toolRequest will not find it and asking again will not change this answer.` (`src/harness.ts` `sessionDisableReason`). It gates the AGENTS ONLY: `harness.executeTool` / `context.callTool` (a nested call, and both execution routes) still run a switched-off name, and no other session or deployment setting moves. It PERSISTS as conversation state â the snapshot's additive `discovery.withheld`, omitted while empty (`HARNESS_SNAPSHOT_VERSION` is `3` — the version bump came from the rank pass, not from this key — and it stays additive within v3), absent means empty, an unknown name is dropped leniently on restore rather than throwing â `reset()` clears it (a new conversation starts with everything on), and `src/server/sessions.ts` `pruneStaleEnabledTools` prunes a name this build no longer registers, so a stale switch is simply forgotten and a name that comes back later comes back ON. A worker lane starts from `LaneBlueprint.withheldTools` (`src/server/workers/protocol.ts`, filled by `blueprintFor`) and is kept honest on a live toggle by the one-way `sync.tools { enabled, withheld }` frame (`LaneToolStateSync`), posted by `lane-host.ts` `broadcastTools()` from `lane-authority.ts` `toolStateNow()`; the frame is additive â no `LANE_PROTOCOL_VERSION` bump â and a replica DROPS a name it cannot register instead of throwing. The hazards are the accepted cost: switching off `toolRequest` removes the model's only switching door, so recovery is user-side only; switching off `tasks`/`delegate`/the thread controls leaves the machinery running while the model loses its writer and dispatcher; switching off `toolCancel` leaves a model no way to withdraw an in-flight call; enabling a searchable name can still EVICT another enabled one through the cap; and a session can hold a name enabled while the deployment deny list still refuses it, because deployment outranks session. |
 | Seeded enabled set | `enableAllTools: true` (`HarnessConfiguration`, **off** for a library caller) enables every registered name that can hold a cap slot at the end of construction through one `enableTools` pass (`src/harness.ts` `seedSwitchableTools`) — so `maxEnabledTools` still caps it, the overflow is left off rather than thrown, a name the deployment denies is filtered out first, and a name THIS conversation has switched off is skipped (an auto-enable never overwrites a user's switch). The shipped server sets it on BOTH build paths: for a session it CREATES (`SessionStore.create` → `buildHarness(…, { enableAllTools: true })`) and for a session it RESTORES (`SessionStore.restoreSession`, the same call), and re-runs the pass whenever a session is RESET (`src/server/sessions.ts` `SessionStore.reset`, via `harness.enableAllSwitchableTools()`) — a reset starts a new conversation, in any process. Setting it on the restore path does not refill anything: `harness.restore()` replaces the enabled set with the persisted `discovery.enabled` (`src/harness.ts` `restore()`) after construction, so a restored session keeps the set it committed and only a RESET starts full again; the flag on that path is what lets the reset seam fire at all after a restart, because the seam is gated on the per-process build configuration. A pre-existing record (written before the seed) needs nothing special: it refills on its first reset and never on a plain restart. The one qualification of "exactly": an enabled name THIS build no longer registers is pruned off the committed set on restore instead of losing the conversation (`src/server/sessions.ts` `pruneStaleEnabledTools`) — the same function prunes a switched-off name that is no longer registered out of `discovery.withheld`, silently. A deployment denial outranks either figure: a denied name is filtered out of the seed, hidden from the model, and refused at the launch gate whatever a row's `enabled` says. `harness.isToolSwitchable(name)` states which names hold a cap slot — cap arithmetic, not permission to switch: every registered name is switchable, and a row's `protected` figure is the kernel's UNREGISTER rule (`visibility === 'core'`), which only `DELETE` consults. |
 | Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation — the conversation's switches too, because `reset()` clears the `withheldTools` set beside the enabled set. `harness.discoveredTools` exposes the enabled names — seeded ones included, switched-off names excluded; `harness.withheldTools` exposes the switches. |
 | Scope on the server | The enabled set is per harness and ONE session owns one harness, so discovery is per conversation — and a CPU-isolated lane replica resolves that same session's enabled names AND its switches (`src/server/workers/lane-authority.ts` `enabledNow()`/`toolStateNow()`, the `sync.tools` frame above). Two switches sit ABOVE that set and are deliberately not per conversation: the deployment **tool deny list** (`PATCH /v1/harness/tools/:id`, one store per process, honoured on the next turn of every session AND thread, `src/server/tool-settings.ts`) and the plugin **template** (`PATCH /v1/harness/plugins/:id`, inherited by sessions created after the write). Plugin settings proper are per conversation — `PATCH /v1/harness/sessions/:id/plugins/:pluginId` (`src/server/plugins.ts`, "THE TWO SCOPES"). A session CAN switch ANY name in its own toolbox off or on — every registered name, the harness-owned core controls included (`PATCH /v1/harness/sessions/:id/tools/:tool_id`, the `withheldTools` row above) — but that is not a copy of the deny list: every harness re-filters the request list through the provider (`src/harness.ts` `isToolGloballyDisabled`) and refuses to launch a denied name (its launch gate), so a session cannot lift a deployment denial — while the MANUAL path (`harness.executeTool`, both tool-execution routes) is not gated by either switch at all, which is what lets an operator run a name the model was refused or a conversation switched off. |
@@ -1015,7 +1016,7 @@ tasks({ "tasks": [{ "id": "1", "completed": true }],
   collection, so a task reader is never woken by chapter edits. A `since` ahead of the store is an
   error, not an empty answer.
 - Every result is a defensive copy, never a live reference.
-- The list is **per harness**, shared by the primary and its subagents, kept across
+- The list is **per harness**, shared by every agent in it, kept across
   turns, and cleared by `reset()` (ids restart at `"1"`, `storeRev` restarts at 0, the
   log empties). Snapshot/restore carry it inside the snapshot-v2 `records` block: one
   collection map `{ nextId, collections: { tasks: { definition?, items, storeRev?, changes? } } }`
@@ -1117,7 +1118,7 @@ the list, it does not copy that API, and it does not claim compatibility.
 
 Three more harness-owned stores follow `tasks`' lifecycle exactly - registered,
 searchable, and opened by `toolRequest` (R9-R11) - one store per
-harness (therefore per server session), shared by the primary and its subagents,
+harness (therefore per server session), shared by every agent in the harness,
 stable decimal-string ids from `"1"`, and cleared by `reset()` (ids restart at
 `"1"`). They share one action set and one validation policy:
 
@@ -1171,9 +1172,11 @@ is the record.
 
 ### Agent results (`agentManage`, `agentResult`)
 
-Two core tools, declared to the primary **and** to every subagent, let an agent
-inspect what the session's other agents have produced without reading their
-transcripts:
+Two harness-owned tools — `activation: 'always'` so every harness registers them, but
+`visibility: 'searchable'` with `alwaysDeclared: false`, so the model enables them with
+`toolRequest` — let an agent inspect what the session's other agents have produced without
+reading their transcripts. Neither is rank- or role-restricted: under the rank model EVERY
+registered agent may call both, so a junior delegate can read what its own siblings produced.
 
 ```ts
 agentManage({})                                  // agents + truncated result previews
@@ -1182,7 +1185,9 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 ```
 
 `agentManage` lists EVERY configured agent (even one that has not run), with
-`name`, `role`, `model`, `invocationCount`, and up to five recent invocations
+`name`, `rank` (the A–Z letter that decides what that agent may delegate to — this listing
+used to report `role: 'primary' | 'subagent'`, and the model's own view of the team needed the
+fact that actually decides delegation), `model`, `invocationCount`, and up to five recent invocations
 newest first. Each invocation preview carries `invocationId`, `kind` (`root`,
 `delegation`, `fork`, or `autoanswer`), `status`, `contentLength`, a
 200-character `preview`, and a `truncated` flag. A running invocation has status
@@ -1216,11 +1221,15 @@ Both tools expose ONLY the completed assistant answer value. They never return
 system instructions, transcript messages, tool arguments, or tool bodies. Results
 are held in a bounded per-harness registry (64 completed records, active runs are
 never evicted) and are **durable across snapshot/restore**: terminal results —
-completed, failed, or cancelled — are stored as an optional `agentResults` array
-in the existing snapshot v2 (`invocationId`, `sequence`, `completedOrder`, agent,
-role, kind, status, content, error?), so a restart keeps every answer that already
+completed, failed, or cancelled — are stored in the snapshot's ADDITIVE `agentResults` array
+(`invocationId`, `sequence`, `completedOrder`, agent, `rank` (the field the rank pass
+renamed from `role`), kind, status, content, error?), so a restart keeps every answer that already
 exists. Running invocations are omitted from a snapshot (they have no answer yet),
-old snapshots without the field restore with an empty registry, restore advances
+a snapshot written without that optional key restores with an empty registry (the KEY is
+additive; the DOCUMENT version is not — a v2 file is refused outright, because the rank pass
+renamed the transcript's `role` key to `rank` and refuses to guess a letter from the old word:
+`Snapshot version 2 is not supported; this harness reads version 3.`,
+`src/core/snapshot.ts:107,302-316,1205-1207`), restore advances
 the run/completion/branch id counters so a later run in THAT restored harness cannot
 overwrite an id the same snapshot archived — which is a restore guarantee, not a global one:
 an invocation id is per-process (see [Progress events](#progress-events)), so treat
@@ -1247,7 +1256,7 @@ share one.
 | `requestTools` | `toolRequest` | core; always declared |
 | `createTool` (tool) | `toolCreate` | core; the host method is `harness.createTool()` |
 | `createTaskTool` | `tasks` (one collection of the one store) | core; always declared (R9-R11 renamed the tool from `todoManage` and made its action enum ONE patch command; records-engine Decision J renamed `task` → `tasks`, and T3 deleted the factory — `core/task.ts` is now the collection SPEC and `core/records.ts` is the store) |
-| `delegate` | `delegate` | core; primary only, when subagents exist |
+| `delegate` | `delegate` | core; registered only while the rank map spans two or more DISTINCT letters, and DECLARED PER CALLER only to an agent that holds a strictly-lower-ranked target (rank model, not a role flag) |
 | `readFile` | `read` | **batched and bounded**: `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines?, maxBytes?, lossy?, numbered? })[])` → `{ files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, budgetGranted?, error? }], truncated, bytes, wireBytes, contentBudget, budgetPool, modelBytes, skipped, note? }` |
 | `writeFile` / `fileWrite` | `write` | **batched**: `({ path, content }[])` → `{ path, bytes, lossy? }[]` |
 | `editFile` | `edit` | **batched**: `({ path, oldString, newString, replaceAll? }[])` → `{ path, replacements, bytes, match?, changed? }[]` |
@@ -1345,8 +1354,13 @@ process lists and loads a brand-new entry with nothing regenerated. `core/tool-m
 is the generated, data-only mirror of that scan (one `import()` per entry) and is
 the **browser** inventory — the browser cannot scan, so it is the only rows a
 browser can see. See `docs/runtime-tools.md` for the activation
-table and the policy flags (`primaryOnly`, `answerExtraction`, `control`,
-`pendingOnly`).
+table and the policy flags (`activation`, `mode`, `order`, `pendingOnly`, `control`,
+`answerExtraction`, `sessionBound`, `listed`, `alwaysDeclared`). No flag carries authority:
+the removed `primaryOnly` is gone from `ToolRegistration` and `DiscoveredTool`
+(`src/core/tool-metadata.ts:95-124,128-151`), and the only rank-derived behaviour happens in
+the runtime, as two projections — `delegate` for the callers that hold a strictly-lower-ranked
+target (`rankProjectedDefinitions`) and `toolCreate` under the `toolCreation` policy
+(`creationGatedDefinitions`).
 
 The preset exports are **lazy proxies**, not implementations. The discovered
 descriptor rows hold the static metadata (name, description, tags, schema) and the
@@ -1924,8 +1938,8 @@ agrees with `data`. A host tool that over-attaches fails the call loudly with
 ```ts
 const writer = harness({
     agents: { writer: agent({...}), researcher: agent({...}) },
-    primary: 'writer',               // entry point (explicit; first key is the default)
-    subagents: ['researcher'],       // optional delegation allowlist
+    entry: 'writer',                            // routing ONLY (first key is the default)
+    ranks: { writer: 'A', researcher: 'B' },    // authority; any number of agents may share a rank
     tools: { search: tool({...}) },
     report: { progress: async (event) => {} }
 });
@@ -1933,9 +1947,9 @@ const writer = harness({
 
 | Field | Meaning |
 |---|---|
-| `agents` | Every brain, keyed by name. **The first key is the entry point** unless `primary` names another one. |
-| `primary` | Which agent the callable runs. Optional; must name a registered agent. Use it in multi-agent configs so routing is explicit. |
-| `subagents` | Allowlist the primary may delegate to. Optional; defaults to every agent except the primary. Empty (or a one-agent config) means no `delegate` tool at all. Must not contain the primary or an unknown name. |
+| `agents` | Every brain, keyed by name. **The first key is a DEFAULT, nothing more** — it is the fallback `entry` and the order every per-member read returns. Order says nothing about authority; that is `ranks`. |
+| `entry` | Which agent the callable runs (`HarnessConfiguration.entry`, `src/types/index.ts:4710-4718`). Optional; must name a registered agent, or construction throws `Entry agent "zzz" is not registered. Configured agents: …`; defaults to the first `agents` key. ROUTING ONLY: it grants NO capability and it is not a rank — the entry agent may hold Rank A or Rank C, and an entry that cannot delegate is a normal configuration. Use it in multi-agent configs so routing is explicit. A legacy `primary` (or `subagents`) key here is REFUSED at construction, not translated: this build routes with `entry` and ranks with `ranks`, and silently dropping `primary` would move routing to the first `agents` key AND — with `ranks` absent — put Rank A on that same first agent, so a stale document would resume as a different team with a different authority. |
+| `ranks` | Authority map: agent name → `AgentRank` (`'A'`…`'Z'`, `src/types/index.ts:1469`), where a LARGER letter is a LOWER authority and **any number of agents may share one rank** (two Rank A agents are ordinary peers). Optional, and it may cover fewer agents than the roster: an omitted map ranks the ENTRY agent at `'A'` and every other agent at `'B'` (the direct successor of the old `primary`/`subagents` pair), a stated map fills every agent it omits — the entry agent included — ONE RANK BELOW the lowest rank it names, and `ranks: {}` states "no ranking", which puts every agent on one letter and registers no `delegate` at all. An unknown name or a bad letter throws at construction naming the exact site. Delegation targets, the nesting ceiling and the `toolCreation` ceiling all derive from these letters — nothing else. |
 | `maxIterations` | OPTIONAL runaway guard: model requests one agent run may make before the harness throws. Every request counts: the first answer, each immediate tool continuation, a pause turn, and every completion or timed wake. **Unset by default = no limit**, and `Infinity` states that explicitly; a finite value must be a positive safe integer (validated at construction). The app presets set no limit either. |
 | `forks` | `{ enabled?, maxDepth?, maxConcurrent?, maxHistoryBytes?, maxBranchRecords? }`. `enabled` defaults **true** and registers the core `threadFork` tool. Defaults: depth 2, 4 live branches, 8 MiB serialized branch history, 64 retained records; every numeric bound must be a positive safe integer. |
 | `interaction` | `{ actionRequest?: (context, signal) => Promise<HarnessActionChoice>, autoAnswer? }`. Presence registers the core `actionRequest` tool. `autoAnswer` defaults true and only governs a child/fork request's automatic owner fork; it never selects an option by itself. |
@@ -1958,18 +1972,18 @@ repeat the name inside the definition.
 
 | Member | Meaning |
 |---|---|
-| `writer(input)` | Run the entry agent to completion. Resolves with its message. |
-| `writer.name` | The entry agent's name. |
-| `writer.agent` | The entry agent. `writer.agent.messages` is the live transcript. |
+| `writer(input)` | Run the entry agent to completion. Resolves with its message. Once the agent `entry` names has been detached by `removeAgent`, the call REFUSES rather than re-routing onto another brain. |
+| `writer.name` | The EFFECTIVE entry agent's name — the agent `entry` names while it is registered, else the first still-registered member (so `removeAgent(entry)` never leaves the handle naming a detached agent). |
+| `writer.agent` | The EFFECTIVE entry agent, resolved by the same rule as `writer.name`. `writer.agent.messages` is the live transcript. |
 | `writer.agents` | Every agent, including the entry one. |
-| `writer.subagents` | The agents the primary may delegate to, keyed by name. Empty when delegation is not configured. |
+| `writer.ranks` | The RESOLVED rank map (agent name → rank letter, `Harness.ranks`, `src/types/index.ts:5017`). A GETTER over the live roster, so `addAgent`/`removeAgent` move it, and each read hands out a frozen defensive copy (`ranksView`, `src/harness.ts:1720`, mounted at `:17211`) — a caller can neither mutate the ranking nor cache a copy its way into a promotion. This replaces the removed `writer.subagents` allowlist: who may delegate to whom follows from these letters and nothing else. |
 | `writer.tools` | Every registered tool, keyed by wire name: the preset/app catalogue plus the harness-owned set (`toolRequest`, `toolList`, `toolManage`, `toolCreate`, `tasks`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `delegate` when it exists, `threadFork` when forks are enabled, and `actionRequest` when interaction is configured). Registration is not declaration: `tool.visibility` and the enabled set — `toolRequest`, `toolManage`, or an `enableAllTools` seed — say which half a name is in. |
 | `writer.discoveredTools` | Names in the CAPPED enabled set, in discovery order: what `toolRequest` has enabled plus what an `enableAllTools` seed put there. A name this conversation switched off is not in it, and neither is a core or pending-only name — those never hold a slot, so this list says nothing about them. Read-only copy; `reset()` empties it (the shipped server re-runs the seed after ITS reset — `SessionStore.reset`). |
 | `writer.withheldTools` | THE CONVERSATION'S SWITCHES: the sorted, copied names this harness's user has switched OFF for its agents (`src/types/index.ts` `Harness.withheldTools` → `src/harness.ts`), and the only place a core or pending-only name's switch exists at all. A getter that copies, so a caller cannot mutate the live Set. It is INDEPENDENT of `discoveredTools` by construction (`applyToolSwitch` frees a searchable name's slot in the same step), cleared by `reset()`, and persisted as the snapshot's additive `discovery.withheld`. What it does NOT gate: `executeTool` (the manual/REST executions) and `context.callTool` (a tool calling a tool) reach a registered name whatever this list says. |
 | `writer.isToolSwitchable(name)` | Whether THIS harness gives that name a SEARCHABLE CAP SLOT (`src/harness.ts` `occupiesSearchableSlot`) — which names an enable spends one of the `maxEnabledTools` slots on, and which an over-cap selection can evict. CORRECTED IN PLACE: this row used to call it the kernel's yes/no on "may a caller switch this name at all", and the fact behind a session-tool row's `protected` figure. Neither holds since the withheld set: `toolManage`'s `enable`/`disable`, the plugin seam and the operator's PATCH accept EVERY registered name (`src/harness.ts` `requireSwitchableTool` refuses only a blank or an unregistered one), so `false` here means only "no cap slot" — an unregistered name, a `visibility: 'core'` declaration, or a pending-only control such as `toolCancel` (registered as `'searchable'`, still pending-only). Read at call time: a tool registered after construction holds a slot the moment it exists, and a removed one does not. `protected` is now the UNREGISTER axis (`visibility === 'core'`, the kernel's `remove` rule), so `toolCancel` is `protected: false` on BOTH reads while `write` is `false` here and `true` there; a pane that wants "is this name off for the agents" reads `withheldTools`, not either of those (`src/server/api-reads.ts` `sessionToolRowsOf`). |
 | `writer.enableAllSwitchableTools()` | OPTIONAL host seam (`src/types/index.ts` `Harness.enableAllSwitchableTools` → `src/harness.ts`): re-runs the `enableAllTools` pass on a LIVE harness — every registered name that can hold a cap slot, minus the deployment's deny list AND minus the names this conversation has switched off, capped in registration order. `reset()` empties the set and the construction seed is not snapshot state, so this is the only way a host whose "new conversation" is a RESET gives one the toolbox a fresh CREATE gets; looping `toolManage enable` per name is not equivalent, because an explicit enable inserts newest-first and keeps a different set once the cap binds. Reports one `state_change` when the set moves, nothing when it does not. |
 | `writer.toolCreate(config)` | Host-side runtime creation. Same validation/registry/budget as the model's `toolCreate`; throws `HarnessError`. |
-| `writer.executeTool(name, parameters)` | Run one registered tool directly, with this harness's context (`agent`, `agents`, `run`). The server's manual-execution path: discovery gates the model, not the operator, so an un-discovered searchable tool still runs. Reserved policy is kept (`toolCreate` registration, primary-only `delegate`); an unregistered name throws, and `actionRequest`/`threadFork` are refused because they need the owning run. |
+| `writer.executeTool(name, parameters)` | Run one registered tool directly, with this harness's context (`agent`, `agents`, `run`). The server's manual-execution path: discovery gates the model, not the operator, so an un-discovered searchable tool still runs. THE CALLER IS THE HOST ACTOR (`agent: hostActor()`, `src/harness.ts:16361`) — the session's ENTRY agent while that agent is registered, and the unregistered Rank A identity named `host` once `removeAgent` detaches it (`hostActor` `:1669`, `hostRank` `:1637`) — so the rank doors behave exactly as they do for that actor: `delegate` is judged at that standing (refused when it holds no strictly-lower-ranked target) and `toolCreate` at the `toolCreation` ceiling; there is no role gate left to keep. `writer.toolCreate()` is the separate HOST path and is never rank-gated (`:16975`). An unregistered name throws, and `actionRequest`/`threadFork` are refused because they need the owning run. |
 | `writer.commands` | The registered slash commands, keyed by name **without** the leading slash (`commands.help` answers `/help`). Every read is a frozen defensive copy of the live registry, so a command registered later shows up in the next read — and mutating the copy changes nothing. |
 | `writer.executeCommand(input)` | Run one slash line (`'/task add "testing"'`) in THIS process. The model is never called and no progress event is emitted; a built-in that calls a tool still fires `stateChange('tool_execute')`, so a persistence layer sees the mutation. Throws `HarnessError` for a line without a leading `/` or an unknown name, and rethrows what a host command throws; every recoverable failure comes back as `{ content, isError: true }`. See [Slash commands](#slash-commands). |
 | `writer.registerCommand(command)` | Register or **replace** one command at runtime, with `registerTool`'s replace semantics. Validates the name and the definition and throws `HarnessError` without touching the registry when either is invalid. |
@@ -2014,10 +2028,18 @@ description ≤2 000 chars, source ≤20 000 chars, **32 created tools per harne
 other's tools. The 32-tool budget is per harness for its LIFETIME: `harness.reset()`
 clears conversations, discovery, tasks and records, but created tools stay
 registered (so a session cannot mint an unbounded number of them by resetting), and
-only a new harness starts the count again. `toolCreation` configures the capability:
-`'all'` (default — `toolCreate` is declared to every agent), `'primary'` (declared to
-the primary only; a subagent that guesses the name gets a clear refusal), or `false`
-(no model-facing tool at all — the host method `harness.createTool()` still works).
+only a new harness starts the count again. `toolCreation` configures the capability
+(`ToolCreationPolicy`, `src/types/index.ts:1556`): `'all'` (the default — `toolCreate` is
+declared to EVERY agent), a rank LETTER — that rank and every rank TOWARD `'A'` may create, so
+`'A'` is the faithful replacement for the removed `'primary'` policy and `'C'` admits A, B and C
+(`holdsCreationRank`, `src/harness.ts:1264`) — or `false` (no model-facing tool at all; the host
+methods `harness.toolCreate()` / `harness.createTool()` still work). A stated letter withholds the
+DECLARATION from the agents below it AND refuses a guessed call with an error naming the caller's
+rank, e.g. `Tool creation is limited to Rank A and above in this harness; "helper" holds Rank B.`
+(`createToolForAgent`, `src/harness.ts:4213-4230`). A bad value fails construction
+(`resolveToolCreation`, `:1246-1257`): the refusal spells all 26 letters —
+`toolCreation must be "all", false, or a rank letter (A, B, C, …, Z). Received primary.` —
+and the lifetime budget applies whichever way the gate goes.
 
 **The budget is per instance, and so is the construction cost.** The counter belongs to
 ONE harness, so N harnesses hold N independent budgets and nothing in the library bounds
@@ -2051,21 +2073,33 @@ constructor and runs with the process's full permissions — the same trust mode
 ```ts
 const team = harness({
     agents: { lead: agent({...}), tester: agent({...}), reviewer: agent({...}) },
-    primary: 'lead',
-    subagents: ['tester', 'reviewer'],
+    entry: 'lead',                                    // routing only, never an authority claim
+    ranks: { lead: 'A', tester: 'B', reviewer: 'B' }, // authority: delegation runs downward
     report: { progress: console.log }
 });
 
 await team('Add a parser and have it reviewed.');
 ```
 
-Each agent keeps its own `instruction`(s) and transcript; a subagent never sees the
-primary's conversation, and only its final `content` comes back. The primary gets
-the core `delegate` tool with `{ agent, input }`; it is **not declared to
-subagents**, a guessed call from a subagent is rejected, and `run()` refuses to
-re-enter an agent that is already running, so delegation is one level deep and
-cycles fail fast. `delegate` is not registered at all when there are no
-subagents. A tool can still call `ctx.run(name, input)` directly when it needs a
+Each agent keeps its own `instruction`(s) and transcript; a delegated agent never sees the
+caller's conversation, and only its final `content` comes back. The `delegate` tool is
+`{ agent, input }`, and it is registered exactly when the rank map spans TWO OR MORE DISTINCT
+letters — a one-agent harness, an all-Rank-A roster, and a roster whose members all share one
+letter hold no `delegate` at all (the tool is never registered, so the model is never offered
+it). Delegation is **strictly downward**: an agent may hand work only to a registered agent
+ranked strictly below it, so a same-rank peer AND any superior are refused, by a sentence that
+names the caller's rank and its legal targets rather than an unnamed privilege —
+`lead holds Rank A and cannot delegate to "co" (Rank A): delegation is strictly downward. The
+legal targets are Rank B and below: helper.` The DECLARATION is projected per caller, so a Rank
+B agent is never shown a tool it cannot use, while the `agent` enum deliberately stays the whole
+roster: a wrong guess then reaches that rank sentence instead of a schema error that cannot name
+a rank. Depth follows from the same letters — a chain of runs visits strictly DESCENDING ranks,
+so it can never be longer than the number of ranks that exist (`A`/`B`/`C` configured makes A→B→C
+legal at three levels); the old hard-coded "one level deep" was that rule for the single roster
+shape the removed vocabulary could express. `run()` still refuses to re-enter an agent that is
+already running, so a cycle keeps its own, earlier refusal
+(`Agent "x" is already running; it cannot be re-entered (delegation cycle).`). A tool can still
+call `ctx.run(name, input)` directly when it needs a
 sibling turn mid-tool, but that path is inside one agent's turn rather than
 model-visible delegation. Under `threadExecution: "worker"` a lane refuses it — the
 child a tool body starts would exist only inside that lane; see
@@ -2086,16 +2120,21 @@ omits is still refused at launch, with the refusal as a readable result.
 
 What that means for the shipped roles:
 
-- **The primary delegates; a subagent never re-delegates.** Drop the `summarizer`
-  (or `workspace`, or `reviewer`) from a Manager's team and that step has no target
-  left: a subagent cannot pick it up, and a Manager whose team is empty has no
-  `delegate` tool at all (the harness does not register it), which is exactly the
-  case its profile tells it to stop and report instead of quietly doing the work.
-- **Briefs must be self-contained.** A subagent starts from its own instruction and
-  the `input` you give it, nothing else, so the primary must include the goal, the
+- **A rank delegates; a same-rank or junior peer never delegates upward.** The six teamed
+  cards each hold their own entry agent at Rank A and every other member at Rank B, so each
+  shipped team has exactly one delegator — and that is a CONSEQUENCE of the letters, not a rule
+  the runtime enforces by role. Drop the `summarizer` (or `workspace`, or `reviewer`) from a
+  Manager's roster and that step has no target left: the Rank B members have no strictly-lower
+  peer to hand it to, and a Manager whose roster is down to itself spans ONE rank, so the
+  harness registers no `delegate` at all — which is exactly the case its profile tells it to
+  stop and report instead of quietly doing the work. Configure `A`/`B`/`C` and the same card
+  gains a three-level chain with no other change; put two members at Rank A and each may
+  delegate to the Rank B members, because a rank is a rung, not a person.
+- **Briefs must be self-contained.** A delegated agent starts from its own instruction and
+  the `input` you give it, nothing else, so the delegator must include the goal, the
   paths/areas, the constraints, and the evidence it wants back.
-- **Verification is the primary's job.** A delegate result is a claim: the shipped
-  profiles tell the primary to check it (read the file, run the check, or send the
+- **Verification is the delegator's job.** A delegate result is a claim: the shipped
+  profiles tell the delegating agent to check it (read the file, run the check, or send the
   Reviewer) before answering. The Manager goes further and is required to send every
   step's result to `reviewer` for an INDEPENDENT check before accepting it, because
   the agent that produced a result is not allowed to be the one that judges it.
@@ -2210,14 +2249,14 @@ commit is guarded by the core precommit check. One host-side caveat: a
 `report.progress` reporter that hangs can still stall the mailbox (and therefore
 cancellation); there is no guaranteed reporter watchdog.
 
-Delegation is the same mechanism: an `delegate` call stays **pending** until
+Delegation is the same mechanism: a `delegate` call stays **pending** until
 the child fully completes, and the parent's `pending` list names it. A second
-delegation to the same subagent does NOT continue the first child's conversation:
+delegation to the same agent does NOT continue the first child's conversation:
 from a thread-backed conversation (a server session, any `createThread` host thread)
 each delegation MINTS ITS OWN child conversation, so a re-`delegate` starts fresh and
 remembers nothing — the follow-up door is `threadSend` into the `threadId` the envelope
 returned, and `threadRead` is how you re-read the answer. Only a delegation issued from
-an agent's own DEFAULT conversation runs in that subagent's standing
+an agent's own DEFAULT conversation runs in that agent's standing
 `agent:<name>` conversation, which is the one case where a second call does continue
 the first transcript. Abandoning an in-flight call with `toolCancel` answers the ACK
 immediately (`{ cancelled: true, callId, name }`) and puts the child's terminal envelope
@@ -2236,7 +2275,7 @@ Failures split in two:
   where the call started and the harness throws, so a failed call is never
   replayed on the next attempt.
 
-`maxIterations` is per agent run — a delegated subagent gets its own budget — and
+`maxIterations` is per agent run — a delegated child gets its own budget — and
 is validated when `harness()` is called: a value that is neither a positive safe
 integer nor `Infinity` throws `HarnessError` immediately instead of failing mid-run.
 
@@ -2352,9 +2391,12 @@ threadFork({ input: 'Audit the parser for edge cases.', label: 'parser audit' })
   reply (trimmed, non-empty). There is no separate summarizer pass and no
   transcript merge. The full branch transcript is available through
   `harness.branch(branchId)`.
-- **Inheritance and bounds.** Ordinary forks inherit the source agent's role and
-  therefore its core/tool declarations (a fork of the primary can still delegate;
-  a fork of a subagent cannot). Forks may nest to `maxDepth` 2, with 4 live
+- **Inheritance and bounds.** Ordinary forks inherit the source agent's RANK and
+  therefore its rank-projected declarations (a fork of a Rank A agent still holds
+  `delegate`, narrowed to its own legal targets; a fork of a Rank B member has no
+  strictly-lower-ranked peer to hand work to). Rank is PROPAGATED to every derived actor
+  (`actorRanks.set`, `src/harness.ts:1588`), never re-derived, which is why a fork obeys the
+  same nesting ceiling as its source and may itself fork. Forks may nest to `maxDepth` 2, with 4 live
   branches, 8 MiB of serialized history, and 64 retained records by default. The
   history cap is explicit: an over-cap fork fails and **never truncates** the
   source. The cap counts the serialized transcript including attachment payloads,
@@ -2365,7 +2407,7 @@ threadFork({ input: 'Audit the parser for edge cases.', label: 'parser audit' })
 - **Ephemeral audit.** `harness.branches()` / `branch(id)` return detached
   `HarnessBranchRecord` values (`status`, remap map, messages, optional result or
   error). Branch records and their events are runtime/session state, deliberately
-  **not** part of snapshot v2: a restart does not restore them.
+  **not** part of the snapshot at all: a restart does not restore them.
 - **`Agent.fork({ label? })` is the standalone primitive.** It does the same
   materialization without a harness; `reset()` on that fork restores its
   fork-time baseline.
@@ -3159,8 +3201,8 @@ toolbox is identical: all nine package tools (`syntax`, the six file tools
 `shell`, `gitDiff`), the app tools (`timeNow`, `textCount`, `diceRoll`,
 `noteSearch`, `textSummarize`), opt-in `search`, and the harness-owned tools
 (`toolRequest`, `toolCreate`, `tasks`, `profiles`, `chapters`,
-`locations`, `agentManage`, `agentResult`, plus `delegate` only when the
-preset declares a subagent,
+`locations`, `agentManage`, `agentResult`, plus `delegate` only when the card's rank map
+spans two or more distinct letters,
 `threadFork` when forks are enabled, and `actionRequest` when the host supplies an
 interaction handler).
 R18 splits declarations: the five core file tools, the harness-owned
@@ -3206,14 +3248,22 @@ part of that declaration.
 | `debugger` | Debugger | Stress-tests the system: unlocks any searchable tool, runs any command, exercises each capability at its edges, and reports a reproduction. |
 | `chat` | Chat | The one card that opts out of the toolbox: the General profile on an EMPTY catalogue — no file, search, delegation, or record tool is registered. It cannot read or write the server host, because the only rows it can call are the harness-owned core tools, and it carries no iteration budget, so it runs until the model answers. `tools: []` on the card is made true in the runtime by `sharedToolbox: false`, not merely promised. |
 
-Every real preset's team is derived from ONE list: each card lists every *other* real
-role plus the `summarizer` as a direct subagent (`teamOf()` in
-`src/server/harnesses/presets.ts`) — with two exclusions. The primary is never its own
-subagent, and `planner` (the Manager) is in nobody else's team because a Manager refuses
-to run as a delegate. `general`'s own team is empty on purpose, which is what makes
-`delegate` disappear from its declaration list rather than merely being discouraged.
-Delegation is **one level deep** and a subagent never receives `delegate`; the
-profiles say so, and none of them asks a subagent to delegate again.
+Every real preset states its ROSTER and its RANK MAP explicitly, side by side
+(`src/server/harnesses/presets.ts`); the derived `teamOf()` list is DELETED, because it
+inferred both decisions from one word — who runs at all, and who may hand work to whom. The
+two letters are named once (`ENTRY_RANK = 'A'` at `:168`, `TEAM_RANK = 'B'` at `:169`), and
+every teamed card puts its OWN entry agent at Rank A with every other member at Rank B, so
+each team has exactly one delegator. The entry agent is listed ONCE in `agents` (its rank is
+what says whether it can delegate), and `planner` (the Manager) is in nobody else's roster
+because a Manager refuses
+to run as a delegate. `general` and the tool-less `chat` card state ONE rank each, which is
+what makes `delegate` disappear from the runtime rather than merely being discouraged:
+`ranksDeclareDelegation` (`src/server/harnesses/toolbox.ts:289-290`) counts DISTINCT letters,
+so one letter registers no delegation tool at all. Every shipped card spans exactly TWO
+letters, so the "one level deep" a reader observes is a property of these RANK MAPS, not a
+rule the runtime enforces by role — a host that configures `A`/`B`/`C` gets a three-level
+chain from the same code, and a Rank B member of a shipped team still forks, spawns threads
+and calls every tool its Rank A entry agent calls, because threading never consults rank.
 
 There is no example tier left. The two presets that used to sit beside these eight —
 `demo` (a scripted offline transport) and `flaky` (the shared toolbox plus a tool that
@@ -3246,10 +3296,12 @@ waits or `steered` / `steered_thread_id` when it folded into a running conversat
 and never echoes the session or the turn record; the content arrives on the stream and
 a bounded `/turns` page carries the row. The server runs it FIFO behind anything already
 pending, so tasks execute in submission order even when they arrive while a run
-streams. **Team membership and the descriptor snapshot are frozen at
+streams. **Team membership, the entry agent, the resolved rank map and the descriptor
+snapshot are frozen at
 session creation**: the preset object and a `harnessDefinition` are captured, so a
-later create/patch never changes which agents a running session has, its primary,
-or the history it reports. The UI's Endpoint panel is sent when a session is
+later create/patch never changes which agents a running session has, which agent routes
+it, the RANKS that decide what it may delegate, or the history it reports. The UI's
+Endpoint panel is sent when a session is
 created; changing it starts a fresh session on the next run.
 
 **A session is created on demand, not on first use.** `POST /v1/harness/sessions` needs a
@@ -3304,7 +3356,8 @@ with (the assistant message it commits names that model), and the **next request
 of that agent uses the new one — including a queued task, whose request starts
 after the patch. Nothing is aborted, rebuilt, or replayed, and the
 frozen `harnessDefinition.agentModels` remains the creation-time record. Team
-editing (primary/subagents) still applies to the next session you start. A session is in
+editing (`agents`/`entry`/`ranks`) still applies to the next session you start — including
+the delegation surface, which is a function of the ranks a session was CREATED with. A session is in
 memory ONLY where no database root is configured: with one (the service's
 `DATABASE_ROOT`, or `startHarnessServer({ databaseRoot })`) it is persisted and restored
 on the next boot (see [Persistence](#persistence-database_root)). Created tools live in the
@@ -3336,7 +3389,7 @@ identified read adds `agent_models`
 rewritten by a session PATCH, so a per-agent dropdown survives a reload and shows
 what the next request will use), the key-free `endpoint` view, `definition_revision`,
 `pending_action_count` and `created_tool_count`; the frozen descriptor itself
-(members, primary, and the models the session was created with) is
+(members, the entry agent, the resolved rank map, and the models the session was created with) is
 `GET /sessions/:id/definition`, and that read is also where `discovered_tools`
 lives, so a reload loses neither the configuration nor the discovery state.
 
@@ -3357,8 +3410,8 @@ were deleted rather than kept behind a flag. See
 | `GET /v1/harness/config` | Global provider defaults and the deployment runtime facts (never per-session) |
 | `PATCH /v1/harness/config` | Change the global provider defaults — `{ settings: { base_url?, model?, api_key? } }`; an explicit `null` puts the shipped default back |
 | `GET /v1/harness/harnesses` | Harness definitions, paged (`q` matches name/title/description). Every entry is an editable application copy |
-| `POST /v1/harness/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, primary, subagents?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }` |
-| `PATCH /v1/harness/harnesses/:name` | Change a harness definition |
+| `POST /v1/harness/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, agents, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }`. `agents` is the ONLY roster field and is REQUIRED beside `name`; it keeps DECLARATION order (the display/cycle order), which is presentation only. `entry` is optional, must be a member, defaults to the first name, and grants no authority. `ranks` may cover fewer members than the roster and is RESOLVED into the map the harness runs with (an omitted map = entry `'A'`, every other member `'B'`; a stated map is filled one rank below the lowest letter it names). A duplicate name, a roster over 16 members, an `entry` outside the roster, a `ranks` key outside the roster, and a bad rank letter are each a `400` naming the members. `primary`/`subagents` are not accepted at all |
+| `PATCH /v1/harness/harnesses/:name` | Change a harness definition. The EXECUTABLE fields are `agents`/`entry`/`ranks`/`agent_models`/`agent_instructions`/`agent_colors` — stating any of them rebuilds the harness's factory, so the change reaches the NEXT session, never a running one; an omitted `entry` survives whenever the patch left it a member, and an omitted `ranks` keeps the current ranks restricted to the surviving members (a member the patch added takes the filled value, so a newcomer never lands at `'A'` by accident) |
 | `DELETE /v1/harness/harnesses/:name` | Remove one — `{ deleted: true, harness_name, tombstoned, restored_by_restart: false }`; a deleted built-in stays deleted across a restart. Existing and saved sessions are untouched: each runs and restores from the definition it captured |
 | `GET /v1/harness/harnesses/:name` | Read ONE definition — the identified read carries what a card omits (the per-agent model map, instruction text, resolved core-tool set); `404` for an unknown name |
 | `GET /v1/harness/harnesses/:name/instructions` | Which members carry an instruction override (not paged: membership is bounded by the definition) |
@@ -3389,11 +3442,11 @@ were deleted rather than kept behind a flag. See
 | `POST /v1/harness/sessions/:id/cancel` | Optional `{ all?: true }` → the cancel receipt. Default cancels the active run only; `all: true` (the UI Stop button) also drains every queued turn, which stays in `/turns` as a `cancelled` row |
 | `GET /v1/harness/sessions/:id/actions` | The owner questions still waiting for an answer |
 | `POST /v1/harness/sessions/:id/actions/:requestId/answer` | `{ choice: { kind: 'option', option_id } \| { kind: 'custom', text } }` → `{ ok: true, request_id, resolved_at }`. Settles one pending `actionRequest`; allowed while the session is busy. `400` invalid/unknown option, `404` unknown session/request, `409` answered or expired |
-| `GET /v1/harness/sessions/:id/agents` | This session's agent roster (bindings joined with what the session actually runs) |
-| `POST /v1/harness/sessions/:id/agents` | Bind a trusted profile, or define a session-owned agent, into this session only |
+| `GET /v1/harness/sessions/:id/agents` | This session's agent roster (bindings joined with what the session actually runs). Each row states the member's `rank`: the definition's `ranks` map is the ONLY authority — the read never derives a letter from the name, the roster order, or "is this the entry agent" — and a member the map does not name reports the LOWEST rank, because authority exists only where the definition grants it (`rankOfMember`, `src/server/api-reads.ts:1477-1488`). Any number of members may share a rank, `'A'` included. The row also carries `deletable`, the same predicate the `DELETE` behind it refuses on |
+| `POST /v1/harness/sessions/:id/agents` | Bind a trusted profile, or define a session-owned agent, into this session only. The answer is ONE `SessionAgentBinding`, and it names the member's `rank` — a letter the caller may state, and one the runtime fills when it does not: an omitted rank takes ONE RANK BELOW the lowest rank configured anywhere (the store's own fallback for a handle that reports no `ranks` at all is `'Z'`, the bottom of the scale — never an inherited middle rank), so a bound newcomer cannot land above the harness's delegator by accident |
 | `GET /v1/harness/sessions/:id/agents/:agentId` | One binding |
 | `PATCH /v1/harness/sessions/:id/agents/:agentId` | Override one session agent's model or instruction |
-| `DELETE /v1/harness/sessions/:id/agents/:agentId` | Remove one binding (the primary is not detachable; live or queued work is a `409`) |
+| `DELETE /v1/harness/sessions/:id/agents/:agentId` | Remove one binding. The ENTRY agent is the one member that is never detachable (`harness.name` and `handle.agent` point at it), and a binding can never REPLACE `definition.entry` — promoting a member is a harness-definition edit, not a session-scoped binding. That entry guard is the SERVER's, and the library handle is looser on purpose: `harness.removeAgent(entry)` is legal (`src/harness.ts:16687-16691`) and `harness.name`/`handle.agent` then resolve to the first still-registered agent, because this route — not the library — is the one that guards a durable roster. An agent that still owns a conversation is refused with a `409` naming those thread ids (delete the threads first), and live or queued work is a `409` |
 | `GET /v1/harness/sessions/:id/agents/:agentId/instruction` | One session agent's effective instruction, naming the layer it came from |
 | `PATCH /v1/harness/sessions/:id/agents/:agentId/instruction` | Replace or clear it (`{ instruction: "…" \| null }`) and return that same document |
 | `GET /v1/harness/sessions/:id/tools` | This session's toolbox: one row per live registry name, with `declared` (in the frozen definition's **`coreTools`**, not the preset's tool list), `enabled` — the CALL axis, `!withheld && (holds a cap slot ? in the capped set : true)` (`src/server/api-reads.ts` `sessionToolRowsOf`). So `false` means EITHER "this conversation switched it off" OR "the cap has no free slot for it", and only the first appears in `harness.withheldTools`; a slotless row (a core declaration, the pending-only `toolCancel`) can only be `false` because it is switched off. The row carries no separate withheld flag, so for a searchable name those two `false`s read identically here. A session the server CREATED starts with every cap-eligible name there, `enableAllTools`, and so does one it RESETS; a name the deployment denies is the one name the seed leaves off, and the denial outranks this figure — `GET /v1/harness/tools` is the row that states it), `origin` (`created` / `discovered` / `catalogue`) and `protected` — the UNREGISTER axis: `visibility === 'core'` on the live registry map, exactly the `DELETE` `403` and nothing else. It is never consulted by an enable/disable PATCH, and `toolCancel` is `protected: false` because the kernel's `remove` accepts it |
@@ -3508,8 +3561,11 @@ including the shipped templates (`general`, `instruct`, `research`, `workspace`,
 metadata-only `PATCH` (`title`/`description`) preserves the template's captured
 factory, so a harness that does not use the live profiled factory keeps whatever it
 was built with. An executable `PATCH`
-(`primary`/`subagents`/`agent_models`/`agent_instructions`) rebuilds the harness as a
-live profiled harness from the shared toolbox.
+(`agents`/`entry`/`ranks`/`agent_models`/`agent_instructions`/`agent_colors`) rebuilds the
+harness as a live profiled harness from the shared toolbox. `agent_colors` is display-only
+yet still counts as executable: the map is captured by the factory closure and reaches every
+`Agent` built from it, so a stated color must rebuild the factory rather than be stored as a
+swatch no agent carries.
 `builtin: true` still marks provenance. `DELETE /v1/harness/harnesses/:name` removes one
 and answers `{ deleted: true, harness_name, tombstoned, restored_by_restore }`:
 `tombstoned` is `true` when a SHIPPED name was removed, because its template still exists
@@ -3518,22 +3574,36 @@ and a later restore can bring it back. Re-creating a name that is tombstoned ans
 the registry is restored from `<root>/harness/index.json` (see Persistence), and
 without one it is in memory only. Registry edits affect FUTURE sessions only,
 because a session freezes its captured preset and descriptor at creation. Both
-routes validate the request — exactly one primary, known agent ids only, no
-duplicate ids, reserved aliases
+routes validate the request — a REQUIRED `agents` roster of known ids with no duplicates
+(at most 16), an optional `entry` that must name a member, an optional `ranks` map whose keys
+are members and whose values are single rank letters, reserved aliases
 (`writer`/`assistant`/`researcher`) and existing names rejected, bounded
 title/description — and reject unknown fields, so a client cannot supply a bare
-`instruction`, a provider, or a tool list.
+`instruction`, a provider, or a tool list. THE OLD VOCABULARY IS NOT TRANSLATED: because the
+field set is closed (`name`/`title`/`description`/`agents`/`entry`/`ranks`/`agent_models`/
+`agent_instructions`/`agent_colors`), a body still sending `primary` or `subagents` is a `400`
+naming the ACCEPTED set — that is the intended migration signal, because accepting the old pair
+would invent authority for a roster the client never ranked. A lowercase letter is refused the
+same way, with the exact shape spelled out:
+`` `ranks.a` must be a single rank letter from A (highest) to Z (lowest), upper-case. Received "a". ``
 
 **Saved registry rows and improved defaults.** A restart replays the registry rows
 saved in `index.json`, but a shipped default may improve between builds (T3 widened
 the real presets' teams and retitled `research`/`workspace`). The conservative rule:
-a built-in row whose executable fields (primary, subagents, agents, tools,
-environmentTools, template, and an empty `agentModels`/`agentInstructions`) still match the previously
+a built-in row whose executable fields (entry, the RESOLVED ranks map, agents, tools,
+environmentTools, template, and empty `agentModels`/`agentInstructions`/`agentColors`/`customAgents`
+maps) still match the previously
 shipped definition recorded in `LEGACY_PRESET_DEFINITIONS`
 (`src/server/harnesses/presets.ts`) is treated as an unmodified default and is
-refreshed to the current template. A row that differs in ANY executable field — or
+refreshed to the current template. The rank map is compared CANONICALISED (`sortedRanks`,
+`src/server/harnesses/registry.ts:912-914`, inside `isLegacyShippedDefinition` at `:1163-1200`)
+because rank is executable AUTHORITY: a row whose planner sits at Rank B instead of Rank A is a
+real customisation and must not be refreshed away. A row that differs in ANY executable field — or
 that carries per-agent models — is a real customisation and is replayed exactly as
 saved. A title/description the operator edited is preserved across a refresh.
+The legacy table itself is written in the current `entry`/`ranks` vocabulary, so it can prove
+"nobody customised this" only for a row that already speaks rank — a row still carrying
+`primary`/`subagents` is REFUSED on load rather than compared.
 Frozen sessions are never rewritten: each session restores from its own recorded
 preset and descriptor, so an old conversation keeps the team it started with.
 
@@ -3541,7 +3611,7 @@ preset and descriptor, so an old conversation keeps the team it started with.
 id**, e.g. `{ "summarizer": "small/fast" }`. A member it omits uses the session's
 `settings.model`, so a dropdown can show "default". Values are trimmed, non-empty,
 at most 200 characters, and free of control characters; keys must belong to the
-resulting `[primary, ...subagents]` set or the request is a `400` naming the members.
+resulting FINAL ROSTER set or the request is a `400` naming the members.
 Only ids are overridable — never a provider, base URL, or key. On `PATCH` the map
 REPLACES the previous one, so `{}` clears every override; changing membership
 without restating the map drops the overrides of agents that are no longer selected.
@@ -3743,7 +3813,9 @@ name and a fix — never a quiet inline fallback:
   4. those refusals live at the **surfaces**, not at a stack depth. A refusing replica does not hand
      a body the raw live handle: `context.harness` is a guarded view of it (`src/harness.ts`
      `toolHandleView`, built once per instance) whose callable, `sendThreadInput` and sibling-brain
-     members throw whenever they are reached — so a reference the body stores and fires from a
+     members throw whenever they are reached — the one surface it hands out READABLE is `ranks`,
+     a fresh frozen copy of the resolved rank map (the replacement for the removed `subagents`
+     member) — so a reference the body stores and fires from a
      callback or a timer AFTER its own call settled is refused exactly like a call made inside the
      body. Everything a lane toolbox needs passes through that view untouched (`runtime.*`,
      `memory`, `tools`, `commands`, `threads()` / `threadMessages()`, `executeTool`, `nestedRuns()`),
@@ -4151,7 +4223,7 @@ still address it
 The tolerance is deliberately scoped to host threads: an invalid **default**
 (`agent:<name>`) conversation still fails the restore and drops the session, because
 that transcript is what the entry point runs and a placeholder there would silently
-rewrite the session's primary conversation. Retention also covers a default conversation
+rewrite the entry agent's own conversation. Retention also covers a default conversation
 whose placeholder came from a live `PUT`; only a hand-broken `core.agents[name].messages`
 in the stored file stays fatal. The raw value of an unreadable host thread
 is retained beside it as `SessionSnapshot.invalidThreads` — additive
@@ -4273,8 +4345,10 @@ call is not a turn - it never changes `status` or appends a turn, only a private
 single-flight flag while it runs. A session model PATCH is the exception: it is a
 model choice, not a harness mutation, so it is accepted while a run streams and
 aborts nothing.
-`delegate` is listed for every host but only exists in a session whose harness
-allows subagents; otherwise the call answers a clear `404`. `actionRequest` and
+`delegate` is listed for every host but only exists in a session whose harness RANK map
+spans two or more distinct letters, i.e. while some agent holds a strictly-lower-ranked
+peer; otherwise the tool is not registered at all and the call answers a clear `404`.
+`actionRequest` and
 `threadFork` are likewise listed (conditional in a session), but a manual call is
 refused because both need the run that owns the conversation. The **Web search** group
 shows whether this server has `EXA_API_KEY`/`TAVILY_API_KEY`/`LINKUP_API_KEY`; an
@@ -4527,7 +4601,7 @@ The standalone server uses the explicit `startHarnessServer({ databaseRoot })`
 option; omitting it keeps the previous in-memory behaviour (and direct unit
 tests need no disk).
 
-The store is version 2 (`HARNESS_DATABASE_VERSION`, `src/server/persistence.ts:195`)
+The store is version 2 (`HARNESS_DATABASE_VERSION`, `src/server/persistence.ts:208`)
 and it is **one logical document spread over a directory tree**, one file per session
 and one per conversation: a single file holding every session and every transcript does
 not survive the population this server is meant to reach (hundreds of sessions,
@@ -4590,6 +4664,30 @@ A row whose id is not a generated host id KEEPS its `messages` inline in
 `session.json`: it has no safe file name, and dropping the transcript would lose bytes
 the previous layout stored (`:2312-2319`). Such a row is refused by
 `src/core/snapshot.ts` on restore either way.
+
+**The rank model is a CLEAN BREAK on disk, not a translation.** The stored roster fields are
+`entry` and `ranks`, and every door that reads them refuses the old vocabulary outright:
+
+- a saved registry row or a frozen session descriptor carrying `primary` or `subagents` is
+  REFUSED at load, naming the label and telling the operator to re-save in the new shape or
+  start from a fresh database root (`requireNoLegacyRosterKeys`, `src/server/persistence.ts:697-706`,
+  called for the frozen descriptor at `:746` and for the preset record at `:837`);
+- a stored `ranks` value must be ONE rank letter —
+  `<label>.<agent> must be a single rank letter
+  from "A" (highest) to "Z" (lowest).` (`readRankMap`, `:717-731`);
+- the harness SNAPSHOT is version 3 (`HARNESS_SNAPSHOT_VERSION`, `src/core/snapshot.ts:107`) and
+  answers `Snapshot version 2 is not supported; this harness reads version 3.` (`:1205-1207`).
+  It will not guess: a v2 transcript record's `role: 'primary' | 'subagent'` maps to a rank only
+  by assumption, and v3 lets any number of agents share Rank A, so a v2 file is refused while its
+  records are read as `rank` (`:302-316`);
+- the per-conversation lane ARCHIVE digest hashes the agent's `rank`, so an archive row written
+  before the rank model digests to the old value and RE-ARCHIVES once by design rather than being
+  shimmed with a `role` alias (`src/server/workers/lane-commit.ts:164-190`).
+
+`HARNESS_DATABASE_VERSION` stays 2 through all of this (`src/server/persistence.ts:208`), because
+the version tracks the shard TREE and none of these keys changed it — the rank change is a change
+to the VALUES inside the same layout, which is exactly why the loaders refuse the old keys loudly
+instead of relying on a version bump to catch them.
 
 Commits are **per shard, ordered, incremental**. Each shard is its own commit unit with
 the discipline the single file always had: the shard's full JSON (compact

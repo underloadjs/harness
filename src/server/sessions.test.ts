@@ -17,7 +17,7 @@ import { agent, harness, tool } from '../harness';
 // value is exact because every frame here was recorded IN THIS PROCESS (the delegated
 // child runs inline), and vitest gives one module registry per file — one epoch per file.
 import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
-import type { HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessUsage } from '../harness';
+import type { AgentRank, HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessUsage } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { AGENT_PROFILES, agentInstruction } from '../agents';
@@ -70,8 +70,15 @@ const presetOf = (
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: agents[0] ?? name,
-    subagents: agents.slice(1),
+    // B3 R15 — `entry` is ROUTING (which member an unfocused submit opens) and `ranks` is
+    // AUTHORITY. The old `subagents: agents.slice(1)` said "everyone but the entry is a delegation
+    // target"; the rank map says the same thing directly — the entry holds Rank A and every target
+    // sits strictly below it (`isLowerRank` derives the allowlist from the map alone). A stored
+    // preset's map covers EVERY member, so this writes it complete rather than sparse.
+    entry: agents[0] ?? name,
+    ranks: Object.fromEntries(
+        agents.map((agent) => [agent, agent === (agents[0] ?? name) ? 'A' : 'B'])
+    ) as Record<string, AgentRank>,
     agents,
     tools: [],
     builtin: true,
@@ -126,7 +133,7 @@ const singlePreset = (): HarnessPreset =>
                     stream: answerStream('hello')
                 })
             },
-            primary: 'single',
+            entry: 'single',
             presets: false,
             report: { progress }
         })
@@ -164,7 +171,7 @@ const usagePreset = (usage: HarnessUsage): HarnessPreset =>
                     ])
                 })
             },
-            primary: 'priced',
+            entry: 'priced',
             presets: false,
             report: { progress }
         })
@@ -201,16 +208,18 @@ const toolRoundPreset = (usage: readonly [HarnessUsage, HarnessUsage]): HarnessP
                     ])
                 })
             },
-            primary: 'rounds',
+            entry: 'rounds',
             presets: false,
             report: { progress }
         })
     );
 
-// Primary + subagent. The primary asks for `delegate` on its first request and,
-// after the harness appends the delegate result as a tool message, answers with
-// text. The helper answers on its own stream. This exercises the fact that the
-// session records subagent progress in the primary turn.
+// Entry agent + a Rank B delegate. The entry agent asks for `delegate` on its first
+// request and, after the harness appends the delegate result as a tool message,
+// answers with text. The helper answers on its own stream. This exercises the fact
+// that the session records a delegated child's progress inside the entry agent's
+// turn — the child is a lower RANK, and rank is what makes it addressable at all
+// (../types `isLowerRank`); the recording rule itself never reads the letter.
 const teamPreset = (): HarnessPreset =>
     presetOf(
         'team',
@@ -248,8 +257,8 @@ const teamPreset = (): HarnessPreset =>
                         stream: answerStream('helper answer')
                     })
                 },
-                primary: 'lead',
-                subagents: ['helper'],
+                entry: 'lead',
+                ranks: { lead: 'A', helper: 'B' },
                 presets: false,
                 report: { progress }
             }),
@@ -678,7 +687,7 @@ describe('SessionStore turns', () => {
                         }
                     })
                 },
-                primary: 'partial',
+                entry: 'partial',
                 presets: false,
                 report: { progress }
             })
@@ -707,7 +716,7 @@ describe('SessionStore turns', () => {
         expect(turn.usage).toEqual(first);
     });
 
-    it('records subagent events in the primary turn', async () => {
+    it("records a delegated child's events in the entry agent's turn", async () => {
         const setClock = pinClock(1_000);
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([teamPreset()]));
         const created = await store.create('team');
@@ -823,7 +832,7 @@ describe('SessionStore turns', () => {
             throw new Error(`expected a snapshot last, got ${terminal?.type}`);
         }
 
-        // One turn owns both agents: the subagent does not create a second turn.
+        // One turn owns both agents: the delegated child does not create a second turn.
         expect(terminal.session.turns).toHaveLength(1);
         expect(terminal.session.turns[0].status).toBe('done');
         expect(terminal.session.turns[0].events).toEqual(events);
@@ -914,7 +923,7 @@ describe('SessionStore turns', () => {
                         }
                     })
                 },
-                primary: 'gated',
+                entry: 'gated',
                 presets: false,
                 report: { progress }
             })
@@ -992,7 +1001,7 @@ describe('SessionStore turns', () => {
                         }
                     })
                 },
-                primary: 'hanging',
+                entry: 'hanging',
                 presets: false,
                 report: { progress }
             })
@@ -1078,7 +1087,7 @@ describe('SessionStore turns', () => {
                         retry: false
                     })
                 },
-                primary: 'broken',
+                entry: 'broken',
                 presets: false,
                 report: { progress }
             })
@@ -1259,8 +1268,8 @@ describe('SessionStore turns', () => {
                 title: 'single',
                 description: 'single scripted preset',
                 requiresEndpoint: false,
-                primary: 'single',
-                subagents: [],
+                entry: 'single',
+                ranks: { single: 'A' },
                 agents: ['single'],
                 tools: [],
                 // R9-R11: the declared core is the bootstrap pair; the demoted
@@ -1312,12 +1321,19 @@ describe('SessionStore and the harness registry', () => {
         });
         expect(before.messages.filter((message) => message.role === 'system')).toHaveLength(1);
 
-        // A registry override replaces the entry; it cannot reach the session that
-        // captured the old preset (and its factory). The allowlist is restated so the
-        // test pins the routing change itself, not the inherited-team derivation.
-        registry.update('instruct', { title: 'Edited', primary: 'workspace', subagents: [] });
+        // A registry override replaces the roster AND the entry agent; it cannot reach the session
+        // that captured the old preset (and its factory). The roster is restated explicitly because
+        // it is a field of its own now — never something derived from the entry — and the one-member
+        // rank map states the flat team the old `subagents: []` described: one distinct rank, so no
+        // `delegate` is registered for the rebuilt harness.
+        registry.update('instruct', {
+            title: 'Edited',
+            agents: ['workspace'],
+            entry: 'workspace',
+            ranks: { workspace: 'A' }
+        });
         expect(store.get(before.id).harnessDefinition?.title).toBe('Instruct');
-        expect(store.get(before.id).harnessDefinition?.primary).toBe('instruct');
+        expect(store.get(before.id).harnessDefinition?.entry).toBe('instruct');
         expect(withoutIds(store.get(before.id).messages[0])).toEqual({
             role: 'system',
             content: agentInstruction(AGENT_PROFILES.instruct)
@@ -1326,7 +1342,7 @@ describe('SessionStore and the harness registry', () => {
         // A new session resolves the patched entry and is built from it.
         const after = await store.create('instruct');
         expect(after.harnessDefinition?.title).toBe('Edited');
-        expect(after.harnessDefinition?.primary).toBe('workspace');
+        expect(after.harnessDefinition?.entry).toBe('workspace');
         expect(after.harnessDefinition?.agents).toEqual(['workspace']);
         expect(withoutIds(after.messages[0])).toEqual({
             role: 'system',
@@ -1357,7 +1373,7 @@ describe('SessionStore and the harness registry', () => {
                         ])
                     })
                 },
-                primary: 'discovering',
+                entry: 'discovering',
                 tools: { reader },
                 presets: false,
                 report: { progress }
@@ -1434,8 +1450,8 @@ describe('SessionStore agent model retargeting', () => {
 
                 return harness({
                     agents: { lead: probe('lead'), helper: probe('helper') },
-                    primary: 'lead',
-                    subagents: ['helper'],
+                    entry: 'lead',
+                    ranks: { lead: 'A', helper: 'B' },
                     presets: false,
                     report: { progress }
                 });
@@ -1644,7 +1660,7 @@ describe('SessionStore manual tool calls', () => {
                         execute: () => 'digested'
                     })
                 },
-                primary: 'toolbox',
+                entry: 'toolbox',
                 presets: false,
                 report: { progress }
             })
@@ -1660,7 +1676,7 @@ describe('SessionStore manual tool calls', () => {
         const mine = await store.create('single');
         const other = await store.create('single');
 
-        // An operator call runs as the session's PRIMARY agent, so the new record is
+        // An operator call runs as the session's ENTRY agent, so the new record is
         // attributed to it. There is no `updatedThreadId`: a manual call has no
         // thread, and the key stays absent rather than `undefined` (copyItem).
         const onlyMine = {
@@ -1738,7 +1754,7 @@ describe('SessionStore manual tool calls', () => {
             message: 'Unknown session "missing".'
         });
 
-        // singlePreset has no subagents, so its harness registers no delegate.
+        // singlePreset's roster spans one rank, so its harness registers no delegate.
         await expect(store.callTool(session.id, 'delegate', { agent: 'x', input: 'go' })).rejects.toMatchObject({
             status: 404,
             message: 'Tool "delegate" is not available in this session.'
@@ -1775,7 +1791,7 @@ describe('SessionStore manual tool calls', () => {
                         }
                     })
                 },
-                primary: 'slow',
+                entry: 'slow',
                 presets: false,
                 report: { progress }
             })
@@ -1861,7 +1877,7 @@ describe('SessionStore manual tool calls', () => {
                         }
                     })
                 },
-                primary: 'gated',
+                entry: 'gated',
                 presets: false,
                 report: { progress }
             })

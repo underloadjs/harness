@@ -364,13 +364,18 @@ describe('harness', () => {
             'profiles',
             'records',
             'chapters',
+            // The `knowledge` entry is a 1-point description hit on this query (its own
+            // description says the base "reads and writes"), so it ranks below every exact
+            // tag hit and above the name-ordered remainder. Tags: src/tools/runtime/knowledge.tool.ts:186.
+            'knowledge',
             'locations',
             'toolManage'
         ]);
-        expect(refined.matched).toBe(11);
+        expect(refined.matched).toBe(12);
         expect(refined.omitted).toBe(0);
 
-        // The newest selection leads the current order; all eight still fit.
+        // The newest selection leads the current order; all eight still fit, plus the
+        // `knowledge` row this query picked up as a description hit.
         expect(writer.discoveredTools).toEqual([
             'file-f',
             'file-a',
@@ -381,6 +386,7 @@ describe('harness', () => {
             'profiles',
             'records',
             'chapters',
+            'knowledge',
             'locations',
             'toolManage'
         ]);
@@ -404,6 +410,9 @@ describe('harness', () => {
             'profiles',
             'chapters',
             'locations',
+            // The cross-session knowledge base registers with the record family
+            // (order 95, after `locations` 90): src/tools/runtime/knowledge.tool.ts:503.
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -1290,6 +1299,10 @@ describe('harness', () => {
         expect(declaredNames(seen[1])).toEqual([
             'toolRequest',
             'tasks',
+            // `knowledge` carries the exact tag "read" this query asks for, so it is a
+            // 2-point exact-tag hit; registration order 95 puts it ahead of the configured
+            // fixture. Tags: src/tools/runtime/knowledge.tool.ts:186.
+            'knowledge',
             'reader',
             'threadFork',
             'agentManage',
@@ -1303,6 +1316,7 @@ describe('harness', () => {
             'toolCreate'
         ]);
         expect(writer.discoveredTools).toEqual([
+            'knowledge',
             'reader',
             'threadFork',
             'agentManage',
@@ -1322,6 +1336,10 @@ describe('harness', () => {
         expect(declaredNames(seen[3])).toEqual([
             'toolRequest',
             'tasks',
+            // `knowledge` carries the exact tag "read" this query asks for, so it is a
+            // 2-point exact-tag hit; registration order 95 puts it ahead of the configured
+            // fixture. Tags: src/tools/runtime/knowledge.tool.ts:186.
+            'knowledge',
             'reader',
             'threadFork',
             'agentManage',
@@ -1335,6 +1353,7 @@ describe('harness', () => {
             'toolCreate'
         ]);
         expect(writer.discoveredTools).toEqual([
+            'knowledge',
             'reader',
             'threadFork',
             'agentManage',
@@ -1611,7 +1630,7 @@ describe('usage reporting', () => {
         ]);
     });
 
-    it('reports a delegated subagent usage with its own agent name, interleaved', async () => {
+    it('reports a delegated child usage with its own agent name, interleaved', async () => {
         const events: HarnessEvent[] = [];
         const leadFirst = { input: 5, output: 2, total: 7 };
         const helperUsage = { input: 9, output: 3, total: 12 };
@@ -1626,11 +1645,10 @@ describe('usage reporting', () => {
                         answer('lead done', leadAnswer)
                     ])
                 ),
-                // The subagent's single request carries its own usage.
+                // The child's single request carries its own usage.
                 helper: brain(scripted([answer('helper answer', helperUsage)]))
             },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
             presets: false,
             report: { progress: (event) => { events.push(event); } }
         });
@@ -1744,7 +1762,7 @@ describe('executeTool', () => {
             'Tool "nope" is not registered in this harness.'
         );
 
-        // No subagents means no delegate tool at all — never a fabricated one.
+        // A roster that spans one rank has no delegate tool at all — never a fabricated one.
         await expect(writer.executeTool('delegate', { agent: 'helper', input: 'go' })).rejects.toThrow(
             'Tool "delegate" is not registered in this harness.'
         );
@@ -1790,20 +1808,19 @@ describe('executeTool', () => {
         await expect(writer.executeTool('upper', {})).resolves.toBe(1);
     });
 
-    it('delegates manually as the primary and leaves the transcript alone', async () => {
+    it('delegates manually from the entry rank and leaves the transcript alone', async () => {
         const writer = harness({
             agents: {
                 lead: brain(scripted([answer('lead answer')])),
                 helper: brain(scripted([answer('helper answer')]))
             },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
             presets: false
         });
 
-        // A manual delegate call runs a REAL turn on the subagent, so its answer is
-        // the same one the model would receive. No user message is appended to the
-        // primary's conversation: this was not a turn.
+        // A manual delegate call runs a REAL turn on the child, so its answer is the same
+        // one the model would receive. No user message is appended to the entry agent's
+        // conversation: this was not a turn.
         //
         // T28: the result is an envelope carrying the child's identity and a paged
         // answer, not the old `{ agent, content }` pair. A manual call has no tool-call
@@ -1823,11 +1840,13 @@ describe('executeTool', () => {
         expect(writer.agent.messages).toEqual([]);
         expect(writer.agents.helper.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
 
-        // The allowlist is still enforced on the manual path (R11: the schema enum
-        // is checked before the implementation's own guard, so the message names
-        // the allowed value).
+        // The RANK rule is still enforced on the manual path. A host call carries the entry
+        // agent's rank (src/harness.ts `hostRank`), so delegating to the entry agent itself is
+        // a same-rank refusal — and because the schema enum is the whole roster on purpose
+        // (a narrow enum could not name a rank), the RANK error is what answers the call. The
+        // message names the caller's rank, the target's rank, and the legal targets.
         await expect(writer.executeTool('delegate', { agent: 'lead', input: 'go' })).rejects.toThrow(
-            '$.agent must be one of: "helper".'
+            'lead holds Rank A and cannot delegate to "lead" (Rank A): delegation is strictly downward. The legal targets are Rank B and below: helper.'
         );
     });
 });

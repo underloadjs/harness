@@ -66,7 +66,7 @@ export type ToolOrigin = 'package' | 'folder';
 //
 //   always       — registered on every harness construction
 //   creation     — registered unless `toolCreation: false`
-//   subagents    — registered only when the harness has an allowlist
+//   delegation   — registered only when the roster has an agent with a strictly-lower-ranked peer
 //   interaction  — registered only when an owner answerer is configured
 //   forks        — registered only when `forks.enabled`
 //   threads      — registered once the session owns an independent thread
@@ -75,7 +75,7 @@ export type ToolOrigin = 'package' | 'folder';
 export type ToolActivation =
     | 'always'
     | 'creation'
-    | 'subagents'
+    | 'delegation'
     | 'interaction'
     | 'forks'
     | 'threads'
@@ -109,8 +109,6 @@ export type ToolRegistration = {
     pendingOnly?: boolean;
     // Dispatched by the owning run rather than executed as an ordinary tool.
     control?: ToolControl;
-    // Not declared to subagents; a guessed call is rejected (delegate).
-    primaryOnly?: boolean;
     // Answer extraction belongs to the baseline delegation definition (T2/R1).
     answerExtraction?: boolean;
     // Needs a live session harness; the server gates manual calls on a sessionId.
@@ -146,7 +144,6 @@ export type DiscoveredTool = {
     order: number;
     pendingOnly?: boolean;
     control?: ToolControl;
-    primaryOnly?: boolean;
     answerExtraction?: boolean;
     sessionBound?: boolean;
     listed?: boolean;

@@ -73,8 +73,11 @@ const gatedPreset = (gates: { promise: Promise<void>; release: () => void }[]): 
     title: 'Worker',
     description: 'Scripted gated preset',
     requiresEndpoint: false,
-    primary: 'worker',
-    subagents: [],
+// A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: 'worker',
+    ranks: { worker: 'A' },
     agents: ['worker'],
     tools: [],
     builtin: true,
@@ -100,7 +103,7 @@ const gatedPreset = (gates: { promise: Promise<void>; release: () => void }[]): 
                     }
                 })
             },
-            primary: 'worker',
+            entry: 'worker',
             presets: false,
             report: { progress }
         })
@@ -122,8 +125,11 @@ const workerPreset = (): HarnessPreset => ({
     title: 'Worker',
     description: 'Scripted live-contract preset',
     requiresEndpoint: false,
-    primary: 'worker',
-    subagents: [],
+// A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: 'worker',
+    ranks: { worker: 'A' },
     agents: ['worker'],
     tools: [],
     builtin: true,
@@ -150,7 +156,7 @@ const workerPreset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'worker',
+            entry: 'worker',
             presets: false,
             report: { progress }
         })

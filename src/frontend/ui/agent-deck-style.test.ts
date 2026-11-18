@@ -134,12 +134,12 @@ it('sizes the strip button to the exposed edge and hides it on the front card', 
 
 it('keeps every card surface opaque so covered cards do not show through', () => {
     // The deck stacks cards, so a translucent surface would let the card underneath
-    // bleed through the front card. The primary's green tint is therefore a gradient
+    // bleed through the front card. The entry agent's green tint is therefore a gradient
     // layer over the solid elevated surface, not a bare rgba background.
-    const primary = blockOf(".agent-tile[data-role='primary'] {");
-    expect(primary).toContain('var(--bg-elevated)');
-    expect(primary).toContain('linear-gradient(rgba(74, 222, 128, 0.1), rgba(74, 222, 128, 0.1))');
-    expect(primary).not.toContain('background: rgba(');
+    const entryCard = blockOf(".agent-tile[data-entry='true'] {");
+    expect(entryCard).toContain('var(--bg-elevated)');
+    expect(entryCard).toContain('linear-gradient(rgba(74, 222, 128, 0.1), rgba(74, 222, 128, 0.1))');
+    expect(entryCard).not.toContain('background: rgba(');
     // The base card surface and the strip hover wash sit on that opaque surface.
     expect(blockOf('.agent-tile {')).toContain('background: var(--bg-elevated)');
     expect(blockOf('.agent-handle:hover {')).toContain('background: rgba(255, 255, 255, 0.05)');

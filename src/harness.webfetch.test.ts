@@ -174,8 +174,8 @@ describe('live toolbox harness', () => {
 
         const seen: HarnessStreamRequest[] = [];
 
-        // A primary + subagent pair mirrors a real preset's shape (the subagents are
-        // what make delegate part of the core declarations). Turn 1 calls fetch
+        // An entry agent + one junior mirrors a real preset's shape (a roster that spans two
+        // ranks is what makes delegate part of the core declarations). Turn 1 calls fetch
         // directly; turn 2 opens the two searchable rows; turn 3 answers.
         const writer = createToolboxHarness(
             {
@@ -193,8 +193,8 @@ describe('live toolbox harness', () => {
                     }),
                     research: agent({ model: 'test/model', stream: scripted([answer('idle')]) })
                 },
-                primary: 'instruct',
-                subagents: ['research']
+                entry: 'instruct',
+                ranks: { instruct: 'A', research: 'B' }
             },
             { baseURL: 'http://provider.test/v1', apiKey: '', model: 'test-model' },
             async () => undefined
@@ -214,6 +214,7 @@ describe('live toolbox harness', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'delegate',
@@ -324,8 +325,7 @@ describe('live toolbox harness', () => {
                         )
                     })
                 },
-                primary: 'instruct',
-                subagents: []
+                entry: 'instruct'
             },
             { baseURL: 'http://provider.test/v1', apiKey: '', model: 'test-model' },
             async () => undefined
@@ -335,7 +335,7 @@ describe('live toolbox harness', () => {
 
         await writer('fetch a page');
 
-        // No team means no delegate; fetch is still declared, keyless and unmoved.
+        // A single-rank roster registers no delegate; fetch is still declared, keyless and unmoved.
         expect(declaredNames(seen[0])).toEqual([
             'toolRequest',
             'tasks',

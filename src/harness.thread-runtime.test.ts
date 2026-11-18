@@ -281,7 +281,7 @@ type RecordShape = {
 
 // One stored record in the exact key set src/core/task.ts `copyItem` produces.
 // `updatedAt` is always present here because every write in this file has an
-// identity (a run, or a manual executeTool call as the primary).
+// identity (a run, or a manual executeTool call as the entry agent).
 const task = (id: string, text: string, shape: RecordShape = {}): TaskItem => ({
     id,
     text,
@@ -319,7 +319,7 @@ const event = (
     ...(shape.itemRev === undefined ? {} : { itemRev: shape.itemRev })
 });
 
-// The live store, read through the host door (identity: the primary, unthreaded).
+// The live store, read through the host door (identity: the entry agent, unthreaded).
 const storedTasks = async (writer: Harness): Promise<TaskItem[]> =>
     ((await writer.executeTool('tasks', {})) as TaskResult).tasks;
 
@@ -656,7 +656,7 @@ describe('steering (R5)', () => {
         ]);
     });
 
-    it('steers the callable root through the primary default conversation', async () => {
+    it('steers the callable root through the entry default conversation', async () => {
         const turn = gate();
         let requests = 0;
 
@@ -678,7 +678,7 @@ describe('steering (R5)', () => {
 
         const running = writer('brief');
         await flush();
-        // The root run owns the primary's default conversation while it executes.
+        // The root run owns the entry agent's default conversation while it executes.
         expect(writer.thread('agent:writer')).toEqual({
             id: 'agent:writer',
             agent: 'writer',
@@ -888,8 +888,8 @@ describe('host-parent delegation (R4)', () => {
 
         const writer = harness({
             agents: { lead, helper },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false
         });
 
@@ -987,8 +987,8 @@ describe('host-parent delegation (R4)', () => {
                 lead: brain(scripted([answer('unused')])),
                 helper: brain(scripted([answer('unused')]))
             },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false
         });
         restored.restore(snapshot);
@@ -1060,8 +1060,8 @@ describe('host-parent delegation (R4)', () => {
 
             return harness({
                 agents: { lead, helper },
-                primary: 'lead',
-                subagents: ['helper'],
+                entry: 'lead',
+                ranks: { lead: 'A', helper: 'B' },
                 presets: false
             });
         };
@@ -1582,7 +1582,7 @@ describe('cross-thread chat and delegation links (R4)', () => {
         await flush();
         expect(requests).toBe(1);
 
-        // The manual path has no run identity, so the sender is the primary agent
+        // The manual path has no run identity, so the sender is the entry agent
         // and no sender thread is claimed.
         await expect(
             writer.executeTool('threadSend', { thread: target.id, message: 'ping' })
@@ -1620,8 +1620,8 @@ describe('cross-thread chat and delegation links (R4)', () => {
 
         const writer = harness({
             agents: { lead, helper },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false
         });
 
@@ -2160,8 +2160,8 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         );
         const writer = harness({
             agents: { lead, helper },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false
         });
 
@@ -2186,8 +2186,8 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
                 ),
                 helper: brain(scripted([answer('facts')]))
             },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false
         });
         await target('go');
@@ -4379,6 +4379,108 @@ describe('a conversation label addresses it at every thread door', () => {
         expect(() => writer.threadMessages('IT14')).toThrow(
             'Thread "IT14" is not available in this harness; it was never created, or it was deleted.'
         );
+    });
+});
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// A HOST `threadSend` RECORDS THE HOST, NEVER A DEPARTED ENTRY AGENT (R70)
+//
+// `threadSend` derives its sender from the RUNTIME CONTEXT, never from a model
+// argument (`threadSendFor`, src/harness.ts:6824). A model call arrives with
+// `context.agent` — a real brain — so that door never had an identity problem. The door
+// pinned here is the HOST one: `runtime.threadSend(undefined, …)`, which carries NO
+// caller brain at all (a plugin outside any conversation, and the lane route at
+// ../server/workers/lane-authority.ts:898). Its fallback used to be `entryName`, the
+// CONFIGURED entry name — and `removeAgent(entryName)` is legal in this library ("THE
+// ENTRY AGENT IS REMOVABLE", src/harness.ts:16706), so after a detach that fallback
+// stamped the message `from agent "entry"` in a roster that had stopped naming `entry`:
+// the same ghost identity already removed at every other host door (`hostActor`, `:1669`,
+// the rank refusal at `:5654`, the `{ agent: 'host', rank: 'A' }` invocation record).
+//
+// THE RULE THIS PINS: a host send records `hostActor()`'s name. The byte-identical half
+// is why the normal case is asserted FIRST and in full: while the entry agent is
+// REGISTERED, `hostActor()` returns that agent, and its name IS `entryName`, because both
+// the construction loop and `addAgent` force `brain.name = key` (`:1488`, `:16645`). So
+// the receipt's `sender` and the transcript attribution line stay word for word what they
+// always were. Only after the detach does the record change — to `host`, the identity
+// `delegate` already records — and NOT to the effective-entry fallback the handle's
+// `name`/`agent` readers use (`effectiveEntryName`, `:16874`), which is why both are
+// asserted below: `scout` becomes the effective entry, `host` stays the sender.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('a host threadSend records the host identity, never the detached entry agent', () => {
+    it('records the entry agent while it is registered and `host` once it is detached', async () => {
+        // Two brains. `entry` is the configured ENTRY agent — the name the ghost fallback
+        // would stamp — and `scout` owns the conversations the host writes into, so it
+        // SURVIVES the detach (removing an agent is refused while a host thread still names
+        // it, src/harness.ts:16735-16741).
+        const session = harness({
+            agents: {
+                entry: brain(scripted([answer('entry turn')])),
+                scout: brain(scripted([answer('scout turn')]))
+            },
+            entry: 'entry',
+            presets: false
+        });
+
+        const before = session.createThread('scout');
+        const after = session.createThread('scout');
+
+        // THE NORMAL CASE, pinned byte for byte before anything moves: the entry agent is
+        // registered, the host sends AS it, and the receipt is exactly the shape this door
+        // has always answered. A `threadless` host caller (`threadId: undefined`) is
+        // unscoped, so the receipt carries no `senderThreadId` and the dormant target is
+        // STARTED (`delivered: 'started'`).
+        expect(
+            session.runtime.threadSend(undefined, undefined, {
+                thread: before.id,
+                message: 'host ping'
+            })
+        ).toEqual({
+            threadId: before.id,
+            delivered: 'started',
+            sender: 'entry'
+        });
+
+        await settleThread(session, before.id);
+
+        // The attributed transcript line is the other half of the same record — it is what
+        // the receiving model actually reads, and it is the value the fix must NOT touch here.
+        expect(textOf(session.threadMessages(before.id))).toEqual([
+            'from agent "entry":\nhost ping',
+            'scout turn'
+        ]);
+
+        // THE DETACH — legal in the library, and the roster stops naming `entry` (the server
+        // refuses the same call with a 409; that asymmetry is accepted and documented).
+        session.removeAgent('entry');
+        expect(session.agents.entry).toBeUndefined();
+
+        // The handle's routing readers follow the roster and land on the FIRST REGISTERED
+        // member; that fallback is the handle's answer, not an identity grant.
+        expect(session.name).toBe('scout');
+
+        // THE RECORD NOW NAMES THE HOST. Pre-fix this answered `sender: 'entry'` — an agent
+        // this roster no longer holds, attributed a message it can no longer send.
+        const receipt = session.runtime.threadSend(undefined, undefined, {
+            thread: after.id,
+            message: 'host ping again'
+        });
+
+        expect(receipt).toEqual({
+            threadId: after.id,
+            delivered: 'started',
+            sender: 'host'
+        });
+        expect(receipt.sender).not.toBe('entry');
+
+        await settleThread(session, after.id);
+
+        // And the line the receiving conversation reads is the host, not the departed agent
+        // and not the fallback entry (`scout`).
+        expect(textOf(session.threadMessages(after.id))).toEqual([
+            'from agent "host":\nhost ping again',
+            'scout turn'
+        ]);
     });
 });
 //

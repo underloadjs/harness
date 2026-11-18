@@ -201,12 +201,11 @@ it('paints the agent identity tone on the composer label and the dialog badges (
     expect(declaresColor(active)).toBe(false);
 
     // The dialog: the badge NAME is the identity (ui/agent-dialog.ts paints the badge),
-    // and the `[+]` option is painted with the tone its badge will keep. The role and
-    // model captions stay `--muted` — they are facts about the agent, not the agent — and
+    // and the `[+]` option is painted with the tone its badge will keep. The rank and    // model captions stay `--muted` — they are facts about the agent, not the agent — and
     // selection/activity keep the accent border, so identity and state stay two facts.
     expect(blockOf('.agent-dialog-agent-name {', agentDialogRules)).toContain('color: var(--agent-color)');
     expect(blockOf('.agent-dialog-add-option {', agentDialogRules)).toContain('color: var(--agent-color)');
-    expect(blockOf('.agent-dialog-agent-role,', agentDialogRules)).toContain('color: var(--muted)');
+    expect(blockOf('.agent-dialog-agent-rank,', agentDialogRules)).toContain('color: var(--muted)');
     expect(blockOf(".agent-dialog-tab[aria-selected='true'] {", agentDialogRules)).toContain(
         'border-color: var(--accent)'
     );

@@ -52,6 +52,11 @@ import type {
 } from './harness-api';
 import type * as Projector from './turn-display';
 import type * as Domain from '../types';
+// THE RANK SCALE as a runtime value. The `Domain` import above is `import type`, so it carries no
+// binding, and this file's job includes pinning the CONTRACT's rank vocabulary to the kernel's:
+// the letters and their ORDER are what `isLowerRank` and the registry's rank FILL both read, so
+// the exact 26-letter sequence is asserted below rather than trusted.
+import { AGENT_RANKS } from '../types';
 import type {
     WsSubscribe,
     WsSubscribeSession,
@@ -431,8 +436,12 @@ describe('harness contract DTO shapes', () => {
             title: 'Painted',
             description: 'Two-member fixture with one configured swatch.',
             requires_endpoint: false,
-            primary: 'research',
-            subagents: ['summarizer'],
+            // ROUTING and AUTHORITY, as the two separate fields the rank model stores: `entry`
+            // says who an unfocused submit opens for, `ranks` says who may delegate to whom. The
+            // fixture keeps the pair the server would emit for a research/summarizer definition
+            // (src/server/api-reads.ts `sessionDefinitionOf` copies the frozen descriptor).
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             agents: ['research', 'summarizer'],
             tools: ['timeNow'],
             builtin: false,
@@ -446,6 +455,12 @@ describe('harness contract DTO shapes', () => {
             current: true
         };
 
+        // The two roster facts round-trip untouched, byte-for-byte — in particular `ranks` keeps
+        // the roster order's letter assignment rather than a re-derivation, which is what lets a
+        // saved session restore the exact team it was built with.
+        expect(frozen.entry).toBe('research');
+        expect(frozen.ranks).toEqual({ research: 'A', summarizer: 'B' });
+
         // Byte-for-byte the map the server emits: `sessionDefinitionOf` (src/server/api-reads.ts)
         // copies the frozen `HarnessDescriptor.agentColors` map, and OMITS the key entirely when
         // that map is empty, so an uncolored session keeps the exact pre-R2 row.
@@ -455,6 +470,90 @@ describe('harness contract DTO shapes', () => {
 
         delete uncolored.agent_colors;
         expect(Object.hasOwn(uncolored, 'agent_colors')).toBe(false);
+    });
+
+    // THE RANK MODEL ON THE WIRE (R1/R6/R12). Routing (`entry`) and authority (`ranks`) are two
+    // independent REQUIRED fields on every definition read; the roster is the client's own
+    // declaration-order list; and every rank field is the kernel's single-letter type, never a
+    // prose role. The compile-time guards below are the load-bearing part: a spec edit that
+    // renames one of them, makes it optional, re-adds the retired pair, or re-spells a rank as
+    // `primary`/`subagent` fails to COMPILE here (this file is excluded from `npm run typecheck`,
+    // so the scoped `npx tsc` run recorded in the task report is what proves it) instead of
+    // shipping a card that states one shape while the server answers another.
+    it('states routing and authority as the rank model, with no second vocabulary', () => {
+        type Card = import('./harness-api').HarnessCard;
+        type Create = import('./harness-api').CreateHarnessRequest;
+        type Update = import('./harness-api').UpdateHarnessRequest;
+        type Binding = import('./harness-api').SessionAgentBinding;
+        type BindingInput = import('./harness-api').CreateSessionAgentRequest;
+        type Section = import('./harness-api').TurnSection;
+
+        const guards: [
+            // A definition read states both facts, typed, and neither is optional.
+            Expect<Equal<Card['entry'], string>>,
+            Expect<Equal<Card['ranks'], Record<string, import('./harness-api').AgentRank>>>,
+            Expect<Equal<undefined extends Card['entry'] ? true : false, false>>,
+            Expect<Equal<undefined extends Card['ranks'] ? true : false, false>>,
+            // The roster is the client's, in declaration order, and REQUIRED on create: the
+            // retired pair had a derived roster, which is the ambiguity the rank pass removes.
+            Expect<Equal<Create['agents'], string[]>>,
+            Expect<Equal<undefined extends Create['agents'] ? true : false, false>>,
+            // `entry`/`ranks` are optional on BOTH writes (each has a documented default), while
+            // the read always states them.
+            Expect<Equal<undefined extends Create['entry'] ? true : false, true>>,
+            Expect<Equal<undefined extends Create['ranks'] ? true : false, true>>,
+            Expect<Equal<undefined extends Update['agents'] ? true : false, true>>,
+            Expect<Equal<undefined extends Update['ranks'] ? true : false, true>>,
+            // Every rank field on the wire is the kernel letter — roster row, binding input, and
+            // the display section the projection emits.
+            Expect<Equal<Binding['rank'], import('./harness-api').AgentRank>>,
+            Expect<Equal<undefined extends BindingInput['rank'] ? true : false, true>>,
+            Expect<Equal<Section['rank'], import('./harness-api').AgentRank>>,
+            // And the retired axis is GONE, not kept "for compatibility": a schema that grew
+            // `role`/`primary`/`subagents` back beside the new fields fails here.
+            Expect<Equal<'role' extends keyof Binding ? true : false, false>>,
+            Expect<Equal<'role' extends keyof BindingInput ? true : false, false>>,
+            Expect<Equal<'role' extends keyof Section ? true : false, false>>,
+            Expect<Equal<'primary' extends keyof Card ? true : false, false>>,
+            Expect<Equal<'subagents' extends keyof Card ? true : false, false>>,
+            Expect<Equal<'primary' extends keyof Create ? true : false, false>>,
+            Expect<Equal<'subagents' extends keyof Update ? true : false, false>>
+        ] = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
+
+        expect(guards.every((guard) => guard)).toBe(true);
+
+        // THE SCALE, pinned to the kernel's own order. The contract accepts exactly these 26
+        // letters (the generated `AgentRank` is the alias the guard above pins), and the order is
+        // what `isLowerRank` and the rank FILL both read — so a scale edited on one side only
+        // fails here rather than disagreeing at runtime.
+        expect([...AGENT_RANKS].join('')).toBe('ABCDEFGHIJKLMNOPQRSTUVWXYZ');
+        expect(AGENT_RANKS.length).toBe(26);
+
+        // A create body in the shape the route documents, asserted byte-for-byte: one roster in
+        // order, the entry it routes to, and three members across two ranks. Nothing here is
+        // derived — drop `entry` and the server takes `writer` because it is first, not because
+        // it holds `A`.
+        const create: Create = {
+            name: 'demo',
+            agents: ['writer', 'researcher', 'editor'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B', editor: 'B' }
+        };
+
+        expect(create).toEqual({
+            name: 'demo',
+            agents: ['writer', 'researcher', 'editor'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B', editor: 'B' }
+        });
+
+        // A single-rank team is a legal definition and carries NO delegation: the contract states
+        // the roster and one letter, and `delegate` absence is then a derived fact the card's
+        // `core_tools` reflects rather than a second field a client has to keep in sync.
+        const solo: Create = { name: 'solo', agents: ['writer'], ranks: { writer: 'A' } };
+
+        expect(solo.agents).toEqual(['writer']);
+        expect(new Set(Object.values(solo.ranks ?? {})).size).toBe(1);
     });
 
     // T5 (R2/R3): the Plugins pane edits a plugin's settings from ONE read, so the row must
@@ -507,6 +606,11 @@ describe('harness contract DTO shapes', () => {
             tags: ['context', 'compaction'],
             hooks: ['turn.before'],
             builtin: true,
+            // REQUIRED on the row (the key list above already names it): the effective switch, kept
+            // separate from `builtin`, which is provenance and never says whether the hook runs.
+            // The fixture was written before the field landed, and vitest never type-checks this
+            // file, so only the scoped `npx tsc` run above could see the gap.
+            enabled: true,
             settings: [
                 {
                     key: 'contextLimit',
@@ -571,6 +675,11 @@ describe('harness contract type wiring (compile time)', () => {
             Expect<Equal<Domain.HarnessActionRequest, import('./harness-api').HarnessActionRequest>>,
             Expect<Equal<Domain.HarnessActionOption, import('./harness-api').HarnessActionOption>>,
             Expect<Equal<Domain.ToolMediaDescriptor, import('./harness-api').ToolMediaDescriptor>>,
+            // THE RANK LETTER (rank pass, 2026-11-18): the spec declares the A–Z enum and the
+            // generator re-exports the kernel's ONE `AgentRank` union (scripts/generate-harness-
+            // contract.ts ALIASES) instead of re-spelling 26 literals. A letter added or dropped on
+            // either side — or a contract that reverts to a prose role — fails to compile here.
+            Expect<Equal<Domain.AgentRank, import('./harness-api').AgentRank>>,
             Expect<
                 Equal<
                     import('./agent-results').AgentResultReference,
@@ -578,7 +687,7 @@ describe('harness contract type wiring (compile time)', () => {
                 >
             >,
         ];
-        const guards: AliasGuards = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
+        const guards: AliasGuards = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
         expect(guards.every((guard) => guard)).toBe(true);
     });
 

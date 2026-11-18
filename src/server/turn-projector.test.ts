@@ -41,7 +41,14 @@ const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     ...overrides
 });
 
-const CONTEXT: DisplayProjectContext = { primary: 'one' };
+// The projection context every fold below shares. `entry` is ROUTING only — it says which flow is
+// the turn's ROOT one, and it grants no authority. The authority a section reports comes from
+// `ranks` (../shared/turn-display.ts `DisplayProjectContext.ranks`), which is the definition's rank
+// map: 'A' is the highest rank and 'Z' the lowest, any number of agents may share one, and a name
+// the map does not list resolves to the LOWEST rank rather than a guessed one. Pinned here as
+// one='A' / two='B' because those are exactly the two flows these fixtures route between: the entry
+// agent that submits, and the member a delegated run answers through.
+const CONTEXT: DisplayProjectContext = { entry: 'one', ranks: { one: 'A', two: 'B' } };
 
 // One recorded event per 10 ms, so a duration is asserted as an exact number.
 const timeOf = (index: number): number => 1_000 + index * 10;
@@ -103,7 +110,7 @@ const toolResult = (
 });
 
 describe('rows and sections', () => {
-    it('opens the root section with the server-minted id and the entry role', () => {
+    it('opens the root section with the server-minted id and the rank its agent holds', () => {
         const result = fold([starts()]);
 
         expect(result.ops[0]).toEqual([
@@ -112,7 +119,7 @@ describe('rows and sections', () => {
                 turnId: 'turn-1',
                 section: {
                     id: 'turn-1:0',
-                    role: 'primary',
+                    rank: 'A',
                     agent: 'one',
                     agentLabel: '',
                     nodes: [],
@@ -148,7 +155,7 @@ describe('rows and sections', () => {
                 op: 'section:set',
                 turnId: 'turn-1',
                 sectionId: 'turn-1:0',
-                patch: { model: 'gpt-x', role: 'primary', agentLabel: '', state: 'streaming' }
+                patch: { model: 'gpt-x', rank: 'A', agentLabel: '', state: 'streaming' }
             }
         ]);
 
@@ -274,7 +281,7 @@ describe('rows and sections', () => {
         expect(child).toMatchObject({
             id: 'turn-1:1',
             parentSectionId: 'turn-1:0',
-            role: 'subagent',
+            rank: 'B',
             agent: 'two',
             invocationId: 'inv-child',
             state: 'streaming'
@@ -302,8 +309,106 @@ describe('rows and sections', () => {
             turnId: 'turn-1',
             // R9: `startedAt` is THIS frame's stamp (event 1 of 10 ms spacing) — the first
             // frame routed to a flow is the earliest recorded evidence that it ran.
-            section: { id: 'turn-1:1', role: 'subagent', agent: 'two', agentLabel: '', nodes: [], context: [], startedAt: 1_010, state: 'open' }
+            section: { id: 'turn-1:1', rank: 'B', agent: 'two', agentLabel: '', nodes: [], context: [], startedAt: 1_010, state: 'open' }
         });
+    });
+
+    // B3 R16 — EVERY FLOW REPORTS THE RANK ITS OWN AGENT HOLDS, AND RANK 'A' IS NOT A SINGLETON.
+    //
+    // The fold used to derive the axis from ONE test — "is this the entry agent?" — which could
+    // describe exactly one privileged flow. The rank model forbids that: any number of agents may
+    // hold Rank A, the ENTRY agent may hold any rank at all (entry is routing), and a member the
+    // definition never ranked holds the LOWEST rank rather than a guessed one. This fixture states
+    // all three at once: two peers that both hold 'A' (one of them the entry, one of them not), a
+    // delegated member at 'B', and an agent the rank map does not name.
+    it('labels every flow with the rank its own agent holds, and keeps Rank A a non-singleton', () => {
+        const ranks: DisplayProjectContext = { entry: 'one', ranks: { one: 'A', peer: 'A', two: 'B' } };
+        const childThread = {
+            id: 'inv-child',
+            parentId: 'inv-root',
+            callId: 'call-1',
+            kind: 'delegation' as const,
+            input: 'sub task'
+        };
+
+        const result = fold(
+            [
+                { type: 'start', agent: 'one', model: 'gpt-x', thread: { id: 'inv-root' } },
+                // A threadless flow from a SECOND Rank A agent: the old rule would have called this
+                // one a subagent, because only the entry could be the top of the axis.
+                { type: 'text', agent: 'peer', delta: 'a peer answers' },
+                toolCall('call-1', 'delegate', JSON.stringify({ agent: 'two', input: 'sub task' })),
+                { type: 'start', agent: 'two', model: 'gpt-y', thread: childThread },
+                // An agent the rank map omits: the lowest rank, never a guessed one.
+                { type: 'text', agent: 'ghost', delta: 'unranked' }
+            ],
+            turnOf(),
+            ranks
+        );
+
+        // Root, the second Rank A flow, the adopted delegated child, and the unlisted flow — each
+        // labelled with ITS OWN agent's rank.
+        expect(result.display().sections.map((section) => [section.id, section.agent, section.rank])).toEqual([
+            ['turn-1:0', 'one', 'A'],
+            ['turn-1:1', 'peer', 'A'],
+            ['turn-1:2', 'two', 'B'],
+            ['turn-1:3', 'ghost', 'Z']
+        ]);
+
+        // The rank rides the WIRE FRAME that opens the row (not only the compiled tree), so a live
+        // client labels the flow the moment it appears — asserted as the exact frame.
+        expect(result.ops[1][0]).toEqual({
+            op: 'section:open',
+            turnId: 'turn-1',
+            section: {
+                id: 'turn-1:1',
+                rank: 'A',
+                agent: 'peer',
+                agentLabel: '',
+                nodes: [],
+                context: [],
+                startedAt: 1_010,
+                state: 'open'
+            }
+        });
+        // ... and the unlisted agent's row opens with the lowest rank, on the frame too.
+        expect(result.ops[4][0]).toEqual({
+            op: 'section:open',
+            turnId: 'turn-1',
+            section: {
+                id: 'turn-1:3',
+                rank: 'Z',
+                agent: 'ghost',
+                agentLabel: '',
+                nodes: [],
+                context: [],
+                startedAt: 1_040,
+                state: 'open'
+            }
+        });
+
+        // The delegated child's row keeps its OWN agent's rank ('B') after the placeholder minted
+        // for the `delegate` call is adopted by the child's `start` — adoption must not re-derive
+        // the label from the spawner, or a Rank A agent delegating would show its child as Rank A.
+        const child = result.display().sections[2];
+
+        expect(child).toMatchObject({ id: 'turn-1:2', parentSectionId: 'turn-1:0', rank: 'B', agent: 'two' });
+    });
+
+    // B3 R16 — NO CONTEXT, NO AUTHORITY: a fold whose context carries no rank map labels every flow
+    // with the lowest rank. Absence is a statement about the definition, not a licence to guess, and
+    // this is the shape a session whose roster predates the rank map folds into.
+    it('labels every flow with the lowest rank when the context names no ranks', () => {
+        const result = fold(
+            [starts(), { type: 'text', agent: 'two', delta: 'orphan' }],
+            turnOf(),
+            { entry: 'one' }
+        );
+
+        expect(result.display().sections.map((section) => [section.agent, section.rank])).toEqual([
+            ['one', 'Z'],
+            ['two', 'Z']
+        ]);
     });
 });
 
@@ -1021,7 +1126,7 @@ describe('pending, wakeups and tokens', () => {
                 { type: 'usage', agent: 'two', thread: childThread, usage: { input: 620, output: 8, total: 628, cached: 300 } }
             ],
             // The store still folds the child's spend into the turn-wide tally: accounting is
-            // untouched, only the displayed primary figure changes.
+            // untouched, only the figure the TURN ITSELF displays changes.
             turnOf({ usage: { input: 620, output: 8, total: 628, cached: 300 } })
         );
 
@@ -1306,10 +1411,10 @@ const SOURCES: TurnInstructionSource[] = [
     { agent: 'two', instructions: [], at: 900 }
 ];
 
-const SOURCED: DisplayProjectContext = { primary: 'one', instructionSourcesOf: () => SOURCES };
+const SOURCED: DisplayProjectContext = { entry: 'one', instructionSourcesOf: () => SOURCES };
 
 const EMPTY_SOURCE: DisplayProjectContext = {
-    primary: 'one',
+    entry: 'one',
     instructionSourcesOf: () => [{ agent: 'one', instructions: [], at: 900 }]
 };
 

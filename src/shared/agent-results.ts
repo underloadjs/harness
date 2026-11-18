@@ -1,8 +1,11 @@
 // Result references shared by the server and the browser client.
 //
 // A "block" is ONE agent invocation inside a submitted turn: the turn's root
-// invocation (the entry agent) or a nested/subagent invocation identified by the
-// runtime's `HarnessThread.id`. The UI renders each block with a compact label
+// invocation (the ENTRY agent's flow — routing, not authority) or a nested invocation
+// identified by the runtime's `HarnessThread.id`, whatever RANK that agent holds. Blocks
+// are structural: every rank — 'A' through 'Z' — produces them exactly the same way, so
+// nothing in this module branches on authority (the label rules below are rank-blind).
+// The UI renders each block with a compact label
 // (`IT1`, `RH2`, … — first+last letter of the agent id plus its occurrence, see
 // ui/agent-label.ts). Occurrence numbering is CONVERSATION-scoped: it continues
 // across the session's turns in recorded order, so two distinct invocations of the
@@ -389,7 +392,9 @@ const blocksOfTurn = (
     const byInline = new Map<string, ReplayBlock>();
 
     let root: ReplayBlock | undefined;
-    let primaryAgent: string | undefined;
+    // The agent recognised as the turn's ENTRY/ROOT flow. Named for ROUTING, not authority:
+    // any rank can be the entry, and this value only decides which block is the root one.
+    let entryAgent: string | undefined;
 
     const createBlock = (
         agent: string,
@@ -433,7 +438,7 @@ const blocksOfTurn = (
     const rootBlock = (agent: string): ReplayBlock => {
         if (root !== undefined) return root;
 
-        primaryAgent = agent;
+        entryAgent = agent;
         // R8: the root block IS the turn's persistent conversation, so it shows
         // that conversation's label (`RR4`) for every run/continuation in it.
         root = createBlock(agent, undefined, undefined, [], turn.threadLabel);
@@ -447,7 +452,7 @@ const blocksOfTurn = (
 
         // The first flat agent of an unknown stream with no root yet IS the entry
         // agent (the pre-thread UI behaviour).
-        if (root === undefined && primaryAgent === undefined) return rootBlock(agent);
+        if (root === undefined && entryAgent === undefined) return rootBlock(agent);
 
         // A threadless legacy block keeps the UI's synthetic key, so a descriptor
         // captured from the transcript is a valid reference identity.

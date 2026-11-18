@@ -162,8 +162,11 @@ const probePreset = (): HarnessPreset => ({
     title: 'Probe',
     description: 'Scripted global-tool-switch probe preset.',
     requiresEndpoint: false,
-    primary: 'probe',
-    subagents: [],
+    // THE RANK PAIR (clean break): `entry` names the routing agent and `ranks` states its
+    // authority. One member, one rank states directly what the retired `subagents: []`
+    // claimed by absence, and this build REFUSES the old pair at load (./persistence.ts).
+    entry: 'probe',
+    ranks: { probe: 'A' },
     agents: ['probe'],
     tools: ['write'],
     builtin: true,
@@ -182,7 +185,8 @@ const probePreset = (): HarnessPreset => ({
                     stream: scripted(probeTurns)
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
+            ranks: { probe: 'A' },
             presets: false,
             tools: {
                 write: tool({

@@ -88,6 +88,11 @@ import type {
     ToolMediaDescriptor
 } from '../harness';
 import type { AgentResultBlock, AgentResultReference, AgentResultStatus } from './agent-results';
+// The rank vocabulary (../types/index.ts `AgentRank` / `AGENT_RANKS`): a section's authority
+// label is a RANK, never a role. Imported from the type module directly (the same specifier
+// ./harness-api.ts:258 uses) so this contract file never depends on what the runtime barrel
+// happens to re-export.
+import type { AgentRank } from '../types';
 
 // ---------------------------------------------------------------------------
 // Bounds — the ONLY reason the display wire is smaller than the raw wire
@@ -197,9 +202,14 @@ export type SectionDisplayState = 'open' | 'streaming' | 'done' | 'error' | 'can
 /** Exact mirror of `ToolState` (../frontend/ui/tools.ts:105). */
 export type StepDisplayState = 'running' | 'ok' | 'error' | 'cancelled';
 
-/** Structural role of a section, decided by the SERVER from the harness entry agent
- *  (`start.agent === primary`, ../frontend/ui/turns.ts:5065). */
-export type DisplayRole = 'primary' | 'subagent';
+/** Authority RANK of the agent one section describes, decided by the SERVER from the
+ *  harness RANK MAP (`DisplayProjectContext.ranks`, keyed by agent name) — never from a
+ *  role axis. `AgentRank` is `'A' | … | 'Z'` with A the highest authority (../types/index.ts).
+ *
+ *  RANK REWRITE: this replaced `DisplayRole = 'primary' | 'subagent'`. A rank is not a
+ *  singleton: any number of sections may carry `'A'`, and the ENTRY agent (`context.entry`)
+ *  may itself hold any rank, so nothing here may be derived from "is this the primary". */
+export type DisplayRank = AgentRank;
 
 /** Tone of a one-line notice. Mirrors the tile's existing notice kinds.
  *  T16 (R16a): the server no longer mints `retry` — a transient model-request retry is
@@ -1034,7 +1044,10 @@ export type TurnSection = {
     /** Nesting resolved by the SERVER from `HarnessThread.parentId`/`callId`/
      *  `branchId` (types/index.ts:1669). A renderer never infers a parent. */
     parentSectionId?: string;
-    role: DisplayRole;
+    /** The RANK of `agent` in this harness (`'A'`–`'Z'`, A highest), resolved by the server
+     *  from `DisplayProjectContext.ranks`. Replaces the old `role: 'primary' | 'subagent'`;
+     *  several sections may legitimately carry the same rank. */
+    rank: DisplayRank;
     agent: string;
     /** The block label (`RR2`) — one sequence with the conversation label
      *  (./agent-results.ts, T14). */
@@ -1120,7 +1133,8 @@ export type TurnSection = {
  *  never re-sends the whole bar. */
 export type TurnSectionPatch = {
     state?: SectionDisplayState;
-    role?: DisplayRole;
+    /** The section's RANK (`'A'`–`'Z'`), replacing the old `role` field. */
+    rank?: DisplayRank;
     model?: string;
     agentLabel?: string;
     invocationId?: string;
@@ -1185,7 +1199,7 @@ export type TurnSummary = {
      *  rule, see ../server/turn-projector.ts `rootLatestInput`). A delegated child's
      *  request never moves it: its figure rides its own `TurnSection.latestInput`.
      *  ABSENT means the turn's own flow made no request with a reported context; a
-     *  renderer then shows NO primary figure rather than falling back to `usage.input`,
+     *  renderer then shows NO root-section figure rather than falling back to `usage.input`,
      *  which is a turn-wide SUM (children included). `cachedInput` below keeps folding
      *  children — that pairing of scopes is the intentional accounting. */
     latestInput?: number;
@@ -1384,8 +1398,21 @@ export type DisplayTurnInput = {
 
 /** Everything the fold needs that is NOT inside one turn record. */
 export type DisplayProjectContext = {
-    /** The harness entry agent: the only agent whose section is `role: 'primary'`. */
-    primary: string;
+    /** The harness ENTRY agent — the member an unfocused submit opens a conversation for.
+     *  Renamed from `primary`, and it is a ROUTING fact only: the entry agent may hold ANY
+     *  rank, so it never decides which section is which rank (that is `ranks` below). */
+    entry: string;
+    /** Agent name -> its RANK in this harness (`'A'`–`'Z'`, A highest), from the frozen
+     *  definition's rank map (../server/sessions.ts passes `record.definition.ranks`).
+     *
+     *  WHY THE FOLD NEEDS THE MAP (rank rewrite): every section's `rank` used to be derived
+     *  from "is this agent the primary", which is a singleton test. Ranks are not singletons
+     *  — any number of agents may be Rank A — so the fold resolves the rank of `agent` here
+     *  and never guesses. A member the map omits holds the LOWEST rank (an agent has no
+     *  authority the definition did not grant it); a branch row overrides this with the rank
+     *  its own `branch_start` frame carries. Optional so a pre-rank fixture or hand-written
+     *  producer still folds; without it every section is emitted at the lowest rank. */
+    ranks?: Readonly<Record<string, AgentRank>>;
     /** `SessionSnapshot.labelSeeds[turnId]` — the per-code counters as of this
      *  turn's start (protocol.ts:466), so a deletion never renumbers a label. */
     labels?: Readonly<Record<string, number>>;

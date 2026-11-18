@@ -62,14 +62,13 @@
 //
 // EIGHT TONES IS ENOUGH FOR EVERY SESSION, AND THE CATALOGUE IS ALLOWED TO EXCEED IT.
 // What a reader actually SEES is one view's roster (the active harness's members), never
-// the whole catalogue. The largest live member set is the Manager card: `teamOf('planner')`
-// keeps all six other specialists plus `summarizer` = 7 subagents, plus its primary = **8
-// members**, which is exactly the palette; every other live card is 6 subagents + primary
-// = 7 (`teamOf()` in src/server/harnesses/presets.ts = SPECIALIST minus the primary minus
-// `planner`, then `summarizer` — and for the Manager the two exclusions collapse into one,
-// because it IS `planner`). So every live session is pairwise-distinct inside 8 slots, with
-// ZERO headroom: an eighth live role would put 9 members on the Manager card and two of
-// them would share a tone. That is a deliberate trade, not an oversight — see the next
+// the whole catalogue. The largest live member set is the planner card: `presets.ts` gives it
+// `entry: 'planner'` plus all six other specialists and `summarizer` = **8 members**, which is
+// exactly the palette; every other live card is an entry agent plus 6 members = 7 (`agents` is
+// ordered `[entry, ...the rest of the roster]`, and every non-planner card drops one specialist
+// and adds `summarizer`). So every live session is pairwise-distinct inside 8 slots, with
+// ZERO headroom: an eighth live member on the planner card would put 9 identities on it and two
+// of them would share a tone. That is a deliberate trade, not an oversight — see the next
 // paragraph. The CATALOGUE (`AGENT_PROFILE_NAMES`) is now exactly this long — eight ids,
 // the seven real roles plus the summarizer — because the `demo`/`flaky` fixture profiles
 // that used to make it ten are deleted, so the shipped roster fills the palette with no
@@ -381,7 +380,7 @@ export const agentColorOf = (agent: string | undefined, explicitColor?: string):
     const key = agentKeyOf(agent);
 
     // Unnamed, or the UI's own placeholder: never assigned a slot. An unknown agent must
-    // not read as (say) the primary's tone and look like a real identity, and it must not
+    // not read as (say) the entry agent's tone and look like a real identity, and it must not
     // burn one of the eight slots a real agent still needs.
     if (!isIdentityKey(key)) return UNKNOWN_AGENT_COLOR;
 

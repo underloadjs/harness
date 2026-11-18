@@ -37,6 +37,16 @@
 //   - `viewAwareFetch` : the same adapter for a test that stubs `fetch(input, init)` directly.
 
 import type { AgentResultBlock, AgentResultTurn } from '../shared/agent-results';
+// The rank vocabulary comes from the kernel barrel, exactly where production reads it: the
+// double has no letter set of its own, so a fixture rank the guard rejects is no rank here
+// and on the wire alike.
+import type { AgentRank } from '../types';
+import { isAgentRank } from '../types';
+// `LOWEST_RANK` is the SERVER's rule for a member no rank map names (an agent has no
+// authority the definition did not grant it), and the double states it from the same
+// constant instead of writing 'Z' in three places (../shared/harness-api.ts
+// `SessionAgentBinding.rank`, ../shared/turn-display.ts `DisplayProjectContext.ranks`).
+import { LOWEST_RANK } from './contract';
 import { listAgentResultBlocks } from '../shared/agent-results';
 import type { DisplayProjectContext, TurnDisplay, TurnDisplayOp, TurnProjector, TurnSummary } from '../shared/turn-display';
 import { createTurnProjector, projectTurn, DISPLAY_NO_TIMESTAMP } from '../server/turn-projector';
@@ -68,21 +78,62 @@ import type {
 // `DisplayProjectContext` is everything the fold needs that is NOT inside one turn record. The
 // server supplies it from the session (`SessionStore.projectionTurns`); the double derives it from
 // the raw fixture, which is the same data:
-//   - `primary`            : the entry agent, i.e. the only section with `role: 'primary'`.
+//   - `entry`              : the harness ENTRY agent (routing only). R20 replaced the old
+//                            `primary`, and it no longer decides a section's rank.
+//   - `ranks`              : agent name -> rank letter, from the frozen definition's rank map.
+//                            THIS is what stamps every section's rank; any number of members
+//                            may hold the same letter, and a member the map omits folds at the
+//                            LOWEST rank (../shared/turn-display.ts `DisplayProjectContext`).
 //   - `labels`             : `SessionSnapshot.labelSeeds[turnId]`, so a deletion never renumbers
 //                            a surviving block's label (protocol.ts:495).
 //   - `blocksOf`           : the conversation's OWN block projection (`listAgentResultBlocks` over
 //                            the recorded prefix, agent-results.ts:652), which is where
 //                            `TurnSummary.blocks` gets `RR1`/`RR2` — one chained allocator, so the
 //                            labels are conversation-scoped exactly as on the wire.
+// What a fixture may override for the fold. ONE type, so a route handler cannot forward a
+// half-renamed option set: `entry` is the routing agent, `ranks` the per-member ladder, and
+// `expiredRequestIds` stays the per-route extra it always was.
+export type ViewTestFoldOptions = {
+    entry?: string;
+    ranks?: Readonly<Record<string, AgentRank>>;
+    expiredRequestIds?: ReadonlySet<string>;
+};
+
+// The overrides one handler forwards to the next layer: the entry agent and the rank map.
+// `expiredRequestIds` is deliberately NOT carried, because it is a figure each route sets
+// for itself, and forwarding it once made two routes disagree about one answer.
+const foldOverridesOf = (options: ViewTestFoldOptions): ViewTestFoldOptions => ({
+    ...(options.entry === undefined ? {} : { entry: options.entry }),
+    ...(options.ranks === undefined ? {} : { ranks: options.ranks })
+});
+
+// The rank map a fixture states, read the way the wire states it: an absent or malformed map
+// is no map at all, and a member the map omits has no rank (the fold then places it at the
+// lowest letter, which is the server's own rule — ./contract.ts `ranksOf` is the client-side
+// reading of the same field).
+const ranksRaw = (source: unknown): Readonly<Record<string, AgentRank>> | undefined => {
+    const declared = (source as { ranks?: unknown } | undefined)?.ranks;
+
+    if (declared === null || typeof declared !== 'object') return undefined;
+
+    const ranks: Record<string, AgentRank> = {};
+
+    for (const [name, rank] of Object.entries(declared as Record<string, unknown>)) {
+        if (isAgentRank(rank)) ranks[name] = rank;
+    }
+
+    return ranks;
+};
+
 export const projectContextOf = (
     snapshot: SessionSnapshot,
-    options: { primary?: string; expiredRequestIds?: ReadonlySet<string> } = {}
+    options: ViewTestFoldOptions = {}
 ): DisplayProjectContext => {
-    const primary =
-        options.primary ??
-        (snapshot.harnessDefinition as { primary?: string } | undefined)?.primary ??
+    const entry =
+        options.entry ??
+        (snapshot.harnessDefinition as { entry?: string } | undefined)?.entry ??
         snapshot.harness;
+    const ranks = options.ranks ?? ranksRaw(snapshot.harnessDefinition);
 
     // Projected once per snapshot and filtered per turn, like the store's memoized prefix read.
     let blocks: AgentResultBlock[] | undefined;
@@ -156,7 +207,8 @@ export const projectContextOf = (
     };
 
     return {
-        primary,
+        entry,
+        ...(ranks === undefined ? {} : { ranks }),
         ...(options.expiredRequestIds === undefined ? {} : { expiredRequestIds: options.expiredRequestIds }),
         blocksOf: (turn) => blocksFor().filter((block) => block.turnId === turn.id),
         // Only supplied when the fixture actually names a conversation, so a roster-less session
@@ -172,7 +224,7 @@ export const projectContextOf = (
 const contextForTurn = (
     snapshot: SessionSnapshot,
     turn: SessionTurn,
-    options: { primary?: string; expiredRequestIds?: ReadonlySet<string> } = {}
+    options: ViewTestFoldOptions = {}
 ): DisplayProjectContext => {
     const context = projectContextOf(snapshot, options);
     const seeds = snapshot.labelSeeds as Record<string, Record<string, number>> | undefined;
@@ -227,7 +279,7 @@ const rosterOf = (snapshot: SessionSnapshot): SessionThreadView[] | undefined =>
 // `turns[].events` are dropped, because the display contract has no place for them.
 export const viewOf = (
     snapshot: SessionSnapshot,
-    options: { primary?: string; expiredRequestIds?: ReadonlySet<string> } = {}
+    options: ViewTestFoldOptions = {}
 ): SessionView => {
     const turns = Array.isArray(snapshot.turns) ? snapshot.turns : [];
     const displays: Record<string, TurnDisplay> = {};
@@ -261,7 +313,7 @@ export const viewOf = (
 // `SessionView` without the node trees).
 export const viewSummaryOf = (
     snapshot: SessionSnapshot,
-    options?: { primary?: string; expiredRequestIds?: ReadonlySet<string> }
+    options?: ViewTestFoldOptions
 ): SessionViewSummary => {
     const { displays: _displays, ...rest } = viewOf(snapshot, options);
 
@@ -272,7 +324,7 @@ export const viewSummaryOf = (
 export const summaryOfTurn = (
     snapshot: SessionSnapshot,
     turn: SessionTurn,
-    options?: { primary?: string; expiredRequestIds?: ReadonlySet<string> }
+    options?: ViewTestFoldOptions
 ): TurnSummary => projectTurn(turn, contextForTurn(snapshot, turn, options)).summary;
 
 // A turn's compiled tree, straight from the fold — used by tests that assert the display state
@@ -280,7 +332,7 @@ export const summaryOfTurn = (
 export const displayOfTurn = (
     snapshot: SessionSnapshot,
     turnId: string,
-    options?: { primary?: string; expiredRequestIds?: ReadonlySet<string> }
+    options?: ViewTestFoldOptions
 ): TurnDisplay | undefined => {
     const turn = (snapshot.turns ?? []).find((candidate) => candidate.id === turnId);
 
@@ -308,7 +360,7 @@ const isTerminalTurn = (status: SessionTurn['status']): boolean =>
 // ROOT `start` (a root run's events carry no `thread`, types/index.ts:1659). Falls back to the
 // first `start` of any kind, and to '' when the fixture has none — the fold then treats every
 // section as nested, which is the honest reading of a turn with no root run.
-const primaryOf = (turn: SessionTurn): string => {
+const entryAgentOf = (turn: SessionTurn): string => {
     let root = '';
     let nested = '';
 
@@ -341,7 +393,7 @@ export const toViewItem = (
     item: SessionStreamItem,
     folds: Map<string, LiveFold>,
     snapshot?: SessionSnapshot,
-    options: { primary?: string; expiredRequestIds?: ReadonlySet<string> } = {}
+    options: ViewTestFoldOptions = {}
 ): SessionViewStreamItem => {
     const host = snapshot ?? undefined;
 
@@ -354,7 +406,10 @@ export const toViewItem = (
     // — a root run's events carry no `thread`).
     const contextOf = (turn: SessionTurn): DisplayProjectContext =>
         host === undefined
-            ? { primary: options.primary ?? primaryOf(turn) }
+            ? {
+                  entry: options.entry ?? entryAgentOf(turn),
+                  ...(options.ranks === undefined ? {} : { ranks: options.ranks })
+              }
             : contextForTurn(host, turn, options);
 
     if (item.type === 'turn') {
@@ -433,7 +488,7 @@ export const toViewItem = (
 export const viewItemsOf = (
     items: readonly SessionStreamItem[],
     snapshot?: SessionSnapshot,
-    options?: { primary?: string; expiredRequestIds?: ReadonlySet<string> }
+    options?: ViewTestFoldOptions
 ): SessionViewStreamItem[] => {
     const folds = new Map<string, LiveFold>();
 
@@ -520,8 +575,12 @@ export type ViewRouteOptions = {
     // The raw snapshot the raw routes describe. Used to compose the lazy-detail and raw-export
     // answers and to seed a live fold that starts mid-turn. A getter lets a mutation's effect show.
     snapshot?: () => SessionSnapshot | undefined;
-    // The entry agent for the fold, when a fixture's snapshot does not carry `harnessDefinition`.
-    primary?: string;
+    // The ENTRY agent for the fold, when a fixture's snapshot does not carry `harnessDefinition`.
+    entry?: string;
+    // R20: the rank map for the fold, same override rule as `entry`. A fixture that states
+    // ranks for two members must see two sections at that letter — the double may not invent
+    // the old one-primary ladder behind a test's back.
+    ranks?: Readonly<Record<string, AgentRank>>;
 
 };
 
@@ -719,7 +778,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
 
         if (Array.isArray(payload.sessions)) {
             const listed = payload.sessions as SessionSnapshot[];
-            translated.views = listed.map((session) => viewSummaryOf(session, { primary: options.primary }));
+            translated.views = listed.map((session) => viewSummaryOf(session, foldOverridesOf(options)));
             delete translated.sessions;
 
             return jsonOf(translated, status);
@@ -729,14 +788,14 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
 
         const session = payload.session as SessionSnapshot;
         lastSeenSession = session;
-        translated.view = viewOf(session, { primary: options.primary });
+        translated.view = viewOf(session, foldOverridesOf(options));
         delete translated.session;
 
         // A submit/answer envelope carries the NEW turn record next to the session; on the display
         // wire that field is the turn's compact row (protocol.ts:705), folded with the same seeds
         // the store would use.
         if (payload.turn !== undefined) {
-            translated.turn = summaryOfTurn(session, payload.turn as SessionTurn, { primary: options.primary });
+            translated.turn = summaryOfTurn(session, payload.turn as SessionTurn, foldOverridesOf(options));
         }
 
         return jsonOf(translated, status);
@@ -763,7 +822,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         // arrives before any `turn` frame still produces real ops. Seeding order: the snapshot the
         // test named, the newest document this adapter has already translated, then — once, lazily —
         // the test's own session route. A fixture with none of those folds from the turn record's
-        // root `start` (`primaryOf`), which is the honest reading of a stream that never names the
+        // root `start` (`entryAgentOf`), which is the honest reading of a stream that never names the
         // entry agent.
         let context: SessionSnapshot | undefined = options.snapshot?.() ?? lastSeenSession;
         let seeding: Promise<SessionSnapshot | undefined> | undefined;
@@ -818,7 +877,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
             // entry agent, the label seeds and the block prefix the store supplies.
             else if (context === undefined) await seed();
 
-            const item = toViewItem(raw, folds, context, { primary: options.primary });
+            const item = toViewItem(raw, folds, context, foldOverridesOf(options));
 
             return `data: ${JSON.stringify(item)}\n\n`;
         };
@@ -884,9 +943,11 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
             );
         }
 
-        const display = displayOfTurn(host ?? ({ turns: [turn] } as unknown as SessionSnapshot), turnId, {
-            primary: options.primary
-        });
+        const display = displayOfTurn(
+            host ?? ({ turns: [turn] } as unknown as SessionSnapshot),
+            turnId,
+            foldOverridesOf(options)
+        );
         const section = display?.sections.find((candidate) =>
             candidate.nodes.some((node) => node.id === stepId && (node.kind === 'tool' || node.kind === 'action'))
         );
@@ -926,9 +987,11 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         const turn = host?.turns?.find((candidate) => candidate.id === turnId);
         if (turn === undefined) return jsonOf({ error: { message: `Unknown turn ${turnId}` } }, 404);
 
-        const display = displayOfTurn(host ?? ({ turns: [turn] } as unknown as SessionSnapshot), turnId, {
-            primary: options.primary
-        });
+        const display = displayOfTurn(
+            host ?? ({ turns: [turn] } as unknown as SessionSnapshot),
+            turnId,
+            foldOverridesOf(options)
+        );
         const section = display?.sections.find((candidate) => (candidate.context ?? []).some((entry) => entry.id === blockId));
         const block = section?.context?.find((entry) => entry.id === blockId);
 
@@ -1235,9 +1298,15 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
     // detached, plus anything it bound or invented — in the server's own order (definition members
     // first, this session's additions after, see src/server/api-session-agents.test.ts:687-691).
     const sessionMembersOf = (definition: Record<string, unknown>, overlay: SessionAgentOverlay): string[] => {
+        // R20: the roster is `agents` in DECLARATION order; `ranks` states authority per
+        // member and may name fewer agents than the roster. A fixture that states no roster
+        // falls back to entry + the rank keys, which is the same information the card carries.
         const listed = Array.isArray(definition.agents)
             ? (definition.agents as string[])
-            : [String(definition.primary ?? ''), ...((definition.subagents as string[] | undefined) ?? [])];
+            : [
+                  String(definition.entry ?? ''),
+                  ...Object.keys(ranksRaw(definition) ?? {})
+              ];
         const names: string[] = [];
 
         for (const name of [...listed, ...overlay.added.map((entry) => entry.name)]) {
@@ -1274,7 +1343,10 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         name: string,
         definition: Record<string, unknown>
     ): Record<string, unknown> => {
-        const primary = String(definition.primary ?? '');
+        // R20: the ENTRY agent (routing, and the one member no session write can detach)
+        // and the rank map this conversation's definition states.
+        const entry = String(definition.entry ?? '');
+        const ranks = ranksRaw(definition) ?? {};
         const threadUsers = new Set(
             ((host.threads ?? []) as Record<string, unknown>[])
                 .filter((thread) => thread.origin === 'host')
@@ -1294,7 +1366,10 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         return {
             agent_id: name,
             profile: added?.profile ?? name,
-            role: name === primary ? 'primary' : 'subagent',
+            // The rank this session RUNS this member at. A member the map omits reports the
+            // LOWEST letter rather than no letter, because the binding field is a letter and
+            // an ungranted authority is the lowest authority (../shared/harness-api.ts).
+            rank: ranks[name] ?? LOWEST_RANK,
             origin: added !== undefined ? 'session' : 'definition',
             // The live brain's model first (this conversation's choice), then the creation
             // baseline, then the session settings model (`inherited_model`, the field that exists
@@ -1314,8 +1389,11 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                 ? { has_instruction_override: true }
                 : {}),
             editable: true,
-            // R6: the entry point and any member that still owns a conversation cannot detach.
-            deletable: name !== primary && !threadUsers.has(name),
+            // R6/R20: the ENTRY agent and any member that still owns a conversation cannot
+            // detach. Note the asymmetry the rank model makes explicit: this protection is the
+            // entry agent's, NOT the top rank's — a Rank A member this conversation did not
+            // start from detaches like anybody else.
+            deletable: name !== entry && !threadUsers.has(name),
             restorable: true,
             revision: host.revision ?? 1
         };
@@ -1542,9 +1620,16 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                     ? {
                           ...entry,
                           requires_endpoint: entry.requiresEndpoint ?? false,
+                          // R20: a card states `entry` + `ranks` + the `agents` roster. A
+                          // fixture row that names no roster falls back to entry + rank keys.
+                          entry: String(entry.entry ?? ''),
+                          ranks: ranksRaw(entry) ?? {},
                           agents: Array.isArray(entry.agents)
                               ? entry.agents
-                              : [entry.primary, ...(((entry.subagents as string[] | undefined) ?? []))],
+                              : [
+                                    String(entry.entry ?? ''),
+                                    ...Object.keys(ranksRaw(entry) ?? {})
+                                ],
                           definition_revision: 1,
                           // T32: a contract CARD omits `agent_models` and the instruction
                           // fields (../shared/harness-api.ts:418-433), so a fixture row that
@@ -1626,14 +1711,16 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
             return map !== undefined && typeof map === 'object' ? (map as Record<string, string>) : {};
         };
 
-        // The members one definition runs, in the contract's order (primary first).
+        // The members one definition runs, in DECLARATION ORDER. R20: order is routing and
+        // presentation only (it is the default `entry`), never authority — `ranks` states
+        // authority, and any number of members may share one letter. The entry agent leads
+        // the list because the contract derives the default entry from the first entry.
         const membersRaw = (definition: Record<string, unknown>): string[] => {
             if (Array.isArray(definition.agents)) return definition.agents as string[];
 
-            const primary = typeof definition.primary === 'string' ? definition.primary : '';
-            const subagents = Array.isArray(definition.subagents) ? (definition.subagents as string[]) : [];
+            const entry = typeof definition.entry === 'string' ? definition.entry : '';
 
-            return [primary, ...subagents.filter((name) => name !== primary)];
+            return [entry, ...Object.keys(ranksRaw(definition) ?? {}).filter((name) => name !== entry)];
         };
 
         // One instruction row: provenance and length, no text. `harness` is the layer this
@@ -1750,8 +1837,8 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                 title: String(definition.title ?? ''),
                 description: String(definition.description ?? ''),
                 requires_endpoint: definition.requires_endpoint ?? definition.requiresEndpoint ?? false,
-                primary: String(definition.primary ?? ''),
-                subagents: Array.isArray(definition.subagents) ? definition.subagents : members.slice(1),
+                entry: String(definition.entry ?? members[0] ?? ''),
+                ranks: ranksRaw(definition) ?? {},
                 agents: members,
                 tools: Array.isArray(definition.tools) ? definition.tools : [],
                 builtin: definition.builtin ?? false,
@@ -1995,7 +2082,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
             const host = await hostEx(sessionId);
             if (host === undefined) return jsonOf({ error: { message: `Unknown session ${sessionId}` } }, 404);
 
-            const compiled = viewOf(host, { primary: options.primary });
+            const compiled = viewOf(host, foldOverridesOf(options));
             const all = (compiled.turns ?? []).map(wireRowOf);
 
             // `order=desc` answers newest first (the tail a client follows) and
@@ -2108,7 +2195,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
             const sessionId = decodeURIComponent(displayMatch[1]);
             const turnId = decodeURIComponent(displayMatch[2]);
             const host = await hostEx(sessionId);
-            const display = host === undefined ? undefined : displayOfTurn(host, turnId, { primary: options.primary });
+            const display = host === undefined ? undefined : displayOfTurn(host, turnId, foldOverridesOf(options));
 
             return display === undefined
                 ? jsonOf({ error: { message: `Unknown turn ${turnId}` } }, 404)
@@ -2539,7 +2626,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
             const rosterId = decodeURIComponent(definitionMatch[1]);
             const overlay = sessionAgentOverlayOf(rosterId);
             const members = sessionMembersOf(definition, overlay);
-            const primary = String(definition.primary ?? members[0] ?? '');
+            const entry = String(definition.entry ?? members[0] ?? '');
             const frozenModels = definition.agentModels ?? definition.agent_models;
             const frozenInstructions = storedInstructionsRaw(definition);
             const foldedModels: Record<string, string> = {
@@ -2565,8 +2652,14 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                     title: definition.title ?? '',
                     description: definition.description ?? '',
                     requires_endpoint: definition.requiresEndpoint ?? false,
-                    primary,
-                    subagents: members.filter((name) => name !== primary),
+                    entry,
+                    // R20: the frozen roster's rank map, restated for the members this
+                    // conversation still runs. A member the definition never ranked stays
+                    // OUT of the map (no rank), which is what the shell renders as
+                    // "rank not stated" — the double must not fill a letter in from position.
+                    ranks: Object.fromEntries(
+                        Object.entries(ranksRaw(definition) ?? {}).filter(([name]) => members.includes(name))
+                    ),
                     agents: members,
                     tools: definition.tools ?? [],
                     builtin: definition.builtin ?? false,
@@ -2605,7 +2698,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         //
         // The refusals are the SERVER's, answered rather than invented per test: a member that
         // owns a HOST conversation cannot be detached (409 naming the ids, nothing moves) and the
-        // primary never can at all (src/server/sessions.ts:5052-5074).
+        // the entry agent never can at all (src/server/sessions.ts:5052-5074).
         //
         // Offer-first as everywhere in this adapter: a fixture that declares one of these routes
         // itself stays authoritative — its own status and body — which is how a test stages a
@@ -2751,7 +2844,7 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
 
             const definition = (host.harnessDefinition ?? {}) as Record<string, unknown>;
             const overlay = sessionAgentOverlayOf(sessionId);
-            const primary = String(definition.primary ?? '');
+            const entry = String(definition.entry ?? '');
 
             if (!sessionMembersOf(definition, overlay).includes(agent)) {
                 return jsonOf(
@@ -2762,11 +2855,11 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
 
             if (verb === 'DELETE') {
                 // The server's own refusals, in its own order (src/server/sessions.ts:5052-5074).
-                if (agent === primary) {
+                if (agent === entry) {
                     return jsonOf(
                         {
                             error: {
-                                message: `Agent "${agent}" is the primary agent of session "${sessionId}" and cannot be detached; every session needs an entry point.`
+                                message: `Agent "${agent}" is the entry agent of session "${sessionId}" and cannot be detached; every session needs an entry point.`
                             }
                         },
                         409
@@ -3290,7 +3383,7 @@ export type HarnessStreamOptions = {
     // client read that record when it opened the conversation.
     record?: (sessionId: string) => SessionSnapshot | undefined;
     // The entry agent when the fixture's snapshot does not carry `harnessDefinition`.
-    primary?: string;
+entry?: string;
     // T44: drive the CLIENT's reconnect/heartbeat timers deterministically (the same hook
     // ./stream.ts `schedule` gives a direct `createHarnessStream`). Without it a reconnect
     // test waits on real 500ms+ backoff with a random jitter, which turns an assertion into
@@ -3502,7 +3595,7 @@ export const installHarnessStream = (options: HarnessStreamOptions = {}): Stream
             if (recordId !== undefined) delivered.set(recordId, raw.session);
         }
 
-        const item = toViewItem(raw, folds, context, { primary: options.primary });
+        const item = toViewItem(raw, folds, context, foldOverridesOf(options));
         const bodies: Record<string, unknown>[] = [];
 
         if (item.type === 'view' || item.type === 'failed') {

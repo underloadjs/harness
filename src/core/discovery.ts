@@ -46,17 +46,18 @@
 // without loading its implementation.
 //
 // ALREADY-AVAILABLE CORE TOOLS (additive, never enabled). A query used to answer
-// "no match" for a capability the caller could already call — the reported case
-// was tag "delegate" in a harness WITH subagents, where the tool is declared
-// on every request yet discovery claimed nothing matched. searchTools now also
-// scores the core tools the CALLER already has (options.declared, supplied by the
-// harness from its own declaration rule) and reports the hits as
-// `alreadyAvailable`. This is a report only:
+// "no match" for a capability the caller could already call — the reported case was
+// tag "delegate" in a harness whose roster HAS a strictly lower-ranked peer, where the
+// tool is declared for that caller on every request yet discovery claimed nothing
+// matched. searchTools now also scores the core tools the CALLER already has
+// (options.declared, supplied by the harness from its own declaration rule — which is
+// the CALLER'S RANK, so the declared set differs between agents of one harness) and
+// reports the hits as `alreadyAvailable`. This is a report only:
 //   - nothing is added to `enabled`/`tools`, so the 5-match budget is untouched;
 //   - no declaration changes, because those tools were declared already;
-//   - the caller supplies the visible set, so a subagent (which never sees
-//     delegate) or a one-agent harness (which has no delegate at all)
-//     gets no such entry — absence stays honest;
+//   - the caller supplies the visible set, so a caller whose rank has no legal
+//     delegation target (delegate is not in its declared set) or a one-agent harness
+//     (which has no delegate at all) gets no such entry — absence stays honest;
 //   - a core hit also counts as a MATCHED query tag, so `unmatchedTags` cannot
 //     claim a capability is absent when it is available.
 //

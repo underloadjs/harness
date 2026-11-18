@@ -29,6 +29,9 @@ import type {
 } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { bumpFixtureEpoch, viewAwareFetch } from './view-test-support';
+// The canonical ladder, so the fakes below can fill ranks exactly the way the route does.
+import { AGENT_RANKS, rankIndexOf } from '../types';
+import type { AgentRank } from '../types';
 import { sessionToolPage, sessionToolRow } from './session-config-test-support';
 import type { HarnessStreamOptions, StreamDouble } from './view-test-support';
 
@@ -93,8 +96,8 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
             'toolCreate',
             'tasks'
         ],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true,
         ...overrides
@@ -343,10 +346,44 @@ function openAgents(): void {
     byClass('.agent-control-button', 'button').click();
 }
 
-const agentRoles = (): (string | undefined)[] => {
+// What a PATCH ANSWER states for the ranks: the map the request carries, with every member the
+// request left unnamed placed ONE rank below the LOWEST letter it does state
+// (../server/harnesses/toolbox.ts:250-276, the rule ../shared/harness-api.ts:808-816 documents
+// for a client). A card read therefore covers the whole roster — which is the fact the deck and
+// the rank steppers render — and a fixture that invented `'A'` for the entry agent instead would
+// hide the one case that matters: an agent added without a rank joins at the BOTTOM of the
+// ladder, not beside the leader.
+const fillRanks = (
+    agents: readonly string[],
+    stated: Readonly<Record<string, AgentRank>> | undefined
+): Record<string, AgentRank> => {
+    const letters = Object.values(stated ?? {}).filter(
+        (rank): rank is AgentRank => (AGENT_RANKS as readonly string[]).includes(rank)
+    );
+    // No letter stated at all is the floor index 0, which is what lands every member on the
+    // rank below the top — the server's own empty-map branch.
+    const floor = letters.length === 0 ? 0 : Math.max(...letters.map(rankIndexOf));
+    const fallback = AGENT_RANKS[Math.min(floor + 1, AGENT_RANKS.length - 1)] as AgentRank;
+
+    return Object.fromEntries(agents.map((agent) => [agent, stated?.[agent] ?? fallback]));
+};
+
+// The RANK LETTER each tab carries (absent when the definition states none). Rank is a letter,
+// not a role: several tabs may read 'A' at the same time, so no expectation here may assume a
+// single top agent. `agentEntryFlags()` (below) is the separate routing fact.
+const agentRanks = (): (string | undefined)[] => {
     openAgents();
     return [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')].map(
-        (row) => row.dataset.role
+        (row) => row.dataset.rank
+    );
+};
+// The same roster read as ENTRY flags: `data-entry="true"` is stamped on the routing member and
+// on nobody else, and `agentEntries()` lists the names with that member first.
+const agentEntryFlags = (): boolean[] => {
+    openAgents();
+
+    return [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map(
+        (tab) => tab.dataset.entry === 'true'
     );
 };
 const agentNames = (): (string | null)[] => {
@@ -383,10 +420,10 @@ const memberToggle = (): HTMLButtonElement => {
 
     return byClass('.agent-dialog-remove', 'button');
 };
-const promoteToggle = (): HTMLButtonElement => {
+const entryToggle = (): HTMLButtonElement => {
     openAgents();
 
-    return byClass('.agent-dialog-promote', 'button');
+    return byClass('.agent-dialog-entry', 'button');
 };
 // R3: the lock explanation paragraph is gone; the reason lives on each locked control.
 const dialogNote = (): string | null => {
@@ -660,7 +697,7 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     // members only (the dropdown that also listed every advertised agent, and the
     // duplicate Team section, are gone). `[+]` is how another agent joins.
     expect(agentNames()).toEqual(['Instruct']);
-    expect(agentRoles()).toEqual(['primary']);
+    expect(agentRanks()).toEqual(['A']);
     expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
     expect(document.querySelector('.agent-add')).toBeNull();
     expect(document.querySelector('.agent-dialog-agent-select')).toBeNull();
@@ -671,9 +708,11 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
         [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => [
             tab.dataset.agent,
             tab.getAttribute('aria-selected') === 'true',
-            tab.querySelector('.agent-dialog-agent-role')?.textContent
+            tab.querySelector('.agent-dialog-agent-rank')?.textContent
         ])
-    ).toEqual([['instruct', true, 'primary']]);
+    // The tab states TWO facts in one line: the rank letter (authority) and, for the routing
+    // member, that it is the entry agent. `data-entry` is the machine-readable half.
+    ).toEqual([['instruct', true, 'Rank A']]);
 
     // The picker, not the strip, is where the other trusted agents are offered.
     byClass('.agent-dialog-add', 'button').click();
@@ -766,7 +805,7 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     // and each one carries the real reason — the explanation paragraph is gone.
     expect(instructionBox().disabled).toBe(true);
     expect(memberToggle().disabled).toBe(true);
-    expect(promoteToggle().disabled).toBe(true);
+    expect(entryToggle().disabled).toBe(true);
     expect(document.querySelector('.agent-dialog-note')).toBeNull();
     expect(byClass('.agent-dialog-add', 'button').title).toBe(
         'A session is being created; try again in a moment.'
@@ -877,9 +916,9 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     expect(instructionBox().getAttribute('title')).toBe(
         'The instruction this agent runs in this conversation.'
     );
-    // The member viewed here is the primary, so its removal is impossible for the structural
+    // The member viewed here is the entry agent, so its removal is impossible for the structural
     // reason — and R7 makes this session's `[+]` a name field as well as a catalogue picker.
-    expect(memberToggle().title).toBe('The primary agent is always part of the team.');
+    expect(memberToggle().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
     expect(teamLockReason()).toBe('Add an agent to the team, or name a new one.');
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
@@ -976,7 +1015,7 @@ it('shows the tools badge only in the tools view and keeps it hidden in the chat
     expect(badge.hidden).toBe(true);
 });
 
-// Token tally: the row shows TWO scopes. The primary is the LATEST request's
+// Token tally: the row shows TWO scopes. The entry agent is the LATEST request's
 // input/context size (derived from the last `usage` event in the turn), and the
 // bracket is the server's cumulative cached input across the turn. See
 // src/frontend/ui/tokens.ts and the tally block in ui/turns.ts. Here request 1
@@ -1223,8 +1262,8 @@ it('keeps the last tally when later frames carry none', async () => {
 it('restores a remembered session with its frozen team and server timings', async () => {
     const frozen = descriptor({
         agents: ['instruct', 'summarizer'],
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         // A subagent allowlist is what makes the server add delegate.
         coreTools: [
             'read',
@@ -1347,7 +1386,7 @@ it('restores a remembered session with its frozen team and server timings', asyn
 
     // The frozen definition is what is displayed, not the live descriptor.
     expect(agentNames()).toEqual(['Instruct', 'Summarizer']);
-    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(agentRanks()).toEqual(['A', 'B']);
     // T3/R1: a locked saved session prints NO header note. The old frozen-team caption
     // restated two facts the reader cannot act on: the team lock is written on the
     // disabled editors themselves (asserted below), and which conversation is open is
@@ -1370,7 +1409,7 @@ it('restores a remembered session with its frozen team and server timings', asyn
     // a saved conversation cannot do is move its entry agent (R5).
     expect(instructionBox().disabled).toBe(false);
     expect(memberToggle().disabled).toBe(true);
-    expect(promoteToggle().disabled).toBe(true);
+    expect(entryToggle().disabled).toBe(true);
     expect(byClass('.agent-dialog-add', 'button').disabled).toBe(false);
     expect(dialogNote()).toBeNull();
     expect(applyAction().textContent).toBe('Save configuration');
@@ -1378,8 +1417,8 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(instructionBox().getAttribute('title')).toBe(
         'The instruction this agent runs in this conversation.'
     );
-    expect(memberToggle().title).toBe('The primary agent is always part of the team.');
-    expect(promoteToggle().title).toBe('The primary agent is fixed for a saved conversation.');
+    expect(memberToggle().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
+    expect(entryToggle().title).toBe('The entry agent is fixed for a saved conversation.');
     expect(teamLockReason()).toBe('Add an agent to the team, or name a new one.');
     // The frozen roster is THIS conversation's team, and only it.
     expect(agentEntries()).toEqual(['instruct', 'summarizer']);
@@ -1684,7 +1723,10 @@ it('still resumes a saved conversation of another harness when the harness on sc
         name: 'workspace',
         title: 'Workspace',
         agents: ['workspace'],
-        primary: 'workspace',
+        // A one-member team: the sole agent is its entry point, and its rank is its own (Rank A,
+        // which is what a card read states for it).
+        entry: 'workspace',
+        ranks: { workspace: 'A' },
         requiresEndpoint: false
     });
     const saved = conversation('s-ws', T + 1_000, { harness: 'workspace' });
@@ -1865,7 +1907,10 @@ const workspaceHarness = (): HarnessDescriptor =>
         name: 'workspace',
         title: 'Workspace',
         agents: ['workspace'],
-        primary: 'workspace',
+        // A one-member team: the sole agent is its entry point, and its rank is its own (Rank A,
+        // which is what a card read states for it).
+        entry: 'workspace',
+        ranks: { workspace: 'A' },
         requiresEndpoint: false
     });
 
@@ -1874,7 +1919,8 @@ const gammaHarness = (): HarnessDescriptor =>
         name: 'gamma',
         title: 'Gamma',
         agents: ['gamma'],
-        primary: 'gamma',
+        entry: 'gamma',
+        ranks: { gamma: 'A' },
         requiresEndpoint: false
     });
 
@@ -2243,21 +2289,30 @@ it('keeps the conversation the reader created across a harness switch, and never
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
 });
 
-it('creates a harness from preset agents with an initial primary', async () => {
+it('creates a harness from preset agents with an entry agent and per-member ranks', async () => {
     const calls = stubFetch((url, method, body) => {
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1'] });
 
         if (url === '/api/harnesses' && method === 'POST') {
-            const request = body as { name: string; title: string; primary: string; subagents: string[] };
+            // R20 request shape (../shared/harness-api.ts `CreateHarnessRequest`): the roster in
+            // declaration order, the entry agent, and one rank letter per member.
+            const request = body as {
+                name: string;
+                title: string;
+                agents: string[];
+                entry: string;
+                ranks: Record<string, AgentRank>;
+            };
             return json(
                 {
                     harness: descriptor({
                         name: request.name,
                         title: request.title,
-                        agents: [request.primary, ...request.subagents],
-                        primary: request.primary,
-                        subagents: request.subagents,
+                        agents: request.agents,
+                        entry: request.entry,
+                        // The answer states the FILLED map the route stores (see `fillRanks`).
+                        ranks: fillRanks(request.agents, request.ranks),
                         builtin: false,
                         editable: true,
                         tools: [],
@@ -2273,7 +2328,7 @@ it('creates a harness from preset agents with an initial primary', async () => {
                             'records',
 
                             'tasks',
-                            ...(request.subagents.length > 0 ? ['delegate'] : [])
+                            ...(request.agents.length > 1 ? ['delegate'] : [])
                         ]
                     })
                 },
@@ -2296,17 +2351,22 @@ it('creates a harness from preset agents with an initial primary', async () => {
     byClass('.create-name', 'input').value = 'release-captain';
     byClass('.create-title-input', 'input').value = 'Release captain';
 
-    const primary = byClass('.create-primary', 'select');
-    primary.value = 'workspace';
-    primary.dispatchEvent(new Event('change', { bubbles: true }));
+    // The entry picker names the agent a new conversation STARTS with; the rank steppers on the
+    // chips are what set authority, and nothing here implies the entry agent leads.
+    const entrySelect = byClass('.create-entry', 'select');
+    entrySelect.value = 'workspace';
+    entrySelect.dispatchEvent(new Event('change', { bubbles: true }));
 
-    // The secondary select cannot offer the primary agent.
+    // The add picker cannot offer the agent already chosen as the entry agent.
     const secondary = byClass('.create-agent-select', 'select');
     expect([...secondary.options].map((option) => option.value)).toEqual(['instruct', 'summarizer']);
     secondary.value = 'summarizer';
     byClass('.create-agent-add', 'button').click();
 
+    // One chip per member, entry agent first: the chip IS the rank stepper, and the routing
+    // agent's rank is just its rank — choosing it as the entry agent does not make it Rank A.
     expect([...document.querySelectorAll('.create-chip-name')].map((chip) => chip.textContent)).toEqual([
+        'Workspace',
         'Summarizer'
     ]);
 
@@ -2318,8 +2378,11 @@ it('creates a harness from preset agents with an initial primary', async () => {
     expect(post?.body).toEqual({
         name: 'release-captain',
         title: 'Release captain',
-        primary: 'workspace',
-        subagents: ['summarizer']
+        // The roster is sent explicitly (entry first) and every member states its own letter: the
+        // create form defaults the entry agent to Rank A and each added member to Rank B.
+        agents: ['workspace', 'summarizer'],
+        entry: 'workspace',
+        ranks: { workspace: 'A', 'summarizer': 'B' }
     });
 
     // The server's descriptor wins: the new harness is listed and selected.
@@ -2333,14 +2396,14 @@ it('creates a harness from preset agents with an initial primary', async () => {
     expect(document.querySelector('.harness-id')?.textContent).toBe('');
     expect(byClass('.harness-id', 'span').hidden).toBe(true);
     expect(agentNames()).toEqual(['Workspace', 'Summarizer']);
-    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(agentRanks()).toEqual(['A', 'B']);
     // R21.2: no right-rail core list follows the new harness; the global tools view
     // (detached while the chat is showing) carries that status instead.
     expect(document.querySelector('.core-tools')).toBeNull();
     expect(document.querySelector('.rail-right .tool-list')).toBeNull();
 });
 
-it('adds a picker agent, promotes it to primary and never duplicates a member', async () => {
+it('adds a picker agent, makes it the entry agent, and never duplicates a member', async () => {
     const base = descriptor();
     let current = base;
     const calls = stubFetch((url, method, body) => {
@@ -2348,11 +2411,15 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
         if (url === '/api/models') return json({ models: ['m1'] });
 
         if (url === '/api/harnesses/instruct' && method === 'PATCH') {
-            const request = body as { primary: string; subagents: string[] };
+            const request = body as {
+                agents: string[];
+                entry: string;
+                ranks: Record<string, AgentRank>;
+            };
             current = descriptor({
-                agents: [request.primary, ...request.subagents],
-                primary: request.primary,
-                subagents: request.subagents,
+                agents: request.agents,
+                entry: request.entry,
+                ranks: fillRanks(request.agents, request.ranks),
                 // A server with a subagent allowlist adds delegate.
                 coreTools: [
                     'read',
@@ -2366,7 +2433,7 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
                     'records',
 
                     'tasks',
-                    ...(request.subagents.length > 0 ? ['delegate'] : [])
+                    ...(request.agents.length > 1 ? ['delegate'] : [])
                 ]
             });
             return json({ harness: current });
@@ -2392,7 +2459,7 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     byClass('.agent-dialog-add', 'button').click();
 
     // 1. Adding is a local draft: `[+]` gives the outside agent a badge, and returning
-    //    to the primary keeps it an add (never a promotion). Nothing was sent by the
+    //    to the entry agent keeps it an add (never a rank change). Nothing was sent by the
     //    picker or the selection.
     byClass('.agent-dialog-add', 'button').click();
     byClass('.agent-dialog-add-option[data-agent="summarizer"]', 'button').click();
@@ -2411,39 +2478,46 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     applyAction().click();
     await flush();
 
-    // Complete team in one PATCH: primary + every remaining member as subagent. No
-    // model/instruction keys are invented for a harness that has none.
+    // One PATCH restates the whole team: the roster, the entry agent, and the rank map. The
+    // member the reader added travels WITHOUT a letter — the route places it one rank below the
+    // lowest one stated, which is why the answer then shows Rank B. No model/instruction keys
+    // are invented for a harness that has none.
     expect(calls.filter((call) => call.method === 'PATCH')[0]?.body).toEqual({
-        primary: 'instruct',
-        subagents: ['summarizer']
+        agents: ['instruct', 'summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A' }
     });
     expect(agentNames()).toEqual(['Instruct', 'Summarizer']);
-    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(agentRanks()).toEqual(['A', 'B']);
+    expect(agentEntryFlags()).toEqual([true, false]);
     // R21.2: the core set is no longer rendered anywhere; the global tools view lists
     // every tool (core entries included) from the server catalogue instead.
     expect(document.querySelector('.core-tool-name')).toBeNull();
 
-    // 2. R3: VIEWING the secondary does not promote it — the panel's own control arms
-    //    the promotion, and the request lists the demoted old primary exactly once.
+    // 2. R3: VIEWING another member changes nothing — the panel's own control arms the ENTRY
+    //    move, and an entry move restates the roster without moving a single rank: `instruct`
+    //    keeps Rank A even though a conversation no longer starts there.
     selectConfigured('summarizer');
     expect(applyAction().textContent).toBe('Save configuration');
     expect(applyAction().disabled).toBe(true);
 
-    promoteToggle().click();
-    expect(applyAction().textContent).toBe('Save & set primary');
+    entryToggle().click();
+    expect(applyAction().textContent).toBe('Save & set entry');
     applyAction().click();
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')[1]?.body).toEqual({
-        primary: 'summarizer',
-        subagents: ['instruct']
+        agents: ['summarizer', 'instruct'],
+        entry: 'summarizer',
+        ranks: { instruct: 'A', 'summarizer': 'B' }
     });
     expect(agentNames()).toEqual(['Summarizer', 'Instruct']);
-    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(agentRanks()).toEqual(['B', 'A']);
+    expect(agentEntryFlags()).toEqual([true, false]);
 
     // 3. Removing is opt-IN through `Remove from team`, and the team never ends up
-    //    without a primary: the removed agent loses its badge, so the view lands on the
-    //    primary rather than configuring an agent the save drops.
+    //    without an entry agent: the removed agent loses its badge, so the view lands on the
+    //    entry agent rather than configuring an agent the save drops.
     selectConfigured('instruct');
     memberToggle().click();
     expect(configuredAgent()).toBe('summarizer');
@@ -2452,24 +2526,30 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')[2]?.body).toEqual({
-        primary: 'summarizer',
-        subagents: []
+        agents: ['summarizer'],
+        entry: 'summarizer',
+        // The surviving member keeps the letter it had: being the only agent, and the entry
+        // point, does not promote it to Rank A.
+        ranks: { summarizer: 'B' }
     });
     expect(agentNames()).toEqual(['Summarizer']);
 
-    // The only member is the primary: its team controls are locked WITH the reason on
+    // The only member is the entry agent: its team controls are locked WITH the reason on
     // the control, so a harness can never be saved with zero agents.
     selectConfigured('summarizer');
     expect(memberToggle().disabled).toBe(true);
-    expect(memberToggle().title).toBe('The primary agent is always part of the team.');
-    expect(document.querySelector('.agent-dialog-field-note')).toBeNull();
+    expect(memberToggle().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
+    // The lock explanation PARAGRAPH is still gone (its reason lives on the locked control);
+    // the only note the panel prints here is the rank line, excluded by its own class.
+    expect(document.querySelector('.agent-dialog-field-note:not(.agent-dialog-rank-note)')).toBeNull();
 });
 
-it('views another agent configuration without promoting it or PATCHing the team', async () => {
+it('views another agent configuration without moving the entry agent or PATCHing the team', async () => {
     const base = descriptor({
         agents: ['instruct', 'summarizer'],
-        primary: 'instruct',
-        subagents: ['summarizer']
+        entry: 'instruct',
+        // Rank A leads and may delegate to Rank B; neither letter is a role.
+        ranks: { instruct: 'A', 'summarizer': 'B' }
     });
     let current = base;
     const calls = stubFetch((url, method, body) => {
@@ -2478,14 +2558,15 @@ it('views another agent configuration without promoting it or PATCHing the team'
 
         if (url === '/api/harnesses/instruct' && method === 'PATCH') {
             const request = body as {
-                primary: string;
-                subagents: string[];
+                agents: string[];
+                entry: string;
+                ranks: Record<string, AgentRank>;
                 agentModels?: Record<string, string>;
             };
             current = descriptor({
-                agents: [request.primary, ...request.subagents],
-                primary: request.primary,
-                subagents: request.subagents,
+                agents: request.agents,
+                entry: request.entry,
+                ranks: fillRanks(request.agents, request.ranks),
                 agentModels: request.agentModels
             });
             return json({ harness: current });
@@ -2498,22 +2579,22 @@ it('views another agent configuration without promoting it or PATCHing the team'
     await flush();
     await flush();
 
-    // T3: the dialog opens on the primary's configuration, and both members are listed.
+    // T3: the dialog opens on the entry agent's configuration, and both members are listed.
     openAgents();
     expect(configuredAgent()).toBe('instruct');
-    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(agentRanks()).toEqual(['A', 'B']);
 
     // Viewing the secondary sends NOTHING: selection is local draft state, so the
-    // primary and the team are untouched.
+    // entry agent and the team are untouched.
     selectConfigured('summarizer');
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
     expect(configuredAgent()).toBe('summarizer');
-    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(agentRanks()).toEqual(['A', 'B']);
 
     // The model choice is a draft too. The one explicit action writes it, and R3: the
-    // promotion the reader did NOT arm does not travel with it.
+    // entry move the reader did NOT arm does not travel with it.
     const select = byClass('.agent-model-select', 'select');
     select.value = 'm2';
     select.dispatchEvent(new Event('change', { bubbles: true }));
@@ -2523,25 +2604,27 @@ it('views another agent configuration without promoting it or PATCHing the team'
     applyAction().click();
     await flush();
 
-    // The team is restated unchanged (instruct stays the primary), and the model map is
+    // The team is restated unchanged (instruct stays the entry agent), and the model map is
     // the complete stored map plus the drafted entry.
     expect(calls.filter((call) => call.method === 'PATCH')[0]?.body).toEqual({
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        agents: ['instruct', 'summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         agentModels: { summarizer: 'm2' }
     });
     // The rebuild the PATCH triggers keeps the configuration being viewed (it is still
     // a member) and shows the saved model instead of yanking the reader elsewhere.
     expect(configuredAgent()).toBe('summarizer');
     expect(byClass('.agent-model-select', 'select').value).toBe('m2');
-    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(agentRanks()).toEqual(['A', 'B']);
 });
 
 it('drops a removed member from the roster and offers it back through the add picker', async () => {
     const base = descriptor({
         agents: ['instruct', 'summarizer'],
-        primary: 'instruct',
-        subagents: ['summarizer']
+        entry: 'instruct',
+        // Rank A leads and may delegate to Rank B; neither letter is a role.
+        ranks: { instruct: 'A', 'summarizer': 'B' }
     });
     let current = base;
     const calls = stubFetch((url, method, body) => {
@@ -2549,11 +2632,15 @@ it('drops a removed member from the roster and offers it back through the add pi
         if (url === '/api/models') return json({ models: ['m1'] });
 
         if (url === '/api/harnesses/instruct' && method === 'PATCH') {
-            const request = body as { primary: string; subagents: string[] };
+            const request = body as {
+                agents: string[];
+                entry: string;
+                ranks: Record<string, AgentRank>;
+            };
             current = descriptor({
-                agents: [request.primary, ...request.subagents],
-                primary: request.primary,
-                subagents: request.subagents
+                agents: request.agents,
+                entry: request.entry,
+                ranks: fillRanks(request.agents, request.ranks)
             });
             return json({ harness: current });
         }
@@ -2565,24 +2652,25 @@ it('drops a removed member from the roster and offers it back through the add pi
     await flush();
     await flush();
 
-    // R3: `Remove from team` drops the badge at once, so the view lands on the primary
+    // R3: `Remove from team` drops the badge at once, so the view lands on the entry agent
     // rather than configuring an agent this save would drop. Nothing is promoted by the
     // removal, and nothing was sent by the click itself.
     openAgents();
     selectConfigured('summarizer');
     memberToggle().click();
     expect(configuredAgent()).toBe('instruct');
-    expect(agentRoles()).toEqual(['primary']);
+    expect(agentRanks()).toEqual(['A']);
 
     applyAction().click();
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')[0]?.body).toEqual({
-        primary: 'instruct',
-        subagents: []
+        agents: ['instruct'],
+        entry: 'instruct',
+        ranks: { instruct: 'A' }
     });
     expect(agentNames()).toEqual(['Instruct']);
-    expect(agentRoles()).toEqual(['primary']);
+    expect(agentRanks()).toEqual(['A']);
 
     // The removed agent is still a trusted agent — it just left the team — so it has no
     // badge (the strip lists THIS team only) and `[+]` offers it again. Re-adding it is
@@ -2600,19 +2688,21 @@ it('drops a removed member from the roster and offers it back through the add pi
     expect(agentEntries()).toEqual(['instruct']);
     expect(applyAction().disabled).toBe(true);
 
-    // The one surviving member is the primary: its team control is locked with the
+    // The one surviving member is the entry agent: its team control is locked with the
     // reason ON the control, so the team can never be saved empty.
     selectConfigured('instruct');
     expect(memberToggle().disabled).toBe(true);
-    expect(memberToggle().title).toBe('The primary agent is always part of the team.');
-    expect(document.querySelector('.agent-dialog-field-note')).toBeNull();
+    expect(memberToggle().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
+    // The lock explanation PARAGRAPH is still gone (its reason lives on the locked control);
+    // the only note the panel prints here is the rank line, excluded by its own class.
+    expect(document.querySelector('.agent-dialog-field-note:not(.agent-dialog-rank-note)')).toBeNull();
 });
 
 it('views a saved conversation’s team and saves a model draft through the session PATCH', async () => {
     const frozen = descriptor({
         agents: ['instruct', 'summarizer'],
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         coreTools: [
             'read',
             'write',
@@ -2667,10 +2757,10 @@ it('views a saved conversation’s team and saves a model draft through the sess
     // the session. The one thing the conversation cannot do is move its entry agent, and a
     // promotion cannot be armed at all.
     expect(configuredAgent()).toBe('summarizer');
-    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(agentRanks()).toEqual(['A', 'B']);
     expect(instructionBox().disabled).toBe(false);
     expect(memberToggle().disabled).toBe(false);
-    expect(promoteToggle().disabled).toBe(true);
+    expect(entryToggle().disabled).toBe(true);
     // No team change was attempted, and the action cannot promote here.
     expect(patches).toEqual([]);
     expect(applyAction().textContent).toBe('Save configuration');
@@ -2698,7 +2788,7 @@ it('views a saved conversation’s team and saves a model draft through the sess
 
     // The refresh keeps the viewed configuration and shows the saved model.
     expect(configuredAgent()).toBe('summarizer');
-    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(agentRanks()).toEqual(['A', 'B']);
     expect(byClass('.agent-model-select', 'select').value).toBe('m2');
 });
 
@@ -2709,8 +2799,8 @@ it('adds a member to a saved conversation through its own roster, never the harn
     // screen after the save is evidence the roster moved — not evidence the client redrew it.
     const frozen = descriptor({
         agents: ['instruct'],
-        primary: 'instruct',
-        subagents: []
+        entry: 'instruct',
+        ranks: { instruct: 'A' }
     });
     const saved = snapshot({ id: 's1', harnessDefinition: frozen } as Partial<SessionSnapshot>);
 
@@ -2767,8 +2857,8 @@ it('blocks removing an agent a conversation in the session runs, with the reason
     // disabled control's tooltip is not reachable.
     const frozen = descriptor({
         agents: ['instruct', 'summarizer'],
-        primary: 'instruct',
-        subagents: ['summarizer']
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' }
     });
     const saved = snapshot({
         id: 's1',
@@ -2793,10 +2883,10 @@ it('blocks removing an agent a conversation in the session runs, with the reason
     await flush();
     await flush();
 
-    // The primary is removable in principle (no thread names it) and the secondary is not.
+    // The entry agent is removable in principle (no thread names it) and the secondary is not.
     openAgents();
     expect(memberToggle().disabled).toBe(true);
-    expect(memberToggle().title).toBe('The primary agent is always part of the team.');
+    expect(memberToggle().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
 
     selectConfigured('summarizer');
     expect(memberToggle().disabled).toBe(true);
@@ -2820,7 +2910,10 @@ it('filters the session strip to the selected harness and opens within it', asyn
         name: 'workspace',
         title: 'Workspace',
         agents: ['workspace'],
-        primary: 'workspace',
+        // A one-member team: the sole agent is its entry point, and its rank is its own (Rank A,
+        // which is what a card read states for it).
+        entry: 'workspace',
+        ranks: { workspace: 'A' },
         requiresEndpoint: false
     });
 
@@ -3068,7 +3161,13 @@ it('stops every task in the originating session while a run is in flight', async
     let cancelRequests = 0;
     let cancelBody: unknown;
 
-    const other = descriptor({ name: 'workspace', title: 'Workspace', agents: ['workspace'], primary: 'workspace' });
+    const other = descriptor({
+        name: 'workspace',
+        title: 'Workspace',
+        agents: ['workspace'],
+        entry: 'workspace',
+        ranks: { workspace: 'A' }
+    });
     const runningTurn: SessionTurn = {
         id: 't1',
         index: 0,
@@ -3198,7 +3297,13 @@ it('stops polling a running session when another harness is selected', async () 
         events: [{ type: 'start', agent: 'instruct', model: 'm1' }]
     };
     const running = snapshot({ id: 'r1', status: 'running', turns: [runningTurn] });
-    const other = descriptor({ name: 'workspace', title: 'Workspace', agents: ['workspace'], primary: 'workspace' });
+    const other = descriptor({
+        name: 'workspace',
+        title: 'Workspace',
+        agents: ['workspace'],
+        entry: 'workspace',
+        ranks: { workspace: 'A' }
+    });
     localStorage.setItem(SESSION_KEY, 'r1');
 
     let gets = 0;
@@ -4188,15 +4293,24 @@ const stubEmptyCatalogue = (): Call[] =>
         if (url === '/api/models') return json({ models: ['m1'] });
 
         if (url === '/api/harnesses' && method === 'POST') {
-            const request = body as { name: string; title: string; primary: string; subagents: string[] };
+            // R20 request shape (../shared/harness-api.ts `CreateHarnessRequest`): the roster in
+            // declaration order, the entry agent, and one rank letter per member.
+            const request = body as {
+                name: string;
+                title: string;
+                agents: string[];
+                entry: string;
+                ranks: Record<string, AgentRank>;
+            };
             return json(
                 {
                     harness: descriptor({
                         name: request.name,
                         title: request.title,
-                        agents: [request.primary, ...request.subagents],
-                        primary: request.primary,
-                        subagents: request.subagents,
+                        agents: request.agents,
+                        entry: request.entry,
+                        // The answer states the FILLED map the route stores (see `fillRanks`).
+                        ranks: fillRanks(request.agents, request.ranks),
                         builtin: false
                     })
                 },
@@ -4287,7 +4401,7 @@ it('creates the first harness from the empty-catalogue state, then selects it', 
 
     // The trusted agent library is available even with an empty catalogue, which is what
     // makes a first create possible at all.
-    expect([...byClass('.create-primary', 'select').options].map((option) => option.value)).toEqual([
+    expect([...byClass('.create-entry', 'select').options].map((option) => option.value)).toEqual([
         'instruct',
         'summarizer',
         'workspace'
@@ -4309,8 +4423,9 @@ it('creates the first harness from the empty-catalogue state, then selects it', 
     expect(post?.body).toEqual({
         name: 'release-captain',
         title: 'Release captain',
-        primary: 'instruct',
-        subagents: []
+        agents: ['instruct'],
+        entry: 'instruct',
+        ranks: { instruct: 'A' }
     });
     expect(canonicalReads.filter((url) => url.split('?')[0] === '/v1/harness/harnesses')).toEqual([
         '/v1/harness/harnesses?limit=25',
@@ -4581,11 +4696,13 @@ it('deletes the running current session, stops watching and creates no replaceme
     // The deleted conversation took its lock with it: the harness is editable again.
     expect(instructionBox().disabled).toBe(false);
     // R3: the roster lists only this harness's own team, and the configured agent is
-    // the primary, so its team control is locked WITH the reason on the control (a
+    // the entry agent, so its team control is locked WITH the reason on the control (a
     // harness always has one) — there is no paragraph to say it.
     expect(memberToggle().disabled).toBe(true);
-    expect(memberToggle().title).toBe('The primary agent is always part of the team.');
-    expect(document.querySelector('.agent-dialog-field-note')).toBeNull();
+    expect(memberToggle().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
+    // The lock explanation PARAGRAPH is still gone (its reason lives on the locked control);
+    // the only note the panel prints here is the rank line, excluded by its own class.
+    expect(document.querySelector('.agent-dialog-field-note:not(.agent-dialog-rank-note)')).toBeNull();
 
     // The agent outside the team is reachable through `[+]` now, and its add is a live
     // draft the reader can still cancel.

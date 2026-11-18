@@ -401,7 +401,7 @@ describe('actionRequest runtime', () => {
         expect(observed?.aborted).toBe(true);
     });
 
-    it('auto-answers a subagent request from the owner fork with both full histories', async () => {
+    it('auto-answers a lower-ranked delegation request from the owner fork with both full histories', async () => {
         const events: HarnessEvent[] = [];
         const writerSeen: HarnessStreamRequest[] = [];
 
@@ -440,8 +440,7 @@ describe('actionRequest runtime', () => {
 
         const writer = harness({
             agents: { writer: lead, helper },
-            primary: 'writer',
-            subagents: ['helper'],
+            entry: 'writer',
             presets: false,
             interaction: { actionRequest: async () => ({ kind: 'option', optionId: 'fast' }) },
             report: { progress: (event) => void events.push(event) }
@@ -490,7 +489,13 @@ describe('actionRequest runtime', () => {
 
         const autoBranch = writer.branches()[0];
         expect(autoBranch.kind).toBe('autoanswer');
-        expect(autoBranch.role).toBe('primary');
+        // The autoanswer branch inherits the OWNER's rank (`actorRanks`), and the entry agent
+        // of a two-rank roster holds Rank A. This replaces `role: 'primary'`.
+        // The autoanswer branch inherits the OWNER's rank (`actorRanks`), and the entry agent
+        // of a two-rank roster holds Rank A. This replaces `role: 'primary'`.
+        // The autoanswer branch inherits the OWNER's rank (`actorRanks`), and the entry agent
+        // of a two-rank roster holds Rank A. This replaces `role: 'primary'`.
+        expect(autoBranch.rank).toBe('A');
         expect(autoBranch.requestId).toBe('request-1');
         expect(autoBranch.status).toBe('completed');
         expect((answerEvent as Extract<HarnessEvent, { type: 'action_answer' }>).answer.branchId).toBe(
@@ -567,8 +572,7 @@ describe('actionRequest runtime', () => {
 
         const writer = harness({
             agents: { writer: lead, helper },
-            primary: 'writer',
-            subagents: ['helper'],
+            entry: 'writer',
             presets: false,
             interaction: { actionRequest: async () => ({ kind: 'option', optionId: 'fast' }) }
         });
@@ -656,8 +660,7 @@ describe('actionRequest runtime', () => {
         const invalid = build('I think fast is best.');
         const invalidHarness = harness({
             agents: { writer: invalid.owner, helper: invalid.helper },
-            primary: 'writer',
-            subagents: ['helper'],
+            entry: 'writer',
             presets: false,
             interaction: { actionRequest: async () => ({ kind: 'option', optionId: 'fast' }) }
         });
@@ -676,8 +679,7 @@ describe('actionRequest runtime', () => {
         const blank = build('   ');
         const blankHarness = harness({
             agents: { writer: blank.owner, helper: blank.helper },
-            primary: 'writer',
-            subagents: ['helper'],
+            entry: 'writer',
             presets: false,
             interaction: { actionRequest: async () => ({ kind: 'option', optionId: 'fast' }) }
         });
@@ -724,8 +726,7 @@ describe('actionRequest runtime', () => {
 
         const writer = harness({
             agents: { writer: lead, helper },
-            primary: 'writer',
-            subagents: ['helper'],
+            entry: 'writer',
             presets: false,
             interaction: {
                 actionRequest: async () => {
@@ -825,8 +826,7 @@ describe('actionRequest runtime', () => {
 
         const writer = harness({
             agents: { writer: owner, helper },
-            primary: 'writer',
-            subagents: ['helper'],
+            entry: 'writer',
             presets: false,
             interaction: { actionRequest: async () => ({ kind: 'option', optionId: 'yes' }) }
         });
@@ -883,8 +883,7 @@ describe('actionRequest runtime', () => {
             const built = build(config as Record<string, unknown>);
             const writer = harness({
                 agents: { writer: built.owner, helper: built.helper },
-                primary: 'writer',
-                subagents: ['helper'],
+                entry: 'writer',
                 presets: false,
                 ...(config as object)
             });

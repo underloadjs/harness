@@ -11,7 +11,7 @@
 // WHAT IS PINNED, exactly:
 //   1. rows after `POST /sessions/{id}/reset` == rows after `POST /sessions` — every field of
 //      every row, name by name, in server order (`enabled`, `protected`, `origin`, `declared`).
-//      Since T6 the enabled figure is the WHOLE 32-row list, not the seeded 22: `enabled` is the
+//      Since T6 the enabled figure is the WHOLE 33-row list, not the seeded 23: `enabled` is the
 //      call axis, and the ten names that hold no `maxEnabledTools` slot are callable through their
 //      declaration list (./api-reads.ts `sessionToolRowsOf`);
 //   2. a toolbox the conversation switched OFF comes back on a reset, and the re-seed is DURABLE
@@ -80,7 +80,7 @@ const API_DEFAULTS = { baseURL: SETTINGS.baseURL, model: SETTINGS.model, hasApiK
 
 const MOUNT = '/v1/harness';
 
-// The CAPPED set a keyless host seeds: the 22 names that hold one of the `maxEnabledTools` slots,
+// The CAPPED set a keyless host seeds: the 23 names that hold one of the `maxEnabledTools` slots,
 // i.e. `ROW_ORDER` minus `SLOTLESS_NAMES`. Stated as exact names so "the reset re-applied the seed"
 // cannot be satisfied by a partial refill. The snapshot assertions below use this list, because
 // `discovery.enabled` IS the capped set; the row assertions use `ROW_ORDER`, because the call axis
@@ -94,6 +94,7 @@ const SEEDED_NAMES = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'threadFork',
@@ -115,7 +116,7 @@ const SEEDED_NAMES = [
 // conversation cannot switch" (it can — the switch just lives in `withheldTools` instead of a
 // slot) and no longer "the protected ten" (`toolCancel` is NOT protected, because its registered
 // visibility is `searchable`). Under the call axis every one of them answers `enabled: true`
-// until this conversation switches it off, which is why the enabled figures below are 32, not 22.
+// until this conversation switches it off, which is why the enabled figures below are 33, not 23.
 const SLOTLESS_NAMES = ['toolRequest', 'tasks', 'delegate', 'toolCancel', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
 
 // The rows the kernel will not let this conversation UNREGISTER: `visibility === 'core'` on the
@@ -124,8 +125,8 @@ const SLOTLESS_NAMES = ['toolRequest', 'tasks', 'delegate', 'toolCancel', 'read'
 // because every comparison below is against a row list.
 const PROTECTED_NAMES = ['toolRequest', 'tasks', 'delegate', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
 
-// All 32 rows in the server's own order. A seeded session answers `enabled: true` for the WHOLE
-// list: the 22 through their cap slots, the 10 slotless ones through their declaration list.
+// All 33 rows in the server's own order. A seeded session answers `enabled: true` for the WHOLE
+// list: the 23 through their cap slots, the 10 slotless ones through their declaration list.
 const ROW_ORDER = [
     'toolRegistry',
     'toolRequest',
@@ -137,6 +138,7 @@ const ROW_ORDER = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'delegate',
@@ -175,8 +177,10 @@ const toolboxPreset = (): HarnessPreset => ({
     title: 'Toolbox',
     description: 'Shared-toolbox fixture for the reset toolbox, scripted model.',
     requiresEndpoint: false,
-    primary: 'boss',
-    subagents: ['helper'],
+    // R15 — the rank map IS the team: entry `boss` at Rank A, `helper` strictly below, which is
+    // what registers `delegate` (two distinct ranks) and what makes `helper` its only target.
+    entry: 'boss',
+    ranks: { boss: 'A', helper: 'B' },
     agents: ['boss', 'helper'],
     tools: SHARED_TOOL_NAMES,
     environmentTools: ['search', 'fetch'],
@@ -184,7 +188,9 @@ const toolboxPreset = (): HarnessPreset => ({
     editable: true,
     create: (settings, progress, report) =>
         createToolboxHarness(
-            { agents: { boss: scriptedBrain('boss'), helper: scriptedBrain('helper') }, primary: 'boss', subagents: ['helper'] },
+            // R1/R6 — the config carries the rank PAIR: `helper` at Rank B is `boss`'s only legal
+            // `delegate` target, and the same-rank rule is what keeps `helper` from delegating back.
+            { agents: { boss: scriptedBrain('boss'), helper: scriptedBrain('helper') }, entry: 'boss', ranks: { boss: 'A', helper: 'B' } },
             settings,
             progress,
             // Forwarded UNMODIFIED, so the store's per-build `enableAllTools` reaches
@@ -206,8 +212,10 @@ const toolboxPreset = (): HarnessPreset => ({
 const unseededToolboxPreset = (): HarnessPreset => {
     const input = {
         agents: { boss: scriptedBrain('boss'), helper: scriptedBrain('helper') },
-        primary: 'boss',
-        subagents: ['helper']
+        // Same rank pair as the seeded card: the unseeded variant differs only in its tool
+        // catalogue, so `delegate` must stay rank-declared here too.
+        entry: 'boss',
+        ranks: { boss: 'A', helper: 'B' }
     };
 
     return {
@@ -330,11 +338,11 @@ describe('POST /sessions/{id}/reset re-applies the new-session toolbox seed', ()
 
         const resetRows = await rowsOf(api, createdId);
 
-        // The reset conversation IS a new conversation: the same 32 rows, the same 32 on, the same
+        // The reset conversation IS a new conversation: the same 33 rows, the same 33 on, the same
         // 9 protected, the same origins, in the same order.
         expect(comparableRows(resetRows)).toEqual(comparableRows(createdRows));
         expect(namesWhere(resetRows, (row) => row.enabled)).toEqual(ROW_ORDER);
-        expect(namesWhere(resetRows, (row) => row.enabled).length).toBe(32);
+        expect(namesWhere(resetRows, (row) => row.enabled).length).toBe(33);
         expect(namesWhere(resetRows, (row) => row.protected).length).toBe(9);
 
         // A SECOND reset changes nothing: the seed is a state, not a one-shot bonus.
@@ -404,7 +412,7 @@ describe('POST /sessions/{id}/reset re-applies the new-session toolbox seed', ()
         expect(row(await rowsOf(reopened.api, sessionId), 'write')).toMatchObject({ enabled: false, protected: true });
         expect(reopened.store.liveSession(sessionId).harness.withheldTools).toEqual(['write']);
 
-        // A reset IS a new conversation: the whole toolbox is on again — all 32 rows, the core one
+        // A reset IS a new conversation: the whole toolbox is on again — all 33 rows, the core one
         // included — and the switch set is empty.
         expect((await call(reopened.api, 'POST', `${MOUNT}/sessions/${sessionId}/reset`)).status).toBe(200);
 
@@ -477,7 +485,7 @@ describe('POST /sessions/{id}/reset re-applies the new-session toolbox seed', ()
         expect(namesWhere(createdRows, (row) => row.enabled)).toEqual(ROW_ORDER);
 
         // THE RESTART: a registry, a store, and an API built again from the persisted document.
-        // Restoring on its own changes nothing (the committed set here happens to be the full 22).
+        // Restoring on its own changes nothing (the committed set here happens to be the full 23).
         const reopened = openPair(root, readDocument(root));
 
         expect(namesWhere(await rowsOf(reopened.api, createdId), (row) => row.enabled)).toEqual(ROW_ORDER);
@@ -492,7 +500,7 @@ describe('POST /sessions/{id}/reset re-applies the new-session toolbox seed', ()
         // Row for row, field for field: `create -> reset` == `create -> restart -> reset`.
         expect(comparableRows(resetRows)).toEqual(comparableRows(createdRows));
         expect(namesWhere(resetRows, (row) => row.enabled)).toEqual(ROW_ORDER);
-        expect(namesWhere(resetRows, (row) => row.enabled).length).toBe(32);
+        expect(namesWhere(resetRows, (row) => row.enabled).length).toBe(33);
         expect(namesWhere(resetRows, (row) => row.protected).length).toBe(9);
 
         // The refill is the SECOND process's committed state, so a further restart keeps it. Before
@@ -521,9 +529,9 @@ describe('POST /sessions/{id}/reset re-applies the new-session toolbox seed', ()
         expect((await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/tools/syntax`, { enabled: false })).status).toBe(200);
         expect((await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/tools/shell`, { enabled: false })).status).toBe(200);
 
-        // THE CAPPED SET this conversation committed: the seeded 22 minus the two it switched off.
+        // THE CAPPED SET this conversation committed: the seeded 23 minus the two it switched off.
         const committed = SEEDED_NAMES.filter((name) => name !== 'syntax' && name !== 'shell');
-        // The same state AS THE ROWS SHOW IT. T6: 30 of 32 rows, not 20 of 32 — the ten names with
+        // The same state AS THE ROWS SHOW IT. T6: 31 of 33 rows, not 21 of 33 — the ten names with
         // no cap slot answer `true` through their declaration list unless this conversation switches
         // them off, and it switched off only `syntax` and `shell`.
         const committedRows = ROW_ORDER.filter((name) => name !== 'syntax' && name !== 'shell');
@@ -532,11 +540,11 @@ describe('POST /sessions/{id}/reset re-applies the new-session toolbox seed', ()
 
         const reopened = openPair(root, readDocument(root));
 
-        // 30, not 32: `syntax` and `shell` are still off, and no third name moved.
+        // 31, not 33: `syntax` and `shell` are still off, and no third name moved.
         const restoredRows = await rowsOf(reopened.api, sessionId);
 
         expect(namesWhere(restoredRows, (row) => row.enabled)).toEqual(committedRows);
-        expect(namesWhere(restoredRows, (row) => row.enabled).length).toBe(30);
+        expect(namesWhere(restoredRows, (row) => row.enabled).length).toBe(31);
         expect(namesWhere(restoredRows, (row) => row.protected).length).toBe(9);
 
         // Not just a paint over a refilled harness: the next mutation this process persists starts
@@ -592,11 +600,11 @@ describe('POST /sessions/{id}/reset re-applies the new-session toolbox seed', ()
         const reopened = openPair(root, readDocument(root));
         const restoredRows = await rowsOf(reopened.api, sessionId);
 
-        // Nothing came back on: 22 of 32 rows still off — including the 9 protected ones, whose
+        // Nothing came back on: 23 of 33 rows still off — including the 9 protected ones, whose
         // switch survived precisely because `discovery.withheld` is part of the snapshot — and only
         // the ten slotless rows on, because they were never switched off.
         expect(namesWhere(restoredRows, (row) => row.enabled)).toEqual(SLOTLESS_NAMES);
-        expect(restoredRows.length).toBe(32);
+        expect(restoredRows.length).toBe(33);
         expect(namesWhere(restoredRows, (row) => row.protected)).toEqual(PROTECTED_NAMES);
 
         // And the reset still refills it, in this process.
@@ -618,14 +626,14 @@ describe('a session built without the seed keeps an empty toolbox, reset or not'
         const { api } = openPair(root, undefined, unseededToolboxPreset());
         const sessionId = await sessionOf(api);
 
-        // The same 32 rows, none of them SEEDED: the toolbox is fully listed and the capped set is
+        // The same 33 rows, none of them SEEDED: the toolbox is fully listed and the capped set is
         // empty. T6 still credits the ten slotless rows with `enabled: true`, because the call axis
         // asks whether this conversation can call the name, and a declared or runtime control is in
         // context without a slot. "Empty toolbox" here means an empty capped set, which is what the
         // snapshot states (asserted below).
         const created = await rowsOf(api, sessionId);
 
-        expect(created.length).toBe(32);
+        expect(created.length).toBe(33);
         expect(namesWhere(created, (row) => row.enabled)).toEqual(SLOTLESS_NAMES);
         expect((readDocument(root).sessions[0].core as HarnessSnapshot).discovery.enabled ?? []).toEqual([]);
         expect(namesWhere(created, (row) => row.protected)).toEqual(PROTECTED_NAMES);

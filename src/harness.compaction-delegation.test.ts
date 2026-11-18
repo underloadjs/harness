@@ -532,8 +532,8 @@ describe('context compaction across a delegation (T6 repro)', () => {
                 writer: agent({ model: MODEL, stream: parentStream }),
                 researcher: agent({ model: MODEL, stream: childStream })
             },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             tools: { seed: seedTool },
             pluginSettings: summarizeSettings(),
             presets: false,

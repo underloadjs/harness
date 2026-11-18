@@ -1155,7 +1155,7 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         invocationId: mutation.invocationId,
                         sequence: mutation.sequence,
                         agent: mutation.agent,
-                        role: mutation.role,
+                        rank: mutation.rank,
                         kind: mutation.runKind,
                         status: mutation.status,
                         ...(mutation.content === undefined ? {} : { content: mutation.content }),

@@ -409,7 +409,7 @@ export const applyOpToDisplay = (
             // `patch` fields are optional-by-contract: absent means unchanged.
             const patch = op.patch;
             if (patch.state !== undefined) section.state = patch.state;
-            if (patch.role !== undefined) section.role = patch.role;
+            if (patch.rank !== undefined) section.rank = patch.rank;
             if (patch.model !== undefined) section.model = patch.model;
             if (patch.agentLabel !== undefined) section.agentLabel = patch.agentLabel;
             if (patch.invocationId !== undefined) section.invocationId = patch.invocationId;

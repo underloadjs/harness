@@ -44,7 +44,7 @@ const WIRE_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const ACTIVATIONS: readonly ToolActivation[] = [
     'always',
     'creation',
-    'subagents',
+    'delegation',
     'interaction',
     'forks',
     'threads',
@@ -621,8 +621,6 @@ const readRegistration = (
     const pendingOnly = flag('pendingOnly');
     if (pendingOnly !== undefined) registration.pendingOnly = pendingOnly;
     if (control !== undefined) registration.control = control as ToolRegistration['control'];
-    const primaryOnly = flag('primaryOnly');
-    if (primaryOnly !== undefined) registration.primaryOnly = primaryOnly;
     const answerExtraction = flag('answerExtraction');
     if (answerExtraction !== undefined) registration.answerExtraction = answerExtraction;
     const sessionBound = flag('sessionBound');
@@ -782,7 +780,6 @@ const readEntry = (
         order: registration.order,
         ...(registration.pendingOnly === undefined ? {} : { pendingOnly: registration.pendingOnly }),
         ...(registration.control === undefined ? {} : { control: registration.control }),
-        ...(registration.primaryOnly === undefined ? {} : { primaryOnly: registration.primaryOnly }),
         ...(registration.answerExtraction === undefined
             ? {}
             : { answerExtraction: registration.answerExtraction }),

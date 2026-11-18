@@ -226,8 +226,11 @@ export const SCRIPTED_FIXTURE: HarnessPreset = {
     // The real `general` profile, not `demo`: see the header. The PRESET is named `demo` (a
     // frozen session record names it, and `presetFromRecord` matches on the preset name), but
     // the AGENT inside it is a role this build actually has.
-    primary: 'general',
-    subagents: [],
+    //
+    // ONE member, ONE rank: a fixture that delegates nothing, which is what the old
+    // `subagents: []` said and what the rank map now says directly.
+    entry: 'general',
+    ranks: { general: 'A' },
     agents: ['general'],
     tools: ['timeNow'],
     // See the header: `builtin: true` keeps the built-in registry paths exercisable.
@@ -257,7 +260,7 @@ export const SCRIPTED_FIXTURE: HarnessPreset = {
             // shared path so a move of the file cannot leave a stale literal here.
             toolSources: { timeNow: SHARED_APP_TOOL_SOURCES.timeNow },
             presets: false,
-            primary: 'general',
+            entry: 'general',
             report: {
                 progress,
                 ...(report?.stateChange === undefined ? {} : { stateChange: report.stateChange }),
@@ -357,9 +360,11 @@ export const FLAKY_FIXTURE: HarnessPreset = {
         'Test fixture: the shared toolbox plus a tool that throws on two out of every three calls, so a run can retry instead of dying. Not a production configuration.',
     requiresEndpoint: true,
     // A REAL profile. There is no `flaky` agent profile any more, and a live harness that
-    // named one would fail validation against the trusted registry.
-    primary: 'general',
-    subagents: [],
+    // named one would fail validation against the trusted registry. One member, one rank:
+    // the extra TOOL is the whole difference from a production card, and there is no
+    // delegation in either.
+    entry: 'general',
+    ranks: { general: 'A' },
     agents: ['general'],
     tools: [...SHARED_TOOL_NAMES, TEST_FLAKY_TOOL_NAME],
     environmentTools: ['search', 'fetch'],
@@ -373,8 +378,8 @@ export const FLAKY_FIXTURE: HarnessPreset = {
                 // uses, so the fixture's only difference from a production harness is the
                 // extra tool.
                 agents: agentsFromProfiles(['general'], settings),
-                primary: 'general',
-                subagents: [],
+                entry: 'general',
+                ranks: { general: 'A' },
                 // A DEFINITION, not a source path: see the header note on why the
                 // examples folder is gone. `createToolboxHarness` registers `extraTools`
                 // last, so a definition wins over a source of the same name.

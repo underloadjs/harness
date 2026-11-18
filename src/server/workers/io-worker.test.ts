@@ -38,7 +38,20 @@ import {
     writeHarnessShardFile,
     createHarnessStagingSequence
 } from '../persistence';
-import type { HarnessDatabase, HarnessShardUnit } from '../persistence';
+// `HarnessShardUnit` is the UNION; the three precise members are imported because `unitsOf`
+// below declares the exact unit kind it builds for each slot. Spreading a union-typed value
+// produces a union of spreads, and a fresh literal spread is excess-property-checked against
+// EVERY member of the target union, so `{ ...units.thread, id, messages }` at
+// ./io-worker.test.ts:638 was refused with "'id' does not exist in type 'HarnessIndexShardUnit'"
+// even though the value IS a thread unit. Naming the members keeps the helper's contract honest.
+import type { HarnessDatabase, HarnessIndexShardUnit, HarnessSessionShardUnit, HarnessShardUnit, HarnessThreadShardUnit } from '../persistence';
+// The snapshot version a session's `core` must carry, asserted by the loader these worker
+// commits are read back through (../persistence.ts `requireCoreSnapshotVersion` ->
+// ../../core/snapshot.ts `HARNESS_SNAPSHOT_VERSION`). This suite writes shards with the worker
+// loop and then reads them with a plain `HarnessPersistence.load()`, so its hand-built core
+// used to carry an arbitrary `version: 1`; the number is part of the read contract now, and
+// pinning the constant keeps the fixture honest the day the kernel bumps the snapshot.
+import { HARNESS_SNAPSHOT_VERSION } from '../../core/snapshot';
 import {
     configureIoWorker,
     executeIoCommand,
@@ -100,8 +113,18 @@ const PRESET = {
     title: 'Live',
     description: 'd',
     requiresEndpoint: false,
-    primary: 'a',
-    subagents: [],
+    // The stored shape of the rank model: `entry` + `ranks`, required by the readers, with the
+    // retired `primary`/`subagents` keys REFUSED (../persistence.ts `requireNoLegacyRosterKeys`) —
+    // see the matching fixture in ./io-client.test.ts.
+    entry: 'a',
+    // `as const` keeps the rank letter a LITERAL. PRESET is declared on its own and only ever
+    // SPREAD into the session row below (`preset: { ...PRESET }`), so `ranks` gets no contextual
+    // type from `HarnessPresetRecord` and a bare 'A' would widen to `string`, which
+    // `Record<string, AgentRank>` refuses (../types/index.ts:1469 `AgentRank` is the A–Z letter
+    // union; ../persistence.ts:294 is the field). Same reason `template` below carries `as const`,
+    // and the spelling the sibling suites already use (../background.test.ts:181,
+    // ../../harness.thread-epoch.test.ts:132).
+    ranks: { a: 'A' as const },
     agents: ['a'],
     tools: [],
     builtin: true,
@@ -114,8 +137,11 @@ const DEFINITION = {
     title: 'Live',
     description: 'd',
     requiresEndpoint: false,
-    primary: 'a',
-    subagents: [],
+    entry: 'a',
+    // `as const` for the same reason as PRESET above: DEFINITION is spread into the row's
+    // `definition` field, so `ranks` must keep the literal type to satisfy
+    // `HarnessDescriptor.ranks: Record<string, AgentRank>` (../persistence.ts `readDescriptor`).
+    ranks: { a: 'A' as const },
     agents: ['a'],
     tools: [],
     builtin: true,
@@ -156,7 +182,9 @@ const document = (marker: string): HarnessDatabase => ({
             ],
             queue: [],
             core: {
-                version: 1,
+                // NOT a free number any more: the loader asserts the snapshot version (see the
+                // import of `HARNESS_SNAPSHOT_VERSION` above).
+                version: HARNESS_SNAPSHOT_VERSION,
                 agents: {},
                 memory: {},
                 threads: [{ id: 'thread-1', title: 't', messages: TRANSCRIPT }]
@@ -169,7 +197,16 @@ const emptyDocument = (): HarnessDatabase => ({ version: HARNESS_DATABASE_VERSIO
 
 // The three units of one document, built through A1's own primitives - the same call the
 // client's split makes (./io-client.ts `harnessShardUnitsOf`).
-const unitsOf = (root: string, doc: HarnessDatabase, savedAt: number): { thread: HarnessShardUnit; session: HarnessShardUnit; index: HarnessShardUnit } => {
+// Each slot is annotated with the EXACT `HarnessShardUnit` member it constructs (the `kind`
+// discriminant is a literal in the body), not the wide union: a caller that spreads one of
+// these units then gets a single object type instead of a union of three, which is what makes
+// the `{ ...units.thread, id: 'thread-2', ... }` thread unit in the record-cap test type-check
+// against `HarnessShardUnit` (./io-worker.test.ts `removes only the transcript...`).
+const unitsOf = (
+    root: string,
+    doc: HarnessDatabase,
+    savedAt: number
+): { thread: HarnessThreadShardUnit; session: HarnessSessionShardUnit; index: HarnessIndexShardUnit } => {
     const record = doc.sessions[0];
     const { record: stored } = splitHarnessSessionRecord(record);
 

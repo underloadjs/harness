@@ -117,8 +117,15 @@ const presetOf = (
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: agents[0] ?? name,
-    subagents: agents.slice(1),
+    // THE RANK PAIR (clean break). `entry` is the routing agent; `ranks` replaces the retired
+    // `primary` + `subagents` pair and states authority per agent: the entry holds Rank A and
+    // everyone it may hand work to holds Rank B, which is exactly the delegation the old
+    // allowlist expressed by listing them. A one-member roster therefore states ONE rank and
+    // gets no `delegate` tool at all (./harnesses/toolbox.ts `ranksDeclareDelegation`).
+    entry: agents[0] ?? name,
+    ranks: Object.fromEntries(
+        agents.map((rosterName, index): [string, AgentRank] => [rosterName, index === 0 ? 'A' : 'B'])
+    ),
     agents,
     tools: [],
     builtin: true,
@@ -138,7 +145,8 @@ const liveScriptedPreset = (name: string, text: string): HarnessPreset =>
                     stream: answerStream(text)
                 })
             },
-            primary: name,
+            entry: name,
+            ranks: { [name]: 'A' as const },
             presets: false,
             report: {
                 progress,
@@ -608,5 +616,154 @@ describe('document-level failures stay fatal (T5 scope)', () => {
         // The tampered text survives the failed load untouched: a fatal load never
         // rewrites the operator's file.
         expect(fs.readFileSync(sessionFile(root, created.id), 'utf8')).toContain('"core":"not-a-snapshot"');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// THE RANK CLEAN BREAK, AT THE SERVER'S OWN DOOR (R11)
+// ---------------------------------------------------------------------------
+// ./persistence-shards.test.ts pins the same refusal at the RAW persistence door
+// (`new HarnessPersistence(root).load()`) for a row carrying BOTH retired keys. This block
+// pins it where an operator actually meets it — `createHarnessRuntime`, the door every
+// server and CLI start goes through — and covers the branch those pins do not:
+//
+//   1. a row carrying ONLY `subagents` (no `primary`, no `ranks`). The guard fires on any
+//      one of the two keys, and the single-key wording is what an operator with a
+//      HALF-migrated file reads, so it has to be right on its own. The row keeps a valid
+//      `entry`, so `subagents` is the ONE thing wrong with it: without the guard the
+//      failure would be `registry[0].ranks must be an object.`, and a silent rename would
+//      instead let the store resume on a delegation model nobody configured.
+//   2. the refusal is FATAL, not a per-session drop. Everything else in this file proves
+//      that a broken SESSION is isolated; a row whose authority model this build cannot
+//      read says nothing trustworthy about ANY session beside it, so the whole store
+//      refuses and no session is quietly dropped to keep the server up.
+//   3. the positive half: `ranks` IS the stored vocabulary, and a saved map that differs from
+//      the one this build ships is a CUSTOMISATION — it is accepted, and it stays in the
+//      document exactly as written. That is the opposite of the refusal above, and the reason
+//      the clean break is not "reject every old file".
+describe('the rank clean break at the durable restore surface (R11)', () => {
+    // The stored row of one shipped card, by name. The label in the error is the row's
+    // POSITION in `index.json`, so the test reads the position from the same document it
+    // tampers instead of hard-coding a key order it does not own.
+    const registryRowOf = (document: StoredDocument, name: string): { row: Record<string, unknown>; index: number } => {
+        const index = document.registry.findIndex((row) => (row as { name?: unknown }).name === name);
+
+        if (index < 0) throw new Error(`the persisted registry holds no row named "${name}".`);
+
+        return { row: document.registry[index] as Record<string, unknown>, index };
+    };
+
+    it('refuses a stored row that still carries `subagents` (no `ranks`) and never rewrites it', async () => {
+        const root = tempRoot('legacy-subagents-row');
+
+        // A healthy session lives next door on purpose: it is the record a lenient loader
+        // would happily resume while quietly re-deriving the team of the card beside it.
+        const first = runtimeOf(root);
+        const created = await first.store.create('one');
+
+        first.store.dispose();
+        expect(created.id).not.toBe('');
+
+        const document = readDocument(root);
+        const { row, index } = registryRowOf(document, 'one');
+
+        // Half-migrated ON PURPOSE: `entry` stays (valid, and the row loads with it), only the
+        // authority map falls back to the retired key.
+        delete row.ranks;
+        row.subagents = [];
+        writeDocument(root, document);
+
+        let refused: unknown;
+
+        try {
+            runtimeOf(root);
+        } catch (error) {
+            refused = error;
+        }
+
+        expect(refused).toBeInstanceOf(HarnessPersistenceError);
+        // The header document is the blamed file, and the label is the row's position — a
+        // hand-editing operator is pointed at the exact row, not at "the registry".
+        expect((refused as HarnessPersistenceError).file).toBe(stateFile(root));
+
+        const message = (refused as Error).message;
+
+        expect(message).toContain(
+            `${stateFile(root)}: The harness database has an invalid shape or version:`
+        );
+        // THE SINGLE-KEY WORDING: only `subagents` is named, because only `subagents` is there.
+        expect(message).toContain(
+            `registry[${index}] was written before the rank model and carries \`subagents\`.`
+        );
+        // The refusal doubles as the migration guide: it states the shape that replaced the pair.
+        expect(message).toContain(
+            'This build stores `entry` (the routing agent, one of `agents`) and `ranks` ' +
+                '(agent id -> a single rank letter, "A" highest to "Z" lowest) instead'
+        );
+        expect(message).toContain('does not translate the old keys');
+        // The retired key is reported, NOT the missing one: had the guard been skipped, this same
+        // document would have failed with `ranks must be an object.` and the operator would have
+        // been told to add a map while the stale one sat in the file.
+        expect(message).not.toContain('ranks must be an object.');
+
+        // Nothing was rewritten: a fatal load leaves the operator's bytes exactly as they were,
+        // including the row that has to be fixed by hand.
+        const onDisk = readDocument(root);
+
+        expect(onDisk.registry[index]).toMatchObject({ name: 'one', entry: 'one', subagents: [] });
+        expect(onDisk.registry[index]).not.toHaveProperty('ranks');
+    });
+
+    it('accepts a stored `ranks` map that differs from the shipped one and keeps it verbatim', async () => {
+        const root = tempRoot('saved-ranks-round-trip');
+
+        const first = runtimeOf(root);
+        const created = await first.store.create('one');
+
+        first.store.dispose();
+        expect(created.id).not.toBe('');
+
+        // The operator's own letter for the entry agent — LOWER than the shipped 'A'. It is not a
+        // legacy shape (both new keys are present and every value is a rank letter), so the clean
+        // break above must not touch it.
+        const document = readDocument(root);
+        const { row, index } = registryRowOf(document, 'one');
+
+        row.ranks = { one: 'B' };
+        writeDocument(root, document);
+
+        const restarted = runtimeOf(root);
+
+        try {
+            const restored = restarted.registry.find('one');
+
+            expect(restored).toBeDefined();
+            expect(restored!.entry).toBe('one');
+
+            // THE ROUND-TRIP: the durable row still states the operator's OWN letter after a full
+            // save → refuse-free load. Nothing normalised it back to the shipped 'A' and nothing
+            // dropped it, which is the positive half of the clean break: `ranks` is the stored
+            // vocabulary now and `readRankMap` (../persistence.ts) reads it back verbatim.
+            expect(readDocument(root).registry[index]).toMatchObject({ name: 'one', ranks: { one: 'B' } });
+
+            // The CARD's authority is a different surface, pinned here so the two cannot be
+            // confused. A template this build cannot rebuild from row metadata — an injected
+            // scripted card like this fixture — keeps its captured factory, so the live card keeps
+            // the rank that factory declares ('A'), not the row's 'B'
+            // (./harnesses/registry.ts, "Executable fields are replayed only for templates whose
+            // factory is derivable from them"). The card-level replay of a saved rank map is
+            // pinned where that rule DOES apply in ./harnesses/restore.test.ts ("treats a saved
+            // RANK MAP that differs from the shipped one as a customisation").
+            expect(restored!.ranks).toEqual({ one: 'A' });
+
+            // And the session beside that row is still usable: a differing rank map is legal, so
+            // nothing was dropped on the way in.
+            const listed = await callApi(restarted, 'GET', '/v1/harness/sessions');
+
+            expect(listed.status).toBe(200);
+            expect(sessionIdsOf(listed.body)).toEqual([created.id]);
+        } finally {
+            restarted.store.dispose();
+        }
     });
 });

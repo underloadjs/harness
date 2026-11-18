@@ -8,7 +8,7 @@
 //       of the 'threads' trio on the FIRST thread â€” a harness with one conversation
 //       per agent still never pays for it, and no configuration can turn it off.
 //   R1  It is `visibility: 'core'` and it is DECLARED to every agent in the session,
-//       including an agent that is not the primary, so availability never depends on
+//       including an agent that is not the entry agent, so availability never depends on
 //       who created the thread.
 //   R2  The default `agent:<name>` conversation and an independent host thread are
 //       both readable; the calling run's own thread comes from the runtime, so a
@@ -174,7 +174,7 @@ describe('threadRead registration (R1)', () => {
         ]);
     });
 
-    it('is available to an agent that is not the primary and did not create the thread', async () => {
+    it('is available to an agent that is not the entry agent and did not create the thread', async () => {
         const leadSeen: HarnessStreamRequest[] = [];
         const workerSeen: HarnessStreamRequest[] = [];
         const writer = harness({
@@ -185,7 +185,7 @@ describe('threadRead registration (R1)', () => {
             presets: false
         });
 
-        // The PRIMARY opens the thread; the worker merely owns a conversation.
+        // The ENTRY AGENT opens the thread; the worker merely owns a conversation.
         const workerThread = writer.createThread('worker');
         await writer.sendThreadInput(workerThread.id, 'read your own thread');
 
@@ -314,7 +314,7 @@ describe('threadRead through a model tool call (R2)', () => {
 });
 
 describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
-    // One harness with a primary and a second configured agent, plus an
+    // One harness with the entry agent and a second configured agent, plus an
     // independent thread of the second agent, seeded with a full transcript.
     const fixture = () => {
         const writer = harness({

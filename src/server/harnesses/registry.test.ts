@@ -1,10 +1,29 @@
 // The in-memory harness registry.
 //
-// These tests pin the contract the HTTP layer depends on: exactly one primary,
-// trusted agent ids only, reserved/duplicate names, every template editable
-// (R20.1), and — most importantly — that update() REPLACES a preset rather than
-// mutating it, which is what keeps an already-created session frozen to the
-// configuration it was built with.
+// These tests pin the contract the HTTP layer depends on: an explicit roster, trusted agent
+// ids only, reserved/duplicate names, a RESOLVED rank map, every template editable (R20.1),
+// and — most importantly — that update() REPLACES a preset rather than mutating it, which is
+// what keeps an already-created session frozen to the configuration it was built with.
+//
+// THE RANK MODEL (the pass that replaced `primary` + `subagents`)
+// ---------------------------------------------------------------
+// A harness definition is THREE fields, and each has exactly one rule:
+//   - `agents` — a NON-EMPTY roster in DECLARATION ORDER. Order is ROUTING: its first name is
+//     the entry default. No member may be listed twice, and nothing caps how many members
+//     share a rank;
+//   - `entry`  — ROUTING. Omitted means roster[0]; stated must name a member. It carries no
+//     authority, so the entry agent may hold ANY rank, including the lowest one;
+//   - `ranks`  — AUTHORITY: agent id → a single A–Z letter (A highest). The STORED map is
+//     RESOLVED and COMPLETE — a request may name fewer members, and the server fills every
+//     name it omitted ONE RANK BELOW the lowest rank the request stated, entry agent included
+//     (./toolbox.ts `resolveRosterRanks`, the host mirror of the kernel's fill at
+//     ../../harness.ts:1505-1545). Storing the resolved map is what keeps the durable record,
+//     the card, and the construction argument stating the same ranks.
+//
+// Delegation follows from those ranks and NOTHING else (strictly downward), so there is NO
+// "exactly one primary" invariant left in this file and no allowlist to assert: several members
+// may hold Rank A, a harness may have no Rank A member at all, and `Harness.ranks` replaces the
+// removed `harness.subagents` view.
 //
 // R20.1 specifics:
 //   - the registry starts from independent copies of the shipped templates;
@@ -21,12 +40,13 @@
 //     reviewer, planner, debugger, summarizer, demo, flaky. `research`/`workspace`/
 //     `planner` keep their ids (an agent id is persisted and has no alias fallback) and
 //     only their TITLES moved to Explore / Analyst / Manager;
-//   - the shipped catalogue is 7 live cards, general first (the default); its order is
+//   - the shipped catalogue is 8 live cards, general first (the default); its order is
 //     exactly what `GET /harnesses` returns;
-//   - a built-in team is `teamOf(primary)`: every other live role MINUS the Manager
-//     (`planner` refuses to run as a delegate, ../../agents/planner.ts) PLUS the
-//     summarizer, so the Manager appears only as a primary, never in another card's
-//     allowlist;
+//   - a built-in team is an `entry` + `ranks` PAIR: the entry agent at Rank A, every other
+//     live role MINUS the Manager (`planner` refuses to run as a delegate,
+//     ../../agents/planner.ts) plus the summarizer at Rank B. So the Manager appears at Rank A
+//     on its OWN card only, and never as another card's junior — the shape the removed
+//     `teamOf(primary)` helper used to derive from an allowlist is now data on the card;
 //   - the harness-level aliases are UNCHANGED (writer/assistant -> instruct,
 //     researcher -> research) because they map HARNESS names, not agent titles — and the
 //     titles General/Explore/Analyst/Manager/Debugger are not names and do not resolve.
@@ -135,7 +155,9 @@ describe('the shipped registry', () => {
         expect(presets[1].name).toBe('instruct');
         expect(instruct).not.toBe(presets[1]);
         expect(instruct.tools).not.toBe(presets[1].tools);
-        expect(instruct.subagents).not.toBe(presets[1].subagents);
+        // The rank map is one of the copied objects: a registry entry must never hand out the
+        // shipped module's own map, or an edit here would leak into every other registry.
+        expect(instruct.ranks).not.toBe(presets[1].ranks);
 
         const other = createHarnessRegistry();
         registry.update('instruct', { title: 'Edited' });
@@ -183,17 +205,19 @@ describe('the shipped registry', () => {
             'Chat'
         ]);
 
-        // The DEFAULT card's contract (presets.ts:178-195): `general` is the only live preset
-        // with no allowlist, so the runtime never even registers `delegate` for it — the
-        // default agent cannot split work out, not even by accident.
+        // The DEFAULT card's contract (the `general` entry in ./presets.ts): its roster holds
+        // ONE rank, so the runtime never even registers `delegate` for it — the default agent
+        // cannot split work out, not even by accident. Rank, not an allowlist, is what makes it
+        // alone: its own rank is 'A' and there is nobody below it. (The tool-less `chat` card
+        // runs the same profile and the same one-rank map; ./presets.test.ts pins that pair.)
         const general = presets[0];
-        expect([general.primary, general.subagents, general.agents]).toEqual([
+        expect([general.entry, general.ranks, general.agents]).toEqual([
             'general',
-            [],
+            { general: 'A' },
             ['general']
         ]);
         const generalHarness = general.create(SETTINGS, progress);
-        expect(Object.keys(generalHarness.subagents)).toEqual([]);
+        expect(generalHarness.ranks).toEqual({ general: 'A' });
         expect(generalHarness.tools.delegate).toBeUndefined();
 
         // The fixtures still exist as presets — they are just not shipped. Their
@@ -292,8 +316,8 @@ describe('the shipped registry', () => {
         expect(registry.find('debugger')?.title).toBe('Debugger');
         // A title reserves nothing (an `Explore` harness is still free to create), while a
         // shipped id stays taken case-insensitively, so `General` cannot shadow `general`.
-        expect(registry.create({ name: 'Explore', primary: 'research' }).name).toBe('Explore');
-        expect(registryError(() => registry.create({ name: 'General', primary: 'instruct' }))).toEqual({
+        expect(registry.create({ name: 'Explore', agents: ['research'] }).name).toBe('Explore');
+        expect(registryError(() => registry.create({ name: 'General', agents: ['instruct'] }))).toEqual({
             status: 409,
             message: 'Harness "General" already exists.'
         });
@@ -306,14 +330,13 @@ describe('the shipped registry', () => {
 });
 
 describe('creating a harness', () => {
-    it('registers one primary and its allowlist with the shared toolbox', () => {
+    it('registers an explicit roster with its entry agent, a resolved rank map, and the shared toolbox', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'my-review',
             title: 'My review',
             description: 'A review pairing.',
-            primary: 'research',
-            subagents: ['summarizer']
+            agents: ['research', 'summarizer']
         });
 
         expect({
@@ -321,8 +344,8 @@ describe('creating a harness', () => {
             title: preset.title,
             description: preset.description,
             requiresEndpoint: preset.requiresEndpoint,
-            primary: preset.primary,
-            subagents: preset.subagents,
+            entry: preset.entry,
+            ranks: preset.ranks,
             agents: preset.agents,
             tools: preset.tools,
             environmentTools: preset.environmentTools,
@@ -333,8 +356,15 @@ describe('creating a harness', () => {
             title: 'My review',
             description: 'A review pairing.',
             requiresEndpoint: true,
-            primary: 'research',
-            subagents: ['summarizer'],
+            // ROUTING: an omitted `entry` is the FIRST name of the roster the client sent. Order
+            // is a routing statement only — nothing here says that name outranks the others.
+            entry: 'research',
+            // AUTHORITY, RESOLVED. An omitted rank map is the kernel's rule-1 default: the entry
+            // agent at 'A' and every other member ONE RANK BELOW at 'B' (../../harness.ts
+            // 1505-1545, mirrored by `resolveRosterRanks` in ./toolbox.ts). The map is STORED
+            // complete — every member keyed — so the card, the durable record, and the argument
+            // handed to `harness()` all state the same ranks instead of re-deriving them.
+            ranks: { research: 'A', summarizer: 'B' },
             agents: ['research', 'summarizer'],
             tools: SHARED_TOOL_NAMES,
             // The live toolbox opts into websearch AND webfetch; search stays
@@ -345,11 +375,11 @@ describe('creating a harness', () => {
             editable: true
         });
 
-        // It is a real harness: same agents, same registry, and delegate exists
-        // exactly because there is a subagent.
+        // It is a real harness: same agents, same registry, and `delegate` exists exactly
+        // because the roster SPANS TWO RANKS — not because an allowlist named a target.
         const harness = preset.create(SETTINGS, progress);
         expect(Object.keys(harness.agents)).toEqual(['research', 'summarizer']);
-        expect(Object.keys(harness.subagents)).toEqual(['summarizer']);
+        expect(harness.ranks).toEqual({ research: 'A', summarizer: 'B' });
         expect(harness.tools.delegate.visibility).toBe('core');
         // R9-R11: createToolboxHarness opts into `webfetch: true`, and the harness
         // appends environment tools after the configured table and before the
@@ -368,6 +398,7 @@ describe('creating a harness', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'delegate',
@@ -391,151 +422,298 @@ describe('creating a harness', () => {
         ]);
     });
 
-    it('defaults title to the name and description to empty', () => {
+    it('defaults title to the name and description to empty, and a one-member roster to one rank', () => {
         const registry = createHarnessRegistry();
-        const preset = registry.create({ name: 'solo', primary: 'workspace' });
+        const preset = registry.create({ name: 'solo', agents: ['workspace'] });
 
         expect(preset.title).toBe('solo');
         expect(preset.description).toBe('');
+        expect(preset.entry).toBe('workspace');
+        // A one-member roster has nobody BELOW the entry, so the resolved map holds one rank —
+        // and a single-rank roster registers no `delegate` row at all (the kernel's
+        // `rosterHasDelegation()` in ../../harness.ts). The refusal to split work is a property
+        // of the ranks, not of a missing allowlist entry.
+        expect(preset.ranks).toEqual({ workspace: 'A' });
         expect(preset.agents).toEqual(['workspace']);
-        expect(preset.subagents).toEqual([]);
 
-        // No subagents means the harness registers no delegate tool at all.
         expect(preset.create(SETTINGS, progress).tools.delegate).toBeUndefined();
     });
 
     it('rejects bad names, reserved aliases, duplicates and unknown agents', () => {
         const registry = createHarnessRegistry();
 
-        expect(registryError(() => registry.create({ name: '1nope', primary: 'instruct' }))).toEqual({
+        expect(registryError(() => registry.create({ name: '1nope', agents: ['instruct'] }))).toEqual({
             status: 400,
             message:
                 '`name` must start with a letter and contain only letters, digits, "_" or "-", at most 64 characters.'
         });
 
-        expect(registryError(() => registry.create({ name: 'writer', primary: 'instruct' }))).toEqual({
+        expect(registryError(() => registry.create({ name: 'writer', agents: ['instruct'] }))).toEqual({
             status: 400,
             message: 'Harness name "writer" is reserved as an alias of "instruct".'
         });
 
-        expect(registryError(() => registry.create({ name: 'instruct', primary: 'instruct' }))).toEqual({
+        expect(registryError(() => registry.create({ name: 'instruct', agents: ['instruct'] }))).toEqual({
             status: 409,
             message: 'Harness "instruct" already exists.'
         });
 
         // Case-insensitive: a second card that differs only by case is ambiguous.
-        expect(registryError(() => registry.create({ name: 'Instruct', primary: 'instruct' }))).toEqual({
+        expect(registryError(() => registry.create({ name: 'Instruct', agents: ['instruct'] }))).toEqual({
             status: 409,
             message: 'Harness "Instruct" already exists.'
         });
 
-        expect(registryError(() => registry.create({ name: 'x', primary: 'nobody' }))).toEqual({
+        expect(registryError(() => registry.create({ name: 'x', agents: ['nobody'] }))).toEqual({
             status: 400,
             // The refusal names the whole trusted roster, in `AGENT_PROFILE_NAMES` order
             // (src/agents/index.ts:78-89) — pinned as literal prose so a renamed or added
-            // profile is a deliberate test edit rather than a silent message change.
+            // profile is a deliberate test edit rather than a silent message change. The FIELD
+            // name is now `agents`: there is one roster field, not a primary plus an allowlist.
             message:
-                '`primary` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer.'
+                '`agents` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer.'
         });
     });
 
-    it('enforces exactly one primary and a distinct, bounded allowlist', () => {
+    it('refuses a roster that is not an array, is empty, is too long, or repeats a member', () => {
         const registry = createHarnessRegistry();
 
+        // A roster is an ARRAY of names. Anything else is a client that sent the old scalar
+        // shape, and the message says what `agents` has to be.
         expect(
-            registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', subagents: ['instruct'] })
-            )
+            registryError(() => registry.create({ name: 'x', agents: 'instruct' as never }))
         ).toEqual({
             status: 400,
-            message: 'Subagent "instruct" is the primary agent; a harness has exactly one primary.'
+            message: '`agents` must be a non-empty array of agent names.'
+        });
+
+        // An EMPTY roster is refused rather than defaulted: a harness with no agent cannot run
+        // a turn, and silently picking someone would make the entry default (the first name)
+        // depend on a value the client never sent.
+        expect(registryError(() => registry.create({ name: 'x', agents: [] }))).toEqual({
+            status: 400,
+            message: '`agents` must name at least one agent; a harness with no agent cannot run a turn.'
+        });
+
+        // A name listed TWICE is ambiguous — which occurrence, and which rank entry, was meant?
+        // The registry refuses instead of guessing, which is also what replaced the old
+        // "subagent X is the primary agent" refusal: an agent may now appear exactly ONCE,
+        // whatever rank it holds.
+        expect(
+            registryError(() => registry.create({ name: 'x', agents: ['instruct', 'instruct'] }))
+        ).toEqual({
+            status: 400,
+            message: 'Agent "instruct" is listed in `agents` more than once.'
         });
 
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', subagents: ['workspace', 'workspace'] })
+                registry.create({ name: 'x', agents: Array.from({ length: 17 }, () => 'instruct') })
             )
         ).toEqual({
             status: 400,
-            message: 'Subagent "workspace" is listed more than once.'
+            // The cap is checked BEFORE the duplicate scan, so 17 entries is a length refusal.
+            message: '`agents` cannot exceed 16 entries.'
         });
 
         expect(
-            registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', subagents: ['critic'] })
-            )
+            registryError(() => registry.create({ name: 'x', agents: ['instruct', 'critic'] }))
         ).toEqual({
             status: 400,
-            // Same roster prose as the `primary` refusal above (registry.ts:362).
+            // Same roster prose as the refusal above (./registry.ts `requireAgent`).
             message:
-                '`subagents` names unknown agent "critic". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer.'
+                '`agents` names unknown agent "critic". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer.'
+        });
+    });
+
+    it('fills an unlisted rank one letter below the LOWEST rank the request stated — entry agent included', () => {
+        const registry = createHarnessRegistry();
+
+        // The client named ONE member and left the entry agent unranked. The kernel's rule
+        // (../../harness.ts:1505-1545) puts every member the map omits one rank BELOW the
+        // lowest rank the map states, and that includes the entry agent — so a map that ranks a
+        // junior at 'B' leaves the entry at 'C'. Being first in the roster buys routing, never
+        // authority.
+        const preset = registry.create({
+            name: 'inverted',
+            agents: ['research', 'summarizer'],
+            ranks: { summarizer: 'B' }
+        });
+
+        expect(preset.entry).toBe('research');
+        expect(preset.ranks).toEqual({ summarizer: 'B', research: 'C' });
+
+        // The runtime runs with exactly the stored map: the host resolved it once, and the
+        // kernel re-derives nothing.
+        const harness = preset.create(SETTINGS, progress);
+        expect(harness.ranks).toEqual({ summarizer: 'B', research: 'C' });
+        // Delegation follows the ranks, not the roster order: the Rank B member may hand work to
+        // the Rank C one, and the roster spans two ranks, so `delegate` is registered.
+        expect(harness.tools.delegate).toBeDefined();
+    });
+
+    it('reads an empty rank map as a flat team, and accepts several Rank A agents', () => {
+        const registry = createHarnessRegistry();
+
+        // `ranks: {}` states NO rank, so the fill puts every member one below the lowest stated
+        // rank — and with nothing stated that is 'B', the entry agent included. One distinct
+        // rank means no delegation anywhere: this is the explicit "a team of peers" shape the
+        // old model could not express.
+        const peers = registry.create({ name: 'peers', agents: ['instruct', 'research'], ranks: {} });
+
+        expect(peers.entry).toBe('instruct');
+        expect(peers.ranks).toEqual({ instruct: 'B', research: 'B' });
+        expect(peers.create(SETTINGS, progress).tools.delegate).toBeUndefined();
+
+        // TWO Rank A AGENTS ARE LEGAL. The removed model needed a rule against it ("a harness
+        // has exactly one primary"); the rank model needs none, because delegation is strictly
+        // DOWNWARD — two peers simply cannot hand work to each other, and both may hand it to
+        // the junior below them. Nothing promoted, flattened, or rejected this map.
+        const coLeads = registry.create({
+            name: 'co-leads',
+            agents: ['instruct', 'research', 'summarizer'],
+            ranks: { instruct: 'A', research: 'A', summarizer: 'C' }
+        });
+
+        expect(coLeads.entry).toBe('instruct');
+        expect(coLeads.ranks).toEqual({ instruct: 'A', research: 'A', summarizer: 'C' });
+
+        const harness = coLeads.create(SETTINGS, progress);
+        expect(harness.ranks).toEqual({ instruct: 'A', research: 'A', summarizer: 'C' });
+        expect(Object.keys(harness.agents)).toEqual(['instruct', 'research', 'summarizer']);
+        expect(harness.tools.delegate.visibility).toBe('core');
+    });
+
+    it('validates `entry` as routing and `ranks` as authority, independently', () => {
+        const registry = createHarnessRegistry();
+
+        // `entry` must name a MEMBER, and the refusal lists the members: the usual mistake is a
+        // client that renamed an agent or sent an `entry` for a member it forgot to add.
+        expect(
+            registryError(() =>
+                registry.create({ name: 'x', agents: ['instruct'], entry: 'research' })
+            )
+        ).toEqual({
+            status: 400,
+            message:
+                '`entry` names "research", which is not a member of this harness. Members: instruct.'
+        });
+
+        // A rank key for an agent this harness does not select can never apply, so it is a
+        // visible 400 rather than a stored no-op — the same reasoning the model map follows.
+        expect(
+            registryError(() =>
+                registry.create({ name: 'x', agents: ['instruct'], ranks: { research: 'A' } })
+            )
+        ).toEqual({
+            status: 400,
+            message:
+                '`ranks` names "research", which is not a member of this harness. Members: instruct.'
+        });
+
+        // A rank VALUE is one upper-case letter, checked with the shared `isAgentRank` guard
+        // rather than a re-spelled letter set. Case matters: `'a'` is refused instead of quietly
+        // upper-cased, because a lowercase letter is exactly what a hand-edited document or a UI
+        // bug produces.
+        expect(
+            registryError(() =>
+                registry.create({ name: 'x', agents: ['instruct'], ranks: { instruct: 'a' as never } })
+            )
+        ).toEqual({
+            status: 400,
+            message:
+                '`ranks.instruct` must be a single rank letter from A (highest) to Z (lowest), upper-case. Received "a".'
         });
 
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', subagents: 'workspace' as never })
+                registry.create({ name: 'x', agents: ['instruct'], ranks: { instruct: 7 as never } })
             )
-        ).toEqual({ status: 400, message: '`subagents` must be an array of agent names.' });
+        ).toEqual({
+            status: 400,
+            message:
+                '`ranks.instruct` must be a single rank letter from A (highest) to Z (lowest), upper-case. Received 7.'
+        });
 
         expect(
-            registryError(() =>
-                registry.create({
-                    name: 'x',
-                    primary: 'instruct',
-                    subagents: Array.from({ length: 17 }, () => 'workspace')
-                })
-            )
-        ).toEqual({ status: 400, message: '`subagents` cannot exceed 16 entries.' });
+            registryError(() => registry.create({ name: 'x', agents: ['instruct'], ranks: [] as never }))
+        ).toEqual({
+            status: 400,
+            message: '`ranks` must be an object mapping agent ids to rank letters.'
+        });
+
+        // ROUTING SAYS NOTHING ABOUT AUTHORITY, and the edge accepts that on purpose: the entry
+        // agent here is the LOWEST-ranked member of its own harness, so requests land on an agent
+        // that has nobody below it while a senior still holds the delegation.
+        const routed = registry.create({
+            name: 'low-entry',
+            agents: ['instruct', 'summarizer'],
+            entry: 'summarizer',
+            ranks: { instruct: 'A', summarizer: 'B' }
+        });
+
+        expect(routed.entry).toBe('summarizer');
+        expect(routed.ranks).toEqual({ instruct: 'A', summarizer: 'B' });
+        expect(routed.create(SETTINGS, progress).ranks).toEqual({ instruct: 'A', summarizer: 'B' });
     });
 
     it('validates title and description types and bounds', () => {
         const registry = createHarnessRegistry();
 
         expect(
-            registryError(() => registry.create({ name: 'x', primary: 'instruct', title: 7 as never }))
+            registryError(() => registry.create({ name: 'x', agents: ['instruct'], title: 7 as never }))
         ).toEqual({ status: 400, message: '`title` must be a string.' });
 
         expect(
-            registryError(() => registry.create({ name: 'x', primary: 'instruct', title: '   ' }))
+            registryError(() => registry.create({ name: 'x', agents: ['instruct'], title: '   ' }))
         ).toEqual({ status: 400, message: '`title` cannot be empty.' });
 
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', title: 'a'.repeat(121) })
+                registry.create({ name: 'x', agents: ['instruct'], title: 'a'.repeat(121) })
             )
         ).toEqual({ status: 400, message: '`title` cannot exceed 120 characters.' });
 
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', description: 'a'.repeat(2001) })
+                registry.create({ name: 'x', agents: ['instruct'], description: 'a'.repeat(2001) })
             )
         ).toEqual({ status: 400, message: '`description` cannot exceed 2000 characters.' });
     });
 });
 
 describe('updating a harness', () => {
-    it('replaces metadata and routing without mutating the old preset', () => {
+    it('replaces metadata, roster, routing and authority without mutating the old preset', () => {
         const registry = createHarnessRegistry();
         const before = registry.find('instruct')!;
 
+        // A real client restates the three roster fields together, because they are three
+        // INDEPENDENT statements: who is on the team, who receives the turn, and what each
+        // member may delegate to.
         const after = registry.update('instruct', {
             title: 'Instruct (edited)',
             description: 'Edited description.',
-            primary: 'workspace',
-            subagents: ['research', 'summarizer']
+            agents: ['workspace', 'research', 'summarizer'],
+            entry: 'workspace',
+            ranks: { workspace: 'A', research: 'B' }
         });
 
         expect({
             title: after.title,
             description: after.description,
-            primary: after.primary,
-            subagents: after.subagents,
+            entry: after.entry,
+            ranks: after.ranks,
             agents: after.agents
         }).toEqual({
             title: 'Instruct (edited)',
             description: 'Edited description.',
-            primary: 'workspace',
-            subagents: ['research', 'summarizer'],
+            entry: 'workspace',
+            // The stated map, FILLED: `summarizer` is the member the patch did not name, so it
+            // takes one rank BELOW the lowest rank the patch stated ('B') → 'C'. A PATCH resolves
+            // the map with the same rule create() applies, so a card never stores a partial map
+            // the next start would have to re-derive (./toolbox.ts `resolveRosterRanks`).
+            ranks: { workspace: 'A', research: 'B', summarizer: 'C' },
+            // A stated roster REPLACES the members, order included.
             agents: ['workspace', 'research', 'summarizer']
         });
 
@@ -544,70 +722,232 @@ describe('updating a harness', () => {
         expect({
             title: before.title,
             description: before.description,
-            primary: before.primary,
-            subagents: before.subagents,
+            entry: before.entry,
+            ranks: before.ranks,
             agents: before.agents
         }).toEqual({
             title: 'Instruct',
             // The shipped description, byte-for-byte: the patch replaced the
             // registry entry, not the object the old session captured.
             description: presets[1].description,
-            primary: 'instruct',
-            // The shipped team (`teamOf('instruct')`, presets.ts:161-164): every OTHER live
-            // role except the Manager (`planner`, which refuses to run as a delegate), plus
-            // the summarizer. The two new profiles `general` and `debugger` are now members.
-            subagents: ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            entry: 'instruct',
+            // The shipped card, as data: the entry agent at Rank A and every OTHER live role
+            // except the Manager (`planner`, which refuses to run as a delegate) plus the
+            // summarizer at Rank B. `teamOf(primary)` is gone — this map is the team now.
+            ranks: {
+                instruct: 'A',
+                general: 'B',
+                research: 'B',
+                workspace: 'B',
+                reviewer: 'B',
+                debugger: 'B',
+                summarizer: 'B'
+            },
             agents: ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']
         });
         expect(before).not.toBe(after);
         expect(registry.find('instruct')).toBe(after);
 
-        // The rebuilt harness follows the new routing, and delegate appears now
-        // that the primary has somewhere to delegate.
+        // The rebuilt harness runs with the stored map, and `delegate` follows the two ranks.
         const harness = after.create(SETTINGS, progress);
         expect(Object.keys(harness.agents)).toEqual(['workspace', 'research', 'summarizer']);
-        expect(Object.keys(harness.subagents)).toEqual(['research', 'summarizer']);
+        expect(harness.ranks).toEqual({ workspace: 'A', research: 'B', summarizer: 'C' });
         expect(harness.tools.delegate.visibility).toBe('core');
     });
 
-    it('drops the new primary from the old allowlist when subagents are not restated', () => {
+    it('re-targets routing on its own, and keeps every rank the operator stated', () => {
         const registry = createHarnessRegistry();
 
-        // Explore starts with the shipped team (`teamOf('research')`, presets.ts:223):
-        // general, instruct, workspace, reviewer, debugger, summarizer — note the Manager is
-        // absent from every built-in team but its own. Promoting one member must remove it
-        // from the allowlist and keep the rest in order.
-        const after = registry.update('research', { primary: 'summarizer' });
+        // Explore ships as `entry: research` at Rank A over seven members. Patching `entry`
+        // ALONE is a routing decision, so it changes exactly that:
+        //   - the roster keeps its stored ORDER. Order is only the entry DEFAULT, so there is
+        //     nothing to reorder and no allowlist to prune — the rule that "removed the new
+        //     primary from subagents" is gone with the allowlist itself;
+        //   - every rank survives, so `research` stays Rank A and the new entry stays Rank B.
+        const after = registry.update('research', { entry: 'summarizer' });
 
-        expect(after.primary).toBe('summarizer');
-        expect(after.subagents).toEqual(['general', 'instruct', 'workspace', 'reviewer', 'debugger']);
+        expect(after.entry).toBe('summarizer');
         expect(after.agents).toEqual([
+            'research',
+            'general',
+            'instruct',
+            'workspace',
+            'reviewer',
+            'debugger',
+            'summarizer'
+        ]);
+        expect(after.ranks).toEqual({
+            research: 'A',
+            general: 'B',
+            instruct: 'B',
+            workspace: 'B',
+            reviewer: 'B',
+            debugger: 'B',
+            summarizer: 'B'
+        });
+
+        // ROUTING DOES NOT BUY AUTHORITY. The entry agent here is Rank B, so IT has no legal
+        // target — while the roster still spans two ranks, so `delegate` is registered (for the
+        // Rank A member that stayed on the team). The entry-first registration order is what the
+        // factory applies, and it changes nothing about the ranks.
+        const harness = after.create(SETTINGS, progress);
+        expect(Object.keys(harness.agents)).toEqual([
             'summarizer',
+            'research',
             'general',
             'instruct',
             'workspace',
             'reviewer',
             'debugger'
         ]);
-        expect(after.create(SETTINGS, progress).tools.delegate.visibility).toBe('core');
+        expect(harness.ranks).toEqual({
+            summarizer: 'B',
+            research: 'A',
+            general: 'B',
+            instruct: 'B',
+            workspace: 'B',
+            reviewer: 'B',
+            debugger: 'B'
+        });
+        expect(harness.tools.delegate).toBeDefined();
     });
 
-    it('validates a patched allowlist against the effective primary', () => {
+    it('restricts an unrestated rank map to surviving members, and never invents a Rank A', () => {
         const registry = createHarnessRegistry();
 
-        expect(
-            registryError(() => registry.update('research', { subagents: ['research'] }))
-        ).toEqual({
-            status: 400,
-            message: 'Subagent "research" is the primary agent; a harness has exactly one primary.'
+        // Replace the roster and say NOTHING about ranks. Two rules run in order:
+        //   1. the current map is RESTRICTED TO THE SURVIVORS — a rank for a member this patch
+        //      removed can no longer apply, so it is dropped rather than rejected;
+        //   2. routing falls back to the FIRST name of the new roster, because this patch dropped
+        //      the entry agent and a harness can never be routed at an agent it no longer holds.
+        const after = registry.update('instruct', { agents: ['general', 'research', 'summarizer'] });
+
+        expect(after.entry).toBe('general');
+        // Every survivor kept its stated 'B', and nothing was PROMOTED into the vacated top rank:
+        // a rank is authority the operator stated, and the host does not manufacture one because
+        // a seat emptied. One distinct rank, therefore no delegation — a visible consequence the
+        // card reports, not a silent substitution.
+        expect(after.ranks).toEqual({ general: 'B', research: 'B', summarizer: 'B' });
+
+        const harness = after.create(SETTINGS, progress);
+        expect(harness.ranks).toEqual({ general: 'B', research: 'B', summarizer: 'B' });
+        expect(harness.tools.delegate).toBeUndefined();
+    });
+
+    it('fills a member a PATCH added one rank below the lowest rank that survives', () => {
+        const registry = createHarnessRegistry();
+
+        // `planner` is the one catalogue profile the shipped Instruct team does not select, so
+        // it is a real newcomer here. The retained map covers the two surviving members
+        // (Instruct 'A', summarizer 'B'); the newcomer is unlisted, so it takes one rank BELOW
+        // the LOWEST rank that survived — never 'A' by accident, and never a duplicate of its
+        // new peers.
+        const after = registry.update('instruct', { agents: ['instruct', 'planner', 'summarizer'] });
+
+        expect(after.entry).toBe('instruct');
+        expect(after.ranks).toEqual({ instruct: 'A', summarizer: 'B', planner: 'C' });
+
+        const harness = after.create(SETTINGS, progress);
+        expect(harness.ranks).toEqual({ instruct: 'A', summarizer: 'B', planner: 'C' });
+        // Three ranks in the roster, and the Rank B member now has a junior of its own — which is
+        // the two-level chain the old flat allowlist could not express.
+        expect(harness.tools.delegate.visibility).toBe('core');
+    });
+
+    it('replaces the rank map on a PATCH, and reads `{}` as a flat team', () => {
+        const registry = createHarnessRegistry();
+
+        // A STATED map REPLACES: the operator's new map is the whole statement, so a member the
+        // new map omits is filled, not carried over from the old one.
+        const restacked = registry.update('instruct', { ranks: { instruct: 'A', general: 'C' } });
+
+        expect(restacked.ranks).toEqual({
+            instruct: 'A',
+            general: 'C',
+            // Every other member is unlisted, so each takes one below the lowest stated rank.
+            research: 'D',
+            workspace: 'D',
+            reviewer: 'D',
+            debugger: 'D',
+            summarizer: 'D'
         });
 
+        // `{}` clears EVERY rank. With nothing stated the fill lands one below Rank A, which is
+        // 'B' for all seven members: one flat rank, and no `delegate` row anywhere.
+        const flattened = registry.update('instruct', { ranks: {} });
+
+        expect(flattened.ranks).toEqual({
+            instruct: 'B',
+            general: 'B',
+            research: 'B',
+            workspace: 'B',
+            reviewer: 'B',
+            debugger: 'B',
+            summarizer: 'B'
+        });
+        expect(flattened.create(SETTINGS, progress).tools.delegate).toBeUndefined();
+    });
+
+    it('treats a roster that shares NO member with the old team as UNRANKED, not as flat', () => {
+        const registry = fixtureRegistry();
+
+        // The scripted fixture's roster is `general` alone, so a wholesale roster swap leaves
+        // NOTHING for the rank restriction to keep. An OMITTED `ranks` is "no opinion", not "no
+        // ranks", so the map is filled by the same rule-1 default create() applies — entry 'A',
+        // every other member 'B'. That matters: a two-member new team keeps the delegation
+        // surface an equivalent POST would have given it, instead of silently losing it because
+        // the host read its own empty derived map as the client's statement.
+        const swapped = registry.update('demo', { agents: ['workspace', 'research'] });
+
+        expect(swapped.entry).toBe('workspace');
+        expect(swapped.ranks).toEqual({ workspace: 'A', research: 'B' });
+        expect(swapped.create(SETTINGS, progress).tools.delegate.visibility).toBe('core');
+
+        // The same harness, one PATCH later, with the map STATED EMPTY: now the client has
+        // spoken, and 'flat' is exactly what it asked for.
+        const flattened = registry.update('demo', { ranks: {} });
+
+        expect(flattened.ranks).toEqual({ workspace: 'B', research: 'B' });
+        expect(flattened.create(SETTINGS, progress).tools.delegate).toBeUndefined();
+    });
+
+    it('validates a patched roster, entry and rank map against the final roster', () => {
+        const registry = createHarnessRegistry();
+
+        // A rank key for an agent this harness does not select is a 400 that lists the members.
+        // `planner` is exactly that on Explore's roster.
+        expect(registryError(() => registry.update('research', { ranks: { planner: 'C' } }))).toEqual({
+            status: 400,
+            message:
+                '`ranks` names "planner", which is not a member of this harness. Members: research, general, instruct, workspace, reviewer, debugger, summarizer.'
+        });
+
+        // `entry` is validated against the roster the SAME patch produced, so a patch that both
+        // narrows the roster and restates routing cannot route at a member it just dropped.
         expect(
-            registryError(() => registry.update('research', { primary: 'nobody' }))
+            registryError(() =>
+                registry.update('research', { agents: ['research', 'general'], entry: 'summarizer' })
+            )
         ).toEqual({
             status: 400,
             message:
-                '`primary` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer.'
+                '`entry` names "summarizer", which is not a member of this harness. Members: research, general.'
+        });
+
+        // A rank VALUE is one upper-case letter, whatever the patch shape.
+        expect(
+            registryError(() => registry.update('research', { ranks: { research: 'b' as never } }))
+        ).toEqual({
+            status: 400,
+            message:
+                '`ranks.research` must be a single rank letter from A (highest) to Z (lowest), upper-case. Received "b".'
+        });
+
+        // An unknown member names the whole trusted roster (the same message create() gives).
+        expect(registryError(() => registry.update('research', { agents: ['nobody'] }))).toEqual({
+            status: 400,
+            message:
+                '`agents` names unknown agent "nobody". Known agents: general, instruct, research, workspace, reviewer, planner, debugger, summarizer.'
         });
     });
 
@@ -664,6 +1004,7 @@ describe('updating a harness', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -683,7 +1024,7 @@ describe('updating a harness', () => {
         const before = registry.find('demo')!;
         const scripted = before.create(SETTINGS, progress);
 
-        const after = registry.update('demo', { primary: 'workspace' });
+        const after = registry.update('demo', { agents: ['workspace'] });
 
         // The descriptor stops claiming the offline fixture: it now needs a
         // provider, advertises the shared toolbox the live factory registers, and
@@ -694,7 +1035,7 @@ describe('updating a harness', () => {
         expect(after.requiresEndpoint).toBe(true);
         expect(after.tools).toEqual(SHARED_TOOL_NAMES);
         expect(after.environmentTools).toEqual(['search', 'fetch']);
-        expect(after.primary).toBe('workspace');
+        expect(after.entry).toBe('workspace');
         expect(after.agents).toEqual(['workspace']);
 
         const live = after.create(SETTINGS, progress);
@@ -708,7 +1049,7 @@ describe('updating a harness', () => {
         const registry = fixtureRegistry();
 
         const after = registry.update('flaky', {
-            primary: 'workspace',
+            agents: ['workspace'],
             agentModels: { workspace: 'big/model' }
         });
 
@@ -747,7 +1088,7 @@ describe('updating a harness', () => {
 describe('deleting a harness', () => {
     it('removes a user harness without tombstoning it', () => {
         const registry = createHarnessRegistry();
-        registry.create({ name: 'temp', primary: 'instruct' });
+        registry.create({ name: 'temp', agents: ['instruct'] });
 
         // The removed entry is returned by identity, so a caller can log or roll back
         // exactly what disappeared.
@@ -801,7 +1142,7 @@ describe('deleting a harness', () => {
         // Alias names stay reserved whether or not their target exists: accepting
         // `writer` as a new harness would make an old client's `writer` request mean
         // something different after this harness is deleted.
-        expect(registryError(() => registry.create({ name: 'writer', primary: 'instruct' }))).toEqual({
+        expect(registryError(() => registry.create({ name: 'writer', agents: ['instruct'] }))).toEqual({
             status: 400,
             message: 'Harness name "writer" is reserved as an alias of "instruct".'
         });
@@ -844,7 +1185,7 @@ describe('deleting a harness', () => {
 
         // The name is free again: deleting the shipped card and creating your own
         // under the same id is the documented way to replace a default.
-        const rebuilt = registry.create({ name: 'instruct', title: 'My instruct', primary: 'research' });
+        const rebuilt = registry.create({ name: 'instruct', title: 'My instruct', agents: ['research'] });
         expect(rebuilt.builtin).toBe(false);
 
         // The tombstone is gone, or the next restore would delete the harness the
@@ -938,7 +1279,7 @@ describe('deleting a harness', () => {
         const captured = registry.snapshot();
 
         // Every mutation shape at once: create, patch, and delete.
-        registry.create({ name: 'extra', primary: 'instruct' });
+        registry.create({ name: 'extra', agents: ['instruct'] });
         registry.update('research', { title: 'Renamed' });
         registry.remove('planner');
 
@@ -991,25 +1332,24 @@ describe('per-agent model overrides', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'mixed',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentModels: { summarizer: 'small/fast' }
         });
 
         expect(preset.agentModels).toEqual({ summarizer: 'small/fast' });
 
         const harness = preset.create(SETTINGS, progress);
-        // The override applies to the summarizer; the primary keeps the session
+        // The override applies to the summarizer; the entry agent keeps the session
         // model because the map omits it (not because it is special).
         expect(harness.agents.summarizer.model()).toBe('small/fast');
         expect(harness.agents.research.model()).toBe('test-model');
     });
 
-    it('accepts an override for the primary and trims the id', () => {
+    it('accepts an override for the entry agent and trims the id', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'trimmed',
-            primary: 'instruct',
+            agents: ['instruct'],
             agentModels: { instruct: '  merge/ds4-flash  ' }
         });
 
@@ -1023,7 +1363,7 @@ describe('per-agent model overrides', () => {
         // Not a plain object.
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', agentModels: [] as never })
+                registry.create({ name: 'x', agents: ['instruct'], agentModels: [] as never })
             )
         ).toEqual({ status: 400, message: '`agentModels` must be an object mapping agent ids to model ids.' });
 
@@ -1033,7 +1373,7 @@ describe('per-agent model overrides', () => {
             registryError(() =>
                 registry.create({
                     name: 'x',
-                    primary: 'instruct',
+                    agents: ['instruct'],
                     agentModels: { summarizer: 'small/fast' }
                 })
             )
@@ -1047,13 +1387,13 @@ describe('per-agent model overrides', () => {
         // characters are all rejected with the agent named.
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', agentModels: { instruct: 7 as never } })
+                registry.create({ name: 'x', agents: ['instruct'], agentModels: { instruct: 7 as never } })
             )
         ).toEqual({ status: 400, message: '`agentModels.instruct` must be a model id string.' });
 
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', agentModels: { instruct: '   ' } })
+                registry.create({ name: 'x', agents: ['instruct'], agentModels: { instruct: '   ' } })
             )
         ).toEqual({ status: 400, message: '`agentModels.instruct` cannot be empty.' });
 
@@ -1061,7 +1401,7 @@ describe('per-agent model overrides', () => {
             registryError(() =>
                 registry.create({
                     name: 'x',
-                    primary: 'instruct',
+                    agents: ['instruct'],
                     agentModels: { instruct: 'a'.repeat(201) }
                 })
             )
@@ -1074,7 +1414,7 @@ describe('per-agent model overrides', () => {
             registryError(() =>
                 registry.create({
                     name: 'x',
-                    primary: 'instruct',
+                    agents: ['instruct'],
                     agentModels: { instruct: 'bad\nmodel' }
                 })
             )
@@ -1088,13 +1428,12 @@ describe('per-agent model overrides', () => {
         const registry = createHarnessRegistry();
         registry.create({
             name: 'mixed',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentModels: { research: 'big/model', summarizer: 'small/fast' }
         });
 
         // A stated map replaces the previous one: only `summarizer` is overridden
-        // now, so the primary goes back to the session model.
+        // now, so the entry agent goes back to the session model.
         const replaced = registry.update('mixed', { agentModels: { summarizer: 'tiny/model' } });
         expect(replaced.agentModels).toEqual({ summarizer: 'tiny/model' });
         expect(replaced.create(SETTINGS, progress).agents.research.model()).toBe('test-model');
@@ -1102,13 +1441,13 @@ describe('per-agent model overrides', () => {
 
         // Changing membership without restating the map drops the override for the
         // agent that is no longer selected; the survivor keeps its model.
-        const narrowed = registry.update('mixed', { subagents: [] });
+        const narrowed = registry.update('mixed', { agents: ['research'] });
         expect(narrowed.agentModels).toEqual({});
         expect(narrowed.create(SETTINGS, progress).agents.research.model()).toBe('test-model');
 
         // An explicit empty map clears every override.
         const reseeded = registry.update('mixed', {
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentModels: { summarizer: 'small/fast' }
         });
         expect(reseeded.agentModels).toEqual({ summarizer: 'small/fast' });
@@ -1119,8 +1458,7 @@ describe('per-agent model overrides', () => {
         const registry = createHarnessRegistry();
         registry.create({
             name: 'mixed',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentModels: { summarizer: 'small/fast' }
         });
 
@@ -1128,7 +1466,7 @@ describe('per-agent model overrides', () => {
         // it: a stated key is explicit input, so it is a 400 rather than silently
         // discarded.
         expect(
-            registryError(() => registry.update('mixed', { subagents: [], agentModels: { summarizer: 'x' } }))
+            registryError(() => registry.update('mixed', { agents: ['research'], agentModels: { summarizer: 'x' } }))
         ).toEqual({
             status: 400,
             message:
@@ -1140,8 +1478,7 @@ describe('per-agent model overrides', () => {
         const registry = createHarnessRegistry();
         const before = registry.create({
             name: 'mixed',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentModels: { summarizer: 'small/fast' }
         });
         const oldHarness = before.create(SETTINGS, progress);
@@ -1162,12 +1499,12 @@ describe('per-agent model overrides', () => {
     it('describes the override map only when it is non-empty', () => {
         const registry = createHarnessRegistry();
 
-        const bare = registry.create({ name: 'bare', primary: 'instruct' });
+        const bare = registry.create({ name: 'bare', agents: ['instruct'] });
         expect(describeHarness(bare).agentModels).toBeUndefined();
 
         const mapped = registry.create({
             name: 'mapped',
-            primary: 'instruct',
+            agents: ['instruct'],
             agentModels: { instruct: 'big/model' }
         });
         // The descriptor carries the OVERRIDE map, not a resolved model per agent:
@@ -1226,8 +1563,7 @@ describe('per-agent instruction overrides', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'voiced',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentInstructions: { summarizer: 'Condense to one line.' }
         });
 
@@ -1256,7 +1592,7 @@ describe('per-agent instruction overrides', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'voiced',
-            primary: 'summarizer',
+            agents: ['summarizer'],
             agentInstructions: { summarizer: 'Rewrite it as a haiku.' }
         });
 
@@ -1268,7 +1604,7 @@ describe('per-agent instruction overrides', () => {
         // entry, and a second harness built from the same profile is unaffected.
         expect(AGENT_PROFILES.summarizer.instruction).toBe(TRUSTED_SUMMARIZER_INSTRUCTION);
         expect(
-            registry.create({ name: 'plain', primary: 'summarizer' }).create(SETTINGS, progress)
+            registry.create({ name: 'plain', agents: ['summarizer'] }).create(SETTINGS, progress)
                 .agents.summarizer.instructions
         ).toEqual([TRUSTED_SUMMARIZER_PROMPT]);
     });
@@ -1277,7 +1613,7 @@ describe('per-agent instruction overrides', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'multiline',
-            primary: 'instruct',
+            agents: ['instruct'],
             agentInstructions: { instruct: '  Lead with the answer.\n\nThen show the evidence.  ' }
         });
 
@@ -1306,7 +1642,7 @@ describe('per-agent instruction overrides', () => {
         // Not a plain object.
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', agentInstructions: [] as never })
+                registry.create({ name: 'x', agents: ['instruct'], agentInstructions: [] as never })
             )
         ).toEqual({
             status: 400,
@@ -1319,7 +1655,7 @@ describe('per-agent instruction overrides', () => {
             registryError(() =>
                 registry.create({
                     name: 'x',
-                    primary: 'instruct',
+                    agents: ['instruct'],
                     agentInstructions: { summarizer: 'Condense.' }
                 })
             )
@@ -1335,7 +1671,7 @@ describe('per-agent instruction overrides', () => {
             registryError(() =>
                 registry.create({
                     name: 'x',
-                    primary: 'instruct',
+                    agents: ['instruct'],
                     agentInstructions: { instruct: 7 as never }
                 })
             )
@@ -1343,7 +1679,7 @@ describe('per-agent instruction overrides', () => {
 
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', agentInstructions: { instruct: '   ' } })
+                registry.create({ name: 'x', agents: ['instruct'], agentInstructions: { instruct: '   ' } })
             )
         ).toEqual({
             status: 400,
@@ -1355,7 +1691,7 @@ describe('per-agent instruction overrides', () => {
             registryError(() =>
                 registry.create({
                     name: 'x',
-                    primary: 'instruct',
+                    agents: ['instruct'],
                     agentInstructions: { instruct: 'a'.repeat(8_001) }
                 })
             )
@@ -1368,7 +1704,7 @@ describe('per-agent instruction overrides', () => {
             registryError(() =>
                 registry.create({
                     name: 'x',
-                    primary: 'instruct',
+                    agents: ['instruct'],
                     agentInstructions: { instruct: 'null\u0000byte' }
                 })
             )
@@ -1382,12 +1718,11 @@ describe('per-agent instruction overrides', () => {
         const registry = createHarnessRegistry();
         registry.create({
             name: 'voiced',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentInstructions: { research: 'Ask before acting.', summarizer: 'Two lines max.' }
         });
 
-        // A stated map REPLACES: the primary is back on its trusted one-message prompt.
+        // A stated map REPLACES: the entry agent is back on its trusted composed prompt.
         const replaced = registry.update('voiced', { agentInstructions: { summarizer: 'One line.' } });
         expect(replaced.agentInstructions).toEqual({ summarizer: 'One line.' });
 
@@ -1403,12 +1738,12 @@ describe('per-agent instruction overrides', () => {
         // Narrowing the team drops the override of the agent that left, so a later
         // re-add cannot silently resurrect an old prompt. `summarizer`'s entry is the
         // only one standing, so the map ends up empty.
-        const narrowed = registry.update('voiced', { subagents: [] });
+        const narrowed = registry.update('voiced', { agents: ['research'] });
         expect(narrowed.agentInstructions).toEqual({});
 
         // An explicit empty map clears every override.
         registry.update('voiced', {
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentInstructions: { summarizer: 'One line.' }
         });
         expect(registry.update('voiced', { agentInstructions: {} }).agentInstructions).toEqual({});
@@ -1421,8 +1756,7 @@ describe('per-agent instruction overrides', () => {
         const registry = createHarnessRegistry();
         const before = registry.create({
             name: 'voiced',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentInstructions: { summarizer: 'Two lines max.' }
         });
         const oldHarness = before.create(SETTINGS, progress);
@@ -1462,11 +1796,11 @@ describe('per-agent instruction overrides', () => {
     it('describes the override map only when it is non-empty', () => {
         const registry = createHarnessRegistry();
 
-        expect(describeHarness(registry.create({ name: 'bare2', primary: 'instruct' })).agentInstructions).toBeUndefined();
+        expect(describeHarness(registry.create({ name: 'bare2', agents: ['instruct'] })).agentInstructions).toBeUndefined();
 
         const mapped = registry.create({
             name: 'voiced2',
-            primary: 'instruct',
+            agents: ['instruct'],
             agentInstructions: { instruct: 'Lead with the answer.' }
         });
         // The OVERRIDE map, not the catalogue: a member listed here runs exactly this text,
@@ -1479,8 +1813,7 @@ describe('per-agent instruction overrides', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'voiced3',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentInstructions: { summarizer: 'One line.' }
         });
 
@@ -1533,8 +1866,12 @@ describe('an injected registry', () => {
         title: 'Scripted',
         description: 'A scripted fixture.',
         requiresEndpoint: false,
-        primary: 'scripted',
-        subagents: [],
+        // ROUTING and AUTHORITY are separate fields on a preset card now, and an injected card
+        // states both: the scripted agent receives the turn, and a one-agent roster holds one
+        // rank. The fixture's agent id is NOT a catalogue profile, which is why the card carries
+        // it as data rather than resolving it from `agents()`.
+        entry: 'scripted',
+        ranks: { scripted: 'A' },
         agents: ['scripted'],
         tools: [],
         builtin: true,
@@ -1569,7 +1906,7 @@ describe('an injected registry', () => {
         ]);
 
         // Creating into an injected registry is still validated and works.
-        const created = registry.create({ name: 'fresh', primary: 'instruct' });
+        const created = registry.create({ name: 'fresh', agents: ['instruct'] });
         expect(registry.list().map((entry) => entry.name)).toEqual(['scripted', 'fresh']);
         expect(created.create).not.toBe(scripted.create);
     });
@@ -1621,8 +1958,7 @@ describe('per-agent identity colors', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'painted',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentColors: { summarizer: '#4ade80' }
         });
 
@@ -1638,8 +1974,7 @@ describe('per-agent identity colors', () => {
         // prompts and the same models. A color is not a prompt override.
         const bare = registry.create({
             name: 'unpainted',
-            primary: 'research',
-            subagents: ['summarizer']
+            agents: ['research', 'summarizer'],
         }).create(SETTINGS, progress);
 
         expect(harness.agents.summarizer.instructions).toEqual(bare.agents.summarizer.instructions);
@@ -1647,11 +1982,11 @@ describe('per-agent identity colors', () => {
         expect(harness.agents.research.model()).toBe('test-model');
     });
 
-    it('accepts an override for the primary and trims the value', () => {
+    it('accepts an override for the entry agent and trims the value', () => {
         const registry = createHarnessRegistry();
         const preset = registry.create({
             name: 'trimmed',
-            primary: 'instruct',
+            agents: ['instruct'],
             agentColors: { instruct: '  #4ADE80  ' }
         });
 
@@ -1666,7 +2001,7 @@ describe('per-agent identity colors', () => {
         // Not a plain object.
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', agentColors: [] as never })
+                registry.create({ name: 'x', agents: ['instruct'], agentColors: [] as never })
             )
         ).toEqual({
             status: 400,
@@ -1679,7 +2014,7 @@ describe('per-agent identity colors', () => {
             registryError(() =>
                 registry.create({
                     name: 'x',
-                    primary: 'instruct',
+                    agents: ['instruct'],
                     agentColors: { summarizer: '#4ade80' }
                 })
             )
@@ -1693,7 +2028,7 @@ describe('per-agent identity colors', () => {
         // naming the agent, so the UI can point at the offending swatch.
         expect(
             registryError(() =>
-                registry.create({ name: 'x', primary: 'instruct', agentColors: { instruct: 7 as never } })
+                registry.create({ name: 'x', agents: ['instruct'], agentColors: { instruct: 7 as never } })
             )
         ).toEqual({
             status: 400,
@@ -1703,7 +2038,7 @@ describe('per-agent identity colors', () => {
         for (const color of HEX_REJECTED) {
             expect(
                 registryError(() =>
-                    registry.create({ name: 'x', primary: 'instruct', agentColors: { instruct: color } })
+                    registry.create({ name: 'x', agents: ['instruct'], agentColors: { instruct: color } })
                 )
             ).toEqual({ status: 400, message: registryRefusal(color) });
         }
@@ -1718,7 +2053,7 @@ describe('per-agent identity colors', () => {
                 // Registry edge: stored verbatim (trimmed), and reported back.
                 registry.create({
                     name: `both-ok-${HEX_ACCEPTED.indexOf(color)}`,
-                    primary: 'instruct',
+                    agents: ['instruct'],
                     agentColors: { instruct: color }
                 }).agentColors,
                 // Library edge: the same value reaches the agent.
@@ -1740,8 +2075,7 @@ describe('per-agent identity colors', () => {
         const registry = createHarnessRegistry();
         registry.create({
             name: 'painted',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentColors: { research: '#4ade80', summarizer: '#f97316' }
         });
 
@@ -1755,11 +2089,14 @@ describe('per-agent identity colors', () => {
 
         // Narrowing the team drops the swatch of the agent that left, so a later re-add
         // cannot silently resurrect an old color.
-        const narrowed = registry.update('painted', { subagents: [] });
+        const narrowed = registry.update('painted', { agents: ['research'] });
         expect(narrowed.agentColors).toEqual({});
 
         // An explicit empty map clears every color, and the rebuilt agents carry none.
-        registry.update('painted', { subagents: ['summarizer'], agentColors: { summarizer: '#22d3ee' } });
+        registry.update('painted', {
+            agents: ['research', 'summarizer'],
+            agentColors: { summarizer: '#22d3ee' }
+        });
         expect(registry.update('painted', { agentColors: {} }).agentColors).toEqual({});
         expect(
             Object.hasOwn(registry.find('painted')!.create(SETTINGS, progress).agents.summarizer, 'color')
@@ -1770,8 +2107,7 @@ describe('per-agent identity colors', () => {
         const registry = createHarnessRegistry();
         const before = registry.create({
             name: 'painted',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentColors: { summarizer: '#4ade80' }
         });
 
@@ -1805,7 +2141,7 @@ describe('per-agent identity colors', () => {
         // scripted entry whose primary is not a catalogue profile can therefore only go
         // live by naming one.
         const recolored = registry.update('demo', {
-            primary: 'instruct',
+            agents: ['instruct'],
             agentColors: { instruct: '#4ade80' }
         });
 
@@ -1824,7 +2160,7 @@ describe('per-agent identity colors', () => {
 
         const colored = registry.create({
             name: 'carded',
-            primary: 'instruct',
+            agents: ['instruct'],
             agentColors: { instruct: '#4ade80' }
         });
         expect(describeHarness(colored).agentColors).toEqual({ instruct: '#4ade80' });
@@ -1845,8 +2181,7 @@ describe('per-agent identity colors', () => {
         const registry = createHarnessRegistry();
         const created = registry.create({
             name: 'saved',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
             agentColors: { research: '#4ade80', summarizer: '#f97316' }
         });
 
@@ -1863,7 +2198,7 @@ describe('per-agent identity colors', () => {
 
         // A harness with no colors writes NO field, so a document saved before R2 keeps
         // its exact old byte shape (and a record without the field stays equal to itself).
-        const bare = presetToRecord(registry.create({ name: 'bare', primary: 'research' }));
+        const bare = presetToRecord(registry.create({ name: 'bare', agents: ['research'] }));
         expect(Object.hasOwn(bare, 'agentColors')).toBe(false);
         expect(presetRecordEquals(bare, bare)).toBe(true);
         expect(presetFromRecord({ ...bare, agentColors: undefined }).agentColors).toBeUndefined();
@@ -1882,7 +2217,7 @@ describe('per-agent identity colors', () => {
         // would otherwise vanish on the next restart.
         const registry = createHarnessRegistry();
         const record = presetToRecord(
-            registry.create({ name: 'colored', primary: 'research', subagents: ['summarizer'] })
+            registry.create({ name: 'colored', agents: ['research', 'summarizer'] })
         );
 
         // Same shape adjustment the instruction test above makes: the record is from THIS
@@ -1936,15 +2271,16 @@ describe('session-defined agents in the durable preset record (R7)', () => {
         const registry = createHarnessRegistry();
         const created = registry.create({
             name: 'owned',
-            primary: 'research',
-            subagents: ['summarizer']
+            agents: ['research', 'summarizer'],
         });
 
-        // The shape a SESSION writes: the invented name joins `agents`/`subagents`, its model
-        // joins `agentModels`, and its base text joins the new `customAgents` map.
+        // The shape a SESSION writes: the invented name joins `agents`, its rank joins the
+        // COMPLETE rank map (a durable record's map keys EVERY member, invented ones included —
+        // ../persistence.ts refuses one that does not), its model joins `agentModels`, and its
+        // base text joins the new `customAgents` map.
         const withCustom: HarnessPreset = {
             ...created,
-            subagents: [...created.subagents, CUSTOM],
+            ranks: { ...created.ranks, [CUSTOM]: 'B' },
             agents: [...created.agents, CUSTOM],
             agentModels: { ...created.agentModels, [CUSTOM]: 'small/fast' },
             agentColors: { ...created.agentColors, [CUSTOM]: '#22d3ee' },
@@ -1956,11 +2292,18 @@ describe('session-defined agents in the durable preset record (R7)', () => {
         expect(record.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
         expect(record.agentModels).toEqual({ [CUSTOM]: 'small/fast' });
         expect(record.agents).toEqual(['research', 'summarizer', CUSTOM]);
+        // The map round-trips in SORTED KEY ORDER (the rank map is the one field whose key order
+        // carries no meaning, so `presetRecordEquals` must not read an insertion-order change as
+        // an executable difference).
+        expect(record.ranks).toEqual({ research: 'A', summarizer: 'B', [CUSTOM]: 'B' });
+        expect(Object.keys(record.ranks)).toEqual([CUSTOM, 'research', 'summarizer']);
 
         const rebuilt = presetFromRecord(record);
 
         expect(rebuilt.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
         expect(rebuilt.agents).toEqual(['research', 'summarizer', CUSTOM]);
+        expect(rebuilt.entry).toBe('research');
+        expect(rebuilt.ranks).toEqual({ research: 'A', summarizer: 'B', [CUSTOM]: 'B' });
 
         const harness = rebuilt.create(SETTINGS, progress);
 
@@ -1968,6 +2311,9 @@ describe('session-defined agents in the durable preset record (R7)', () => {
         expect(Object.keys(harness.agents).sort()).toEqual(
             ['research', 'summarizer', CUSTOM].sort()
         );
+        // The invented brain is RANKED like any other member: no profile means no privilege, and
+        // no penalty either — it sits where the record put it.
+        expect(harness.ranks).toEqual({ research: 'A', summarizer: 'B', [CUSTOM]: 'B' });
         // THE point: the invented brain is built from its own stored text VERBATIM (no guideline
         // block, because there is no trusted profile to supply one) on its own model, and the
         // R2 swatch travels with it exactly like a catalogue member's.
@@ -1990,7 +2336,7 @@ describe('session-defined agents in the durable preset record (R7)', () => {
 
     it('writes no field without custom agents and keeps a pre-R7 record equal', () => {
         const registry = createHarnessRegistry();
-        const bare = presetToRecord(registry.create({ name: 'plain', primary: 'research' }));
+        const bare = presetToRecord(registry.create({ name: 'plain', agents: ['research'] }));
 
         // Absent, not `{}`: a document saved before R7 (or a harness definition) keeps its exact
         // old byte shape, so a later reader cannot invent a roster member.
@@ -2018,7 +2364,7 @@ describe('session-defined agents in the durable preset record (R7)', () => {
         // the next restart while its sessions still name it.
         const registry = createHarnessRegistry();
         const record = presetToRecord(
-            registry.create({ name: 'invented', primary: 'research', subagents: ['summarizer'] })
+            registry.create({ name: 'invented', agents: ['research', 'summarizer'] })
         );
         const asShippedRow = {
             ...record,
@@ -2051,8 +2397,11 @@ describe('session-defined agents in the durable preset record (R7)', () => {
             title: 'Injected',
             description: 'A host-supplied factory with no template hint.',
             requiresEndpoint: false,
-            primary: 'instruct',
-            subagents: [],
+            // A card states routing and authority even when its factory is opaque: a record
+            // written from this preset must carry a complete rank map, or the restore cannot
+            // rebuild the team it froze.
+            entry: 'instruct',
+            ranks: { instruct: 'A' },
             agents: ['instruct'],
             tools: [],
             builtin: false,

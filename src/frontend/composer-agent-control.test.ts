@@ -14,13 +14,14 @@
 //     hold opens it. The cycle itself (order, the pending selection, the commit at send) is
 //     `composer-agent-cycle.test.ts`; this file keeps the dialog half, on both devices, and
 //     the negative half of R11 (no cycle button, no chevron popover);
-//   - R12: the dialog selects a different primary, changes every agent's model, shows
+//   - R12: the dialog selects a different entry agent, changes every agent's model, shows
 //     the instructions, and (T7b/R5) states the SCOPE a save writes: a saved conversation
 //     edits its own team, prompts and live models, and only its entry agent is fixed.
 //   - R13: closing restores focus to the composer button and a live rebuild keeps the
 //     open dialog (and the control the reader was using) in place.
 
 import type { AgentDescriptor, HarnessDescriptor, SessionSnapshot } from '../server/protocol';
+import type { AgentRank } from '../types';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
 import type { StreamDouble } from './view-test-support';
@@ -54,8 +55,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct', 'research', 'workspace'],
         tools: [],
         coreTools: ['toolRequest', 'toolCreate', 'tasks', 'delegate'],
-        primary: 'instruct',
-        subagents: ['research', 'workspace'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'research': 'B', 'workspace': 'B' },
         builtin: true,
         editable: true,
         ...overrides
@@ -161,23 +162,34 @@ const touchRelease = (): void => {
 };
 
 // One PATCH handler shared by the fixtures: it answers with the server-confirmed
-// harness descriptor the way the real route does (primary first in `agents`).
+// harness descriptor the way the real route does (entry agent first in `agents`).
 const patchHarness = (
     current: HarnessDescriptor,
     body: unknown
-): { harness: HarnessDescriptor; body: { primary: string; subagents: string[]; agentModels?: Record<string, string> } } => {
+): {
+    harness: HarnessDescriptor;
+    body: {
+        agents: string[];
+        entry: string;
+        ranks: Record<string, AgentRank>;
+        agentModels?: Record<string, string>;
+    };
+} => {
     const request = body as {
-        primary: string;
-        subagents: string[];
+        agents: string[];
+        entry: string;
+        ranks: Record<string, AgentRank>;
         agentModels?: Record<string, string>;
     };
 
     return {
         body: request,
+        // Every field the route RECEIVES replaces its stored twin, so the answer echoes the
+        // request: the roster (entry first), the entry agent, and the rank map as restated.
         harness: descriptor({
-            agents: [request.primary, ...request.subagents],
-            primary: request.primary,
-            subagents: request.subagents,
+            agents: request.agents,
+            entry: request.entry,
+            ranks: request.ranks,
             ...(request.agentModels === undefined ? {} : { agentModels: request.agentModels })
         })
     };
@@ -302,14 +314,14 @@ it('opens the shared agent dialog from the single composer button', async () => 
     expect(
         [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => [
             tab.dataset.agent,
-            tab.dataset.role,
+            tab.dataset.entry === 'true',
             tab.getAttribute('aria-selected') === 'true',
             tab.querySelector('.agent-dialog-agent-name')?.textContent
         ])
     ).toEqual([
-        ['instruct', 'primary', true, 'Instruct'],
-        ['research', 'secondary', false, 'Researcher'],
-        ['workspace', 'secondary', false, 'Coder']
+        ['instruct', true, true, 'Instruct'],
+        ['research', false, false, 'Researcher'],
+        ['workspace', false, false, 'Coder']
     ]);
     expect(document.querySelector('.agent-dialog-agent-select')).toBeNull();
     expect(document.querySelector('.agent-dialog-note')).toBeNull();
@@ -341,7 +353,7 @@ it('opens the shared agent dialog from the single composer button', async () => 
     expect(document.activeElement).toBe(byClass('.agent-control-button', 'button'));
 });
 
-it('selects a different primary agent from the dialog and PATCHes the complete team', async () => {
+it('selects a different entry agent from the dialog and PATCHes the complete team', async () => {
     let current = descriptor();
     const patches: unknown[] = [];
 
@@ -379,8 +391,8 @@ it('selects a different primary agent from the dialog and PATCHes the complete t
 
     byClass('.agent-control-button', 'button').click();
 
-    // T3/R3: clicking the badge is a LOCAL view change — nothing is sent, nobody is
-    // promoted, and the team is untouched. The panel's own control arms the promotion
+    // T3/R3: clicking the tab is a LOCAL view change — nothing is sent, nobody is
+    // moved, and the team is untouched. The panel's own control arms the entry move
     // the reader asked for, and the bottom-right action writes it in the same
     // complete-team PATCH the deck used.
     byClass('.agent-dialog-tab[data-agent="research"]', 'button').click();
@@ -389,18 +401,24 @@ it('selects a different primary agent from the dialog and PATCHes the complete t
     expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(true);
     expect(byClass('.agent-dialog-apply', 'button').textContent).toBe('Save configuration');
 
-    // The promotion is a deliberate press, and the rebuild repaints the action's label
+    // The entry move is a deliberate press, and the rebuild repaints the action's label
     // to say what the write will do.
-    byClass('.agent-dialog-promote', 'button').click();
+    byClass('.agent-dialog-entry', 'button').click();
     const apply = byClass('.agent-dialog-apply', 'button');
-    expect(apply.textContent).toBe('Save & set primary');
+    expect(apply.textContent).toBe('Save & set entry');
     expect(apply.disabled).toBe(false);
     apply.click();
     await flush();
     await flush();
 
     // The existing complete-team PATCH path, not a new endpoint.
-    expect(patches[0]).toEqual({ primary: 'research', subagents: ['instruct', 'workspace'] });
+    expect(patches[0]).toEqual({
+        // The entry agent leads the roster it sends, `entry` names it, and every rank is the
+        // letter it already had — an entry move restates the ladder, it does not climb it.
+        agents: ['research', 'instruct', 'workspace'],
+        entry: 'research',
+        ranks: { instruct: 'A', 'research': 'B', 'workspace': 'B' }
+    });
 
     // The open dialog is refreshed in place: the header follows the agent being
     // configured, and every badge now states the new team truth.
@@ -409,12 +427,14 @@ it('selects a different primary agent from the dialog and PATCHes the complete t
     expect(
         [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => [
             tab.dataset.agent,
-            tab.dataset.role
+            tab.dataset.entry === 'true'
         ])
     ).toEqual([
-        ['research', 'primary'],
-        ['instruct', 'secondary'],
-        ['workspace', 'secondary']
+        // The entry move reorders the strip (the entry agent leads it) without touching a
+        // single rank, so `data-rank` would read the same before and after.
+        ['research', true],
+        ['instruct', false],
+        ['workspace', false]
     ]);
     expect(byClass('.agent-control-name', 'span').textContent).toBe('Researcher');
     expect(byClass('.agent-control-code', 'span').textContent).toBe('RR');
@@ -495,8 +515,9 @@ it('changes a model from the dialog and keeps the open dialog in sync without dr
     // The complete override map is sent (the server replaces, never merges), and only
     // the model changed: the team is restated unchanged.
     expect(patches[0]).toEqual({
-        primary: 'instruct',
-        subagents: ['research', 'workspace'],
+        agents: ['instruct', 'research', 'workspace'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'research': 'B', 'workspace': 'B' },
         agentModels: { instruct: 'm3' }
     });
 
@@ -626,22 +647,22 @@ it('keeps a saved conversation editable and states the scope a save writes', asy
     expect(instruction.value).toBe('Answer directly.');
     expect(instruction.title).toBe('The instruction this agent runs in this conversation.');
 
-    // R6: a member this conversation runs is removable — the primary excepted, for the structural
+    // R6: a member this conversation runs is removable — the entry agent excepted, for the structural
     // reason — and R7: `[+]` offers a typed name as well as the catalogue.
     expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true);
     expect(byClass('.agent-dialog-remove', 'button').title).toBe(
-        'The primary agent is always part of the team.'
+        'The entry agent is always part of the team: every harness needs an entry point.'
     );
     expect(byClass('.agent-dialog-add', 'button').disabled).toBe(false);
     expect(byClass('.agent-dialog-add', 'button').title).toBe(
         'Add an agent to the team, or name a new one.'
     );
 
-    // R5: the entry agent of a saved conversation is FIXED, so `Make primary` carries that reason
+    // R5: the entry agent of a saved conversation is FIXED, so `Set as entry` carries that reason
     // and the action can never promise a promotion this session cannot write.
-    expect(byClass('.agent-dialog-promote', 'button').disabled).toBe(true);
-    expect(byClass('.agent-dialog-promote', 'button').title).toBe(
-        'The primary agent is fixed for a saved conversation.'
+    expect(byClass('.agent-dialog-entry', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-entry', 'button').title).toBe(
+        'The entry agent is fixed for a saved conversation.'
     );
     const apply = byClass('.agent-dialog-apply', 'button');
     expect(apply.textContent).toBe('Save configuration');
@@ -700,8 +721,8 @@ it('discards every draft on close, overlay and Escape without a single request',
     for (const dismiss of ['close', 'overlay', 'escape'] as const) {
         byClass('.agent-control-button', 'button').click();
 
-        // A draft on a NON-primary agent: an instruction, a model and an armed
-        // promotion, i.e. one edit of every kind the dialog owns here (every trusted
+        // A draft on an agent that is NOT the entry agent: an instruction, a model, and an armed
+        // entry move, i.e. one edit of every kind the dialog owns here (every trusted
         // agent is already on this team, so `[+]` has nothing to add).
         byClass('.agent-dialog-tab[data-agent="research"]', 'button').click();
 
@@ -713,7 +734,7 @@ it('discards every draft on close, overlay and Escape without a single request',
         model.value = 'm2';
         model.dispatchEvent(new Event('change', { bubbles: true }));
 
-        byClass('.agent-dialog-promote', 'button').click();
+        byClass('.agent-dialog-entry', 'button').click();
 
         expect(patches).toEqual([]);
         expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(false);

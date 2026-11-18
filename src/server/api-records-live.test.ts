@@ -72,8 +72,11 @@ const quietPreset = (): HarnessPreset => ({
     title: 'Records',
     description: 'Scripted record-store preset',
     requiresEndpoint: false,
-    primary: 'records',
-    subagents: [],
+// A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: 'records',
+    ranks: { records: 'A' },
     agents: ['records'],
     tools: [],
     builtin: true,
@@ -90,7 +93,7 @@ const quietPreset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'records',
+            entry: 'records',
             presets: false,
             report: { progress }
         })

@@ -149,7 +149,7 @@ describe('production toolbox source compilation', () => {
         const harness = createToolboxHarness(
             {
                 agents: agentsFromProfiles(['instruct'], SETTINGS),
-                primary: 'instruct'
+                entry: 'instruct'
             },
             SETTINGS,
             progress
@@ -215,7 +215,7 @@ export const execute = async () => ({ replaced: true });
         // The fixture is injected, so the registry that rebuilds its template is built
         // with the templates named explicitly.
         const registry = createHarnessRegistry(PRODUCTION_WITH_FIXTURES);
-        const rebuilt = registry.update('flaky', { primary: 'workspace' });
+        const rebuilt = registry.update('flaky', { agents: ['workspace'] });
         const harness = rebuilt.create(SETTINGS, progress);
 
         // The rebuild goes through the toolbox factory (that is what the template selects)
@@ -262,7 +262,7 @@ export const execute = async () => ({ replaced: true });
         const harness = createToolboxHarness(
             {
                 agents: agentsFromProfiles(['instruct'], SETTINGS),
-                primary: 'instruct',
+                entry: 'instruct',
                 extraTools: { timeNow: hostTime }
             },
             SETTINGS,
@@ -379,7 +379,7 @@ export const execute = async () => ({ marker: '${marker}' });
             const live = createToolboxHarness(
                 {
                     agents: agentsFromProfiles(['instruct'], SETTINGS),
-                    primary: 'instruct',
+                    entry: 'instruct',
                     extraToolSources: sources
                 },
                 SETTINGS,

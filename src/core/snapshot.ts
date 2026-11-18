@@ -38,6 +38,10 @@
 //   - ./creation.ts       — compileToolSource, the trusted-source compiler
 
 import { HarnessError } from '../util';
+// `AGENT_RANKS` and `isAgentRank` are the runtime half of the rank vocabulary (../types).
+// Importing the union's DATA form is what keeps `results[].rank` validation from ever
+// disagreeing with the `AgentRank` type: the guard reads the same array the type enumerates.
+import { AGENT_RANKS, isAgentRank } from '../types';
 import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
 // The invocation-RUN key (../shared/run-identity.ts): the one key rule the agent-result reader
 // states its duplicate check on, so a document that legitimately holds the SAME bare invocation id
@@ -89,7 +93,22 @@ import { readRecordsStoreState } from './records';
 // accepting both shapes because R5 says nothing is in production: a v1 file is
 // refused with the version message below, and nobody has to lose data to a
 // half-migrated read.
-export const HARNESS_SNAPSHOT_VERSION = 2 as const;
+//
+// V3 (2026-11-18, the rank model) is a VOCABULARY change with the same posture. The
+// invocation ledger rows renamed `role: 'primary' | 'subagent'` to `rank: AgentRank`,
+// so a v2 document cannot be read by this reader: translating `primary` into `'A'` and
+// `subagent` into `'B'` would invent a ranking the old shape never carried (v3 lets any
+// number of agents share Rank A, so two `primary` rows are not two Rank A rows and not
+// one of each either). A v2 file therefore fails the version gate below, exactly as a v1
+// file does — the repo precedent for a vocabulary break (../types/index.ts
+// `HarnessSnapshotVersion`, and ./harness.creation-policy.test.ts for the same refusal
+// style), and `readAgentResults` keeps ONE accepted spelling so a stale document can
+// never half-load.
+export const HARNESS_SNAPSHOT_VERSION = 3 as const;
+
+// The rank letters, as they appear in the `results[].rank` refusal — so the message can
+// never fall behind the union in ../types (`AGENT_RANKS` is that union's data form).
+const RANK_VOCABULARY = AGENT_RANKS.join(', ');
 
 // The closed RUN-STOP vocabulary (../types `HarnessRunStopReason`) — the reader half of the
 // contract core/tool-outcome.ts sets for `TOOL_OUTCOMES`: ONE table so a refusal message and
@@ -173,7 +192,7 @@ const readAgentResults = (
                 'sequence',
                 'completedOrder',
                 'agent',
-                'role',
+                'rank',
                 'kind',
                 'status',
                 'content',
@@ -200,7 +219,15 @@ const readAgentResults = (
                 // the WHOLE document unrestorable rather than merely losing one field. It is also what
                 // `restore()` rebuilds the ledger key from, which is the difference between fixing the
                 // recycled-id collapse for one restart and fixing it for every restart.
-                'epoch'
+                'epoch',
+                // V3 (the rank model): `role` is the field v2 stored and v3 REMOVED. It is
+                // listed here on purpose rather than left unknown: an exact-key whitelist
+                // would refuse a v2-era row with `has an unknown field "role"`, which names
+                // a field without explaining that its whole vocabulary left. Listing it as a
+                // KNOWN-BUT-REMOVED key lets the reader reach the migration refusal below,
+                // which names both halves of the break. It is in `optional` two lists down,
+                // so no v3 row is ever asked to carry it.
+                'role'
             ],
             entryLabel,
             // Issue 0033: the two forensic keys join `error` as MAY-BE-ABSENT, which is
@@ -218,7 +245,13 @@ const readAgentResults = (
             // existed (EVERY document on disk today) is still valid, restores under its BARE
             // invocation id with its exact prior meaning, and is never re-keyed on load. A current row
             // that carries it is read, not dropped. No version bump.
-            ['error', 'partialContent', 'cancelledAtMessage', 'threadId', 'stopReason', 'epoch']
+            // V3: `rank` is REQUIRED in fact — the reader refuses a row without one two
+            // checks below — but it is listed as optional HERE so that check can be the one
+            // that fires. `readSnapshotKeys` is a generic whitelist and its "missing the
+            // required field" message cannot tell a v2 author that the field RENAMED and its
+            // vocabulary left, which is exactly what a rank-less row needs. Same mechanism as
+            // `role` above: the whitelist knows the key, the dedicated check explains it.
+            ['error', 'partialContent', 'cancelledAtMessage', 'threadId', 'stopReason', 'epoch', 'role', 'rank']
         );
 
         const invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
@@ -241,7 +274,16 @@ const readAgentResults = (
             { min: 1 }
         );
         const agent = readSnapshotString(record.agent, `${entryLabel}.agent`, { min: 1 });
-        const role = readSnapshotString(record.role, `${entryLabel}.role`, { min: 1 });
+        // V3: the RANK letter, replacing v2's `role: 'primary' | 'subagent'`. Read as
+        // OPTIONAL here, and required two checks below AFTER the removed-field refusal: a
+        // v2-era row carries `role` and NO `rank`, and the message it needs is the
+        // migration one ("your field is gone, here is what replaced it"), not a bare
+        // "rank must be a string". The value itself is narrowed by `isAgentRank` — the ONE
+        // untrusted-input guard for the union (../types).
+        const rank =
+            record.rank === undefined
+                ? undefined
+                : readSnapshotString(record.rank, `${entryLabel}.rank`, { min: 1 });
         const kind = readSnapshotString(record.kind, `${entryLabel}.kind`, { min: 1 });
         const status = readSnapshotString(record.status, `${entryLabel}.status`, { min: 1 });
         const content = readSnapshotString(record.content, `${entryLabel}.content`);
@@ -252,8 +294,26 @@ const readAgentResults = (
             );
         }
 
-        if (role !== 'primary' && role !== 'subagent') {
-            throw new HarnessError(`${entryLabel}.role must be one of: primary, subagent.`);
+        // A v2-era spelling reaching this line means the document got past the version
+        // gate by hand (or a writer from another build produced it), so the refusal names BOTH
+        // halves of the break: the field that moved, and the vocabulary that left. Translating
+        // `role: 'primary'` here would be a guess about the harness's real ranking, which is why
+        // the reader refuses rather than maps (the same call the version gate records).
+        if (record.role !== undefined) {
+            throw new HarnessError(
+                `${entryLabel} carries the removed \`role\` field (snapshot v2 vocabulary); v3 stores \`rank\` as a rank letter (${RANK_VOCABULARY}).`
+            );
+        }
+
+        // Both halves of a wrong rank are the same mistake, so they share one refusal: an
+        // ABSENT rank (a v3 writer that never wrote one, after the `role` row above already
+        // explained the rename) and a rank spelled with the removed WORDS both have to be one
+        // of the letters. `isAgentRank` (../types) is the guard, so the accepted set can
+        // never drift from the `AgentRank` union.
+        if (rank === undefined || !isAgentRank(rank)) {
+            throw new HarnessError(
+                `${entryLabel}.rank must be one of: ${RANK_VOCABULARY} (the removed primary/subagent vocabulary is not accepted).`
+            );
         }
 
         if (kind !== 'root' && kind !== 'delegation' && kind !== 'fork' && kind !== 'autoanswer') {
@@ -304,7 +364,9 @@ const readAgentResults = (
             sequence,
             completedOrder,
             agent,
-            role,
+            // Narrowed by the `isAgentRank` guard above — the same idiom `kind` and `status`
+            // use, so no cast is needed and a widened vocabulary cannot sneak through.
+            rank,
             kind,
             status,
             content
@@ -566,6 +628,11 @@ export const readHarnessMessages = (
     return entries.map((entry, index) => {
         const entryLabel = `${label}[${index}]`;
         const record = readSnapshotRecord(entry, entryLabel);
+        // A transcript entry's `role` (system / user / assistant / tool) is NOT the
+        // removed ACTOR role, so snapshot v3 renames nothing here: `results[].rank`
+        // (see the invocation-record reader above) is the only rank-carrying field, and
+        // this vocabulary is the model wire format, which is unchanged. Read as a string
+        // so a non-string reports the shared type message, then switched below.
         const role = readSnapshotString(record.role, `${entryLabel}.role`, { min: 1 });
 
         switch (role) {

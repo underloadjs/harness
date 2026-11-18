@@ -125,6 +125,12 @@ const answerStream = (text: string): HarnessStream =>
         yield { type: 'done', stopReason: 'stop', toolCalls: [] };
     };
 
+// The rank map the kernel's rule 1 produces for a team: the entry agent at Rank A, every
+// other member at Rank B. Fixture shorthand so a multi-agent preset reads the same way a
+// shipped card does (src/server/harnesses/toolbox.ts `resolveRosterRanks`).
+const rankMap = (names: readonly string[]): Record<string, 'A' | 'B'> =>
+    Object.fromEntries(names.map((name, index) => [name, index === 0 ? ('A' as const) : ('B' as const)]));
+
 const presetOf = (
     name: string,
     create: HarnessPreset['create'],
@@ -134,8 +140,8 @@ const presetOf = (
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: agents[0] ?? name,
-    subagents: agents.slice(1),
+    entry: agents[0] ?? name,
+    ranks: rankMap(agents),
     agents,
     tools: [],
     builtin: true,
@@ -156,7 +162,7 @@ const liveScriptedPreset = (name = 'one', text = 'hello'): HarnessPreset =>
                     stream: answerStream(text)
                 })
             },
-            primary: name,
+            entry: name,
             presets: false,
             report: {
                 progress,
@@ -192,7 +198,7 @@ const gatedPreset = (): { preset: HarnessPreset; started: Promise<void>; release
                     }
                 })
             },
-            primary: 'gated',
+            entry: 'gated',
             presets: false,
             report: {
                 progress,
@@ -515,7 +521,8 @@ describe('R3b durable harness database', () => {
             name: 'mine',
             title: 'My harness',
             description: 'created through the API',
-            primary: 'instruct'
+            agents: ['instruct'],
+            entry: 'instruct'
         });
         await first.store.persistRegistry();
 
@@ -574,7 +581,7 @@ describe('R3b durable harness database', () => {
         const parsed = JSON.parse(raw) as {
             version: number;
             sessions: { id: string; settings: Record<string, unknown>; turns: unknown[] }[];
-            registry: { name: string; primary: string }[];
+            registry: { name: string; entry: string }[];
         };
         expect(parsed.version).toBe(HARNESS_DATABASE_VERSION);
         expect(parsed.sessions).toHaveLength(1);
@@ -615,7 +622,7 @@ describe('R3b durable harness database', () => {
         expect(mine).toBeDefined();
         expect(mine?.title).toBe('My harness');
         expect(mine?.description).toBe('created through the API');
-        expect(mine?.primary).toBe('instruct');
+        expect(mine?.entry).toBe('instruct');
         expect(mine?.builtin).toBe(false);
         expect(mine?.editable).toBe(true);
         expect(mine?.agents).toEqual(['instruct']);
@@ -632,8 +639,9 @@ describe('R3b durable harness database', () => {
         const first = runtimeOf(root, [preset]);
         first.registry.create({
             name: 'voiced',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             agentInstructions: { summarizer: 'Condense to one line.' }
         });
         await first.store.persistRegistry();
@@ -672,8 +680,9 @@ describe('R3b durable harness database', () => {
         const first = runtimeOf(root, [preset]);
         first.registry.create({
             name: 'painted',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             agentColors: { research: '#4ade80', summarizer: '#f97316' }
         });
         await first.store.persistRegistry();
@@ -707,8 +716,9 @@ describe('R3b durable harness database', () => {
         const first = runtimeOf(root, [preset]);
         first.registry.create({
             name: 'unpainted',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             // An OVERRIDE the pre-R2 loader already understood: proves the new optional
             // field is read alongside the old ones rather than replacing them.
             agentModels: { summarizer: 'small/fast' }
@@ -745,8 +755,9 @@ describe('R3b durable harness database', () => {
         const first = runtimeOf(root, [preset]);
         first.registry.create({
             name: 'painted',
-            primary: 'research',
-            subagents: ['summarizer'],
+            agents: ['research', 'summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             agentColors: { summarizer: '#4ade80' }
         });
         await first.store.persistRegistry();
@@ -946,10 +957,14 @@ describe('R3b durable harness database', () => {
         });
         const created = await first.store.create('instruct');
         const frozen = first.store.get(created.id).harnessDefinition;
-        expect(frozen?.primary).toBe('instruct');
+        expect(frozen?.entry).toBe('instruct');
 
         // Executable patch: the registry entry now routes to a different agent.
-        first.registry.update('instruct', { primary: 'workspace', subagents: [] });
+        // The entry agent alone: a roster of one, so `delegate` is not registered at all.
+        // THE ROSTER AND THE ENTRY TRAVEL SEPARATELY now: `entry` alone would keep the
+        // seven-member team and only move the routing point, so "routes to workspace with
+        // nobody to delegate to" is the one-agent roster plus that agent as its entry.
+        first.registry.update('instruct', { agents: ['workspace'], entry: 'workspace' });
         await first.store.persistRegistry();
         first.store.dispose();
 
@@ -961,17 +976,17 @@ describe('R3b durable harness database', () => {
             loadEnvironment: false
         });
 
-        expect(second.registry.find('instruct')?.primary).toBe('workspace');
+        expect(second.registry.find('instruct')?.entry).toBe('workspace');
         expect(second.registry.find('instruct')?.agents).toEqual(['workspace']);
 
         const restored = second.store.get(created.id);
         expect(restored.harnessDefinition).toEqual(frozen);
-        expect(restored.harnessDefinition?.primary).toBe('instruct');
+        expect(restored.harnessDefinition?.entry).toBe('instruct');
         // Every member of the FROZEN team reports its effective model, so the restored
         // conversation renders the same dropdowns it had before the restart. The frozen instruct
         // team is SEVEN agents: every other role except the Manager (`planner` is excluded from
         // every built-in team because it refuses to run as a delegate) plus the summarizer
-        // (src/server/harnesses/presets.ts `teamOf`).
+        // (src/server/harnesses/presets.ts `rankOf`).
         expect(restored.agentModels).toEqual({
             instruct: SETTINGS.model,
             general: SETTINGS.model,
@@ -982,7 +997,7 @@ describe('R3b durable harness database', () => {
             summarizer: SETTINGS.model
         });
         // The frozen harness was rebuilt (not the patched registry entry), and its
-        // primary's prompt is the frozen instruct profile joined into ONE system
+        // entry agent's prompt is the frozen instruct profile joined into ONE system
         // message (../agents/index.ts `agentInstruction`).
         expect(restored.messages.map((message) => message.role)).toEqual(['system']);
         expect(withoutIds(restored.messages)).toEqual([
@@ -1151,7 +1166,12 @@ describe('R3b durable harness database', () => {
             method: 'POST',
             pathname: '/v1/harness/harnesses',
             mount: '/v1/harness',
-            readBody: async () => ({ name: 'viaapi', title: 'Via API', primary: 'instruct' })
+            readBody: async () => ({
+                name: 'viaapi',
+                title: 'Via API',
+                agents: ['instruct'],
+                entry: 'instruct'
+            })
         });
 
         expect(created).toMatchObject({ kind: 'json', status: 201 });
@@ -1220,7 +1240,7 @@ describe('R3b durable harness database', () => {
                         }
                     })
                 },
-                primary: 'mutator',
+                entry: 'mutator',
                 presets: false,
                 report: {
                     progress,
@@ -1305,7 +1325,7 @@ describe('R3b durable harness database', () => {
                     stream: answerStream('helper')
                 })
             },
-            primary: 'lead',
+            entry: 'lead',
             presets: false
         }).snapshot();
 
@@ -1451,7 +1471,7 @@ describe('R3b durable harness database', () => {
                         }
                     })
                 },
-                primary: 'probe',
+                entry: 'probe',
                 presets: false,
                 report: {
                     progress,
@@ -1561,7 +1581,7 @@ describe('R3b durable harness database', () => {
                         }
                     })
                 },
-                primary: 'blocking',
+                entry: 'blocking',
                 presets: false,
                 report: {
                     progress,
@@ -1719,7 +1739,7 @@ describe('T5 durable harness deletion', () => {
     type Document = {
         version: number;
         savedAt: number;
-        registry: { name: string; title?: string; primary?: string; builtin?: boolean }[];
+        registry: { name: string; title?: string; entry?: string; builtin?: boolean }[];
         deleted?: string[];
         sessions: { id: string; harness: string }[];
     };
@@ -1764,7 +1784,7 @@ describe('T5 durable harness deletion', () => {
         const root = tempRoot('delete-custom');
         const first = runtimeOf(root, [liveScriptedPreset('one')]);
 
-        first.registry.create({ name: 'mine', title: 'Mine', primary: 'workspace' });
+        first.registry.create({ name: 'mine', title: 'Mine', agents: ['workspace'], entry: 'workspace' });
         expect((await first.store.mutateRegistry(() => first.registry.remove('mine'))).name).toBe('mine');
 
         // A user harness is absent from the document as soon as it is absent from
@@ -1936,7 +1956,12 @@ describe('T5 durable harness deletion', () => {
         await first.store.mutateRegistry(() => {
             first.registry.remove('workspace');
 
-            return first.registry.create({ name: 'workspace', title: 'My coder', primary: 'reviewer' });
+            return first.registry.create({
+                name: 'workspace',
+                title: 'My coder',
+                agents: ['reviewer'],
+                entry: 'reviewer'
+            });
         });
 
         // Row and tombstone can never both name the harness: `create` cleared the
@@ -1949,9 +1974,9 @@ describe('T5 durable harness deletion', () => {
         expect({
             name: row?.name,
             title: row?.title,
-            primary: row?.primary,
+            entry: row?.entry,
             builtin: row?.builtin
-        }).toEqual({ name: 'workspace', title: 'My coder', primary: 'reviewer', builtin: false });
+        }).toEqual({ name: 'workspace', title: 'My coder', entry: 'reviewer', builtin: false });
 
         first.store.dispose();
 
@@ -1965,7 +1990,7 @@ describe('T5 durable harness deletion', () => {
 
         expect(second.registry.deletedBuiltins()).toEqual([]);
         expect(second.registry.find('workspace')?.title).toBe('My coder');
-        expect(second.registry.find('workspace')?.primary).toBe('reviewer');
+        expect(second.registry.find('workspace')?.entry).toBe('reviewer');
 
         // Documented limitation of the replay: a re-created name occupies the shipped
         // row's position, so its `builtin` provenance flag comes back true (the
@@ -1999,7 +2024,7 @@ describe('T5 durable harness deletion', () => {
         ]);
 
         // The same guarantee for a create: no phantom card.
-        expect(await failureOf(async () => await store.mutateRegistry(() => registry.create({ name: 'ghost', primary: 'instruct' })))).toEqual(
+        expect(await failureOf(async () => await store.mutateRegistry(() => registry.create({ name: 'ghost', agents: ['instruct'], entry: 'instruct' })))).toEqual(
             {
                 status: 500,
                 message: expect.stringContaining('Could not save the harness database')
@@ -2770,7 +2795,7 @@ describe('compaction pass persistence (T3 pruning, T4.4 coalescing)', () => {
                         messages
                     })
                 },
-                primary: 'writer',
+                entry: 'writer',
                 presets: false,
                 pluginSettings: {
                     // The operator's compaction numbers, plus ONE deliberate host-side override:

@@ -20,6 +20,11 @@ import type {
 } from '../harness';
 import type { RunnerSettings } from './harnesses/types';
 import type { AgentResultReference } from '../shared/agent-results';
+// THE RANK VOCABULARY (R1) — the ONE A–Z letter type the kernel publishes
+// (./types/index.ts), reused here verbatim rather than re-declared, so the wire can
+// never drift from what the kernel accepts. `import type` only: the emitted file has
+// no runtime dependency, which this module must keep (a browser imports it).
+import type { AgentRank } from '../types';
 // The display contract is imported (not just re-exported) because the view
 // envelopes below embed its shapes. `import type` only: this file stays free of any
 // runtime dependency, and `../shared/turn-display.ts` never imports this file back,
@@ -50,6 +55,14 @@ export type {
 } from '../harness';
 export type { RunnerSettings } from './harnesses/types';
 export type { AgentResultReference, AgentResultBlock, AgentResultStatus } from '../shared/agent-results';
+// THE LIVE SESSION RECORD, re-exported for consumers that name the store's read model rather than
+// a wire envelope (`./sessions.ts:958` — `export type SessionRecord = Session`, the alias
+// ./api-reads.ts already imports). TYPE-ONLY on purpose: `export type { … } from` is erased, so
+// this adds no runtime dependency to a module a browser loads (see the header) and cannot pull
+// `./sessions.ts` into a bundle. It is NOT a wire shape — `Session` carries the live
+// `harness`/`preset`/`settings` objects — so a client reads the envelopes declared below, while a
+// host or a test names this alias when it means the record the store is holding.
+export type { SessionRecord } from './sessions';
 
 // The server-compiled DISPLAY contract (R1/R3). Types only, on purpose: the bounds
 // constants (`DISPLAY_PREVIEW_CHARS`, ...) stay importable from
@@ -76,7 +89,7 @@ export type {
     DisplayPanelBlockSummary,
     DisplayPanelSummary,
     DisplayProjectContext,
-    DisplayRole,
+    DisplayRank,
     DisplayStep,
     DisplayStepDetailRef,
     DisplaySteerSummary,
@@ -107,7 +120,7 @@ export type SessionStatus = 'idle' | 'running' | 'error';
 // because a browser reload loses the stream but must still render the same
 // transcript. `index` is the position in the session (0-based, monotonic) and
 // `events` holds every `HarnessEvent` observed while the turn ran — including
-// events from subagents a delegation reached — in emission order, each one stamped
+// events from every agent a delegation reached — in emission order, each one stamped
 // with the display lane it was recorded on (`SessionTurnEvent` below).
 //
 // `startedAt`/`updatedAt` are epoch milliseconds from the server clock.
@@ -216,7 +229,7 @@ export type SessionTurn = {
     eventTimes?: number[];
     // The turn's token tally, summed BY THE SERVER from every per-request `usage`
     // event the run reported (each agent's requests included, so a delegated
-    // subagent is part of the same bill). Optional because providers, not this
+    // child run is part of the same bill). Optional because providers, not this
     // server, decide whether usage exists at all: absent means "no request
     // reported any", which is not the same as a zero-spend turn. A turn RESUMED in
     // place starts from an empty tally like a fresh submit, because the row reports
@@ -358,7 +371,7 @@ export type SessionSteerRecord = {
     references?: AgentResultReference[];
 };
 
-// One trusted agent, as the UI needs it to choose a primary/subagent. The text
+// One trusted agent, as the UI needs it to pick a roster member. The text
 // fields are trusted catalogue content (src/agents), never client input and never
 // secret: `instruction` is the identity system message and `guidelines` are the
 // rules appended to it at runtime.
@@ -376,16 +389,18 @@ export type HarnessDescriptor = {
     title: string;
     description: string;
     requiresEndpoint: boolean;
-    // The selected entry agent, and the exact allowlist the primary may delegate
-    // to. `agents` is derived: [primary, ...subagents].
-    primary: string;
-    subagents: string[];
+    // THE ENTRY AGENT (routing) and THE RANK MAP (authority) — R1/R6. `agents` is the
+    // roster in DECLARATION ORDER, so a client that needs an entry when `entry` is
+    // absent takes its first member; several members may carry the entry rank A, and
+    // nothing here picks one of them out as "the" leader.
+    entry: string;
+    ranks: Record<string, AgentRank>;
     agents: string[];
     tools: string[];
     // The core tools this card's runs will declare (R18): the four core file tools
     // (read/write/edit/glob/grep) when registered, the harness-owned
-    // toolRequest/toolCreate/task, delegate when a subagent allowlist
-    // exists, and search when this host has a provider key. The UI core dropdown
+    // toolRequest/toolCreate/task, delegate when the rank map states two or more
+    // distinct ranks, and search when this host has a provider key. The UI core dropdown
     // renders this exact set, so it reflects runtime visibility rather than a
     // hard-coded harness list. files and the other presets stay searchable.
     coreTools?: string[];
@@ -431,20 +446,47 @@ export type HarnessDescriptor = {
 // final member set and the server applies when it builds the agent, and it CAN
 // record a per-agent display color (`agentColors`, R2), a validated CSS hex color
 // the registry applies the same way and projects onto the descriptor.
+//
+// THE ROSTER IS `agents` (R1/R5/R7), in declaration order, and it is the only
+// roster field: there is no allowlist beside it, because authority comes from
+// `ranks` instead. Two roster fields is exactly the ambiguity the rank pass removes.
 export type CreateHarnessRequest = {
     name: string;
     title?: string;
     description?: string;
-    primary: string;
-    subagents?: string[];
+    // The roster, in declaration order; one to the cap the registry states.
+    agents: string[];
+    // The ENTRY agent (routing) — must name a member. Omitted = the roster's first
+    // agent, so the position in `agents` is a meaningful default a client can rely on.
+    entry?: string;
+    // THE RANK MAP (authority): member id → one rank letter A–Z. Keys must be members,
+    // and a request MAY name fewer: every member it does not name is filled one rank
+    // BELOW the lowest rank it states (the entry agent included), and the read returns
+    // the RESOLVED map. Omitted entirely = the ordinary team (entry 'A', everyone else
+    // 'B', which spans two ranks and registers `delegate`); `{}` = the flat team
+    // (everyone 'B', one rank, no delegation).
+    ranks?: Record<string, AgentRank>;
     agentModels?: Record<string, string>;
     agentInstructions?: Record<string, string>;
     agentColors?: Record<string, string>;
 };
 
 // Body of PATCH /harnesses/:name. `name` is immutable; an omitted field keeps its
-// current value. Changing `primary` without `subagents` removes the new primary
-// from the old allowlist.
+// current value, with two roster-specific rules the rank model needs and the old
+// pair did not:
+//
+// - `agents` REPLACES the roster (it is a list, not a scalar).
+// - `entry` is resolved AFTER the new roster is known: omitted keeps the current entry
+//   when the new roster still contains it, and otherwise falls back to the new roster's
+//   first agent, because a harness whose entry agent left the roster has to route to
+//   SOMEONE. Passing `entry` explicitly replaces the recorded agent whatever the roster
+//   says, and naming a non-member is the 400.
+// - `ranks` REPLACES the map, because "rank X for agent Y" is per-entry wording an
+//   operator answers with the full map. A key naming an agent outside the resulting
+//   roster is the 400 — never a silent drop — while members the new map does not name
+//   are filled by the kernel's rule, so an operator can rank the top and let the server
+//   place the rest, and read back exactly what was decided. Omitting `ranks` keeps the
+//   ranks of the members that survive and fills only the members this patch added.
 //
 // `agentModels`, when present, REPLACES the harness's override map: `{}` clears
 // every per-agent model, and every key must name a member of the resulting harness
@@ -463,8 +505,9 @@ export type CreateHarnessRequest = {
 export type UpdateHarnessRequest = {
     title?: string;
     description?: string;
-    primary?: string;
-    subagents?: string[];
+    agents?: string[];
+    entry?: string;
+    ranks?: Record<string, AgentRank>;
     agentModels?: Record<string, string>;
     agentInstructions?: Record<string, string>;
     agentColors?: Record<string, string>;
@@ -911,7 +954,7 @@ export type SessionSnapshot = {
 
 // Payload of GET /api/harnesses. Provider defaults come from the server
 // environment; the API key itself is never sent, only whether one exists.
-// `agents` is the trusted agent registry, so a client can offer primary/subagent
+// `agents` is the trusted agent registry, so a client can offer the roster
 // choices without a second request. The list name stays `harnesses` (and the
 // bootstrap list stays `presets`) for compatibility.
 export type HarnessIndex = {
@@ -1219,7 +1262,7 @@ export type SubmitTaskRequest = SubmitMessageRequest & {
     references?: AgentResultReference[];
     // R1-R6: the persistent thread this input belongs to.
     //
-    //   - ABSENT — a NEW standalone host thread is opened for the primary agent
+    //   - ABSENT — a NEW standalone host thread is opened for the ENTRY agent
     //     (owned by its default conversation), so unfocused input becomes its own
     //     conversation without touching any other. When the task references prior
     //     blocks, the new thread is CONNECTED to the referenced threads: the
@@ -1386,7 +1429,7 @@ export type ToolCallRequest = {
     // (one request shape for the UI); a `sessionBound` core tool then answers 400.
     //
     // 400 when a core call omits it; 404 when the session (or the tool inside that
-    // session, e.g. delegate without subagents) does not exist; 409 when the
+    // session, e.g. `delegate` on a roster that spans only one rank) does not exist; 409 when the
     // session is busy (a run, a reset, or another manual call), so a manual
     // mutation cannot race an active operation.
     sessionId?: string;

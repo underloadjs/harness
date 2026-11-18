@@ -11,6 +11,7 @@
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
+import type { AgentRank } from '../types';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { bumpFixtureEpoch, viewAwareFetch } from './view-test-support';
 import { sessionToolReads } from './session-config-test-support';
@@ -49,8 +50,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         requiresEndpoint: true,
         agents: ['instruct'],
         tools: [],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true,
         ...overrides
@@ -208,7 +209,7 @@ it('keeps a legacy editable:false preset fully editable and never says read-only
         name: 'demo',
         title: 'Demo',
         agents: ['instruct'],
-        primary: 'instruct',
+        entry: 'instruct',
         builtin: true,
         // Old-server metadata: R21.1 says ignore it.
         editable: false
@@ -220,13 +221,27 @@ it('keeps a legacy editable:false preset fully editable and never says read-only
         if (url === '/api/models') return json({ models: ['m1'] });
 
         if (url === '/api/harnesses/demo' && method === 'PATCH') {
-            const request = body as { primary: string; subagents: string[] };
+            // The route's own answer: the roster, the entry agent and the rank map it stored,
+            // with a member the request left unnamed placed one rank below the lowest letter the
+            // map states (../shared/harness-api.ts:808-816) — here the added `summarizer`, which
+            // lands on Rank B because Instruct is the only letter named.
+            const request = body as {
+                agents: string[];
+                entry: string;
+                ranks: Record<string, AgentRank>;
+            };
+            const stored: Record<string, AgentRank> = { ...request.ranks };
+
+            for (const agent of request.agents) {
+                if (stored[agent] === undefined) stored[agent] = 'B';
+            }
+
             patched = descriptor({
                 name: 'demo',
                 title: 'Demo',
-                agents: [request.primary, ...request.subagents],
-                primary: request.primary,
-                subagents: request.subagents,
+                agents: request.agents,
+                entry: request.entry,
+                ranks: stored,
                 builtin: true,
                 editable: false
             });
@@ -251,15 +266,15 @@ it('keeps a legacy editable:false preset fully editable and never says read-only
 
     // T3/R3: the team is genuinely editable — the instruction editor, the model select
     // and the team controls are all live (nothing here is a read-only "not editable"
-    // surface, and the entry still never says read-only). The only agent is the primary,
+    // surface, and the entry still never says read-only). The only agent is the entry point,
     // so it cannot leave its own team.
     openDeck();
     expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(false);
     expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
-    expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true); // the primary
+    expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true); // the entry agent
 
     // Adding a trusted agent: `[+]` lists only the agents without a badge, picking one
-    // drafts the membership, and saving from the primary adds without promoting.
+    // drafts the membership, and saving from the entry agent adds without moving the entry.
     byClass('.agent-dialog-add', 'button').click();
     byClass('.agent-dialog-add-option[data-agent="summarizer"]', 'button').click();
     byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').click();
@@ -268,9 +283,13 @@ it('keeps a legacy editable:false preset fully editable and never says read-only
     await flush();
     await flush();
 
+    // The save restates the roster, the entry agent, and the rank map. `summarizer` has no
+    // letter in that map — an added member never claims one — so the route places it one rank
+    // below the lowest stated letter (../shared/harness-api.ts:808-816).
     expect(calls.find((call) => call.method === 'PATCH')?.body).toEqual({
-        primary: 'instruct',
-        subagents: ['summarizer']
+        agents: ['instruct', 'summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A' }
     });
     expect(patched).toBeDefined();
     expect(document.querySelector('.harness-meta')?.textContent).toBe('template · 2 agents');
@@ -669,8 +688,8 @@ it('derives panels from a polled snapshot without replaying old activity', async
 });
 
 it('keeps a manual playground result out of every conversation board (R7)', async () => {
-    const alpha = descriptor({ name: 'alpha', title: 'Alpha', agents: ['instruct'], primary: 'instruct' });
-    const beta = descriptor({ name: 'beta', title: 'Beta', agents: ['instruct'], primary: 'instruct' });
+    const alpha = descriptor({ name: 'alpha', title: 'Alpha', agents: ['instruct'], entry: 'instruct' });
+    const beta = descriptor({ name: 'beta', title: 'Beta', agents: ['instruct'], entry: 'instruct' });
 
     const publish = {
         name: 'publish',

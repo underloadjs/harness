@@ -422,7 +422,10 @@ describe('harness server', () => {
         const created = await fetch(`${base}${HARNESS_ROUTES.harnesses()}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...CLIENT },
-            body: JSON.stringify({ name: 'temporary-server-card', primary: 'instruct' })
+            // R5/R7 — the roster is `agents`, and `entry` is optional (it defaults to the roster's
+            // first member). The retired `primary` is an unknown field, so this is the only shape
+            // a create card can take.
+            body: JSON.stringify({ name: 'temporary-server-card', agents: ['instruct'] })
         });
         expect(created.status).toBe(201);
 

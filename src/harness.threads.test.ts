@@ -1,5 +1,5 @@
 // Invocation identity (T3 UI threads): every event of a NON-ROOT run carries a
-// `thread` that lets a client group one subagent invocation into a row, indent it
+// `thread` that lets a client group one delegated invocation into a row, indent it
 // under its parent, and anchor it to the tool call that spawned it.
 //
 // Contract pinned here (frozen additive shape, see src/types/index.ts):
@@ -144,8 +144,8 @@ describe('invocation identity (T3 UI threads)', () => {
 
         const writer = harness({
             agents: { lead, helper },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false,
             report: {
                 progress: (event) => {
@@ -223,7 +223,10 @@ describe('invocation identity (T3 UI threads)', () => {
 
         const writer = harness({
             agents: { lead, helper },
-            primary: 'lead',
+            // `entry` is a ROUTING choice only. `ctx.run` is threading, not delegation, so it
+            // is not rank-restricted and this fixture needs no `ranks` map — which is itself
+            // part of what the test pins.
+            entry: 'lead',
             tools: { spawn },
             presets: false,
             report: {
@@ -282,8 +285,8 @@ describe('invocation identity (T3 UI threads)', () => {
 
         const writer = harness({
             agents: { lead, helper },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             tools: { hold },
             presets: false,
             report: {
@@ -365,8 +368,8 @@ describe('invocation identity (T3 UI threads)', () => {
 
         const writer = harness({
             agents: { lead, helper },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             tools: { hold },
             presets: false,
             report: {

@@ -17,9 +17,9 @@
 //     a tone never drifts when some other agent shows up;
 //   - THE EIGHT TONES COVER EVERY SESSION, AND THE CATALOGUE MAY EXCEED THEM: what a
 //     reader SEES is one view's roster (the active harness's members), never the whole
-//     catalogue. The largest live team — the Manager's — is its primary plus its
-//     `teamOf()` allowlist = 8 members, exactly the palette, and every other live team is
-//     7, so no live session ever has two members in one tone. The CATALOGUE
+//     catalogue. The largest live roster — the `planner` card's — is its entry agent plus
+//     the seven members its own `agents` roster declares = 8 members, exactly the palette,
+//     and every other live card is 7, so no live session ever has two members in one tone. The CATALOGUE
 //     (src/agents/index.ts `AGENT_PROFILE_NAMES`) is now ALSO exactly eight ids: the
 //     `demo`/`flaky` fixture profiles were deleted, so the roster and the palette are the
 //     same size and the catalogue fills the palette with no repeat at all. The repeat rule
@@ -54,7 +54,7 @@
 
 import type { AgentColor } from './agent-color';
 import { AGENT_PROFILE_NAMES } from '../../agents';
-import { presets, teamOf } from '../../server/harnesses/presets';
+import { presets } from '../../server/harnesses/presets';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
     AGENT_PALETTE,
@@ -121,53 +121,56 @@ const CUSTOM_HEX = '#ff6600';
 const CUSTOM_TONE: AgentColor = { slot: -1, color: CUSTOM_HEX, line: 'rgba(255, 102, 0, 0.6)' };
 
 // The seven distinct LIVE rosters the shipped cards paint (`presets` in
-// src/server/harnesses/presets.ts) and the exact set each one paints: primary first, then its `teamOf()` allowlist, and the exact slot
-// each member lands on when THAT roster is configured on an empty page. The member sets
+// src/server/harnesses/presets.ts) and the exact set each one paints: the entry agent first, then
+// the rest of the card's own `agents` roster in declaration order, and the exact slot each member
+// lands on when THAT roster is configured on an empty page. The member sets
 // and slots are measured off the module, not derived in the assertion; the live test
-// re-derives the members from production `teamOf` and requires this literal.
+// re-derives the members from the shipped card's own `agents` roster and requires this literal.
 //
-// `planner` (the Manager) is the largest team there is: `teamOf()` drops the primary and
-// the Manager from every OTHER team, so its own allowlist keeps all six remaining
-// specialists plus the summarizer = 7 subagents + the primary = 8 members, EXACTLY the
-// palette. Every other live team is 7. That is the real "the roster fits the palette"
-// guarantee — the largest live team fits (the Manager's fills it), and the catalogue may
-// exceed it and repeats stably. `general`'s shipped preset passes `subagents: []`, so what
+// `planner` is the largest card there is: its roster keeps every other specialist and the
+// summarizer, so its declaration lists all six remaining
+// specialists plus the summarizer = 7 members + the entry agent = 8, EXACTLY the
+// palette. Every other live card is 7. That is the real "the roster fits the palette"
+// guarantee — the largest live roster fits (the planner's fills it), and the catalogue may
+// exceed it and repeats stably. `general`'s shipped preset declares ONE member, so what
 // that card really paints is one member; the 7-member set below is its upper bound.
-const LIVE_TEAMS: { primary: string; members: readonly string[]; slots: readonly number[] }[] = [
+const LIVE_TEAMS: { entry: string; members: readonly string[]; slots: readonly number[] }[] = [
     {
-        primary: 'general',
-        members: ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
-        slots: [3, 4, 5, 6, 2, 7, 0]
+        // The `general` card declares ONE member, so that is the roster the module is configured
+        // with for it — one tone, no sharing question.
+        entry: 'general',
+        members: ['general'],
+        slots: [3]
     },
     {
-        primary: 'instruct',
+        entry: 'instruct',
         members: ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
         slots: [3, 4, 5, 6, 2, 7, 0]
     },
     {
-        primary: 'research',
+        entry: 'research',
         members: ['research', 'general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer'],
         slots: [4, 3, 5, 6, 2, 7, 0]
     },
     {
-        primary: 'workspace',
+        entry: 'workspace',
         members: ['workspace', 'general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer'],
         slots: [6, 3, 4, 5, 2, 7, 0]
     },
     {
-        primary: 'reviewer',
+        entry: 'reviewer',
         members: ['reviewer', 'general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer'],
         slots: [2, 3, 4, 5, 6, 7, 0]
     },
     {
         // The Manager: eight members, so the palette is exactly used up — no spare slot,
         // and still no shared tone.
-        primary: 'planner',
+        entry: 'planner',
         members: ['planner', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
         slots: [3, 4, 5, 6, 7, 2, 0, 1]
     },
     {
-        primary: 'debugger',
+        entry: 'debugger',
         members: ['debugger', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer'],
         slots: [6, 3, 4, 5, 7, 2, 0]
     }
@@ -598,9 +601,9 @@ describe('palette shape (the largest live team fits; the catalogue may exceed it
         // The eight live cards (`presets`), in catalogue order — the fixtures are absent
         // here, which is exactly why the catalogue is not the constraint. The eighth primary
         // repeats `general`: the tool-less `chat` card (issue 0005-D) reuses the trusted
-        // General profile instead of adding a role, so it contributes NO new roster and the
+        // General profile instead of adding a member, so it contributes NO new roster and the
         // `LIVE_TEAMS` list below stays the seven distinct rosters the palette has to fit.
-        expect(presets.map((preset) => preset.primary)).toEqual([
+        expect(presets.map((preset) => preset.entry)).toEqual([
             'general',
             'instruct',
             'research',
@@ -611,19 +614,22 @@ describe('palette shape (the largest live team fits; the catalogue may exceed it
             'general'
         ]);
 
-        // Member counts, per card: the Manager's team is the largest there is and lands
-        // exactly on the palette size, every other live team is smaller. A new specialist
-        // role (or a summarizer that joins twice) pushes this vector past 8 and fails.
-        expect(LIVE_TEAMS.map((team) => team.members.length)).toEqual([7, 7, 7, 7, 7, 8, 7]);
+        // Member counts, per card: the planner roster is the largest there is and lands
+        // exactly on the palette size, every other live card is smaller. A new specialist
+        // (or a summarizer that joins twice) pushes this vector past 8 and fails. The `general`
+        // and `chat` cards declare a single member each, which is why the vector starts at 1.
+        expect(LIVE_TEAMS.map((team) => team.members.length)).toEqual([1, 7, 7, 7, 7, 8, 7]);
         expect(Math.max(...LIVE_TEAMS.map((team) => team.members.length))).toBe(8);
 
         for (const team of LIVE_TEAMS) {
             resetAgentColors();
 
-            // The members the module is configured with: the primary plus the production
-            // allowlist (`teamOf`), so a changed rule shows up here instead of in a stale
-            // copy of the list.
-            expect([team.primary, ...teamOf(team.primary)]).toEqual(team.members);
+            // The members the module is configured with: the roster the shipped card declares
+            // itself (`agents`, entry agent first). `teamOf()` is gone with the role axis — the
+            // rank map (`ranks`) states who may delegate — so a changed roster shows up here
+            // instead of in a stale copy of the list.
+            const card = presets.find((preset) => preset.entry === team.entry);
+            expect(card?.agents).toEqual(team.members);
 
             configureAgentColors({ roster: team.members });
 

@@ -3,7 +3,7 @@
 // The user's two previous designs are GONE on purpose:
 //   1. the entry-agent transcript button on the left flank (R9 removes it with its
 //      plumbing), and
-//   2. the "cycle the primary + chevron disclosure" pair on the right flank (R11
+//   2. the "cycle the entry agent + chevron disclosure" pair on the right flank (R11
 //      replaces both with ONE button).
 //
 // It is still ONE button — no chevron, no second control, no disclosure popover — but
@@ -21,12 +21,12 @@
 // The cycle is a PENDING choice the shell holds per conversation (main.ts
 // `Instance.agentSelection`): this component never touches the team, never sends a
 // request, and never claims a promotion. What the button PAINTS is the agent the shell
-// resolved for the next send (`primary` below), so the chip and the routing label can
+// resolved for the next send (`agent` below), so the chip and the routing label can
 // only ever state one answer.
 //
 // CONTRACT
 // --------
-//   createAgentControl({ primary, agents, activity, hint, device, cycleBlocked?,
+//   createAgentControl({ agent, agents, activity, hint, device, cycleBlocked?,
 //                        onCycle, onActivate })
 //       -> { element, focus() }
 //
@@ -99,9 +99,10 @@ export type AgentCycleDirection = 1 | -1;
 
 export type AgentControlOptions = {
     // The agent this chip PAINTS: the shell's pending selection when there is one, and
-    // the team's entry agent otherwise. It is not the team's primary, and nothing here
-    // promotes it.
-    primary: string;
+    // the team's entry agent otherwise. It holds no rank claim, and nothing here
+    // promotes it: the name is `agent`, never `primary` or `entry`, because the chip may
+    // paint ANY member and calling it the entry agent would read as an authority claim.
+    agent: string;
     // Trusted preset library; supplies the display title and the compact code.
     agents: readonly AgentDescriptor[];
     // Agents that should show the activity ring right now (the instance's live set).
@@ -169,11 +170,11 @@ export const createAgentControl = (options: AgentControlOptions): AgentControl =
     //
     // The id stored here is the CANONICAL one (trimmed). The previous raw write only
     // ever mattered for a padded id, and a padded `data-agent` could not match the
-    // server's activity names anyway; a blank/`unknown` primary now carries no identity
+    // server's activity names anyway; a blank/`unknown` agent now carries no identity
     // attribute at all, exactly like the transcript's unattributable tiles.
-    paintAgentColor(wrapper, options.primary);
+    paintAgentColor(wrapper, options.agent);
 
-    const title = titleOf(options.agents, options.primary);
+    const title = titleOf(options.agents, options.agent);
 
     const button = el('button', 'agent-control-button');
     button.type = 'button';
@@ -238,7 +239,7 @@ export const createAgentControl = (options: AgentControlOptions): AgentControl =
 
     // Snapshot-time activity: main.ts also repaints this wrapper from the live
     // instance set on every frame (ui/activity.ts `paintActivity`).
-    if (options.activity?.includes(options.primary) === true) {
+    if (options.activity?.includes(options.agent) === true) {
         wrapper.dataset.activity = 'active';
         wrapper.setAttribute('aria-busy', 'true');
     }

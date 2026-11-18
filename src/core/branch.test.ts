@@ -880,7 +880,8 @@ describe('branch bounds', () => {
             branchId,
             kind: 'fork',
             agent: 'a',
-            role: 'primary',
+            // A fork inherits its source's rank; the summary has no `role` anymore.
+            rank: 'A',
             forkDepth: 1,
             model: 'm',
             tools: [],

@@ -103,8 +103,10 @@ const delegatingPreset = (): HarnessPreset => {
                     }
                 })
             },
-            primary: 'lead',
-            subagents: ['helper'],
+            // R1 — `entry` (routing) + `ranks` (authority) replace `primary`/`subagents`; `helper`
+            // is Rank B, so it is `lead`'s only legal `delegate` target.
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false,
             report: { progress }
         });
@@ -114,8 +116,9 @@ const delegatingPreset = (): HarnessPreset => {
         title: 'lead',
         description: 'lead + helper',
         requiresEndpoint: false,
-        primary: 'lead',
-        subagents: ['helper'],
+        // R15 — the rank map IS the team: entry `lead` at Rank A, `helper` strictly below it.
+        entry: 'lead',
+        ranks: { lead: 'A', helper: 'B' },
         agents: ['lead', 'helper'],
         tools: [],
         builtin: true,

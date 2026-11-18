@@ -70,7 +70,12 @@ import { readSnapshotInteger, readSnapshotString } from '../../core/snapshot-val
 // barrel does not re-export these, and importing the union from core is what keeps a lane payload
 // from inventing a reason that the reader then refuses on reload.
 import { HARNESS_RUN_STOP_REASONS, isHarnessRunStopReason } from '../../core/snapshot';
-import type { HarnessAgentResultSnapshot, HarnessMessage, HarnessRunStopReason } from '../../types';
+import type {
+    AgentRank,
+    HarnessAgentResultSnapshot,
+    HarnessMessage,
+    HarnessRunStopReason
+} from '../../types';
 import type { IdentityLedger } from './lane-identity';
 import { idOf } from './lane-identity';
 import { ABSENT_DIGEST, applyMemoryWrite, digestMemoryValue } from './lane-memory';
@@ -146,11 +151,28 @@ export type CanonicalTool = { name: string; source: string; revision: string; re
 // they are the answer's content, and the authority stores them verbatim — src/harness.ts drops them
 // on `completed` and the fold in this file drops them the same way, so both sides project the same
 // keys and the digests stay equal.
+//
+// RANK REWRITE (2026-11-18): the authority axis is a RANK (`AgentRank`, 'A'–'Z') rather than the
+// retired `role: 'primary' | 'subagent'` pair, and this projection is the ONE place that axis
+// enters the digest — every caller hands in a whole record, so renaming the key here moves both
+// sides of the seam at once (the writer's `deriveOperations` input and the canonical slot the
+// receipt is computed from are both built by the same record shape). Determinism is otherwise
+// untouched: the field ORDER, the absent-vs-present rules, and the excluded keys
+// (`completedOrder`, `threadId`, the stop reason) are exactly what they were, so two peers that
+// agree on the vocabulary still digest byte-identically.
+//
+// A CLEAN BREAK, stated rather than shimmed: a pre-rank archive row carries `role` and digests to
+// the old value, while this build digests `rank`. A lane replaying an older document therefore
+// sees its `lane.archived` digest disagree with `archiveDigestOf(record)` and RE-ARCHIVES that row
+// once, and a writer from an older build against this authority gets a digest MISMATCH that sends
+// it to re-read canonical (the existing recovery path). Both are by design: the vocabulary change
+// is a protocol change, and re-archiving a terminal row is idempotent — the alternative, keeping a
+// `role` alias in the digest, would pin the retired axis into the durable identity of every row.
 export const archiveDigestOf = (record: {
     invocationId: string;
     sequence: number;
     agent: string;
-    role: string;
+    rank: AgentRank;
     kind: string;
     status: string;
     content?: string;
@@ -162,7 +184,9 @@ export const archiveDigestOf = (record: {
         invocationId: record.invocationId,
         sequence: record.sequence,
         agent: record.agent,
-        role: record.role,
+        // The authority axis, digested under its RANK name (see the note above — this is the
+        // single place the rank vocabulary enters the digest).
+        rank: record.rank,
         kind: record.kind,
         status: record.status,
         content: record.content ?? '',
@@ -398,7 +422,9 @@ export type SharedMutation =
           sequence: number;
           completedOrder: number;
           agent: string;
-          role: 'primary' | 'subagent';
+          // The agent's RANK ('A'–'Z'), replacing the retired `role` pair. It rides the op
+          // because it is part of the archived row's content, and `archiveDigestOf` digests it.
+          rank: AgentRank;
           // The run's origin (root / delegation / fork / autoanswer). Named `runKind`
           // because `kind` is this union's own discriminator.
           runKind: HarnessAgentResultSnapshot['kind'];
@@ -439,7 +465,7 @@ export type SharedMutation =
           // `interrupted` (a lost worker) vs `refusal`/`error`. The forensic pair above says WHAT the
           // run said and WHERE it stopped; this says WHO ended it, which is the one thing a client
           // cannot derive from `status: 'stopped'` — the bare status also covers an approval hold and
-          // a parked subagent (../core/agent-limits.ts `AgentOutcomeStopReason`).
+          // a parked delegated run (../core/agent-limits.ts `AgentOutcomeStopReason`).
           //
           // Optional and validated (see `readArchiveStopReason`), so an older send stays valid. It is
           // deliberately NOT in `archiveDigestOf`'s field list, and that is a load-bearing difference
@@ -1134,7 +1160,7 @@ export const applySharedMutation = (
                     sequence: mutation.sequence,
                     completedOrder: mutation.completedOrder,
                     agent: mutation.agent,
-                    role: mutation.role,
+                    rank: mutation.rank,
                     kind: mutation.runKind,
                     status: mutation.status,
                     content: mutation.content,
@@ -1185,7 +1211,7 @@ export const applySharedMutation = (
                 sequence: mutation.sequence,
                 completedOrder: mutation.completedOrder,
                 agent: mutation.agent,
-                role: mutation.role,
+                rank: mutation.rank,
                 kind: mutation.runKind,
                 status: mutation.status,
                 content: mutation.content,

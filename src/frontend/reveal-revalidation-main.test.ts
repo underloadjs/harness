@@ -43,8 +43,8 @@ const descriptor = (): HarnessDescriptor =>
         agents: ['instruct'],
         tools: [],
         coreTools: [],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true
     }) as HarnessDescriptor;

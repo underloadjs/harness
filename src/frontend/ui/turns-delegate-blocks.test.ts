@@ -85,7 +85,7 @@ const answer = (id: string, text: string): DisplayNode =>
 
 const section = (overrides: Partial<TurnSection> & { id: string }): TurnSection =>
     ({
-        role: 'subagent',
+        rank: 'B',
         agent: 'helper',
         agentLabel: 'RH1',
         state: 'done',
@@ -97,7 +97,7 @@ const section = (overrides: Partial<TurnSection> & { id: string }): TurnSection 
 
 const ROOT = section({
     id: 't1:0',
-    role: 'primary',
+    rank: 'A',
     agent: 'instruct',
     agentLabel: 'IT1',
     threadId: 'th-it1',
@@ -159,7 +159,7 @@ const summary = (id: string, overrides: Partial<TurnSummary> = {}): TurnSummary 
 
 const IT2 = section({
     id: 't2:0',
-    role: 'primary',
+    rank: 'A',
     agent: 'instruct',
     agentLabel: 'IT2',
     threadId: 'th-it2',
@@ -397,6 +397,66 @@ describe('a delegated conversation is an independent card (R18)', () => {
             'RR2',
             'RR3'
         ]);
+    });
+
+    it('gives a conversation that ran twice in one turn ONE card (R1)', () => {
+        // A `threadSend` reply-run is recorded into its CALLER's turn (../harness.ts:6794-6798),
+        // so ONE turn can hold two root-shaped sections for ONE persistent conversation: the
+        // same `TurnSection.threadId` (../server/turn-projector.ts:1402) and the same server
+        // label, two invocations. The reported defect was exactly this listing the code twice
+        // under one parent. Nothing server-side changed: the card builder keys a card by the
+        // CONVERSATION, so the later run is that card's ordered exchange and withdraws its
+        // repeated code instead of adding a second name. The DEVICE is the row's role marker
+        // plus the shipped stylesheet's `visibility: hidden` (styles.css:3469-3472), NOT the
+        // `hidden` attribute: `display: none` would drop the code's flex slot and knock
+        // `.thread-preview` out of column with the rows around it. ./turns-thread-repeat-labels
+        // .test.ts pins that stylesheet, so the marker assertions below cannot pass on a rule
+        // that stopped hiding anything.
+        const firstRun = { ...RR1, threadId: 'th-rr1' };
+        const replyRun = section({
+            id: 't1:4',
+            agent: 'research',
+            agentLabel: 'RR1',
+            threadId: 'th-rr1',
+            invocationId: 'inv-rr1-b',
+            // No `parentSectionId`: the reply-run was spawned without a parent, which is what
+            // made it a second top-level row.
+            context: [prose('t1:4', '4-user-prompt', 24), block('t1:4', '4-tool-6')],
+            nodes: [answer('4', 'the reply run answer')]
+        });
+
+        const { board } = mount();
+        for (const handle of board.reconcileView(viewOf([summary('t1')], { t1: [ROOT, firstRun, replyRun] })))
+            handle.flush();
+
+        // One name under one parent: the tile lists `RR1` once, and the reply run sits directly
+        // after that card, one level deeper, naming the card it continues (R18's rule).
+        const rows = threadRows();
+        expect(rows.map((row) => row.dataset.threadId)).toEqual(['t1:1', 't1:4']);
+        expect(rows.map((row) => row.querySelector('.thread-name')?.textContent)).toEqual(['RR1', 'RR1']);
+        // Neither row withdraws its code with `hidden` (that would be `display: none`, and the
+        // column would break); the exchange row's code is withdrawn by the stylesheet through
+        // its `data-thread-exchange` role marker, which is why only ONE `RR1` is readable.
+        expect(rows[0].querySelector<HTMLElement>('.thread-name')?.hidden).toBe(false);
+        expect(rows[1].querySelector<HTMLElement>('.thread-name')?.hidden).toBe(false);
+        expect(rows[1].matches('[data-thread-exchange]')).toBe(true);
+        expect(rows[1].hasAttribute('data-thread-repeat')).toBe(false);
+        expect(rows[1].classList.contains('is-exchange')).toBe(true);
+        expect(rows[1].dataset.threadExchange).toBe('th-rr1');
+        expect(rows[1].dataset.parentThread).toBe('t1:1');
+        expect(rows[1].dataset.depth).toBe('2');
+        // Both rows carry the SAME persistent id, so the join and the `#RR1` reference still
+        // resolve for either run (R2).
+        expect(threadRows().map((row) => row.dataset.persistentThread)).toEqual(['th-rr1', 'th-rr1']);
+
+        // No loss of per-run detail (R3): three sections, three strips, and each row still prints
+        // its OWN run's bytes.
+        expect(document.querySelectorAll('.context-bar')).toHaveLength(3);
+        expect(hostOf(rows[1])?.dataset.sectionId).toBe('t1:4');
+        expect(segmentsOf(hostOf(rows[1]) as Element)).toEqual(['4-user-prompt', '4-tool-6']);
+        expect(segmentsOf(hostOf(rows[0]) as Element)).toEqual(['1-user-prompt', '1-tool-4']);
+        expect(rows[1].querySelector('.agent-text')?.textContent?.trim()).toBe('the reply run answer');
+        expect(rows[0].querySelector('.agent-text')?.textContent?.trim()).toBe('first delegate answer');
     });
 });
 

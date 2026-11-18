@@ -13,8 +13,14 @@
 // Two kinds of thread exist at runtime (../harness.ts owns the records):
 //   - 'agent' — the agent's default conversation, whose transcript IS the
 //     registry Agent's `messages`. Delegation and ctx.run keep writing there, so
-//     historical behaviour (a subagent accumulates its conversation across
+//     historical behaviour (a delegated agent accumulates its conversation across
 //     delegations) is preserved, and `sendThreadInput` resumes it.
+//
+// THREADS ARE NEVER RANK-GATED. Threading is the SAME agent running more than one
+// conversation in parallel, not a delegation to another agent, so nothing in this
+// module (or in ../harness.ts' thread doors) consults an agent's rank: a Rank C agent
+// opens threads exactly as a Rank A one does. Rank only PROPAGATES — a thread's, a
+// branch's, a fork's or a restored conversation's agent carries its source's rank.
 //   - 'host'  — an ADDITIONAL, independent conversation created by
 //     `harness.createThread`. It is backed by a fresh Agent instance built from
 //     the same configuration (instructions + seed messages + transport + current

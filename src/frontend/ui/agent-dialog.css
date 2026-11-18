@@ -273,10 +273,13 @@
     line-height: 1.4;
 }
 
-/* Membership: the two explicit team controls, inside the viewed agent's panel.
-   Selecting a badge never changes the team, so `Make primary` and
-   `Remove from team` are the only things that can, and they read as facts rather
-   than as a checkbox whose effect the reader has to remember. */
+/* Membership: the explicit team controls, inside the viewed agent's panel. Selecting a
+   badge never changes the team, so `Set as entry`, the rank stepper and `Remove from
+   team` are the only things that can, and they read as facts rather than as a checkbox
+   whose effect the reader has to remember. R20 split the old single `Make primary` press
+   into two INDEPENDENT controls, because the two facts it used to fuse are separate on
+   the wire: naming the entry agent changes routing and no authority, and a rank changes
+   authority and no routing. */
 .agent-dialog-membership {
     display: flex;
     flex-wrap: wrap;
@@ -300,6 +303,49 @@
     color: var(--accent);
 }
 
+/* The rank row (R20): the readout plus the two steppers on one line. `−` raises one
+   step of authority and `+` lowers one, and each one is a real button with its own
+   accessible name — deliberately not one cycling control, because the reader must be
+   able to state which way a rank moves before pressing it. The row carries `data-rank`
+   for an inspector, absent when no letter is stated. */
+.agent-dialog-rank {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+/* The readout takes the row's remaining width so the two steppers stay together at the
+   end of the line instead of floating next to a short label. */
+.agent-dialog-rank-label {
+    flex: 1 1 auto;
+}
+
+.agent-dialog-rank-raise,
+.agent-dialog-rank-lower {
+    flex: none;
+    width: 26px;
+    padding: 4px 0;
+    text-align: center;
+    font-size: 12px;
+    line-height: 1;
+}
+
+/* The honest footnote (why a stepper is disabled, what an unsaved letter does). It
+   inherits the muted `.agent-dialog-field-note` tone on purpose and gets no colour of its
+   own here: it is an explanation, not a state — the state colours (`--accent` pending,
+   `--danger` refused) belong to the row's controls and the footer line. */
+.agent-dialog-rank-note {
+    flex: 1 1 100%;
+}
+
+/* The entry caption on a roster badge (routing, not authority). Same green as the deck's
+   entry tile (`styles.css` `.agent-tile[data-entry='true']`) so a reader who learned the
+   colour in one surface reads the same fact in the other. */
+.agent-dialog-agent-entry {
+    color: var(--ok);
+}
+
 /* A locked team keeps its controls visible and disabled with the reason in `title`,
    so the lock is stated where it bites instead of in a paragraph nobody reads. */
 .agent-dialog-action:disabled {
@@ -307,8 +353,9 @@
     opacity: 0.55;
 }
 
-/* The armed toggle (`Make primary` pressed). The accent says a pending decision is
-   on the row, so the reader never has to remember whether they clicked it. */
+/* The armed toggle (`Set as entry` pressed, and the rank stepper's pending letter).
+   The accent says a pending decision is on the row, so the reader never has to remember
+   whether they clicked it. */
 .agent-dialog-action[aria-pressed='true'] {
     border-color: var(--accent);
     color: var(--accent);
@@ -334,7 +381,13 @@
     color: var(--agent-color);
 }
 
-.agent-dialog-agent-role,
+/* The badge's rank and entry captions (R20). They replace the old `role` caption: a
+   rank letter is a FACT about the agent's authority (and several members can carry the
+   same one), while the `entry` caption names the routing member — the one distinction
+   the old single caption could not make. Both stay mono-caps like the other caption, and
+   `entry` takes the same green the deck's entry tile uses, so one colour means one thing
+   across the surfaces. */
+.agent-dialog-agent-rank,
 .agent-dialog-agent-state {
     color: var(--muted);
     font-family: var(--mono);

@@ -179,6 +179,7 @@ const TOOL_NAMES = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'delegate',
@@ -507,18 +508,22 @@ describeService('service endpoint discovery and canonical API', () => {
 
         // The definition the session FROZE at creation is its own read, and the generated envelope is
         // `{ definition }` (a card-shaped `SessionDefinitionResource`). This preserves the old "the
-        // session is seeded from the demo profile" behavior assertion: the member set, the primary, and
+        // session is seeded from the demo profile" behavior assertion: the member set, the entry agent,
         // the captured definition name are what this session runs on, and a later global edit cannot
         // move them.
         const definition = await json<SessionDefinitionResponse>(
             await fetch(`${base}${HARNESS_ROUTES.sessionsBySessionIdDefinition(session.id)}`)
         );
 
-        expect({ name: definition.definition.name, primary: definition.definition.primary }).toEqual({
+        // R6/R18 — the frozen card names its ENTRY agent (routing) and its rank map; there is no
+        // `primary` field on a descriptor any more. The scripted `demo` CARD runs a real profile
+        // agent, so the value is read back rather than hard-coded: what is pinned is that the
+        // session froze a card whose entry is one of its own members.
+        expect({ name: definition.definition.name, entry: definition.definition.entry }).toEqual({
             name: 'demo',
-            primary: definition.definition.primary
+            entry: definition.definition.entry
         });
-        expect(definition.definition.agents).toContain(definition.definition.primary);
+        expect(definition.definition.agents).toContain(definition.definition.entry);
 
         const listed = await json<SessionSummaryPage>(await fetch(`${base}${HARNESS_ROUTES.sessions()}`));
         expect(listed.items.map((entry: SessionSummary) => entry.id)).toEqual([session.id]);

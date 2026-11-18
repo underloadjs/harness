@@ -30,18 +30,21 @@ describe('CLI preset selection', () => {
         expect({
             name: preset!.name,
             title: preset!.title,
-            primary: preset!.primary,
+            entry: preset!.entry,
             requiresEndpoint: preset!.requiresEndpoint,
-            subagents: preset!.subagents
+            ranks: preset!.ranks
         }).toEqual({
             name: 'general',
             title: 'General',
-            primary: 'general',
+            // R6 — `entry` is ROUTING and `ranks` is AUTHORITY; the retired `primary`/`subagents`
+            // pair is not aliased, so this is the only shape a card has.
+            entry: 'general',
             requiresEndpoint: true,
-            // Load-bearing, not an omission: the default card has no team, so the
-            // runtime never registers `delegate` for it (src/harness.ts
-            // `activation: 'subagents'`). A non-empty team here is a product change.
-            subagents: []
+            // Load-bearing, not an omission: the default card holds ONE member at ONE rank, so the
+            // kernel never registers `delegate` for it — `activation: 'delegation'`
+            // (src/harness.ts:3752) fires only when the map spans two or more distinct letters. A
+            // second rank here is a product change.
+            ranks: { general: 'A' }
         });
     });
 

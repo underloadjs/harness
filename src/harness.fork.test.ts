@@ -7,7 +7,7 @@
 //   - a branch is a SEPARATE actor: two same-name forks run concurrently without
 //     queuing behind the source or each other;
 //   - normal forks nest up to forkDepth (2) independent of MAX_RUN_DEPTH, and the
-//     branch inherits its source's primary/subagent role;
+//     branch inherits its source's rank;
 //   - every branch event carries kind + branchId on its thread, including nested
 //     parentId links;
 //   - a blank/non-substantive branch answer and a depth/concurrency refusal are
@@ -329,8 +329,7 @@ describe('threadFork runtime', () => {
                 writer: entry,
                 helper: brain(scripted([answer('unused')]))
             },
-            primary: 'writer',
-            subagents: ['helper'],
+            entry: 'writer',
             presets: false,
             report: { progress: (event) => void events.push(event) }
         });
@@ -344,8 +343,9 @@ describe('threadFork runtime', () => {
         expect(records[1].sourceBranchId).toBe(records[0].branchId);
         expect(records.map((record) => record.status)).toEqual(['completed', 'completed']);
 
-        // Role inheritance: a fork of the primary still sees delegate.
-        expect(records[0].role).toBe('primary');
+        // RANK inheritance: a fork of a Rank A agent still holds Rank A, so it still sees
+        // delegate (the entry position grants nothing; the rank does).
+        expect(records[0].rank).toBe('A');
         expect(records[0].tools).toContain('delegate');
         // R9-R11: threadFork is searchable, so it is no longer part of the declared
         // list. The branch still gets the runtime control itself.
@@ -771,7 +771,7 @@ describe('threadFork runtime', () => {
         expect(JSON.stringify(branchRequest!.messages)).not.toContain('included');
     });
 
-    it('gives a subagent fork the subagent role, without delegate or toolCreate', async () => {
+    it('gives a lower-ranked fork its rank, without delegate or toolCreate', async () => {
         const seen: HarnessStreamRequest[] = [];
 
         const helper = brain(
@@ -801,17 +801,16 @@ describe('threadFork runtime', () => {
 
         const writer = harness({
             agents: { lead, helper },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
             presets: false,
-            toolCreation: 'primary'
+            toolCreation: 'A'
         });
 
         await writer('go');
         await flush();
 
         const record = writer.branches()[0];
-        expect(record.role).toBe('subagent');
+        expect(record.rank).toBe('B');
         expect(record.tools).not.toContain('delegate');
         expect(record.tools).not.toContain('toolCreate');
         expect(record.status).toBe('completed');
@@ -820,7 +819,7 @@ describe('threadFork runtime', () => {
         const names = toolNames(branchRequest);
         expect(names).not.toContain('delegate');
         expect(names).not.toContain('toolCreate');
-        // R9-R11: threadFork is searchable for every role, so a subagent fork's
+        // R9-R11: threadFork is searchable for every rank, so a Rank B fork's
         // declarations are exactly the bootstrap pair.
         expect(names).toEqual(['toolRequest', 'tasks']);
     });

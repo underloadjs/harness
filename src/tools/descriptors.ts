@@ -14,7 +14,7 @@
 //
 //   BUILTIN_TOOL_DESCRIPTORS — one descriptor per discovered entry:
 //     { name, metadata, sourcePath, label, origin, group, activation, order,
-//       pendingOnly?, control?, primaryOnly?, answerExtraction?, sessionBound?,
+//       pendingOnly?, control?, answerExtraction?, sessionBound?,
 //       listed?, alwaysDeclared? }
 //   loadDiscoveredTool(label) — generated dynamic import per entry. The imports
 //     live in generated code, never in a hand-written switch, and none of them is
@@ -135,7 +135,7 @@ export type ToolDescriptor = BuiltinToolDescriptor;
 
 // Activation values a preset/capability row can carry. `always` and `creation` are
 // the two that make a runtime entry part of the always-declared core set; the rest
-// are capability-by-configuration (subagents, interaction, forks, threads, web).
+// are capability-by-configuration (delegation, interaction, forks, threads, web).
 const CORE_DECLARED_ACTIVATIONS: ReadonlySet<ToolActivation> = new Set<ToolActivation>([
     'always',
     'creation'
@@ -172,7 +172,6 @@ const cloneDescriptor = (descriptor: ToolDescriptor): ToolDescriptor => ({
     order: descriptor.order,
     ...(descriptor.pendingOnly === undefined ? {} : { pendingOnly: descriptor.pendingOnly }),
     ...(descriptor.control === undefined ? {} : { control: descriptor.control }),
-    ...(descriptor.primaryOnly === undefined ? {} : { primaryOnly: descriptor.primaryOnly }),
     ...(descriptor.answerExtraction === undefined
         ? {}
         : { answerExtraction: descriptor.answerExtraction }),
@@ -297,7 +296,7 @@ export const PRESET_DESCRIPTORS: readonly ToolDescriptor[] = SNAPSHOT_DESCRIPTOR
 // ORDER: baseline rows (always/creation) keep descriptor order, because that is the
 // kernel's registration order and a catalogue must not disagree with the runtime.
 // Capability rows are ordered by the ACTIVATION VOCABULARY — the union declared in
-// core/tool-metadata.ts: always, creation, subagents, interaction, forks, threads,
+// core/tool-metadata.ts: always, creation, delegation, interaction, forks, threads,
 // websearch, webfetch. That reproduces the historical catalogue sequence
 // (delegate → actionRequest → threadFork) from DATA instead of a name list, so
 // adding a capability row needs no edit here and no test rewrite: the position
@@ -305,7 +304,7 @@ export const PRESET_DESCRIPTORS: readonly ToolDescriptor[] = SNAPSHOT_DESCRIPTOR
 const ACTIVATION_ORDER: readonly ToolActivation[] = [
     'always',
     'creation',
-    'subagents',
+    'delegation',
     'interaction',
     'forks',
     'threads',
@@ -390,7 +389,7 @@ export const isAlwaysDeclared = (descriptor: ToolDescriptor): boolean =>
 // searchable now, so a projection built from activation alone advertised a
 // declaration the harness never makes. Visibility is part of the predicate
 // here, which keeps this projection and harness.ts' visibleCoreTools() in
-// agreement. Capability rows (subagents/interaction/forks/threads/web) are
+// agreement. Capability rows (delegation/interaction/forks/threads/web) are
 // still excluded by activation, which is what keeps a single-agent preset
 // from advertising a delegation tool it would never declare.
 export const isCoreRegistered = (descriptor: ToolDescriptor): boolean =>

@@ -98,8 +98,11 @@ const preset = (): HarnessPreset => ({
     title: 'Tooling',
     description: 'Scripted session-tool mutation fixture',
     requiresEndpoint: false,
-    primary: 'tooler',
-    subagents: [],
+// A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: 'tooler',
+    ranks: { tooler: 'A' },
     agents: ['tooler'],
     tools: [],
     builtin: false,
@@ -116,7 +119,7 @@ const preset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'tooler',
+            entry: 'tooler',
             presets: false,
             // The persistence observer MUST be forwarded: it is what refreshes the store's
             // committed `core` snapshot at every harness mutation boundary, and `createdTools`
@@ -160,10 +163,11 @@ const toolboxPreset = (): HarnessPreset => ({
     title: 'Toolbox',
     description: 'Shared-toolbox fixture: the real production rows, scripted model.',
     requiresEndpoint: false,
-    primary: 'boss',
-    // A non-empty allowlist is what makes `delegate` REGISTER (as a core declaration), which is
-    // the exact row the report said errored on click.
-    subagents: ['helper'],
+    entry: 'boss',
+    // R6/R18 — TWO DISTINCT RANKS are what make `delegate` register (as a core declaration): the
+    // entry holds Rank A and `helper` sits strictly below it, so a legal target exists. The
+    // retired allowlist is gone, and this is the exact row the report said errored on click.
+    ranks: { boss: 'A', helper: 'B' },
     agents: ['boss', 'helper'],
     tools: SHARED_TOOL_NAMES,
     // The same line every shipped card carries: `createToolboxHarness` opts into both
@@ -178,8 +182,11 @@ const toolboxPreset = (): HarnessPreset => ({
         createToolboxHarness(
             {
                 agents: { boss: scriptedBrain('boss', settings), helper: scriptedBrain('helper', settings) },
-                primary: 'boss',
-                subagents: ['helper']
+                // R1/R6 — the config carries the rank PAIR, and the map is what derives the per-caller
+                // `delegate` enum: `helper` is a target for `boss`, and `helper` itself has none (a
+                // same-rank peer is not a target). Nothing here is an allowlist.
+                entry: 'boss',
+                ranks: { boss: 'A', helper: 'B' }
             },
             settings,
             progress,
@@ -811,10 +818,10 @@ describe('PATCH with metadata only', () => {
 // report wiring (`SessionStore.buildHarness`), and the real shared toolbox.
 //
 // EXPECTED POPULATION (a keyless host: `search` needs a provider key, `fetch` does not):
-//   - 32 rows total, in the registry order `ROW_ORDER` states below (the order the model sees
+//   - 33 rows total, in the registry order `ROW_ORDER` states below (the order the model sees
 //     them, and the order `namesWhere` compares against);
-//   - 32 of them `enabled: true` on a session that has never run. T6 is why the number is 32 and
-//     not 22: `enabled` answers "may an agent of this conversation call it", so the 22 names that
+//   - 33 of them `enabled: true` on a session that has never run. T6 is why the number is 33 and
+//     not 23: `enabled` answers "may an agent of this conversation call it", so the 23 names that
 //     hold a cap slot are on because the seed filled the slots, and the 10 that hold NO slot
 //     (`SLOTLESS_NAMES`) are on because their declaration list puts them in context on every
 //     request. Before T6 the second group read `enabled: false`, which is a row calling a live,
@@ -870,6 +877,7 @@ const ENABLED_NAMES = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'threadFork',
@@ -886,7 +894,7 @@ const ENABLED_NAMES = [
     'textSummarize'
 ];
 
-// All 32 rows in the server's own order, so an "everything is on" assertion cannot be satisfied
+// All 33 rows in the server's own order, so an "everything is on" assertion cannot be satisfied
 // by a reordered or partially populated list.
 const ROW_ORDER = [
     'toolRegistry',
@@ -899,6 +907,7 @@ const ROW_ORDER = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'delegate',
@@ -972,9 +981,9 @@ describe('R1 — a brand-new session starts with the whole toolbox on', () => {
         const rows = await rowsOf(api, sessionId);
 
         // The reconciliation for a fresh harness, stated as exact name lists.
-        expect(rows.length).toBe(32);
+        expect(rows.length).toBe(33);
         expect(rows.map((row) => row.name)).toEqual(ROW_ORDER);
-        // T6: EVERY row is callable on a fresh session - 22 through their seeded cap slots, 10
+        // T6: EVERY row is callable on a fresh session - 23 through their seeded cap slots, 10
         // through a declaration list that needs no slot. "0 enabled for a core row" was the lie.
         expect(namesWhere(rows, (row) => row.enabled)).toEqual(ROW_ORDER);
         expect(namesWhere(rows, (row) => row.protected)).toEqual(PROTECTED_NAMES);
@@ -1039,9 +1048,9 @@ describe('R1 — a brand-new session starts with the whole toolbox on', () => {
         expect(namesWhere(after, (row) => row.enabled)).toEqual([]);
         expect(namesWhere(after, (row) => row.protected)).toEqual(PROTECTED_NAMES);
 
-        // Off is not gone: the operator still sees all 32 rows, which is the point of a switch that
+        // Off is not gone: the operator still sees all 33 rows, which is the point of a switch that
         // hides a tool from the MODEL only.
-        expect(after.length).toBe(32);
+        expect(after.length).toBe(33);
     });
 
     it('treats the seeded set as the session state: a restart keeps it, and a disable stays disabled', async () => {

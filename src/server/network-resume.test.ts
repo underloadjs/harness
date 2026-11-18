@@ -80,8 +80,11 @@ const probePreset = (
     title: 'probe',
     description: 'probe scripted preset',
     requiresEndpoint: false,
-    primary: 'probe',
-    subagents: [],
+    // A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: 'probe',
+    ranks: { probe: 'A' },
     agents: ['probe'],
     tools: [],
     builtin: true,
@@ -100,7 +103,7 @@ const probePreset = (
                     stream
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
             presets: false,
             // The store's recorder rides the harness's own progress report; a preset that omits it
             // runs without the turn ever recording its frames.

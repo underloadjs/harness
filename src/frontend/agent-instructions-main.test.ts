@@ -22,6 +22,7 @@
 // R4 (T7a) removed the read-only "preset instruction" block and its revert control: there is ONE
 // box, it holds the complete prompt the agent runs, and clearing its text by hand is the undo.
 
+import type { AgentRank } from '../types';
 import type { HarnessDescriptor, SessionSnapshot } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
@@ -38,8 +39,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct', 'summarizer'],
         tools: [],
         coreTools: ['toolRequest', 'toolCreate', 'tasks', 'delegate'],
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         builtin: true,
         editable: true,
         ...overrides
@@ -158,14 +159,14 @@ const typeInstruction = (text: string): void => {
 };
 
 // The server's answer to a harness PATCH, shaped the way the real route answers: the
-// descriptor with the posted maps, primary first in `agents`. `agentInstructions` is
+// descriptor with the posted maps, entry agent first in `agents`. `agentInstructions` is
 // only echoed when the request carried it, which is exactly what makes the `{}` case
 // observable — an omitted field must NOT look like a cleared map.
 const patchedHarness = (body: Record<string, unknown>): HarnessDescriptor =>
     descriptor({
-        agents: [body.primary as string, ...(body.subagents as string[])],
-        primary: body.primary as string,
-        subagents: body.subagents as string[],
+        agents: [body.entry as string, ...Object.keys((body.ranks ?? {}) as Record<string, string>).filter((m) => m !== (body.entry as string))],
+        entry: body.entry as string,
+        ranks: body.ranks as Record<string, AgentRank>,
         ...(body.agentModels === undefined ? {} : { agentModels: body.agentModels as Record<string, string> }),
         ...(body.agentInstructions === undefined
             ? {}
@@ -350,8 +351,9 @@ it('saves an edited instruction as one harness PATCH that keeps every other over
     // ONE request, and it carries the merged map plus the untouched team.
     expect(patches).toEqual([
         {
-            primary: 'instruct',
-            subagents: ['summarizer'],
+            agents: ['instruct', 'summarizer'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', 'summarizer': 'B' },
             agentInstructions: {
                 instruct: 'Answer in one sentence.',
                 summarizer: 'Compress into one paragraph.'
@@ -416,8 +418,9 @@ it('clears one stored override when the box is emptied and keeps the other membe
     // The cleared key drops out of the map while the other member's override survives.
     expect(patches).toEqual([
         {
-            primary: 'instruct',
-            subagents: ['summarizer'],
+            agents: ['instruct', 'summarizer'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', 'summarizer': 'B' },
             agentInstructions: { summarizer: 'Compress into one paragraph.' }
         }
     ]);
@@ -438,7 +441,7 @@ it('sends an explicit empty agentInstructions map when the last override is clea
     await flush();
     await flush();
 
-    // The dialog opens on the primary, whose stored override the reader can clear by hand.
+    // The dialog opens on the entry agent, whose stored override the reader can clear by hand.
     openDialog();
     expect(instructionBox().value).toBe('Answer in two paragraphs.');
 
@@ -452,9 +455,17 @@ it('sends an explicit empty agentInstructions map when the last override is clea
     // `{}` is MEANINGFUL: it clears the stored map. Omitting the field would leave the override
     // in place while the UI claimed the default was running again.
     expect(patches).toEqual([
-        { primary: 'instruct', subagents: ['summarizer'], agentInstructions: {} }
+        {
+            agents: ['instruct', 'summarizer'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', 'summarizer': 'B' },
+            agentInstructions: {}
+        }
     ]);
-    expect(Object.keys(patches[0])).toEqual(['primary', 'subagents', 'agentInstructions']);
+    // The fact pinned here is WHICH fields travel — the roster, the entry agent, the rank map,
+    // and the present-but-empty instruction map (the explicit clear). Their spelling order is
+    // the fixture double's own, so the keys are compared sorted.
+    expect(Object.keys(patches[0]).sort()).toEqual(['agentInstructions', 'agents', 'entry', 'ranks']);
     expect(updated().agentInstructions).toEqual({});
     // The refreshed dialog shows the default, with nothing left to clear.
     expect(instructionBox().value).toBe('Answer directly.');
@@ -719,7 +730,7 @@ it('adds an agent the catalogue never advertised, from a typed name', async () =
 });
 
 it('removes an agent from a saved conversation with one DELETE and no harness write', async () => {
-    // T7b (R6): `Remove from team` detaches THIS conversation's member. The primary stays put, so
+    // T7b (R6): `Remove from team` detaches THIS conversation's member. The entry agent stays put, so
     // the removal is exercised on the secondary.
     const frozen = descriptor({ agentModels: { instruct: 'm2' } });
     const server = stubSession(frozen);

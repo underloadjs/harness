@@ -797,6 +797,7 @@ describe('R3 lane propagation: a worker lane omits a disabled tool from its requ
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'actionRequest',

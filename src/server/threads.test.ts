@@ -34,6 +34,7 @@ import { agent, harness, tool } from '../harness';
 // one epoch for the whole file, across every store restart inside it.
 import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
 import type {
+    AgentRank,
     HarnessMessage,
     HarnessPluginApi,
     HarnessStreamEvent,
@@ -151,8 +152,11 @@ const presetOf = (name: string, create: HarnessPreset['create']): HarnessPreset 
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: [],
+    entry: name,
+    // A ONE-member preset: `ranks` covers the single member, which is also the entry. One distinct
+    // rank means no strictly-lower target, so the runtime registers no `delegate` for it — exactly
+    // what the old `subagents: []` stated.
+    ranks: { [name]: 'A' },
     agents: [name],
     tools: [],
     builtin: true,
@@ -259,7 +263,7 @@ const createFixture = (): Fixture => {
                     }
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
             presets: false,
             report: { progress }
         });
@@ -311,7 +315,7 @@ const flakyFixture = (): { preset: HarnessPreset; heal: () => void } => {
                         }
                     })
                 },
-                primary: 'probe',
+                entry: 'probe',
                 presets: false,
                 // The store's recorder rides the harness's own progress report; a preset that
                 // omits it runs without the turn ever recording its frames.
@@ -359,7 +363,7 @@ const laneFixture = (): {
                     }
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
             presets: false,
             plugins: [
                 {
@@ -457,7 +461,7 @@ const compactionFixture = (): { preset: HarnessPreset; prompts: string[] } => {
                     }
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
             presets: false,
             // THE SHIPPED PLUGIN, mounted by settings alone: `context-compaction` is a
             // built-in (../plugin/manifest.ts), so nothing here imports or re-implements it —
@@ -2989,7 +2993,7 @@ describe('interrupted-turn resume (a stopped OR idle conversation)', () => {
                         }
                     })
                 },
-                primary: 'probe',
+                entry: 'probe',
                 presets: false,
                 report: { progress }
             })
@@ -3461,8 +3465,8 @@ describe('delegated child threads', () => {
             title: 'lead',
             description: 'lead + helper',
             requiresEndpoint: false,
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             agents: ['lead', 'helper'],
             tools: [],
             builtin: true,
@@ -3507,8 +3511,8 @@ describe('delegated child threads', () => {
                             }
                         })
                     },
-                    primary: 'lead',
-                    subagents: ['helper'],
+                    entry: 'lead',
+                    ranks: { lead: 'A', helper: 'B' },
                     presets: false,
                     report: { progress }
                 })
@@ -3707,8 +3711,8 @@ describe('delegated child threads', () => {
             title: 'lead',
             description: 'lead + a child that stops mid-answer',
             requiresEndpoint: false,
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             agents: ['lead', 'helper'],
             tools: [],
             builtin: true,
@@ -3779,8 +3783,8 @@ describe('delegated child threads', () => {
                             }
                         })
                     },
-                    primary: 'lead',
-                    subagents: ['helper'],
+                    entry: 'lead',
+                    ranks: { lead: 'A', helper: 'B' },
                     presets: false,
                     report: { progress }
                 })
@@ -3851,7 +3855,7 @@ describe('delegated child threads', () => {
             invocationId: '2',
             kind: 'delegation',
             partialContent: 'half an answer',
-            role: 'subagent',
+            rank: 'B',
             sequence: 2,
             status: 'cancelled',
             // IT19 R3: the durable row states WHY it halted. The stop here is a child released by
@@ -3879,7 +3883,7 @@ describe('delegated child threads', () => {
             content: 'lead answer',
             invocationId: '1',
             kind: 'root',
-            role: 'primary',
+            rank: 'A',
             sequence: 1,
             status: 'completed',
             // The completed row keeps its owner as well — a finished turn still belongs to the
@@ -3938,8 +3942,8 @@ describe('delegated child threads', () => {
         title: 'lead',
         description: 'lead + branch',
         requiresEndpoint: false,
-        primary: 'lead',
-        subagents: [],
+        entry: 'lead',
+        ranks: { lead: 'A' },
         agents: ['lead'],
         tools: [],
         builtin: true,
@@ -3989,8 +3993,8 @@ describe('delegated child threads', () => {
                         }
                     })
                 },
-                primary: 'lead',
-                subagents: [],
+                entry: 'lead',
+                ranks: { lead: 'A' },
                 presets: false,
                 report: { progress }
             })
@@ -4295,8 +4299,8 @@ describe('delegated child threads', () => {
                 title: 'lead',
                 description: 'lead + helper',
                 requiresEndpoint: false,
-                primary: 'lead',
-                subagents: ['helper'],
+                entry: 'lead',
+                ranks: { lead: 'A', helper: 'B' },
                 agents: ['lead', 'helper'],
                 tools: [],
                 builtin: true,
@@ -4349,8 +4353,8 @@ describe('delegated child threads', () => {
                                 }
                             })
                         },
-                        primary: 'lead',
-                        subagents: ['helper'],
+                        entry: 'lead',
+                        ranks: { lead: 'A', helper: 'B' },
                         presets: false,
                         report: { progress }
                     })
@@ -4736,7 +4740,7 @@ describe('thread deletion atomicity', () => {
                         }
                     })
                 },
-                primary: 'stubborn',
+                entry: 'stubborn',
                 presets: false,
                 report: { progress }
             })
@@ -4934,8 +4938,8 @@ describe('cascaded thread stop', () => {
             title: 'lead',
             description: 'lead',
             requiresEndpoint: false,
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             agents: ['lead', 'helper'],
             tools: [],
             builtin: true,
@@ -4999,8 +5003,8 @@ describe('cascaded thread stop', () => {
                             }
                         })
                     },
-                    primary: 'lead',
-                    subagents: ['helper'],
+                    entry: 'lead',
+                    ranks: { lead: 'A', helper: 'B' },
                     presets: false,
                     report: { progress }
                 })
@@ -5074,8 +5078,8 @@ describe('delegated conversation identity in the compiled view (R18)', () => {
             title: 'lead',
             description: 'lead + helper',
             requiresEndpoint: false,
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             agents: ['lead', 'helper'],
             tools: [],
             builtin: true,
@@ -5119,8 +5123,8 @@ describe('delegated conversation identity in the compiled view (R18)', () => {
                             }
                         })
                     },
-                    primary: 'lead',
-                    subagents: ['helper'],
+                    entry: 'lead',
+                    ranks: { lead: 'A', helper: 'B' },
                     presets: false,
                     report: { progress }
                 })
@@ -5671,5 +5675,213 @@ describe('display lane (C1)', () => {
         expect(readHarnessDatabase(zero).sessions[0].turns[0]).not.toHaveProperty('lane');
 
         fs.rmSync(root, { recursive: true, force: true });
+    });
+});
+
+// RANK AXIS — ONE harness, THREE members, THREE rank letters.
+//
+// WHY A SEPARATE FIXTURE. Every other case here runs a one-member preset, so the question
+// "does a rank change anything about threading?" was never answerable in this file: with one
+// member, every conversation belongs to a single rank by construction. This fixture states
+// the shape the rank model exists for — an entry agent at Rank A, a CO-EQUAL peer at the very
+// same letter, and a member three letters down — which is legal by construction, not an
+// accident: `ranks` is an authority map, several members may hold one rank, and the entry
+// agent is a routing fact rather than a rank rule (../types/index.ts `resolveRosterRanks`
+// states the fill rule, ./harnesses/registry.ts `normalizeEntry` the membership rule).
+//
+// WHAT THE RANKS DELIBERATELY DO NOT REACH. Delegation is rank-gated and strictly downward
+// (../types/index.ts `isLowerRank`), so the Rank C member here may hand work to nobody and
+// the Rank A members may hand to both. Threading is a DIFFERENT axis: a thread names an
+// AGENT, the run is addressed through that agent (./sessions.ts resolves a turn's agent from
+// the thread record, falling back to `definition.entry`), and nothing on the create/send/read
+// path reads a rank. The case below is the executable statement of that separation: same
+// shape, same frames, same transcript, three different letters.
+const RANKED_ROSTER = ['lead', 'peer', 'tail'] as const;
+const RANKED_RANKS: Record<string, AgentRank> = { lead: 'A', peer: 'A', tail: 'C' };
+
+const rankFixture = (): { preset: HarnessPreset; built: Harness[] } => {
+    const built: Harness[] = [];
+
+    const preset: HarnessPreset = {
+        ...presetOf('ranks', (settings, progress) => {
+            // ONE scripted transport, THREE members: every agent answers byte-identically, so
+            // any difference the store records can only come from the member it addressed.
+            const scripted = () =>
+                agent({
+                    model: settings.model,
+                    instruction: 'sys',
+                    stream: async function* (request: HarnessStreamRequest): AsyncGenerator<HarnessStreamEvent> {
+                        yield { type: 'text', delta: `answer:${lastUser(request.messages)}` };
+                        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                    }
+                });
+
+            const instance = harness({
+                agents: { lead: scripted(), peer: scripted(), tail: scripted() },
+                entry: 'lead',
+                ranks: { ...RANKED_RANKS },
+                presets: false,
+                report: { progress }
+            });
+
+            built.push(instance);
+
+            return instance;
+        }),
+        // The preset's OWN roster and authority map, so the durable definition copy a session
+        // freezes carries the same three letters the runtime resolves (./harnesses/types.ts
+        // requires `ranks` to be complete over `agents`, entry agent included).
+        entry: 'lead',
+        agents: [...RANKED_ROSTER],
+        ranks: { ...RANKED_RANKS }
+    };
+
+    return { preset, built };
+};
+
+describe('threading across ranks', () => {
+    it('opens, runs, and reads a conversation identically for a Rank A entry, a Rank A peer, and a Rank C member', async () => {
+        pinClock(2_000);
+
+        const fixture = rankFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('ranks');
+        const runtime = fixture.built[0];
+
+        // THE PRECONDITION, pinned before anything else: three members, three distinct letters,
+        // the entry agent at Rank A, and a peer holding the SAME letter. If this stops being
+        // true, every parity assertion below stops proving anything.
+        expect(runtime.ranks).toEqual(RANKED_RANKS);
+
+        const record = store.liveSession(created.id);
+
+        expect(record.definition.agents).toEqual([...RANKED_ROSTER]);
+        expect(record.definition.entry).toBe('lead');
+        expect(record.definition.ranks).toEqual(RANKED_RANKS);
+
+        // OPEN: one conversation per member, through the same call with one variable — the
+        // agent. The ids are the harness's own per-conversation sequence, so a rank that gated
+        // creation would show up here as a missing or extra id rather than as a thrown error.
+        const opened = RANKED_ROSTER.map((name) => runtime.createThread(name));
+
+        expect(opened.map((thread) => [thread.id, thread.agent])).toEqual([
+            ['thread-1', 'lead'],
+            ['thread-2', 'peer'],
+            ['thread-3', 'tail']
+        ]);
+
+        // MESSAGE: a submit addressed to each conversation, by the same path POST
+        // /sessions/:id/tasks takes (`threadId` is the trailing parameter of `enqueue`).
+        const submitted = [];
+
+        for (const [index, name] of RANKED_ROSTER.entries()) {
+            const task = await store.enqueue(created.id, `go ${name}`, undefined, undefined, opened[index].id);
+
+            expect(task.turn.threadId).toBe(opened[index].id);
+
+            submitted.push(task);
+        }
+
+        for (const task of submitted) await task.settled;
+
+        await store.waitForIdle(created.id);
+
+        const snapshot = store.get(created.id);
+
+        // READ (turns): one done turn per conversation, in submit order, each routed to its own
+        // thread. `index` is session-global, so three threads cannot quietly share a lane.
+        expect(
+            snapshot.turns.map((turn) => ({
+                index: turn.index,
+                prompt: turn.prompt,
+                threadId: turn.threadId,
+                threadLabel: turn.threadLabel,
+                status: turn.status
+            }))
+        ).toEqual([
+            { index: 0, prompt: 'go lead', threadId: 'thread-1', threadLabel: 'LD1', status: 'done' },
+            { index: 1, prompt: 'go peer', threadId: 'thread-2', threadLabel: 'PR1', status: 'done' },
+            { index: 2, prompt: 'go tail', threadId: 'thread-3', threadLabel: 'TL1', status: 'done' }
+        ]);
+
+        // READ (frames): the SAME three-frame sequence per member, and every frame stamped with
+        // the member that ran it. The Rank C member is not a second-class runner: same start,
+        // same text delta, same done. (`threadLabel` above carries the per-agent ordinal, which
+        // ../shared/agent-results.ts `agentCodeOf` derives from the agent NAME — first and last
+        // letter — never from a rank.)
+        expect(
+            snapshot.turns.map((turn) =>
+                turn.events.map((event) => [
+                    (event as { type: string }).type,
+                    (event as { agent: string }).agent
+                ])
+            )
+        ).toEqual([
+            [
+                ['start', 'lead'],
+                ['text', 'lead'],
+                ['done', 'lead']
+            ],
+            [
+                ['start', 'peer'],
+                ['text', 'peer'],
+                ['done', 'peer']
+            ],
+            [
+                ['start', 'tail'],
+                ['text', 'tail'],
+                ['done', 'tail']
+            ]
+        ]);
+
+        // READ (conversations): the full roster rows, byte for byte. Every row has the same keys
+        // in the same order and the same values, except the three identity fields a conversation
+        // necessarily carries — its id, its agent, and the label its per-agent ordinal minted —
+        // plus the invocation id the harness issued for its run (a harness-wide sequence, so
+        // submit order decides it: 1, 2, 3) and its record `sequence`.
+        //
+        // `sequence` is the OTHER half of the proof, and its numbers are derived, not read off
+        // a run: every configured agent's DEFAULT conversation takes a slot first, in
+        // configuration order — `lead` 1, `peer` 2, `tail` 3 (./harness.ts:6584-6596) — and only
+        // then do the host threads, in creation order: 4, 5, 6. Nothing in that accounting
+        // consults a rank, which is exactly what the rank axis is supposed to guarantee; the
+        // separate `thread-<N>` id high-water mark (./harness.ts:6485-6491) is why the first host
+        // conversation is still `thread-1`. A rank that gated threading could not hide behind
+        // this comparison either: it would drop a row, change `origin`/`status`, or leave a
+        // transcript short.
+        const rowOf = (
+            id: string,
+            agent: string,
+            label: string,
+            sequence: number,
+            invocation: string,
+            turnId: string,
+            prompt: string
+        ) => ({
+            id,
+            agent,
+            origin: 'host',
+            status: 'idle',
+            sequence,
+            label,
+            originTurnId: turnId,
+            originInvocationId: invocation,
+            invocationId: invocation,
+            epoch: HARNESS_PROCESS_EPOCH,
+            invocationIds: [invocation],
+            messages: [
+                { role: 'system', content: 'sys' },
+                { role: 'user', content: prompt },
+                { role: 'assistant', content: `answer:${prompt}` }
+            ]
+        });
+
+        const [firstTurn, secondTurn, thirdTurn] = snapshot.turns;
+
+        expect(withoutIds(snapshot.threads)).toEqual([
+            rowOf('thread-1', 'lead', 'LD1', 4, '1', firstTurn.id, 'go lead'),
+            rowOf('thread-2', 'peer', 'PR1', 5, '2', secondTurn.id, 'go peer'),
+            rowOf('thread-3', 'tail', 'TL1', 6, '3', thirdTurn.id, 'go tail')
+        ]);
     });
 });

@@ -149,10 +149,10 @@ const CARD_KEY_SET = [
     'builtin',
     'definition_revision',
     'description',
+    'entry',
     'name',
-    'primary',
+    'ranks',
     'requires_endpoint',
-    'subagents',
     'title',
     'tools'
 ];
@@ -187,6 +187,7 @@ const TOOL_NAMES = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'delegate',
@@ -232,12 +233,13 @@ const TOOLBOX = [
     'textSummarize'
 ];
 
-// The declared core of a live card WITH subagents (R9-R11 visibility): the bootstrap pair, the
+// The declared core of a live card WITH a delegating team (R9-R11 visibility): the bootstrap pair, the
 // session plan, delegation, the five file tools, and the credential-free fetch row.
 const LIVE_CORE_TOOLS = ['toolRequest', 'tasks', 'delegate', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
 
-// The `general` card is the one live card with NO team (`subagents: []`), and the runtime therefore
-// never registers `delegate` for it (src/harness.ts `activation: 'subagents'`). Pinning the whole
+// The `general` card is the one live card with NO team (`ranks: { general: 'A' }` — one distinct
+// rank, so no member sits strictly below it), and the runtime therefore never registers `delegate`
+// for it (src/harness.ts `activation: 'delegation'` with `rosterHasDelegation()` false). Pinning the whole
 // core list rather than "does not include delegate" is what makes the omission a contract: adding a
 // team to the default card, or registering the tool anyway, fails here.
 const GENERAL_CORE_TOOLS = ['toolRequest', 'tasks', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
@@ -262,13 +264,14 @@ const joinedPrompt = (identity: string, guidelines: readonly string[]): string =
     [identity, '', 'Guidelines:', ...guidelines.map((line) => `- ${line}`)].join('\n');
 
 // General: the DEFAULT profile, and the only one whose guidelines forbid handing work out at all
-// (no delegation line, because its harness configures no subagents and the tool is unregistered).
+// (no delegation line, because its harness configures no agent ranked below its entry agent, so
+// the tool is unregistered).
 // The lone-agent bullet names the two ways a step could still escape WITHOUT `delegate` —
 // `threadFork` and `threadSend` — so it is pinned as one literal, exactly as src/agents/general.ts ships it.
 const GENERAL_IDENTITY = 'You are the General agent, the default. Do every step of the task yourself, in this conversation, and never hand work to another agent.';
 const GENERAL_GUIDELINES = [
     'Treat the brief as the specification: do exactly what it asks, keep the scope it states, and say plainly when it is ambiguous or when a claim cannot be checked.',
-    'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.',
+    'You work alone: no agent is ranked below you here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.',
     DISCOVERY_GUIDELINE,
     WEB_SEARCH_GUIDELINE,
     'Prefer a tool result over memory when a declared tool can answer more accurately, and name the tool you used.',
@@ -547,8 +550,8 @@ const gatedPreset = (gate: Promise<void>): HarnessPreset => ({
     title: 'Gated',
     description: 'Scripted gated preset for busy-session policy',
     requiresEndpoint: false,
-    primary: 'gated',
-    subagents: [],
+    entry: 'gated',
+    ranks: { gated: 'A' },
     agents: ['gated'],
     tools: [],
     builtin: true,
@@ -567,7 +570,7 @@ const gatedPreset = (gate: Promise<void>): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'gated',
+            entry: 'gated',
             presets: false,
             // The store hands its recorder in as `progress`; without it the run records no events.
             report: { progress }
@@ -879,7 +882,7 @@ describe('canonical root and provider document', () => {
 // PUT after the session exists. THE semantics this pins (./api.ts postSession, and the JSDoc on
 // `CreateSessionRequest.messages` in ./harness.swagger.yaml):
 //   - the seed is validated BEFORE anything is created, so a bad row is a 400 and no session;
-//   - it is a whole-document REPLACE of the entry agent's default conversation (`agent:<primary>`),
+//   - it is a whole-document REPLACE of the entry agent's default conversation (`agent:<entry>`),
 //     which is why a seed with no `system` row drops the profile prompt (see `role_counts` below);
 //   - the write goes through the same store signal as a transcript PUT, so the optimistic lock and
 //     the persistence layer are unchanged - the seeded document simply starts at revision 1.
@@ -892,7 +895,7 @@ describe('seeded transcript on session create', () => {
     ];
 
     // The conversation a `general` session seeds: the entry agent's default thread, id derived
-    // from the card's primary (./sessions.ts `THREAD_AGENT_PREFIX`). It is NOT a user thread, so
+    // from the card's ENTRY agent (./sessions.ts `THREAD_AGENT_PREFIX`). It is NOT a user thread, so
     // `GET /sessions/:id/threads` stays empty - pinned below so a future "seed creates a thread"
     // change is a visible decision here.
     const ENTRY_THREAD = 'agent:general';
@@ -1070,7 +1073,7 @@ describe('seeded transcript on session create', () => {
         expect(definition.status).toBe(200);
         expect(definition.body.harness.name).toBe('chat');
         expect(definition.body.harness.title).toBe('Chat');
-        expect(definition.body.harness.primary).toBe('general');
+        expect(definition.body.harness.entry).toBe('general');
         expect(definition.body.harness.agents).toEqual(['general']);
         // THE picker contract: an empty tool list, and the only declarations the harness makes are
         // the kernel's bootstrap pair - which is how the model is told to unlock a tool later.
@@ -1239,9 +1242,9 @@ describe('harness catalogue reads', () => {
     // The default card's own description text (`HarnessPreset.description`, NOT the agent
     // profile's shorter picker sentence - both are pinned, here and in the agents read below).
     const GENERAL_DESCRIPTION =
-        'The default general-purpose agent, with the full shared toolbox and NO subagents: it does every step itself, so `delegate` is not registered and cannot be enabled. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes.';
+        'The default general-purpose agent, with the full shared toolbox and NO delegates: it does every step itself, so `delegate` is not registered and cannot be enabled. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes.';
     const INSTRUCT_DESCRIPTION =
-        'General worker with the full shared toolbox and the other roles as direct subagents. It does its own building and editing, and delegates only the steps that would burn its context: research, exploration, a long read, a review. Unlike the Manager, it never hands out work it must still finish itself.';
+        'General worker with the full shared toolbox and the other roles as its Rank B delegates. It does its own building and editing, and delegates only the steps that would burn its context: research, exploration, a long read, a review. Unlike the Manager, it never hands out work it must still finish itself.';
 
     it('pages the cards as identity + tool names, with no definition text', async () => {
         const runtime = createRuntime();
@@ -1276,15 +1279,15 @@ describe('harness catalogue reads', () => {
 
         // The first card, byte for byte: the DEFAULT. `requires_endpoint` is the snake_case
         // spelling of the old `requiresEndpoint`, and `editable` is gone: every template is
-        // patchable now. `subagents: []` and `agents: ['general']` are load-bearing (see
-        // presets.ts) - the default card has no team, so it has nothing to delegate to.
+        // patchable now. `ranks: { general: 'A' }` and `agents: ['general']` are load-bearing (see
+        // presets.ts) — a lone member has no strictly-lower target, so there is nothing to delegate to.
         expect(page.body.items[0]).toEqual({
             name: 'general',
             title: 'General',
             description: GENERAL_DESCRIPTION,
             requires_endpoint: true,
-            primary: 'general',
-            subagents: [],
+            entry: 'general',
+            ranks: { general: 'A' },
             agents: ['general'],
             tools: [...TOOLBOX, 'fetch'],
             builtin: true,
@@ -1299,31 +1302,34 @@ describe('harness catalogue reads', () => {
             title: 'Instruct',
             description: INSTRUCT_DESCRIPTION,
             requires_endpoint: true,
-            primary: 'instruct',
-            subagents: ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', general: 'B', research: 'B', workspace: 'B', reviewer: 'B', debugger: 'B', summarizer: 'B' },
             agents: ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
             tools: [...TOOLBOX, 'fetch'],
             builtin: true,
             definition_revision: 0
         });
 
-        // The Manager card is the mirror image: its team holds every other role by id, because it
-        // delegates everything and never works.
-        expect(page.body.items[5].subagents).toEqual([
-            'general',
-            'instruct',
-            'research',
-            'workspace',
-            'reviewer',
-            'debugger',
-            'summarizer'
-        ]);
+        // The Manager card is the mirror image: the rank map is the authority, and it states the
+        // manager alone at Rank A with every other role one below — it delegates everything and
+        // never works. The map is the full resolved roster map, entry agent included, so a client
+        // never has to guess a member's rank.
+        expect(page.body.items[5].ranks).toEqual({
+            planner: 'A',
+            debugger: 'B',
+            general: 'B',
+            instruct: 'B',
+            research: 'B',
+            reviewer: 'B',
+            summarizer: 'B',
+            workspace: 'B'
+        });
 
         // THE TOOL-LESS CARD (issue 0005-D), byte for byte. This is the wire evidence that a client
         // CAN select an empty toolbox: `tools: []` is what the card advertises, and the runtime
         // behind it registers no catalogue tool either (pinned in
         // ./harnesses/presets.test.ts, which compares this card's descriptor against
-        // `harness.tools`). `primary: 'general'` is deliberate — the card selects the trusted
+        // `harness.tools`). `entry: 'general'` is deliberate — the card selects the trusted
         // lone-wolf profile rather than inventing a prompt.
         expect(page.body.items[7]).toEqual({
             name: 'chat',
@@ -1331,8 +1337,8 @@ describe('harness catalogue reads', () => {
             description:
                 'A single answer with no toolbox: the General profile on an empty catalogue (no file, search, delegation, or record tool is registered), so it cannot read or write the server host — the only tools it can ever call are the harness-owned core rows. It carries no iteration budget, so it keeps going until the model answers.',
             requires_endpoint: true,
-            primary: 'general',
-            subagents: [],
+            entry: 'general',
+            ranks: { general: 'A' },
             agents: ['general'],
             tools: [],
             builtin: true,
@@ -1349,8 +1355,8 @@ describe('harness catalogue reads', () => {
             requires_endpoint: false,
             // The AGENT is a real role even though the CARD is a fixture: there is no `demo`
             // profile in this build, and a harness that named one could not be validated.
-            primary: 'general',
-            subagents: [],
+            entry: 'general',
+            ranks: { general: 'A' },
             agents: ['general'],
             tools: ['timeNow'],
             builtin: true,
@@ -1403,10 +1409,11 @@ describe('harness catalogue reads', () => {
         expect(card.name).toBe('instruct');
         expect(card.definition_revision).toBe(runtime.events.getRevision('definition', 'instruct'));
         // The core set is what THIS host would declare: the bootstrap pair, the session plan,
-        // delegation (this card has subagents), the five file tools, and the credential-free fetch.
+        // delegation (this card's team sits one rank below its entry agent), the five file tools,
+        // and the credential-free fetch.
         expect(card.core_tools).toEqual(LIVE_CORE_TOOLS);
         // Summary rows carry sizes, never text: the instruction routes below are where text lives.
-        // One row per team member, in `preset.agents` order (primary first). `chars` is the identity
+        // One row per team member, in `preset.agents` order (entry agent first). `chars` is the identity
         // sentence length, and the roster moved every figure: seven members now that the instruct
         // team carries `general` and `debugger` and no longer `planner`.
         // NOTE (regression pin): `chars` is `profile.instruction.length` (api-reads.ts:1289), NOT
@@ -1423,10 +1430,10 @@ describe('harness catalogue reads', () => {
         ]);
 
         // The DEFAULT card, same read. One summary row because it has no team, and `delegate` is
-        // absent from its declared core - the runtime never registers it for `subagents: []`
-        // (src/harness.ts `activation: 'subagents'`), so the default agent cannot split work out.
+        // absent from its declared core - the runtime never registers it for a one-rank roster
+        // (src/harness.ts `activation: 'delegation'`), so the default agent cannot split work out.
         const generalDefinition = await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('general'));
-        expect(generalDefinition.body.harness.subagents).toEqual([]);
+        expect(generalDefinition.body.harness.ranks).toEqual({ general: 'A' });
         expect(generalDefinition.body.harness.agents).toEqual(['general']);
         expect(generalDefinition.body.harness.core_tools).toEqual(GENERAL_CORE_TOOLS);
         expect(generalDefinition.body.harness.instruction_summary).toEqual([
@@ -1517,7 +1524,7 @@ describe('harness catalogue reads', () => {
             name: 'general',
             title: 'General',
             description:
-                'The default general-purpose agent. It does the whole task itself, start to finish: this harness configures no subagents, so delegate is not even registered and it never splits work out.',
+                'The default general-purpose agent. It does the whole task itself, start to finish: this harness configures no agent ranked below it, so delegate is not even registered and it never splits work out.',
             has_instruction_override: false,
             has_global_override: false
         });
@@ -1537,8 +1544,9 @@ describe('harness catalogue reads', () => {
         ]);
 
         // The DEFAULT profile, read whole: id, title, and the two prompt halves. Its guidelines are
-        // the only set with NO delegation line, because its harness configures no subagents and the
-        // runtime never registers `delegate` (src/agents/general.ts). `referenced_by` shows the
+        // the only set with NO delegation line, because its harness configures no agent ranked below
+        // its entry agent, and the runtime never registers `delegate` (src/agents/general.ts).
+        // `referenced_by` shows the
         // other half of the roster contract: every OTHER live card CAN delegate to `general`.
         const generalProfile = await call(runtime, 'GET', HARNESS_ROUTES.agentsByAgentId('general'));
 
@@ -1890,8 +1898,8 @@ describe('harness catalogue reads', () => {
 //
 // `createHarnessRegistry([])` had never been exercised here, and the frontend's healthy empty
 // state depends on exactly these two answers: the list is a NORMAL paged 200 with an empty
-// `items` array (not an error), and the first create needs nothing pre-existing (its primary
-// only has to be a trusted agent, which the shipped catalogue always provides). A UI that read
+// `items` array (not an error), and the first create needs nothing pre-existing (the roster it
+// states only has to be trusted agents, which the shipped catalogue always provides). A UI that read
 // the empty list as "no server" would lock "+ New" and make the empty state unrecoverable.
 describe('a zero-harness registry', () => {
     // The same runtime `createRuntime` builds, minus every template: search keys are stubbed
@@ -1935,8 +1943,11 @@ describe('a zero-harness registry', () => {
             name: 'release-captain',
             title: 'Release captain',
             description: 'The first harness of an empty registry.',
-            primary: 'instruct',
-            subagents: []
+            // B3: the roster is an explicit field of its own (`CreateHarnessRequest.agents`); the
+            // server never derives a team from the entry agent any more.
+            agents: ['instruct'],
+            entry: 'instruct',
+            ranks: { instruct: 'A' }
         });
 
         expect(created.status).toBe(201);
@@ -1948,8 +1959,8 @@ describe('a zero-harness registry', () => {
             title: 'Release captain',
             description: 'The first harness of an empty registry.',
             requires_endpoint: true,
-            primary: 'instruct',
-            subagents: [],
+            entry: 'instruct',
+            ranks: { instruct: 'A' },
             agents: ['instruct'],
             tools: [...TOOLBOX, 'fetch'],
             builtin: false,
@@ -2126,14 +2137,14 @@ describe('canonical sessions', () => {
             'current_revision',
             'definition_revision',
             'description',
+            'entry',
             'frozen_at',
             'name',
-            'primary',
             'requires_endpoint',
             'revision',
             'session_id',
             'source_revision',
-            'subagents',
+            'ranks',
             'title',
             'tools'
         ].sort());
@@ -2165,14 +2176,14 @@ describe('canonical sessions', () => {
             'model',
             'origin',
             'profile',
+            'rank',
             'restorable',
-            'revision',
-            'role'
+            'revision'
         ].sort());
         expect(roster.agents[0]).toEqual({
             agent_id: 'general',
             profile: 'general',
-            role: 'primary',
+            rank: 'A',
             origin: 'definition',
             model: 'demo-model',
             inherited_model: 'demo-model',
@@ -2753,6 +2764,7 @@ describe('task submit and recorded history', () => {
         expect(JSON.parse(discovery.event.content).enabled).toEqual([
             'timeNow',
             'actionRequest',
+            'knowledge',
             'threadFork',
             'toolManage',
             'toolRegistry'
@@ -2904,7 +2916,7 @@ describe('task submit and recorded history', () => {
             'latestInput',
             'model',
             'nodes',
-            'role',
+            'rank',
             // R9: the compiled tree now also states WHEN the flow started (a field the
             // contract already declared — see `TurnSection.startedAt`). Without it every
             // delegate row hides its elapsed label, because the client settles a row's
@@ -2919,7 +2931,10 @@ describe('task submit and recorded history', () => {
             'threadLabel'
         ]);
         expect(section.agent).toBe('general');
-        expect(section.role).toBe('primary');
+        // R16: the row reports the RANK its agent holds in this harness. `demo` is a one-member
+        // fixture, and a single-member roster resolves its entry agent at Rank A (one distinct rank,
+        // so no `delegate`) — the read never infers the letter from "is this the entry".
+        expect(section.rank).toBe('A');
         expect(section.state).toBe('done');
         expect(section.startedAt).toBeLessThan(section.endedAt);
         expect(section.model).toBe('demo-model');
@@ -3579,7 +3594,7 @@ describe('manual tool execution', () => {
         // T1 shape of the SAME result (src/core/task.ts project + copyItem): every
         // record carries its content `rev` (1 on add) and the write attribution, and
         // the envelope carries the monotonic `storeRev`. An execution route runs as the
-        // session PRIMARY ("general") with NO thread, so `updatedBy` is set and
+        // session's ENTRY agent ("general") with NO thread, so `updatedBy` is set and
         // `updatedThreadId` stays absent — never `undefined`.
         //
         // This file deliberately never pins the wall clock (unlike ./sessions.test.ts),
@@ -3948,8 +3963,11 @@ describe('harness registry writes over HTTP', () => {
             name: 'review',
             title: 'Review pair',
             description: 'Research plus a summarizer.',
-            primary: 'research',
-            subagents: ['summarizer']
+            // B3: the roster is an explicit field of its own (`CreateHarnessRequest.agents`); the
+            // server never derives a team from the entry agent any more.
+            agents: ['research', 'summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' }
         });
 
         expect(created.status).toBe(201);
@@ -3961,8 +3979,8 @@ describe('harness registry writes over HTTP', () => {
             title: 'Review pair',
             description: 'Research plus a summarizer.',
             requires_endpoint: true,
-            primary: 'research',
-            subagents: ['summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             agents: ['research', 'summarizer'],
             tools: [...TOOLBOX, 'fetch'],
             builtin: false,
@@ -3987,8 +4005,8 @@ describe('harness registry writes over HTTP', () => {
             title: 'Review pair',
             description: 'Research plus a summarizer.',
             requires_endpoint: true,
-            primary: 'research',
-            subagents: ['summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             agents: ['research', 'summarizer'],
             tools: [...TOOLBOX, 'fetch'],
             builtin: false,
@@ -4006,12 +4024,14 @@ describe('harness registry writes over HTTP', () => {
 
         const roster = await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionIdAgents(session.body.session.id));
         expect(roster.body.total).toBe(2);
-        expect(roster.body.agents.map((row: any) => [row.agent_id, row.role, row.model])).toEqual([
-            ['research', 'primary', 'demo-model'],
-            ['summarizer', 'subagent', 'demo-model']
+        // R16: one row per member, each with the RANK the definition grants it — research leads and
+        // summarizer sits strictly below it, which is what makes it a delegation target.
+        expect(roster.body.agents.map((row: any) => [row.agent_id, row.rank, row.model])).toEqual([
+            ['research', 'A', 'demo-model'],
+            ['summarizer', 'B', 'demo-model']
         ]);
 
-        // The instruction text the research primary actually runs, read from the harness definition
+        // The instruction text the research member actually runs, read from the harness definition
         // routes: raw identity plus the trusted guidelines block, joined by the one documented rule.
         const instruction = await call(
             runtime,
@@ -4029,13 +4049,16 @@ describe('harness registry writes over HTTP', () => {
 
         const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), {
             name: 'modelled',
-            primary: 'research',
-            subagents: ['summarizer'],
+            // B3: the roster is an explicit field of its own (`CreateHarnessRequest.agents`); the
+            // server never derives a team from the entry agent any more.
+            agents: ['research', 'summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             agent_models: { summarizer: 'small/fast' }
         });
 
         expect(created.status).toBe(201);
-        // The card carries the OVERRIDE map only: the primary is absent because it uses the session
+        // The card carries the OVERRIDE map only: the entry agent is absent because it uses the session
         // model, which is what a dropdown renders as "default".
         expect(created.body.harness.agent_models).toEqual({ summarizer: 'small/fast' });
 
@@ -4073,7 +4096,7 @@ describe('harness registry writes over HTTP', () => {
             summarizer: 'small/fast'
         });
 
-        // An override on the primary becomes the session model, and the member the replacement map
+        // An override on the entry agent becomes the session model, and the member the replacement map
         // dropped falls back again.
         const focused = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'modelled' });
         expect(focused.body.session.model).toBe('big/model');
@@ -4096,8 +4119,11 @@ describe('harness registry writes over HTTP', () => {
 
         const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), {
             name: 'painted',
-            primary: 'research',
-            subagents: ['summarizer'],
+            // B3: the roster is an explicit field of its own (`CreateHarnessRequest.agents`); the
+            // server never derives a team from the entry agent any more.
+            agents: ['research', 'summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             agent_colors: { summarizer: '#4ade80' }
         });
 
@@ -4201,7 +4227,10 @@ describe('harness registry writes over HTTP', () => {
         expect(
             await call(runtime, 'POST', HARNESS_ROUTES.harnesses(), {
                 name: 'wide',
-                primary: 'research',
+                // B3: the roster is an explicit field of its own (`CreateHarnessRequest.agents`); the
+                // server never derives a team from the entry agent any more.
+                agents: ['research'],
+                entry: 'research',
                 agent_colors: { summarizer: '#4ade80' }
             })
         ).toEqual({
@@ -4256,7 +4285,7 @@ describe('harness registry writes over HTTP', () => {
             body: {
                 error: {
                     message:
-                        'Unknown field "agentColors". Allowed fields: title, description, primary, subagents, agent_models, agent_instructions, agent_colors.'
+                        'Unknown field "agentColors". Allowed fields: title, description, agents, entry, ranks, agent_models, agent_instructions, agent_colors.'
                 }
             }
         });
@@ -4267,8 +4296,11 @@ describe('harness registry writes over HTTP', () => {
 
         const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), {
             name: 'voiced',
-            primary: 'research',
-            subagents: ['summarizer'],
+            // B3: the roster is an explicit field of its own (`CreateHarnessRequest.agents`); the
+            // server never derives a team from the entry agent any more.
+            agents: ['research', 'summarizer'],
+            entry: 'research',
+            ranks: { research: 'A', summarizer: 'B' },
             agent_instructions: { summarizer: 'Condense to one line.' }
         });
         expect(created.status).toBe(201);
@@ -4291,7 +4323,7 @@ describe('harness registry writes over HTTP', () => {
         expect(text.body.chars).toBe('Condense to one line.'.length);
 
         // A session built with it runs the override VERBATIM for that member (T6: a stored
-        // override is the complete prompt, so no guideline block rides below it); the primary
+        // override is the complete prompt, so no guideline block rides below it); the entry agent
         // keeps its trusted composed profile, and the store proves the words reached the
         // AGENT rather than only the card.
         const session = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'voiced' });
@@ -4345,7 +4377,10 @@ describe('harness registry writes over HTTP', () => {
         ]);
     });
 
-    it('validates create requests: one primary, trusted agents, no client prompt', async () => {
+    // B3 R14/R15 — the create contract's axis fields, pinned on the wire. Each case isolates ONE
+    // rule, so every body names the roster explicitly (`agents` is its own field now) and the message
+    // that comes back is the rule under test, never the first unrelated refusal.
+    it('validates create requests: a roster, trusted agents, ranked members, no client prompt', async () => {
         const runtime = createRuntime();
         const post = (body: unknown) => call(runtime, 'POST', HARNESS_ROUTES.harnesses(), body);
 
@@ -4353,59 +4388,116 @@ describe('harness registry writes over HTTP', () => {
             status: 400,
             body: { error: { message: 'A harness definition requires a "name".' } }
         });
-        expect(await post({ name: 'writer', primary: 'instruct' })).toEqual({
+        // A roster-less create is refused rather than defaulted: a harness with no member has no
+        // entry and no rank, so it could never run a turn.
+        expect(await post({ name: 'nobody-team' })).toEqual({
+            status: 400,
+            body: { error: { message: '`agents` must be a non-empty array of agent names.' } }
+        });
+        expect(await post({ name: 'writer', agents: ['instruct'], entry: 'instruct' })).toEqual({
             status: 400,
             body: { error: { message: 'Harness name "writer" is reserved as an alias of "instruct".' } }
         });
-        expect((await post({ name: 'dup', primary: 'instruct' })).status).toBe(201);
-        expect(await post({ name: 'dup', primary: 'instruct' })).toEqual({
+        expect((await post({ name: 'dup', agents: ['instruct'], entry: 'instruct' })).status).toBe(201);
+        expect(await post({ name: 'dup', agents: ['instruct'], entry: 'instruct' })).toEqual({
             status: 409,
             body: { error: { message: 'Harness "dup" already exists.' } }
         });
-        expect(await post({ name: 'bad-agent', primary: 'nobody' })).toEqual({
+        expect(await post({ name: 'bad-agent', agents: ['nobody'], entry: 'nobody' })).toEqual({
             status: 400,
             body: {
                 error: {
-                    message: `\`primary\` names unknown agent "nobody". Known agents: ${AGENT_NAMES.join(', ')}.`
+                    // The field is `entry` now (routing), and the ROSTER is what gets checked first:
+                    // an unknown agent is refused as a member, never as a role.
+                    message: `\`agents\` names unknown agent "nobody". Known agents: ${AGENT_NAMES.join(', ')}.`
                 }
             }
         });
-        expect(await post({ name: 'self', primary: 'instruct', subagents: ['instruct'] })).toEqual({
-            status: 400,
-            body: { error: { message: 'Subagent "instruct" is the primary agent; a harness has exactly one primary.' } }
+
+        // R15 — TWO MEMBERS MAY HOLD THE SAME TOP RANK, and neither one is "the" primary: a peer at
+        // Rank A is an ordinary roster, not a conflict. The retired rule ("a harness has exactly one
+        // primary", with the entry agent naming itself in the allowlist as a 400) is gone, so the
+        // request that used to be refused answers 201 and reads back with BOTH letters.
+        const peers = await post({
+            name: 'peers',
+            agents: ['instruct', 'research'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', research: 'A' }
         });
-        expect(await post({ name: 'extra', primary: 'instruct', subagents: ['critic'] })).toEqual({
+
+        expect(peers.status).toBe(201);
+        expect(peers.body.harness.entry).toBe('instruct');
+        expect(peers.body.harness.ranks).toEqual({ instruct: 'A', research: 'A' });
+
+        // A RANK must be one letter of the scale. An array is the retired allowlist shape; a
+        // multi-character value is not a letter; the refusal names the accepted range and never
+        // guesses one.
+        expect(
+            await post({ name: 'flat-array', agents: ['instruct'], entry: 'instruct', ranks: ['instruct'] })
+        ).toEqual({
             status: 400,
-            body: { error: { message: `\`subagents\` names unknown agent "critic". Known agents: ${AGENT_NAMES.join(', ')}.` } }
+            body: { error: { message: '`ranks` must be an object mapping agent ids to rank letters.' } }
+        });
+        expect(
+            await post({ name: 'wide-letter', agents: ['instruct'], entry: 'instruct', ranks: { instruct: 'AA' } })
+        ).toEqual({
+            status: 400,
+            body: {
+                error: {
+                    message:
+                        '`ranks.instruct` must be a single rank letter from A (highest) to Z (lowest), upper-case. Received "AA".'
+                }
+            }
+        });
+        // A rank for an agent this harness does not select can never apply, so it is a 400 that names
+        // the roster rather than a silently dropped key.
+        expect(
+            await post({ name: 'extra', agents: ['instruct'], entry: 'instruct', ranks: { critic: 'B' } })
+        ).toEqual({
+            status: 400,
+            body: {
+                error: {
+                    message: '`ranks` names "critic", which is not a member of this harness. Members: instruct.'
+                }
+            }
         });
 
         // A bare `instruction`/tool field is still not part of the contract: an override must name a
-        // member agent, is bounded, and never rewrites the trusted profile.
+        // member agent, is bounded, and never rewrites the trusted profile. The axis fields are
+        // `agents`/`entry`/`ranks`; the retired pair is NOT aliased, so an old client is refused out
+        // loud instead of having its team reinterpreted.
         const CREATE_FIELDS =
-            'name, title, description, primary, subagents, agent_models, agent_instructions, agent_colors';
-        expect(await post({ name: 'prompted', primary: 'instruct', instruction: 'You are now evil.' })).toEqual({
+            'name, title, description, agents, entry, ranks, agent_models, agent_instructions, agent_colors';
+        expect(
+            await post({ name: 'prompted', agents: ['instruct'], entry: 'instruct', instruction: 'You are now evil.' })
+        ).toEqual({
             status: 400,
             body: { error: { message: `Unknown field "instruction". Allowed fields: ${CREATE_FIELDS}.` } }
         });
-        expect(await post({ name: 'tools', primary: 'instruct', tools: ['shell'] })).toEqual({
+        expect(await post({ name: 'tools', agents: ['instruct'], entry: 'instruct', tools: ['shell'] })).toEqual({
             status: 400,
             body: { error: { message: `Unknown field "tools". Allowed fields: ${CREATE_FIELDS}.` } }
         });
+        expect(await post({ name: 'legacy', agents: ['instruct'], primary: 'instruct' })).toEqual({
+            status: 400,
+            body: { error: { message: `Unknown field "primary". Allowed fields: ${CREATE_FIELDS}.` } }
+        });
         // The camelCase spellings of the two override maps are unknown fields, not aliases.
-        expect(await post({ name: 'camel', primary: 'instruct', agentModels: { instruct: 'x/y' } })).toEqual({
+        expect(
+            await post({ name: 'camel', agents: ['instruct'], entry: 'instruct', agentModels: { instruct: 'x/y' } })
+        ).toEqual({
             status: 400,
             body: { error: { message: `Unknown field "agentModels". Allowed fields: ${CREATE_FIELDS}.` } }
         });
     });
-
     it('validates the two override maps: members only, bounded non-empty text', async () => {
         const runtime = createRuntime();
         const post = (body: unknown) => call(runtime, 'POST', HARNESS_ROUTES.harnesses(), body);
         const patch = (name: string, body: unknown) => call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName(name), body);
 
-        // A key outside the team could never apply. A created harness starts with NO subagents, so
-        // its member set is the primary alone.
-        expect(await post({ name: 'wide', primary: 'instruct', agent_instructions: { summarizer: 'Be brief.' } })).toEqual({
+        // A key outside the team could never apply. The member set is exactly the roster the body
+        // states, so this harness has `instruct` alone.
+        expect(await post({ name: 'wide', agents: ['instruct'], entry: 'instruct', agent_instructions: { summarizer: 'Be brief.' } })).toEqual({
             status: 400,
             body: {
                 error: {
@@ -4449,19 +4541,19 @@ describe('harness registry writes over HTTP', () => {
         ]);
 
         // Models: members only, an object of strings, bounded non-empty ids - naming the agent.
-        expect(await post({ name: 'model-x', primary: 'instruct', agent_models: { demo: 'small/fast' } })).toEqual({
+        expect(await post({ name: 'model-x', agents: ['instruct'], entry: 'instruct', agent_models: { demo: 'small/fast' } })).toEqual({
             status: 400,
             body: { error: { message: '`agentModels` names "demo", which is not a member of this harness. Members: instruct.' } }
         });
-        expect(await post({ name: 'model-y', primary: 'instruct', agent_models: ['small/fast'] })).toEqual({
+        expect(await post({ name: 'model-y', agents: ['instruct'], entry: 'instruct', agent_models: ['small/fast'] })).toEqual({
             status: 400,
             body: { error: { message: '`agentModels` must be an object mapping agent ids to model ids.' } }
         });
-        expect(await post({ name: 'model-z', primary: 'instruct', agent_models: { instruct: '  ' } })).toEqual({
+        expect(await post({ name: 'model-z', agents: ['instruct'], entry: 'instruct', agent_models: { instruct: '  ' } })).toEqual({
             status: 400,
             body: { error: { message: '`agentModels.instruct` cannot be empty.' } }
         });
-        expect(await post({ name: 'model-w', primary: 'instruct', agent_models: { instruct: 'a'.repeat(201) } })).toEqual({
+        expect(await post({ name: 'model-w', agents: ['instruct'], entry: 'instruct', agent_models: { instruct: 'a'.repeat(201) } })).toEqual({
             status: 400,
             body: { error: { message: '`agentModels.instruct` cannot exceed 200 characters.' } }
         });
@@ -4506,7 +4598,7 @@ describe('harness registry writes over HTTP', () => {
         });
 
         const PATCH_FIELDS =
-            'title, description, primary, subagents, agent_models, agent_instructions, agent_colors';
+            'title, description, agents, entry, ranks, agent_models, agent_instructions, agent_colors';
         expect(await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('instruct'), {})).toEqual({
             status: 400,
             body: { error: { message: `A patch must change at least one field.` } }
@@ -4540,21 +4632,30 @@ describe('harness registry writes over HTTP', () => {
         // Executable PATCH: demo becomes an honest live profiled harness, so the descriptor stops
         // advertising the offline script.
         const live = await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('demo'), {
-            primary: 'workspace'
+            agents: ['workspace'],
+            entry: 'workspace',
+            // The PATCH states its OWN authority map, because `ranks` REPLACES the map
+            // (./harnesses/registry.ts:264) rather than re-deriving it. Pinning the letter this
+            // body asks for keeps the assertion about the PATCH contract instead of about
+            // whatever letters the shipped demo card happens to declare.
+            ranks: { workspace: 'B' }
         });
         expect(live.status).toBe(200);
         expect(live.body.harness).toMatchObject({
             name: 'demo',
             requires_endpoint: true,
-            primary: 'workspace',
-            subagents: [],
+            entry: 'workspace',
+            // The entry agent holds Rank B here: `ranks` is authority, the PATCH stated it, and
+            // being the entry agent neither forces nor forbids a letter.
+            ranks: { workspace: 'B' },
             agents: ['workspace'],
             builtin: true
         });
         // The upgrade replaces the script with the live toolbox plus the environment rows this
         // keyless host can run: `fetch` (native, no credential) always, `search` only with a key.
         expect(live.body.harness.tools).toEqual([...TOOLBOX, 'fetch']);
-        // No subagents, so no `delegate` in the declared core - the same rule a card and a frozen
+        // A roster of one ranks nobody below the entry agent, so `delegate` stays out of the declared
+        // core - the same rule a card and a frozen
         // session both follow, so they cannot disagree.
         expect(live.body.harness.core_tools).toEqual(['toolRequest', 'tasks', 'read', 'write', 'edit', 'glob', 'grep', 'fetch']);
 
@@ -4566,7 +4667,7 @@ describe('harness registry writes over HTTP', () => {
             'GET',
             `${HARNESS_ROUTES.sessionsBySessionId(after.body.session.id)}/definition`
         );
-        expect(afterDefinition.body.definition.primary).toBe('workspace');
+        expect(afterDefinition.body.definition.entry).toBe('workspace');
         expect(afterDefinition.body.definition.requires_endpoint).toBe(true);
 
         // The scripted session is untouched: its frozen copy still describes the offline script,
@@ -4586,7 +4687,7 @@ describe('deleting a harness over HTTP', () => {
     it('deletes a user harness and drops it from every listing', async () => {
         const runtime = createRuntime();
 
-        const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), { name: 'temporary', primary: 'instruct' });
+        const created = await callWithHeaders(runtime, 'POST', HARNESS_ROUTES.harnesses(), { name: 'temporary', agents: ['instruct'], entry: 'instruct' });
         expect(created.status).toBe(201);
 
         const removed = await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('temporary'));

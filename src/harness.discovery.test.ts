@@ -502,6 +502,12 @@ describe('toolRequest selection', () => {
             availableTags: [
                 'agents',
                 'answer',
+                // The six tags the `knowledge` entry declares (its own tag, the two
+                // article words, and the three capability words). 'edit' is already in
+                // this vocabulary from `toolManage`, so it is not new here.
+                // Tags: src/tools/runtime/knowledge.tool.ts:186.
+                'article',
+                'articles',
                 'branch',
                 'catalogue',
                 'chapter',
@@ -519,6 +525,7 @@ describe('toolRequest selection', () => {
                 'history',
                 'inspect',
                 'inventory',
+                'knowledge',
                 'list',
                 'location',
                 'locations',
@@ -532,21 +539,27 @@ describe('toolRequest selection', () => {
                 'preview',
                 'profile',
                 'profiles',
+                // RANK tag (2026-11-18): `agentManage`/`agentResult` replaced their retired
+                // `subagent` tag with `rank`, so `rank` is now part of the searchable
+                // vocabulary and `subagent` is not.
+                'rank',
+                'read',
                 'record',
                 'records',
+                'reference',
                 'registry',
                 'reload',
                 'research',
                 'result',
                 'results',
                 'scene',
+                'search',
                 'self-modifying',
                 'setting',
                 'settings',
                 'source',
                 'store',
                 'story',
-                'subagent',
                 'summarize',
                 'team',
                 'thread',
@@ -604,6 +617,7 @@ const SEEDABLE_RUNTIME_NAMES = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'threadFork'
@@ -654,6 +668,7 @@ describe('configuration.enableAllTools — starting with the whole switchable to
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -1187,6 +1202,7 @@ describe('the conversation tool switch (the withheld set)', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -1223,6 +1239,7 @@ describe('the conversation tool switch (the withheld set)', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork'
@@ -1322,6 +1339,7 @@ describe('the conversation tool switch (the withheld set)', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -1362,6 +1380,7 @@ describe('the conversation tool switch (the withheld set)', () => {
                 'profiles',
                 'chapters',
                 'locations',
+                'knowledge',
                 'agentManage',
                 'agentResult',
                 'threadFork'
@@ -1511,7 +1530,8 @@ describe('the conversation tool switch (the withheld set)', () => {
                 // switch has to be visible from both sides of the delegation.
                 researcher: brain(scripted([answer('checked')], seen))
             },
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             tools: {
                 ...fixtures(1),
                 ping: tool({
@@ -1527,9 +1547,9 @@ describe('the conversation tool switch (the withheld set)', () => {
 
         await writer('go');
 
-        // Request 1 is the primary, 2 is the DELEGATED child (no `delegate`: a subagent
-        // cannot delegate further), 3 is the primary's follow-up. `ping` is declared to all
-        // three — one session-level rule, not a per-actor list.
+        // Request 1 is the Rank A entry, 2 is the DELEGATED child (no `delegate`: Rank B has
+        // nobody below it in this two-rank roster), 3 is the entry's follow-up. `ping` is
+        // declared to all three — one session-level rule, not a per-actor list.
         expect(seen.map((request) => (request.tools ?? []).map((entry) => entry.name))).toEqual([
             ['toolRequest', 'tasks', 'delegate', 'ping'],
             ['toolRequest', 'tasks', 'ping'],

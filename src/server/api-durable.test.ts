@@ -48,8 +48,11 @@ const preset = (): HarnessPreset => ({
     title: 'Worker',
     description: 'Scripted durable-contract preset',
     requiresEndpoint: false,
-    primary: 'worker',
-    subagents: [],
+// A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: 'worker',
+    ranks: { worker: 'A' },
     agents: ['worker'],
     tools: [],
     builtin: false,
@@ -66,7 +69,7 @@ const preset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'worker',
+            entry: 'worker',
             presets: false,
             report: { progress }
         })

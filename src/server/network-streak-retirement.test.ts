@@ -65,8 +65,11 @@ const presetOf = (stream: () => AsyncGenerator<HarnessStreamEvent>): HarnessPres
     title: 'probe',
     description: 'probe scripted preset',
     requiresEndpoint: false,
-    primary: 'probe',
-    subagents: [],
+    // A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: 'probe',
+    ranks: { probe: 'A' },
     agents: ['probe'],
     tools: [],
     builtin: true,
@@ -81,7 +84,7 @@ const presetOf = (stream: () => AsyncGenerator<HarnessStreamEvent>): HarnessPres
                     stream
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
             presets: false,
             report: { progress }
         })

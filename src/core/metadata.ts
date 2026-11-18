@@ -208,22 +208,23 @@ export const THREAD_DELETE_METADATA = coreMetadataOf(THREAD_DELETE_NAME);
 // ---------------------------------------------------------------------------
 
 // Delegation (R4). Capability-by-configuration: the harness registers delegate
-// only when the allowlist is non-empty, so this metadata has two honest forms:
-//   - with subagents - the runtime declaration, whose `agent` enum is the exact
-//     allowlist and whose description names it;
+// only while some agent of the roster has a strictly-lower-ranked peer, so this
+// metadata has two honest forms:
+//   - with delegable targets - the per-caller declaration, whose `agent` enum is that
+//     target set and whose description names it;
 //   - without - the catalogue-only baseline below (the server lists the capability
-//     and a session without subagents answers a clear 404 when it is called).
+//     and a session with no lower-ranked peer answers a clear 404 when it is called).
 //
 // The BASELINE IS THE ENTRY'S LITERAL (read from the generated manifest), and this
 // function only applies the allowlist transformation to it. Keeping the baseline
 // as data is what stops the two copies of the wording from drifting.
 //
-// T28: the allowlist form is derived from the BASELINE SCHEMA, not re-typed. The
+// T28: the target form is derived from the BASELINE SCHEMA, not re-typed. The
 // previous version restated `properties` by hand, so every new delegate argument
 // (`maxChars`, `requireClarification`, `timeoutMs`, `maxTurns`) had to be added twice
 // and the projection silently advertised a smaller surface than the entry it claimed
-// to mirror. Only `agent` is replaced (its enum IS the allowlist); every other
-// property is copied from the entry's own literal.
+// to mirror. Only `agent` is replaced (its enum IS the caller's legal target set);
+// every other property is copied from the entry's own literal.
 //
 // The DESCRIPTION below is the one hand-duplicated string in this module: it is the
 // entry's `agentDelegateMetadata` allowlist wording (../tools/runtime/delegate.tool.ts),
@@ -231,10 +232,10 @@ export const THREAD_DELETE_METADATA = coreMetadataOf(THREAD_DELETE_NAME);
 // entry has the matching note, and core/metadata.ownership.test.ts compares the two
 // projections, so the equality is enforced rather than intended.
 export const agentDelegateMetadata = (
-    subagents: readonly string[] = []
+    targets: readonly string[] = []
 ): CoreToolMetadata => {
     const baseline = coreMetadataOf(AGENT_DELEGATE_NAME);
-    const listed = [...subagents];
+    const listed = [...targets];
 
     if (listed.length === 0) return baseline;
 
@@ -246,7 +247,7 @@ export const agentDelegateMetadata = (
 
     return {
         name: baseline.name,
-        description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, and each delegation starts a NEW conversation with it, so it remembers no earlier one either - unless the call comes from the host rather than one of your conversations, and then the child re-enters that subagent's default conversation (agent:<name>), where it may remember what it answered for you before: the brief must carry everything it needs. Only the primary agent can delegate; subagents cannot delegate further. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset and durationMs, and - when the run is identifiable - invocationId, threadId and status; a child whose ledger entry cannot be resolved (released with its thread, or aged out of the bounded result ledger) reports its answer with those three keys ABSENT rather than inventing an identity, and a run that did not complete adds error, plus the forensic fields it has: partialContent - only the LAST assistant TEXT that run committed; the run keeps every turn it committed and its transcript stays readable with threadRead, where only a tool call left without an answer is recorded as interrupted - and cancelledAtMessage, which counts the messages that run had committed and is not a measure of progress. threadId and invocationId are HANDLES, not bookkeeping: threadId is the conversation the child ran in, so post a follow-up message into it with threadSend and read its transcript with threadRead, while agentResult pages that answer by invocationId; a finished child thread stays addressable until it is released with threadDelete, which is also how a session frees a thread slot. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset - and pass limit, because agentResult's own page is at most 8000 and DEFAULTS TO 4000, so following the cursor without it silently halves your page - or delegate again with a larger maxChars. A cancelled or failed child is reported as a structured result rather than an empty record: its error, plus partialContent whenever it had committed assistant text. That partial is one assistant message, so work the child did through tools is not recoverable from it, and cancelledAtMessage counts committed messages - durationMs is the field that scales with the work. maxTurns caps how many model REQUESTS the child may make (1-64) when you want a deliberately short run; its answer must land inside the cap, so N leaves room for at most N-1 tool rounds and 1 only suits a child that answers with no tool call. Omit it and the harness-wide limit applies. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId, name, invocationId, threadId, elapsedMs, note } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). The two ids are in the placeholder on purpose: while the child is still running you can already page what it has produced with agentResult by invocationId, or read its live transcript with threadRead / post into it with threadSend by threadId - and both are ABSENT when the child never started, so a missing id means no run, not an unknown one. Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder. Abandoning a live child with toolCancel does not discard its outcome: the tool message of that call carries the same envelope, built from the child's terminal record - status, any partialContent/cancelledAtMessage - plus callCancelled: true, which marks that you released the call while the child's result stayed readable. The toolCancel result itself is an acknowledgement, not the delegation's answer.`,
+        description: `Delegate a self-contained task to a lower-ranked agent and return its answer. Agents you may delegate to: ${listed.join(', ')}. You may delegate only to a strictly lower-ranked agent (a Rank A agent reaches Rank B and below); your own rank and every rank above it are refused, by an error that names your rank and the legal targets. That child does not see this conversation, and each delegation starts a NEW conversation with it, so it remembers no earlier one either - unless the call comes from the host rather than one of your conversations, and then the child re-enters that agent's default conversation (agent:<name>), where it may remember what it answered for you before: the brief must carry everything it needs. Delegation never widens upward: the targets above are the whole set for your rank, and a rank change is a harness reconfiguration, not a call. The result carries agent, content, contentLength, offset, limit, truncated, nextOffset and durationMs, and - when the run is identifiable - invocationId, threadId and status; a child whose ledger entry cannot be resolved (released with its thread, or aged out of the bounded result ledger) reports its answer with those three keys ABSENT rather than inventing an identity, and a run that did not complete adds error, plus the forensic fields it has: partialContent - only the LAST assistant TEXT that run committed; the run keeps every turn it committed and its transcript stays readable with threadRead, where only a tool call left without an answer is recorded as interrupted - and cancelledAtMessage, which counts the messages that run had committed and is not a measure of progress. threadId and invocationId are HANDLES, not bookkeeping: threadId is the conversation the child ran in, so post a follow-up message into it with threadSend and read its transcript with threadRead, while agentResult pages that answer by invocationId; a finished child thread stays addressable until it is released with threadDelete, which is also how a session frees a thread slot. content is ONE page of at most maxChars characters (default 8000): when truncated is true, read the rest with agentResult using invocationId and nextOffset as offset - and pass limit, because agentResult's own page is at most 8000 and DEFAULTS TO 4000, so following the cursor without it silently halves your page - or delegate again with a larger maxChars. A cancelled or failed child is reported as a structured result rather than an empty record: its error, plus partialContent whenever it had committed assistant text. That partial is one assistant message, so work the child did through tools is not recoverable from it, and cancelledAtMessage counts committed messages - durationMs is the field that scales with the work. maxTurns caps how many model REQUESTS the child may make (1-64) when you want a deliberately short run; its answer must land inside the cap, so N leaves room for at most N-1 tool rounds and 1 only suits a child that answers with no tool call. Omit it and the harness-wide limit applies. DELIVERY: a delegation is background work, so the RESULT SHAPE is always the envelope above, but WHEN it arrives depends on the child. A child that finishes without real I/O has its result in the tool message of your next turn; a child that is still running leaves a { status: "pending", callId, name, invocationId, threadId, elapsedMs, note } placeholder there instead, and the real envelope arrives in a later turn (use toolCancel with that callId to abandon it). The two ids are in the placeholder on purpose: while the child is still running you can already page what it has produced with agentResult by invocationId, or read its live transcript with threadRead / post into it with threadSend by threadId - and both are ABSENT when the child never started, so a missing id means no run, not an unknown one. Never treat the placeholder as an answer, and never assume the envelope is missing just because the first turn showed a placeholder. Abandoning a live child with toolCancel does not discard its outcome: the tool message of that call carries the same envelope, built from the child's terminal record - status, any partialContent/cancelledAtMessage - plus callCancelled: true, which marks that you released the call while the child's result stayed readable. The toolCancel result itself is an acknowledgement, not the delegation's answer.`,
         tags: [...baseline.tags],
         visibility: 'core',
         parameters: {
@@ -256,7 +257,7 @@ export const agentDelegateMetadata = (
                 agent: {
                     type: 'string',
                     enum: listed,
-                    description: 'Subagent name, one of the configured allowlist.'
+                    description: 'Agent name, one of the lower-ranked targets listed above.'
                 }
             },
             required: [...(baselineParameters.required ?? ['agent', 'input'])],

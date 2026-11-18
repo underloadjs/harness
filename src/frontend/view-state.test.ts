@@ -77,7 +77,7 @@ const summary = (overrides: Partial<TurnSummary> = {}): TurnSummary => ({
 
 const section = (id: string, overrides: Partial<TurnSection> = {}): TurnSection => ({
     id,
-    role: 'primary',
+    rank: 'A',
     agent: 'instruct',
     agentLabel: 'RR1',
     state: 'streaming',
@@ -179,7 +179,7 @@ describe('read helpers', () => {
 
     it('collects only the addressable steps, in section order then node order', () => {
         const tree = display('t1', [
-            section('t1:1', { role: 'subagent', agent: 'helper', nodes: [step({ id: '2' }), prose('n0', 'prose')] }),
+            section('t1:1', { rank: 'B', agent: 'helper', nodes: [step({ id: '2' }), prose('n0', 'prose')] }),
             section('t1:0', { nodes: [step({ id: '0', name: 'delegate' })] })
         ]);
 
@@ -211,8 +211,8 @@ describe('derived state', () => {
             {
                 t1: display('t1', [
                     section('t1:0', { agent: 'instruct', state: 'streaming' }),
-                    section('t1:1', { agent: 'helper', role: 'subagent', state: 'open' }),
-                    section('t1:2', { agent: 'closed', role: 'subagent', state: 'done' })
+                    section('t1:1', { agent: 'helper', rank: 'B', state: 'open' }),
+                    section('t1:2', { agent: 'closed', rank: 'B', state: 'done' })
                 ]),
                 t9: display('t9', [section('t9:0', { agent: 'late', state: 'streaming' })])
             }
@@ -293,7 +293,7 @@ describe('derived state', () => {
             {
                 // A foreign turn whose tree RAN a thread of this subtree contributes
                 // events to the document, so its record has to be readable.
-                t2: display('t2', [section('t2:0', { agent: 'helper', role: 'subagent', invocationId: 'inv-b' })]),
+                t2: display('t2', [section('t2:0', { agent: 'helper', rank: 'B', invocationId: 'inv-b' })]),
                 t3: display('t3', [section('t3:0', { invocationId: 'inv-z' })])
             }
         );
@@ -323,7 +323,7 @@ describe('applyOpToDisplay', () => {
         expect(sectionsOf(tree).map((entry) => [entry.id, entry.agentLabel])).toEqual([['t1:0', 'RR1']]);
         expect(tree.lastSectionOrdinal).toBe(0);
 
-        expect(open(section('t1:3', { role: 'subagent', agent: 'helper' }))).toBe(true);
+        expect(open(section('t1:3', { rank: 'B', agent: 'helper' }))).toBe(true);
         expect(sectionsOf(tree).map((entry) => entry.id)).toEqual(['t1:0', 't1:3']);
         expect(tree.lastSectionOrdinal).toBe(3);
 
@@ -341,7 +341,7 @@ describe('applyOpToDisplay', () => {
 
         expect(sectionsOf(tree)[0]).toEqual({
             id: 't1:0',
-            role: 'primary',
+            rank: 'A',
             agent: 'instruct',
             agentLabel: 'RR1',
             state: 'done',
@@ -355,7 +355,7 @@ describe('applyOpToDisplay', () => {
 
     it('removes a discarded section and the pending snapshot parked beside it', () => {
         const pending = freshPending();
-        const tree = display('t1', [section('t1:0'), section('t1:1', { agent: 'helper', role: 'subagent', invocationId: 'inv-x' })]);
+        const tree = display('t1', [section('t1:0'), section('t1:1', { agent: 'helper', rank: 'B', invocationId: 'inv-x' })]);
 
         expect(applyOpToDisplay(tree, 't1', { op: 'pending:set', turnId: 't1', sectionId: 't1:1', pending: [tool('c1', 'read')] }, pending)).toBe(true);
         expect(pending.get(pendingKeyOf('t1', 't1:1'))).toEqual([tool('c1', 'read')]);
@@ -732,7 +732,7 @@ describe('applyOpsToActivity', () => {
     const running = view([summary({ id: 't1', status: 'running' })], {
         t1: display('t1', [
             section('t1:0', { agent: 'instruct', state: 'streaming' }),
-            section('t1:1', { agent: 'helper', role: 'subagent', state: 'streaming' })
+            section('t1:1', { agent: 'helper', rank: 'B', state: 'streaming' })
         ])
     });
 
@@ -795,7 +795,7 @@ describe('applyOpsToActivity', () => {
 
         // A brand new flow that opens already-settled never lights a ring.
         const only = new Set<string>();
-        frame(only, [{ op: 'section:open', turnId: 't1', section: section('t1:5', { agent: 'late', role: 'subagent', state: 'done' }) }]);
+        frame(only, [{ op: 'section:open', turnId: 't1', section: section('t1:5', { agent: 'late', rank: 'B', state: 'done' }) }]);
         expect([...only]).toEqual([]);
     });
 

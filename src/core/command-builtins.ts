@@ -28,7 +28,13 @@
 // ----------------------------------------------------
 // The record engine requires an `expects: [{ id, rev }]` token for every content
 // patch or removal made by a caller that HAS an agent identity, and `executeTool`
-// always gives one (`agent: primary`). So `/task complete|reopen|remove` reads the
+// always gives one. WHAT THAT IDENTITY IS (verified against src/harness.ts on
+// 2026-11-18, not assumed): `executeToolInternal` (src/harness.ts:16177) builds the
+// tool context with `agent: entryAgent` (src/harness.ts:16209) — the session's ENTRY
+// agent, i.e. the roster member `configuration.entry` names (the first configured agent
+// when `entry` is omitted), carrying whatever rank the roster's `ranks` map gives it
+// (Rank A when `ranks` is absent). There is no `primary` agent any more, and being the
+// entry is a routing choice, not a rank. So `/task complete|reopen|remove` reads the
 // store first and sends the real revisions; it never invents a rev. There are no
 // ownership verbs left to skip the token (Decision P), which is why exactly THREE
 // subcommands do the read dance and `/task add` does not (a new record has no rev to
@@ -182,6 +188,13 @@ const TASK_READ_MAX_PAGES = 16;
 // holder: the old `(claimed by X until Y)` suffix described a lock that can no longer
 // exist. `rev` and the attribution still ride in `data` — the exact machine-readable
 // records — which is what an operator or a host uses to send the next `expects` token.
+//
+// NO ROLE LABEL IN THE OUTPUT (re-checked for the rank-model pass, 2026-11-18): no built-in
+// command prints a role / `primary` label. A task row is `#id [x]/[ ] text` plus the counts
+// and the cursor, and the attribution inside `data` is the agent NAME that last edited the
+// record — under the rank model just a roster name, and the ENTRY agent's name when the write
+// came through `executeTool` (see the header block). `/tools` prints names and description
+// previews, `/help` prints command entries; neither has a role axis to restate.
 const formatTaskPage = (result: unknown): string => {
     const page = (result ?? {}) as Partial<TaskPage>;
     const tasks = Array.isArray(page.tasks) ? page.tasks : [];
@@ -206,8 +219,10 @@ const formatTaskPage = (result: unknown): string => {
 
 // Reads the store and answers `id -> rev`, the token every guarded write needs.
 //
-// WHY A READ FIRST: `harness.executeTool` always hands the tool an agent identity
-// (`agent: primary`, src/harness.ts `executeToolInternal`), and core/task.ts
+// WHY A READ FIRST: `harness.executeTool` always hands the tool an agent identity —
+// `agent: entryAgent`, the session's entry agent, set on the manual-call context inside
+// `executeToolInternal` (src/harness.ts:16177) at src/harness.ts:16209; the retired
+// `agent: primary` spelling named an identity the engine no longer holds. core/task.ts
 // requires an `expects: [{ id, rev }]` entry for EVERY record an identified caller
 // patches or removes. A blind command would die on `guarded write: pass expects
 // [...]`; the read is what makes `/task complete 1` legal again. It is also the
@@ -332,7 +347,8 @@ const taskCommand: HarnessCommand = {
 
             try {
                 // `completed` is a PATCH by an IDENTIFIED caller (executeTool always
-                // supplies `agent: primary`), so it needs the rev that is stored right
+                // supplies the session's entry agent as `agent: entryAgent`,
+                // src/harness.ts:16209), so it needs the rev that is stored right
                 // now — see readTaskRevisions. An id the read did not see gets NO
                 // token, and the tool's own unknown-id rejection is what surfaces.
                 const revisions = await readTaskRevisions(context.harness);

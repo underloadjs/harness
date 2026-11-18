@@ -94,8 +94,11 @@ const gatedFixture = (): { preset: HarnessPreset; started: (p: string) => { prom
         title: 'gated',
         description: 'gated scripted preset',
         requiresEndpoint: false,
-        primary: 'gated',
-        subagents: [],
+        // A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+        // One distinct rank means nobody sits strictly below it, so the runtime registers no
+        // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+        entry: 'gated',
+        ranks: { gated: 'A' },
         agents: ['gated'],
         tools: [],
         builtin: true,
@@ -128,7 +131,7 @@ const gatedFixture = (): { preset: HarnessPreset; started: (p: string) => { prom
                         }
                     })
                 },
-                primary: 'gated',
+                entry: 'gated',
                 presets: false,
                 report: { progress }
             })

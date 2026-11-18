@@ -7,8 +7,11 @@ export const THREAD_READ_NAME = 'threadRead';
 
 // R2/R4 transcript reading. The third half of the thread trio: `threadList` shows
 // which conversations exist, `threadSend` writes into one, and this tool READS one
-// back. It is available to EVERY agent, not only the primary or the thread's owner:
-// the point is that a model can see the conversation a tool result only hinted at
+// back. It is registered and declared for EVERY agent in the session at EVERY rank —
+// not only the entry agent, and not only the thread's owner. THREADING IS NOT
+// RANK-GATED: a bottom-of-the-ladder worker reads exactly the transcripts the
+// entry agent reads (rank moves DELEGATION authority, never transcript access).
+// The point is that a model can see the conversation a tool result only hinted at
 // (a delegation it launched, a chat it received, a sibling thread its owner asked
 // it to inspect).
 //

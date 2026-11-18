@@ -64,7 +64,7 @@ export const CORE_TOOL_GROUP = 'Core tools' as const;
 // The hint a client can print verbatim. It states the one thing that is different
 // about these entries — they need a session — without promising availability in a
 // particular session (delegate, for example, exists only where the harness
-// allows subagents).
+// ranks at least two levels).
 export const CORE_TOOL_SESSION_HINT =
     'Runs inside a session harness: send a sessionId with the call.';
 

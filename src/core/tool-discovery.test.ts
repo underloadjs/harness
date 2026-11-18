@@ -78,6 +78,9 @@ describe('tools folder consolidation (R7)', () => {
             'chapters.tool.ts',
             'delegate.tool.ts',
             'fetch.tool.ts',
+            // The cross-session knowledge entry (its own `knowledge.test.ts` sits beside it).
+            // Sorted with the rest of the folder listing (f before k).
+            'knowledge.tool.ts',
             'locations.tool.ts',
             'profiles.tool.ts',
             'records.tool.ts',
@@ -116,6 +119,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'delegate',
@@ -186,17 +190,19 @@ describe('discoverToolMetadata (R8/R9)', () => {
                 activation: descriptor!.activation,
                 pendingOnly: descriptor!.pendingOnly,
                 control: descriptor!.control,
-                primaryOnly: descriptor!.primaryOnly,
                 answerExtraction: descriptor!.answerExtraction,
                 sessionBound: descriptor!.sessionBound
             };
         };
 
+        // The delegate row's activation is the RANK-gated one: it registers only
+        // while the roster spans two ranks (src/harness.ts `rosterHasDelegation`),
+        // and there is no `primaryOnly` flag any more — the rank rule lives in
+        // `delegateFor`, and the declared enum is projected per caller.
         expect(policy('delegate')).toEqual({
-            activation: 'subagents',
+            activation: 'delegation',
             pendingOnly: undefined,
             control: undefined,
-            primaryOnly: true,
             answerExtraction: true,
             sessionBound: true
         });
@@ -204,7 +210,6 @@ describe('discoverToolMetadata (R8/R9)', () => {
             activation: 'always',
             pendingOnly: true,
             control: 'cancel',
-            primaryOnly: undefined,
             answerExtraction: undefined,
             sessionBound: true
         });
@@ -212,7 +217,6 @@ describe('discoverToolMetadata (R8/R9)', () => {
             activation: 'forks',
             pendingOnly: undefined,
             control: 'fork',
-            primaryOnly: undefined,
             answerExtraction: undefined,
             sessionBound: true
         });
@@ -220,7 +224,6 @@ describe('discoverToolMetadata (R8/R9)', () => {
             activation: 'interaction',
             pendingOnly: undefined,
             control: 'action',
-            primaryOnly: undefined,
             answerExtraction: undefined,
             sessionBound: true
         });
@@ -228,7 +231,6 @@ describe('discoverToolMetadata (R8/R9)', () => {
             activation: 'websearch',
             pendingOnly: undefined,
             control: undefined,
-            primaryOnly: undefined,
             answerExtraction: undefined,
             sessionBound: true
         });
@@ -236,7 +238,6 @@ describe('discoverToolMetadata (R8/R9)', () => {
             activation: 'webfetch',
             pendingOnly: undefined,
             control: undefined,
-            primaryOnly: undefined,
             answerExtraction: undefined,
             sessionBound: true
         });
@@ -248,7 +249,6 @@ describe('discoverToolMetadata (R8/R9)', () => {
             activation: 'threads',
             pendingOnly: undefined,
             control: undefined,
-            primaryOnly: undefined,
             answerExtraction: undefined,
             sessionBound: true
         });
@@ -256,7 +256,6 @@ describe('discoverToolMetadata (R8/R9)', () => {
             activation: 'threads',
             pendingOnly: undefined,
             control: undefined,
-            primaryOnly: undefined,
             answerExtraction: undefined,
             sessionBound: true
         });
@@ -266,7 +265,6 @@ describe('discoverToolMetadata (R8/R9)', () => {
             activation: 'threads',
             pendingOnly: undefined,
             control: undefined,
-            primaryOnly: undefined,
             answerExtraction: undefined,
             sessionBound: true
         });
@@ -274,7 +272,6 @@ describe('discoverToolMetadata (R8/R9)', () => {
             activation: 'always',
             pendingOnly: undefined,
             control: undefined,
-            primaryOnly: undefined,
             answerExtraction: undefined,
             sessionBound: false
         });
@@ -293,6 +290,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'delegate',
@@ -491,11 +489,12 @@ describe('generated manifest parity (R9)', () => {
     });
 
     it('describes every package entry, and no folder entry', () => {
-        // 32 generated rows: the 31 package entries before this change (the 29
+        // 33 generated rows: the 32 package entries before the knowledge tool (the 29
         // historical rows including the `download` preset at order 235, plus the
         // `threadRead` runtime entry at order 265) plus the `threadDelete` runtime
-        // entry (order 255) that releases a finished conversation (issue 0027).
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(32);
+        // entry (order 255) that releases a finished conversation (issue 0027), plus
+        // the `knowledge` runtime entry (order 95, src/tools/runtime/knowledge.tool.ts).
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(33);
 
         for (const descriptor of BUILTIN_TOOL_DESCRIPTORS) {
             expect(descriptor.origin).toBe('package');

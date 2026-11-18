@@ -1,14 +1,14 @@
 // agentManage / agentResult (R3) — session-wide agent result inspection.
 //
 // Contract pinned here:
-//   - both are ALWAYS-registered core tools, declared to the primary AND to
-//     subagents, and their wire names are reserved;
+//   - both are ALWAYS-registered core tools, declared to EVERY agent in the session at
+//     every rank, and their wire names are reserved;
 //   - agentManage lists EVERY configured agent (even one that never ran) with
 //     only truncated previews of recent invocations;
 //   - agentResult reads one completed answer by agent (latest finished when no
 //     invocationId is given) and pages long text explicitly, so the harness's
 //     64 KiB result cap never silently truncates a full result;
-//   - subagent and fork results are available without reading the owner's
+//   - delegated and fork results are available without reading the owner's
 //     transcript;
 //   - `archiveInvocation` — the door a LANE result comes through — carries the forensic
 //     pair of a stopped run (`partialContent` / `cancelledAtMessage`), refuses a malformed
@@ -99,7 +99,7 @@ const CORE_DECLARATIONS = [
 ];
 
 describe('agentManage / agentResult registration', () => {
-    it('declares both core tools to the primary and to subagents', async () => {
+    it('declares both core tools to every agent, at every rank', async () => {
         const seenLead: HarnessStreamRequest[] = [];
         const seenHelper: HarnessStreamRequest[] = [];
 
@@ -119,11 +119,16 @@ describe('agentManage / agentResult registration', () => {
 
         expect(writer.tools.agentManage.visibility).toBe('searchable');
         expect(writer.tools.agentResult.visibility).toBe('searchable');
+        // RANK TAGS (2026-11-18): the retired `subagent` tag is replaced by `rank`, the
+        // delegate entry's existing rank vocabulary. These are EQUALITY pins, so the whole
+        // array is the expectation — and because both tools are `searchable`, these tags are
+        // also the `availableTags` vocabulary a no-match `toolRequest` reports (pinned in
+        // src/harness.already-available.test.ts and src/harness.discovery.test.ts).
         expect(writer.tools.agentManage.tags).toEqual([
             'agents',
             'results',
             'preview',
-            'subagent',
+            'rank',
             'team',
             'inspect'
         ]);
@@ -132,7 +137,7 @@ describe('agentManage / agentResult registration', () => {
             'result',
             'answer',
             'output',
-            'subagent',
+            'rank',
             'inspect'
         ]);
 
@@ -223,7 +228,7 @@ describe('agentManage', () => {
             agents: [
                 {
                     name: 'lead',
-                    role: 'primary',
+                    rank: 'A',
                     model: 'merge/ds4-flash',
                     invocationCount: 1,
                     results: [
@@ -239,7 +244,7 @@ describe('agentManage', () => {
                 },
                 {
                     name: 'helper',
-                    role: 'subagent',
+                    rank: 'B',
                     model: 'merge/ds4-flash',
                     invocationCount: 1,
                     results: [
@@ -280,7 +285,7 @@ describe('agentManage', () => {
             agents: [
                 {
                     name: 'writer',
-                    role: 'primary',
+                    rank: 'A',
                     model: 'merge/ds4-flash',
                     invocationCount: 1,
                     results: [
@@ -585,7 +590,7 @@ describe('agentResult', () => {
             agents: [
                 {
                     name: 'writer',
-                    role: 'primary',
+                    rank: 'A',
                     model: 'merge/ds4-flash',
                     invocationCount: 0,
                     results: []
@@ -607,8 +612,8 @@ describe('agentResult', () => {
     });
 });
 
-describe('subagent and fork results', () => {
-    it('makes a delegated subagent result readable by agent and invocation id', async () => {
+describe('delegated and fork results', () => {
+    it('makes a delegated result readable by agent and invocation id', async () => {
         const helper = brain(scripted([answer('helper result')]));
         const lead = brain(
             scripted([
@@ -811,7 +816,7 @@ describe('result pagination and Unicode boundaries', () => {
 });
 
 describe('snapshot durability (R3)', () => {
-    it('round-trips root, subagent and fork results, and advances ids', async () => {
+    it('round-trips root, delegated and fork results, and advances ids', async () => {
         const helper = brain(scripted([answer('helper answer')]));
 
         const lead = brain(
@@ -876,7 +881,7 @@ describe('snapshot durability (R3)', () => {
                 sequence: 1,
                 completedOrder: 3,
                 agent: 'lead',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: 'root final',
@@ -891,7 +896,7 @@ describe('snapshot durability (R3)', () => {
                 sequence: 2,
                 completedOrder: 1,
                 agent: 'helper',
-                role: 'subagent',
+                rank: 'B',
                 kind: 'delegation',
                 status: 'completed',
                 content: 'helper answer',
@@ -903,7 +908,7 @@ describe('snapshot durability (R3)', () => {
                 sequence: 3,
                 completedOrder: 2,
                 agent: 'lead',
-                role: 'primary',
+                rank: 'A',
                 kind: 'fork',
                 status: 'completed',
                 content: 'fork answer',
@@ -1000,7 +1005,7 @@ describe('snapshot durability (R3)', () => {
                 sequence: 1,
                 completedOrder: 1,
                 agent: 'writer',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'failed',
                 // Issue 0036 R3: the CAUSE of the halt travels on the row beside the
@@ -1086,7 +1091,7 @@ describe('snapshot durability (R3)', () => {
                 sequence: 1,
                 completedOrder: 1,
                 agent: 'writer',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: 'late answer',
@@ -1187,7 +1192,7 @@ describe('snapshot durability (R3)', () => {
             sequence: index + 1,
             completedOrder: index + 1,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'completed',
             content: 'x'
@@ -1890,7 +1895,7 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             sequence: 1,
             completedOrder: 1,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'cancelled',
             // Issue 0036 R3: the row names WHY the run halted, separately from the fact
@@ -2039,7 +2044,7 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             sequence: 1,
             completedOrder: 1,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'failed',
             // Issue 0036 R3: the cause travels beside the status — a provider that died
@@ -2093,7 +2098,7 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
                 sequence: 1,
                 completedOrder: 1,
                 agent: 'writer',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'cancelled',
                 content: '',
@@ -2104,7 +2109,7 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
                 sequence: 2,
                 completedOrder: 2,
                 agent: 'writer',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: 'a finished answer'
@@ -2176,7 +2181,7 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             sequence: 1,
             completedOrder: 1,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status,
             content: '',
@@ -2319,7 +2324,7 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
         invocationId: '513',
         sequence: 3,
         agent: 'writer',
-        role: 'subagent',
+        rank: 'B',
         kind: 'delegation',
         status: 'cancelled',
         content: '',
@@ -2341,7 +2346,7 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             sequence: 3,
             completedOrder: 1,
             agent: 'writer',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'cancelled',
             content: '',
@@ -2360,7 +2365,7 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             sequence: 3,
             completedOrder: 1,
             agent: 'writer',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'cancelled',
             content: '',
@@ -2399,7 +2404,7 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             sequence: 3,
             completedOrder: 1,
             agent: 'writer',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'completed',
             content: 'the finished answer',
@@ -2411,7 +2416,7 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             sequence: 3,
             completedOrder: 1,
             agent: 'writer',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'completed',
             content: 'the finished answer',
@@ -2435,7 +2440,7 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             sequence: 3,
             completedOrder: 2,
             agent: 'writer',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'completed',
             content: 'the finished answer',
@@ -2489,7 +2494,7 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             sequence: 4,
             completedOrder: 1,
             agent: 'writer',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'cancelled',
             content: '',
@@ -2508,7 +2513,7 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             invocationId: '515',
             sequence: 5,
             agent: 'writer',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'cancelled',
             content: '',
@@ -2524,7 +2529,7 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
             sequence: 5,
             completedOrder: 2,
             agent: 'writer',
-            role: 'subagent',
+            rank: 'B',
             kind: 'delegation',
             status: 'cancelled',
             content: '',

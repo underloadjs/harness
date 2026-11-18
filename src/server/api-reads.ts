@@ -86,6 +86,10 @@ import { HARNESS_SERVICE_LIMITS } from '../shared/harness-api';
 // which is what the two projections below turn into wire rows. Domain types come from
 // ../types, the same barrel ./sessions.ts reads, never from the runtime entry point.
 import type { RecordEntry, RecordFieldDefinition, RecordStoreChange } from '../types';
+// The rank vocabulary, imported as a VALUE so the fallback rank below comes from the same
+// ordered list every other rank rule in the repo reads (../types/index.ts `AGENT_RANKS`).
+import { AGENT_RANKS } from '../types';
+import type { AgentRank } from '../types';
 import { previewText } from './turn-projector';
 import type { SessionRecord, ThreadLaneInfo } from './sessions';
 // R19: the roster's invocation joins are keyed by INVOCATION RUN (`id\0epoch` / bare id) inside
@@ -1463,6 +1467,26 @@ export const sessionToolSourceOf = (record: SessionRecord, name: string): Sessio
 // Session agents
 // ---------------------------------------------------------------------------
 
+// The LOWEST rank in the vocabulary, derived (never hard-coded) from the ordered list in
+// ../types/index.ts so a vocabulary change needs no edit here.
+const LOWEST_RANK = AGENT_RANKS[AGENT_RANKS.length - 1];
+
+/**
+ * The RANK one member holds in a harness.
+ *
+ * The definition's `ranks` map is the ONLY authority: this read never derives a rank from a
+ * name, from roster order, or from "is this the entry agent" (entry is routing — which
+ * conversation an unfocused submit opens — and the entry agent may hold any rank). A member the
+ * map does not name holds `LOWEST_RANK`, because authority exists only where the definition
+ * grants it. Any number of members may hold the same rank, including 'A'.
+ *
+ * The map is read as a partial because the harness DEFINITION's `ranks` is
+ * `Partial<Record<string, AgentRank>>` (../types, B1's contract); a resolved descriptor map is
+ * the same shape with every member named, and both read identically here.
+ */
+const rankOfMember = (ranks: Partial<Record<string, AgentRank>> | undefined, name: string): AgentRank =>
+    ranks?.[name] ?? LOWEST_RANK;
+
 /**
  * The live roster: what the session was BUILT with (the frozen definition) joined with
  * what it RUNS now (the running brains). Instruction TEXT is absent - it is one named
@@ -1529,7 +1553,15 @@ export const sessionAgentRowsOf = (record: SessionRecord, context: ReadContext):
         return {
             agent_id: name,
             profile: name,
-            role: name === definition.primary ? 'primary' : 'subagent',
+            // The member's RANK ('A'–'Z', A highest). Preferred: what the LIVE harness resolves
+            // (`../types` `Harness.ranks`, complete for every registered agent) — this roster already
+            // reports what the session RUNS, not only what it was built with (see `model` below), and
+            // the rank the runtime holds is the one that decides delegation. The frozen definition's
+            // map is the fallback for a handle that reports no ranks (a scripted harness). This
+            // replaces `role: 'primary' | 'subagent'`; several members may report the same rank, the
+            // entry agent is NOT necessarily Rank A (entry is routing, see `deletable`), and a member
+            // no map names holds the lowest rank.
+            rank: record.harness.ranks?.[name] ?? rankOfMember(definition.ranks, name),
             // T27: the roster lists BOTH kinds of member, and the contract distinguishes them.
             // A member the harness definition shipped is `definition`; one bound into THIS
             // conversation by `POST /sessions/{id}/agents` is `session` — same trusted profile,
@@ -1553,11 +1585,14 @@ export const sessionAgentRowsOf = (record: SessionRecord, context: ReadContext):
                   : {}),
             ...(brain === undefined ? {} : { guidelines_count: brain.instructions.length }),
             editable: true,
-            // The entry agent cannot be detached: every session needs an entry point. R6: neither
-            // can a member that still owns a DISCOVERABLE conversation — its history would go with
-            // it. A soft-deleted conversation is not counted here (the roster hides it) yet still
-            // blocks the write; see the asymmetry note on this function's header.
-            deletable: name !== definition.primary && !threadUsers.has(name),
+            // Detachability is governed by the ENTRY agent, not by rank: every session needs an
+            // entry point, so the entry member is never detachable, while ANY other member is —
+            // whatever its rank (several Rank A members can coexist and detach freely). R6: a
+            // member that still owns a DISCOVERABLE conversation cannot be detached either — its
+            // history would go with it. A soft-deleted conversation is not counted here (the
+            // roster hides it) yet still blocks the write; see the asymmetry note on this
+            // function's header.
+            deletable: name !== definition.entry && !threadUsers.has(name),
             // A custom member always has a stated undo (`null` restores its stored base), and an
             // inherited member has one as soon as its text is not the plain shipped profile.
             restorable: isCustom ? true : source !== 'catalogue',
@@ -1621,8 +1656,13 @@ export const harnessCardOf = (preset: HarnessPreset, hub: HarnessEventHub, tools
     title: preset.title,
     description: preset.description,
     requires_endpoint: preset.requiresEndpoint,
-    primary: preset.primary,
-    subagents: [...preset.subagents],
+    // The ENTRY agent (routing: the agent an unfocused submit opens a conversation for) plus the
+    // RANK map. These replace `primary` + `subagents`: membership is `agents`, authority is
+    // `ranks`, and delegation targets are derived from rank rather than from a list. The map is
+    // emitted whole — an empty one honestly states "no member was granted authority", which under
+    // the rank rules means every member holds the lowest rank.
+    entry: preset.entry,
+    ranks: { ...preset.ranks },
     agents: [...preset.agents],
     tools: [...tools],
     builtin: preset.builtin,
@@ -1862,8 +1902,11 @@ export const sessionDefinitionOf = (
         title: definition.title,
         description: definition.description,
         requires_endpoint: definition.requiresEndpoint,
-        primary: definition.primary,
-        subagents: [...definition.subagents],
+        // The frozen copy's ENTRY agent and RANK map — what this conversation was built with, so
+        // a client paints the authority layout it actually runs, not whatever the live registry
+        // entry says after a later rank edit. Replaces `primary`/`subagents`.
+        entry: definition.entry,
+        ranks: { ...definition.ranks },
         agents: [...definition.agents],
         tools: [...definition.tools],
         builtin: definition.builtin,

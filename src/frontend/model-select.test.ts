@@ -6,17 +6,18 @@
 //     and any current override the catalogue no longer lists;
 //   - the default option and a catalogue entry with the same id are deduped;
 //   - a model change PATCHes the complete override map;
-//   - promotion/add preserve the map, removal drops the removed member's key, and
+//   - the entry move/add preserve the map, removal drops the removed member's key, and
 //     choosing the default deletes that member's entry;
 //   - R1/R2/R3: for a harness TEMPLATE whose card omits `agent_models` (what the real server
 //     publishes), the save merges onto the stored map the dialog RENDERS from, so clearing an
 //     override is never refused as "Nothing changed.", other members' overrides survive, and
 //     clearing the last one sends an explicit empty map;
 //   - a saved session's TEAM is frozen (New session affordance, disabled
-//     promotion/add/remove) but its MODELS are live (R2): the dropdowns stay
+//     entry move/add/remove) but its MODELS are live (R2): the dropdowns stay
 //     enabled and PATCH /sessions/:id, applying the returned snapshot, including
 //     while the session is running.
 
+import type { AgentRank } from '../types';
 import type { HarnessDescriptor, SessionSnapshot } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
@@ -33,8 +34,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct', 'summarizer'],
         tools: [],
         coreTools: ['toolRequest', 'toolCreate', 'tasks', 'delegate'],
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         builtin: true,
         editable: true,
         ...overrides
@@ -128,11 +129,12 @@ const addAgent = (name: string): void => {
     byClass(`.agent-dialog-add-option[data-agent="${name}"]`, 'button').click();
 };
 
-// The two explicit team controls inside the viewed agent's panel.
-const promoteAction = (): HTMLButtonElement => {
+// The two explicit team controls inside the viewed agent's panel. `entryAction` moves
+// ROUTING only (R20): pressing it never changes anybody's rank.
+const entryAction = (): HTMLButtonElement => {
     openDeck();
 
-    return byClass('.agent-dialog-promote', 'button');
+    return byClass('.agent-dialog-entry', 'button');
 };
 
 const removeAction = (): HTMLButtonElement => {
@@ -174,17 +176,25 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
             if (url === '/api/models') return json({ models: ['m1', 'm2', 'm3'] });
 
             if (url === '/api/harnesses/instruct' && init?.method === 'PATCH') {
+                // The wire body of a harness PATCH (../shared/harness-api.ts
+                // `UpdateHarnessRequest`): the ROSTER, the ENTRY agent, the rank map, and the
+                // override maps in the wire's own snake_case spelling.
                 const request = JSON.parse(String(init.body)) as {
-                    primary: string;
-                    subagents: string[];
+                    agents: string[];
+                    entry: string;
+                    ranks: Record<string, AgentRank>;
                     agentModels?: Record<string, string>;
                 };
                 patches.push(request);
 
+                // The answer restates what the route stores: `agents`, `entry` and `ranks` all
+                // REPLACE, so the fixture echoes the request rather than keeping its own copy —
+                // and a member the map omits really is left unstated, which is the fact the next
+                // save reads.
                 current = descriptor({
-                    primary: request.primary,
-                    agents: [request.primary, ...request.subagents],
-                    subagents: request.subagents,
+                    agents: request.agents,
+                    entry: request.entry,
+                    ranks: request.ranks,
                     ...(request.agentModels === undefined
                         ? {}
                         : { agentModels: request.agentModels })
@@ -230,8 +240,9 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     await flush();
 
     expect(patches[0]).toEqual({
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        agents: ['instruct', 'summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         agentModels: { instruct: 'm3', summarizer: 'm1' }
     });
     expect(modelSelects()[0].value).toBe('m3');
@@ -241,18 +252,22 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
 
     // --- adding a member preserves existing entries -----------------------
     // R3: `[+]` is what drafts the membership; the picker lists only agents without a
-    // badge, and adding one never promotes it.
+    // badge, and adding one states no rank for the new member.
     addAgent('critic');
     expect(patches).toHaveLength(1);
 
-    // Saved from the PRIMARY's configuration so adding does not also promote.
+    // Saved from the entry agent's configuration so adding does not also move the entry.
     selectConfigured('instruct');
     applyAction().click();
     await flush();
 
     expect(patches[1]).toEqual({
-        primary: 'instruct',
-        subagents: ['summarizer', 'critic'],
+        agents: ['instruct', 'summarizer', 'critic'],
+        entry: 'instruct',
+        // `critic` is NOT in the map: adding a member never claims a rank for it, and the
+        // server fills an unnamed member one rank below the lowest letter this body states
+        // (../shared/harness-api.ts:808-816) — the bottom of this team's ladder.
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         agentModels: { instruct: 'm3', summarizer: 'm1' }
     });
 
@@ -268,24 +283,29 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     await flush();
 
     expect(patches[2]).toEqual({
-        primary: 'instruct',
-        subagents: ['summarizer', 'critic'],
+        agents: ['instruct', 'summarizer', 'critic'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         agentModels: { instruct: 'm3', summarizer: 'm1', critic: 'm2' }
     });
 
-    // --- promotion preserves every mapping --------------------------------
-    // R3: the promotion is armed by the panel control, and its label states it; saving
-    // from there restates the complete team with the new primary first.
+    // --- the entry move preserves every mapping -----------------------------
+    // R3: the entry move is armed by the panel control, and its label states it; saving
+    // from there restates the complete team with the new entry agent first.
     selectConfigured('critic');
     expect(applyAction().textContent).toBe('Save configuration');
-    promoteAction().click();
-    expect(applyAction().textContent).toBe('Save & set primary');
+    entryAction().click();
+    expect(applyAction().textContent).toBe('Save & set entry');
     applyAction().click();
     await flush();
 
     expect(patches[3]).toEqual({
-        primary: 'critic',
-        subagents: ['instruct', 'summarizer'],
+        // The entry agent leads the roster (the order the shell renders), and every rank is
+        // the one it already had: `critic` is still unnamed, because an entry move is
+        // ROUTING, not an authority change.
+        agents: ['critic', 'instruct', 'summarizer'],
+        entry: 'critic',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         agentModels: { instruct: 'm3', summarizer: 'm1', critic: 'm2' }
     });
     expect(
@@ -294,7 +314,7 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
 
     // --- removal drops only the removed member's key ----------------------
     // R3: `Remove from team` is the deliberate press, and the removed agent loses its
-    // badge at once, so the view lands on the primary instead of a dropped agent.
+    // badge at once, so the view lands on the entry agent instead of a dropped agent.
     selectConfigured('summarizer');
     removeAction().click();
 
@@ -302,8 +322,9 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     await flush();
 
     expect(patches[4]).toEqual({
-        primary: 'critic',
-        subagents: ['instruct'],
+        agents: ['critic', 'instruct'],
+        entry: 'critic',
+        ranks: { instruct: 'A' },
         agentModels: { instruct: 'm3', critic: 'm2' }
     });
     selectConfigured('critic');
@@ -323,8 +344,9 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     await flush();
 
     expect(patches[5]).toEqual({
-        primary: 'critic',
-        subagents: ['instruct'],
+        agents: ['critic', 'instruct'],
+        entry: 'critic',
+        ranks: { instruct: 'A' },
         agentModels: { critic: 'm2' }
     });
     selectConfigured('instruct');
@@ -366,8 +388,9 @@ it('saves harness model changes against the stored map the dialog renders from',
                     // The adapter hands the fixture the body in the fixture's own spelling
                     // (`agentModels`), which is what every other fixture here asserts on.
                     const request = JSON.parse(String(init.body)) as {
-                        primary: string;
-                        subagents: string[];
+                        agents: string[];
+                        entry: string;
+                        ranks: Record<string, AgentRank>;
                         agentModels?: Record<string, string>;
                     };
                     patches.push(request);
@@ -408,8 +431,9 @@ it('saves harness model changes against the stored map the dialog renders from',
     // field, so this pins both halves of R2 at once.
     expect(patches).toEqual([
         {
-            primary: 'instruct',
-            subagents: ['summarizer'],
+            agents: ['instruct', 'summarizer'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', 'summarizer': 'B' },
             agentModels: { summarizer: 'other/model' }
         }
     ]);
@@ -427,8 +451,9 @@ it('saves harness model changes against the stored map the dialog renders from',
     // The field is SENT even though the map is empty (mirror of the instructions half,
     // `sendsInstructions` in ./main.ts `patchAgents`).
     expect(patches[1]).toEqual({
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        agents: ['instruct', 'summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         agentModels: {}
     });
 
@@ -708,7 +733,7 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     await flush();
 
     // T7b (R5/R6): a saved conversation edits its OWN team, prompts and models, so NOTHING here
-    // is locked because a session is open — only the entry agent is fixed (R5) and the primary can
+    // is locked because a session is open — only the entry agent is fixed (R5) and it can
     // never leave the team. R3's rule is unchanged: every restriction is stated ON the control and
     // there is no explanation paragraph. R7: the `[+]` of a session also takes a typed name.
     // T3/R1: a saved session still prints NO header note — since T9 the CYCLER beside the title is
@@ -729,13 +754,13 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     );
     expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true);
     expect(byClass('.agent-dialog-remove', 'button').title).toBe(
-        'The primary agent is always part of the team.'
+        'The entry agent is always part of the team: every harness needs an entry point.'
     );
     // R5: the entry agent of a saved conversation cannot move, so the control states that reason
     // instead of arming a promotion the session would refuse.
-    expect(byClass('.agent-dialog-promote', 'button').disabled).toBe(true);
-    expect(byClass('.agent-dialog-promote', 'button').title).toBe(
-        'The primary agent is fixed for a saved conversation.'
+    expect(byClass('.agent-dialog-entry', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-entry', 'button').title).toBe(
+        'The entry agent is fixed for a saved conversation.'
     );
     // R7: a session gains agents the catalogue never advertised, so `[+]` is live here.
     expect(byClass('.agent-dialog-add', 'button').disabled).toBe(false);

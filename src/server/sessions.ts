@@ -63,7 +63,7 @@
 // Record ownership (H3): the server — not the browser — is the source of truth for
 // the renderable transcript. Each submitted task becomes one SessionTurn that owns
 // the prompt, status, timestamps, and every HarnessEvent the run produced
-// (including events from subagents reached by delegation). `eventTimes` is a
+// (including events from members reached by delegation). `eventTimes` is a
 // parallel epoch-ms array, so per-step and per-tool elapsed time survives a
 // reload. `usage` is the server's running token tally for the turn, folded from the
 // per-request `usage` events (see addUsage) and repeated on every stream frame, so
@@ -87,8 +87,8 @@
 // (`harness.threads()`); the store owns the TURN records and decides which thread
 // an input executes in.
 //
-//   - POST /tasks WITHOUT threadId opens a NEW standalone host thread for the
-//     primary agent. A reference to a prior block is a LINK only (the roster
+//   - POST /tasks WITHOUT threadId opens a NEW standalone host thread for the ENTRY
+//     agent (whatever rank it holds). A reference to a prior block is a LINK only (the roster
 //     derives `connectedThreadIds`); `ownerThreadId` is reserved for the runtime's
 //     delegation lineage, so stopping/deleting a referenced source never aborts or
 //     purges the connected conversation.
@@ -158,6 +158,7 @@ import type {
     HarnessDiagnosticEvent,
     HarnessEvent,
     HarnessInteractionConfiguration,
+    HarnessKnowledge,
     HarnessMessage,
     HarnessSnapshot,
     HarnessStateChangeEvent,
@@ -165,6 +166,13 @@ import type {
     HarnessThreadSnapshot,
     HarnessThreadSteerReceipt
 } from '../harness';
+// The rank vocabulary, from the type module (../types/index.ts), which is where the contract puts
+// it. `AGENT_RANKS` is imported as a VALUE for two reasons: it is the ordered authority list
+// (A = highest) that the binding validator reads, and it is the source of the DEFAULT rank this
+// store gives a binding that names none — derived, never hard-coded, so a vocabulary change here
+// cannot drift from the runtime's own rank rules (`rankIndexOf`/`isLowerRank` live there).
+import { AGENT_RANKS, isAgentRank } from '../types';
+import type { AgentRank } from '../types';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { validateAttachments } from '../shared/attachments';
 import {
@@ -992,6 +1000,18 @@ export type SessionStoreOptions = {
     // because an injected client IS the write path. In-memory stores (no `persistence`)
     // refuse one: there is nothing off-loop to write.
     io?: HarnessIoClient;
+    // T7: the cross-session KNOWLEDGE base every harness this store builds writes through
+    // (`HarnessConfiguration.knowledge`, ../types). Accept either form:
+    //   - a VALUE (a `KnowledgeStore`, or a bare `KnowledgeEngine`) — a host that owns one
+    //     object for the process and hands this store that reference;
+    //   - a FUNCTION — what ./runtime.ts passes, because `createHarnessRuntime` is sync while
+    //     the store's load is async, and a restored session builds its harness inside THIS
+    //     constructor, possibly before the load settles. The build-time read
+    //     (`buildHarness`) therefore sees the live answer: the shared engine early, the store
+    //     as soon as it lands, one object either way.
+    // Absent (an in-memory store, a test, a library host) means each harness gets its own
+    // in-memory engine: knowledge still works, and the member carries no durability verbs.
+    knowledge?: HarnessKnowledge | (() => HarnessKnowledge | undefined);
 };
 
 // Recovery wording used when a turn was running at save time. The policy is
@@ -1063,7 +1083,7 @@ const PROVIDER_NETWORK_STOP_REASON = 'provider-network';
 // The two spellings the union already has that this rule must treat differently.
 const API_ERROR_STOP_REASON = 'api-error';
 
-// F1: the runaway guard. The durable streak is the primary bound (it rises on every failed
+// F1: the runaway guard. The durable streak is the governing bound (it rises on every failed
 // attempt, auto-resumed or not), but a row can be re-run while the streak is being reset by
 // a sibling success, so a turn also carries a live cap on how many auto-resumes the store
 // will START for that one row. It equals the ceiling, so no turn can ever loop more than the
@@ -1101,6 +1121,44 @@ export class SessionError extends Error {
         this.name = 'SessionError';
     }
 }
+
+// ---------------------------------------------------------------------------
+// B3 R14/R15 — THE ONE RANK VALIDATOR FOR A BINDING.
+//
+// WHY IT IS MODULE-LEVEL AND EXPORTED: two callers need the SAME verdict with the SAME wording.
+// The HTTP edge (./api.ts POST /sessions/:id/agents) runs it BEFORE its durability and idle gates
+// so an invalid body answers 400 on any session rather than 409 about a busy one; the store runs it
+// again because a binding is also reachable without HTTP. One rule, one message, two call sites.
+//
+// THE CLEAN BREAK: the accepted values are the letters of the authority scale, read from
+// `AGENT_RANKS` (../types/index.ts:1816) so this text can never drift from the scale. An old client
+// sending the retired two-value axis lands in the unknown-field refusal at the edge, and an old
+// value that does reach here is refused out loud — the validator NEVER reinterprets it as a rank,
+// which is the whole point of not keeping a compat shim.
+//
+// ABSENT IS NOT AN ERROR: `undefined`/`null` means "no authority requested" and returns
+// `undefined`, leaving the caller to resolve it. The store does NOT invent a value here — it hands
+// the absence to the runtime (`../types` `Harness.addAgent` documents the rank-less default) and
+// records whatever the handle resolves, so the durable roster can never disagree with what the run
+// enforces. Only a PRESENT value can be wrong.
+// ---------------------------------------------------------------------------
+export const validateBindingRank = (value: unknown): AgentRank | undefined => {
+    if (value === undefined || value === null) {
+        return undefined;
+    }
+
+    // `isAgentRank` (../types/index.ts:1547) is B1's untrusted-input guard for a rank — the one
+    // place the scale is enumerated for a `unknown` value. Using it here means the API, the config
+    // resolver and a binding can never disagree about what a rank letter is.
+    if (isAgentRank(value)) {
+        return value;
+    }
+
+    throw new SessionError(
+        400,
+        `An agent binding takes a "rank": one letter of the authority scale, ${AGENT_RANKS.join(', ')}. The rank is what decides what the agent may reach; the roster alone does not.`
+    );
+};
 
 // What enqueue() hands its caller. `session`/`turn` are copies (the 202 body);
 // `settled` resolves when THIS turn is terminal (or dropped by a cancel-all), so
@@ -1543,9 +1601,9 @@ const isTerminalTurnStatus = (status: SessionTurn['status']): boolean =>
 // whole life of the turn — which is what makes it safe to freeze the entry agent's
 // instruction source at the turn-start boundary.
 const runAgentOf = (session: Session, turn: SessionTurn): string => {
-    if (turn.threadId === undefined) return session.definition.primary;
+    if (turn.threadId === undefined) return session.definition.entry;
 
-    return session.harness.threads().find((thread) => thread.id === turn.threadId)?.agent ?? session.definition.primary;
+    return session.harness.threads().find((thread) => thread.id === turn.threadId)?.agent ?? session.definition.entry;
 };
 
 // An index the record can actually address. A segment keeps the event range it was
@@ -1846,18 +1904,18 @@ const submittedCount = (value: unknown): number => {
 
 // The agent a command turn's synthesized events are attributed to, and the model the
 // `start` frame reports. Both MUST equal what `snapshot()` already publishes
-// (`agentModels[primary]` / `model`), otherwise a live tile and a reloaded tile
+// (`agentModels[entry]` / `model`), otherwise a live tile and a reloaded tile
 // disagree about the same turn. A host handle without the entry-agent member falls
 // back to the frozen descriptor and the session model, so these are never empty.
 const commandAgentOf = (session: Session): string => {
     const harness = session.harness as Partial<Harness>;
     const name =
-        typeof harness.name === 'string' && harness.name.length > 0 ? harness.name : session.definition.primary;
+        typeof harness.name === 'string' && harness.name.length > 0 ? harness.name : session.definition.entry;
 
-    // `name` and `definition.primary` are the SAME string for every preset built by
-    // the registry (HarnessPreset.primary is the entry agent), so the fallback only
+    // `name` and `definition.entry` are the SAME string for every preset built by
+    // the registry (HarnessPreset.entry names it), so the fallback only
     // fires for a hand-built handle; the agent-name guard then keeps the frontend's
-    // primary/subagent colouring exact instead of colouring a command as a subagent.
+    // per-agent painting exact instead of attributing a command turn to a delegated member.
     return name;
 };
 
@@ -1960,6 +2018,14 @@ export class SessionStore {
     // LIVE provider every harness in this store is built with (./tool-settings.ts).
     private readonly tools: HarnessToolSettingsStore;
 
+    // T7: the CROSS-SESSION knowledge base, as a build-time accessor (see
+    // `SessionStoreOptions.knowledge`). Read once per `buildHarness` call, never cached across
+    // builds: the durable store may land after this constructor restored its sessions, and the
+    // accessor is what makes that a non-event instead of a permanently ephemeral process.
+    // Knowledge is NOT stored per session and NOT snapshotted — one object for the whole store
+    // (./runtime.ts owns it), which is why deleting a session cannot delete an article.
+    private readonly knowledgeOf: () => HarnessKnowledge | undefined;
+
     private host?: LaneHost;
 
     // D4 (R1/R2/R4): the IO worker client that performs this store's checkpoint and journal
@@ -2003,7 +2069,7 @@ export class SessionStore {
     }
 
     // `registry` defaults to a fresh in-memory registry over the shipped presets.
-    // It is injectable so tests can run scripted harnesses (including subagents and
+    // It is injectable so tests can run scripted harnesses (including delegated members and
     // failures) without reaching a provider, and so the host can share ONE registry
     // with the API. `describe` captures host-specific availability (search) in
     // the frozen snapshot: the store owns no catalogue, so production injects a
@@ -2047,6 +2113,21 @@ export class SessionStore {
         this.tools = createToolSettingsStore({
             ...(options.database === undefined ? {} : { values: options.database.toolSettings })
         });
+
+        // T7: the knowledge accessor, normalised to ONE shape (a getter) so `buildHarness` has
+        // a single read. A value is captured by REFERENCE, never copied: the durable store is
+        // the process's one store for one database root (./runtime.ts owns the table), and a
+        // copy would be a second `onStoreChange` subscriber committing the same directory.
+        //
+        // WHY A GETTER EVEN THOUGH MOST HOSTS PASS A VALUE: the restore path builds harnesses
+        // inside this constructor, and ./runtime.ts resolves the durable half asynchronously.
+        // A captured `undefined` would strand every restored session on a private engine for
+        // the whole process; a read at build time gets the store the moment it lands, with the
+        // SAME engine underneath either way.
+        this.knowledgeOf =
+            typeof options.knowledge === 'function'
+                ? (options.knowledge as () => HarnessKnowledge | undefined)
+                : () => options.knowledge as HarnessKnowledge | undefined;
 
         // R3: the runtime is already validated (./config.ts resolveRuntimeConfiguration), and
         // ./runtime.ts asserted readiness BEFORE constructing this store. A missing option is
@@ -2772,6 +2853,11 @@ export class SessionStore {
             }
         };
 
+        // T7: read the knowledge base ONCE per build (see the field for why it is an accessor
+        // at all). One read, one object: `create` and every later turn of this session use the
+        // SAME engine, so a store that lands mid-build cannot split the session in two.
+        const knowledge = this.knowledgeOf();
+
         const harness = preset.create(settings, progress, {
             stateChange,
             interaction,
@@ -2809,6 +2895,14 @@ export class SessionStore {
             // its `session.json` shard. Forwarded through `HarnessPresetReport.toolSettings` by the
             // shared toolbox (../harnesses/toolbox.ts), exactly like `pluginSettings`.
             toolSettings: this.tools.provider,
+            // T7: THE SESSION'S KNOWLEDGE BASE, read at build time for the reason documented on
+            // the field. Presence is what makes two sessions of one server share one article
+            // set, and what makes `harness.knowledge` in a session the SAME store the listener
+            // flushes on shutdown. The whole cross-session guarantee rests on this line plus the
+            // one in ./toolbox.ts: no session owns knowledge, and no session's deletion can
+            // touch the store's directory (`remove()` erases `sessions/<id>/` and the journal,
+            // and nothing else — ./knowledge-session.test.ts pins it byte-for-byte).
+            ...(knowledge === undefined ? {} : { knowledge }),
             // R1: the per-build toolbox seed, forwarded verbatim so a preset factory never has
             // to guess whether ITS session is new. Absent (every restore, and every caller that
             // does not ask) means the library default: an empty enabled set.
@@ -4607,7 +4701,7 @@ export class SessionStore {
             // Scope is deliberately per THREAD: an invalid DEFAULT conversation
             // (`core.agents[name].messages`) still fails the restore, because the
             // agent transcript is what the entry point runs and a placeholder there
-            // would silently rewrite the session's primary conversation.
+            // would silently rewrite the entry agent's own conversation.
             const invalidThreads = this.tolerateThreadTranscripts(core);
 
             // R1: drop only the enabled names THIS rebuilt harness cannot register, so a
@@ -4797,7 +4891,7 @@ export class SessionStore {
     // Failure mapping is the caller's job (src/server/api.ts):
     //   - unknown session            → SessionError 404 (require)
     //   - session busy (run/manual)  → SessionError 409 (single-flight gate)
-    //   - tool absent from the run   → SessionError 404 (delegate without subagents)
+    //   - tool absent from the run   → SessionError 404 (delegate with no member allowed to delegate)
     //   - the tool itself throws     → whatever it throws (reported as ok:false)
     //
     // `parameters` is the value `execute` receives, i.e. already unwrapped by the
@@ -4806,7 +4900,7 @@ export class SessionStore {
         const session = this.require(id);
 
         // A manual core call mutates harness state (enabled tools, created tools,
-        // the todo list, a subagent turn). Letting it interleave with a streaming
+        // the todo list, a delegated run). Letting it interleave with a streaming
         // run would make that run's transcript internally inconsistent, so it is
         // rejected like a second submitted task rather than queued.
         //
@@ -5606,7 +5700,24 @@ export class SessionStore {
         };
 
         return {
-            primary: session.definition.primary,
+            // Routing fact for the fold: which flow is the turn's ROOT one, and the agent an
+            // unfocused submit reaches when nothing names one. Renamed from the old axis name
+            // because it was never authority — authority travels in `ranks` now, which is what
+            // the projector reads to label every section with the rank its OWN agent holds
+            // (../shared/turn-display.ts `DisplayProjectContext.ranks`, ../server/turn-projector.ts
+            // `rankOfAgent`). Copied, so a later definition edit cannot move a folded turn.
+            entry: session.definition.entry,
+            // THE ROSTER RANKS for this fold. Preferred: the LIVE harness's resolved map
+            // (`../types` `Harness.ranks`, complete for every registered agent), because that is the
+            // ranking the run itself enforces — a section must be labelled with the authority its
+            // agent actually held, not with a definition copy that a runtime binding or a reconfigure
+            // has since moved. The frozen definition's map is the base, so a member the handle does
+            // not list still resolves to the lowest rank (./turn-projector.ts `rankOfAgent`). Copied
+            // either way, so nothing written after this frame can restamp a folded turn.
+            ranks: {
+                ...session.definition.ranks,
+                ...((session.harness as Partial<Harness>).ranks ?? {})
+            },
             threadLabels,
             invocationThreadIds: threadIds,
             expiredRequestIds: new Set(session.completedActions),
@@ -6747,7 +6858,7 @@ export class SessionStore {
     // what a member's prompt says, WITHOUT touching the conversation itself. The alternative
     // every caller had was a history reset — the runtime's only wholesale text write was
     // `setThreadMessages`, which replaces a committed transcript to change a prompt — so a
-    // retitled role cost the session its memory. It does not any more.
+    // retitled member cost the session its memory. It does not any more.
     //
     // THREE COPIES OF THE TRUTH MOVE TOGETHER, IN THIS ORDER:
     //   1. the live runtime (`harness.addAgent`/`removeAgent`/`setAgentInstruction`) — what
@@ -6767,14 +6878,16 @@ export class SessionStore {
     // WHAT STAYS FROZEN: `definition.agentModels`/`definition.agentInstructions` are the
     // CREATION-time inherited baseline — that is what `SessionAgentBinding.inherited_model`
     // reports — so a session override writes `preset.agentModels`/`preset.agentInstructions`
-    // only. Membership (`agents`/`subagents`) is the single definition field a binding is
-    // allowed to change, because the roster budget in the contract is defined over it.
+    // only. Membership (`agents`) and authority (`ranks`) are the only definition fields a binding
+    // is allowed to change, because the roster budget in the contract is defined over `agents` and
+    // the delegation graph is derived from `ranks`.
     //
     // THE IDENTITY RULE (`name` must equal `profile`)
     // -----------------------------------------------
     // `CreateSessionAgentRequest` carries both, so a client may ask for a member called
     // `extra` bound to profile `instruct`. That cannot be honoured across a restart: the team
-    // a session rebuilds from is the preset's `agents`/`subagents` NAME LIST, and each name is
+    // a session rebuilds from is the preset's `agents` NAME LIST (with authority from `ranks`),
+    // and each name is
     // resolved through `agentFromProfile(name)` (./harnesses/toolbox.ts), so a roster key that
     // is not itself a trusted profile id makes the restored session throw and get DROPPED. A
     // rename would also silently change which profile the next build resolves. The store
@@ -6788,8 +6901,8 @@ export class SessionStore {
     // survives a restart for exactly the same reason a profile binding does — the durable map
     // states it — so the refusal stays reserved for the case that genuinely cannot resolve.
     //
-    // PROTECTED MEMBERS: the primary is never removable (it is the entry point, and
-    // `harness.name`/`handle.agent` point at it), and `session.definition.primary` is never
+    // PROTECTED MEMBERS: the entry agent is never removable (it is the entry point, and
+    // `harness.name`/`handle.agent` point at it), and `session.definition.entry` is never
     // replaced by a binding — promoting a member is a harness-definition edit
     // (`PATCH /harnesses/{name}`), not a session-scoped binding.
     //
@@ -6814,6 +6927,16 @@ export class SessionStore {
     // decides what its own document may hold.
     private readonly maxSessionAgents = 64;
     private readonly maxAgentInstructionChars = 8_000;
+
+    // B3 R15 — the rank recorded for a new member when NEITHER the caller nor the runtime names
+    // one: the LOWEST authority in the scale, never an inherited middle rank. The runtime owns the
+    // documented default for a rank-less registration (../types `Harness.addAgent` — one rank below
+    // the lowest explicitly configured rank), and `addSessionAgent` reads that resolved value back
+    // off the handle; this constant is only the fallback for a handle that reports no `ranks` at all
+    // (a scripted test harness), and it is the same statement an unlisted name resolves to
+    // everywhere else (./api-reads.ts `rankOfMember`, ./turn-projector.ts `rankOfAgent`). Derived
+    // from `AGENT_RANKS` (the one source, ../types/index.ts:1501), never a literal.
+    private readonly defaultBindingRank: AgentRank = AGENT_RANKS[AGENT_RANKS.length - 1];
 
     // The gate every binding write shares. `pendingCount` is included deliberately: a queued
     // turn has already been accepted against the CURRENT roster.
@@ -6874,11 +6997,21 @@ export class SessionStore {
         session.core = previous.core;
     }
 
-    // Rewrite the two metadata copies for one binding change. `removed` drops the member from
-    // the roster lists and from BOTH override maps plus the session-defined agent map; `added`
-    // appends it (after the primary, so `[primary, ...subagents]` stays the documented
-    // derivation); `model`/`instruction` are the session-scoped overrides to record, or
-    // `undefined` to leave the map alone (`null` clears an existing entry).
+    // Rewrite the two metadata copies for one binding change. `removed` drops the member from the
+    // roster list, from the RANK map, and from BOTH override maps plus the session-defined agent
+    // map; `added` appends it to `agents` and records its rank in `ranks`.
+    //
+    // RANK REWRITE — the definition's old delegation list is gone, so a binding no longer edits one: the
+    // roster is `agents` and authority is `ranks`, and delegation targets are DERIVED from rank
+    // (a member may call strictly lower ranks — ../types `isLowerRank`). Order stays entry-first:
+    // the ENTRY agent is position 0 by construction, and every bound member is appended after it
+    // in binding order. That order is routing/display metadata, NOT authority — any number of
+    // members may hold Rank A, and being first does not make a member Rank A.
+    //
+    // `rank` is stated only when the caller asked for one; this helper never guesses an authority.
+    // A REMOVED member's rank goes with it, which is load-bearing for the restart: `ranks` is what
+    // rebuilds the delegation graph, and a stale key would hand a detached agent authority it no
+    // longer has.
     //
     // R7: `customInstruction` is the BASE text of a session-defined agent — the entry
     // `agentsFromProfiles` rebuilds that member from (./harnesses/toolbox.ts). It is stated only
@@ -6893,6 +7026,7 @@ export class SessionStore {
         change: {
             added?: boolean;
             removed?: boolean;
+            rank?: AgentRank;
             model?: string | null;
             instruction?: string | null;
             customInstruction?: string;
@@ -6904,7 +7038,8 @@ export class SessionStore {
         const withAgent = (list: readonly string[]): string[] => {
             const next = keep(list);
 
-            // Appended after the primary, which is already first by construction.
+            // Appended after the entry agent, which is already first by construction (order is
+            // routing metadata, not authority — see the note above).
             if (change.added === true && !next.includes(agent)) next.push(agent);
 
             return next;
@@ -6937,6 +7072,18 @@ export class SessionStore {
             customs[agent] = change.customInstruction;
         }
 
+        // RANK map, rebuilt from the previous copy so one binding never drops another member's
+        // authority. `removed` deletes the key (what makes a detach final) and `rank` is the only
+        // writer of a new one — this helper never invents a rank for a member it was not given.
+        // Unlike the three override maps above, the map is ALWAYS written: `ranks` is not an
+        // override, it is the authority statement for this roster, and an absent key honestly
+        // means "the lowest rank" (../types, and ./api-reads.ts `rankOfMember`), never "inherit".
+        const ranks: Record<string, AgentRank> = { ...(previous.ranks ?? {}) };
+
+        if (change.removed === true) delete ranks[agent];
+
+        if (change.removed !== true && change.rank !== undefined) ranks[agent] = change.rank;
+
         // REBUILD, never inherit: the three override maps come ONLY from their computed values,
         // so an emptied map actually leaves the preset instead of surviving as the previous copy
         // through a `...previous` spread. Two real consequences of that stale-key hole, both in
@@ -6951,13 +7098,16 @@ export class SessionStore {
             agentModels: _previousModels,
             agentInstructions: _previousInstructions,
             customAgents: _previousCustoms,
+            ranks: _previousRanks,
             ...carried
         } = previous;
 
         session.preset = {
             ...carried,
             agents: withAgent(previous.agents),
-            subagents: withAgent(previous.subagents),
+            // Authority, not membership: `agents` says who is in the roster, `ranks` says what each
+            // one may reach (delegation targets are derived from the strict ordering).
+            ranks,
             ...(Object.keys(models).length === 0 ? {} : { agentModels: models }),
             ...(Object.keys(instructions).length === 0 ? {} : { agentInstructions: instructions }),
             // Absent vs `{}` are the same statement ("this session defines no extra agent"), and
@@ -6968,10 +7118,13 @@ export class SessionStore {
 
         const definition = session.definition;
 
+        // The frozen descriptor copy moves with the preset. `entry` is deliberately NOT touched:
+        // which agent a session routes unfocused submits to is harness-definition metadata, and a
+        // session-scoped binding can never re-target it (see `addSessionAgent`).
         session.definition = {
             ...copyDescriptor(definition),
             agents: withAgent(definition.agents),
-            subagents: withAgent(definition.subagents)
+            ranks
         };
     }
 
@@ -6996,13 +7149,20 @@ export class SessionStore {
      *     model plus its own instruction text, built by `agentConfigurationForCustom` with no
      *     profile lookup and no guideline composition, and durable as a `preset.customAgents`
      *     entry so `agentsFromProfiles` rebuilds the identical brain on the next start. The
-     *     roster is otherwise the same roster: the cap, the duplicate rule and the primary-role
-     *     refusal apply to both kinds, and a custom member is detachable exactly like a bound
+     *     roster is otherwise the same roster: the cap, the duplicate rule and the rank
+     *     validation apply to both kinds, and a custom member is detachable exactly like a bound
      *     profile member (R6 gates the removal on the conversations it owns).
+     *
+     * B3 R15 — THE BINDING CARRIES AUTHORITY, NOT A LABEL: the optional `rank` is one letter of the
+     * A-Z scale and is written into the definition's `ranks` map (see `applyBindingMaps`). Any rank
+     * is bindable, and several members may hold the same one — the single-structural-role refusal is
+     * gone with the axis. An omitted `rank` is the LOWEST rank, so binding is always a safe act. The
+     * only structural rule left is the entry rule (`removeSessionAgent`), and the entry agent may
+     * itself hold any rank.
      */
     async addSessionAgent(
         id: string,
-        input: { name?: unknown; profile?: unknown; model?: unknown; instruction?: unknown; role?: unknown }
+        input: { name?: unknown; profile?: unknown; model?: unknown; instruction?: unknown; rank?: unknown }
     ): Promise<SessionSnapshot> {
         const session = this.require(id);
 
@@ -7108,14 +7268,12 @@ export class SessionStore {
             );
         }
 
-        // The primary is structural. Refusing here (rather than quietly binding a subagent and
-        // ignoring the requested role) is what keeps the receipt honest about what happened.
-        if (input.role === 'primary') {
-            throw new SessionError(
-                409,
-                `A session binding cannot take the primary role; "${session.definition.primary}" stays the entry point of session "${id}". Change the harness definition to replace it.`
-            );
-        }
+        // B3 R15 — the requested authority, validated against the A-Z scale by the ONE validator
+        // (./`validateBindingRank`; an absent value stays absent here and is resolved below). ANY rank
+        // is bindable, including a top one and including several members at the same level: the
+        // refusal this site used to hold — "a binding cannot take the one structural role" — is gone
+        // with the axis. What still decides structure is the ENTRY (`entry-governed`).
+        const rank = validateBindingRank(input.rank);
 
         // R7: the base instruction of a SESSION-DEFINED member — the caller's text, or the
         // deterministic identity sentence when the caller named none. This one value is written
@@ -7160,12 +7318,31 @@ export class SessionStore {
         const previous = this.captureBindingState(session);
 
         try {
-            session.harness.addAgent(name, configuration, { delegate: true });
+            // B3 R15 — the rank rides the RUNTIME call, not a side map. `../types` `Harness.addAgent`
+            // takes `options.rank` and derives the delegation allowlist from the resulting roster
+            // ranks, so the retired `delegate: true` flag is not passed: with the axis gone, whether
+            // this member may delegate follows from its rank against everyone else's, and passing the
+            // old flag would suggest an allowlist the runtime no longer keeps. A rank the runtime
+            // refuses (not one letter) surfaces through the 409 below, which is the runtime's own
+            // wording for a structural conflict.
+            session.harness.addAgent(name, configuration, rank === undefined ? {} : { rank });
         } catch (error) {
             // A runtime refusal here is a structural conflict (already registered, roster busy),
             // so it surfaces as 409 with the runtime's own reason.
             throw new SessionError(409, messageOf(error));
         }
+
+        // WHICH RANK THE RUNTIME ACTUALLY GAVE IT. When the caller named one, that is the answer.
+        // When it did not, the RUNTIME decided (../types `Harness.addAgent`: the documented default
+        // is one rank below the lowest explicitly configured rank), and reading the resolved map back
+        // off the handle (`../types` `Harness.ranks`) is what keeps the durable record and the live
+        // brain byte-identical — the invariant every other write here obeys — so the roster read
+        // (./api-reads.ts `rankOfMember`) can never disagree with what the runtime enforces. The
+        // fallback is the lowest rank in the scale, the same statement an unlisted name resolves to
+        // everywhere else; it only fires for a handle that reports no `ranks` at all (a scripted
+        // test harness).
+        const harness = session.harness as Partial<Harness>;
+        const bindingRank = rank ?? harness.ranks?.[name] ?? this.defaultBindingRank;
 
         // R7: a profile member records its RAW text override (or `null` for none) in
         // `agentInstructions`, exactly as before. A custom member records NO override — the text
@@ -7175,6 +7352,7 @@ export class SessionStore {
             added: true,
             model,
             instruction: isProfile ? (instruction ?? null) : null,
+            rank: bindingRank,
             customInstruction: baseInstruction
         });
         session.sessionAgents = [...previous.sessionAgents, name];
@@ -7233,10 +7411,15 @@ export class SessionStore {
             throw new SessionError(404, `Agent "${agent}" is not a member of session "${id}".`);
         }
 
-        if (agent === session.definition.primary) {
+        // B3 R15 — THE ENTRY RULE, and the only structural rule left in the roster. `entry` is a
+        // ROUTING fact (which member a turn addresses when nothing names one), so a session cannot
+        // exist without it and it is changed by editing the harness definition, never by a binding
+        // write. Rank is NOT part of this rule: the entry agent may hold any rank in the A-Z scale,
+        // and several other members may hold the same one — there is no singleton left to protect.
+        if (agent === session.definition.entry) {
             throw new SessionError(
                 409,
-                `Agent "${agent}" is the primary agent of session "${id}" and cannot be detached; every session needs an entry point.`
+                `Agent "${agent}" is the entry agent of session "${id}" and cannot be detached; every session needs an entry point. Its rank can change, its membership cannot.`
             );
         }
 
@@ -7687,14 +7870,14 @@ export class SessionStore {
         }
 
         const record = this.threadsSupported(session) ? session.harness.thread(threadId) : undefined;
-        // F8 (2026-11-17): the code comes from the CONVERSATION, not from the session's primary
-        // agent. A live record is the authority; then the hint the caller already had; then the
+        // F8 (2026-11-17): the code comes from the CONVERSATION, not from the entry agent
+        // agent, whatever rank it holds. A live record is the authority; then the hint the caller already had; then the
         // conversation's own durable evidence (the retained row / a shown label / an archived run),
-        // which is what a soft-deleted or restored conversation still offers; the preset's primary
+        // which is what a soft-deleted or restored conversation still offers; the preset's entry
         // agent is LAST, because it is the fallback that minted `IT*` for conversations that never
-        // ran the primary agent (see `threadAgentContextOf` for the dump evidence).
+        // ran the entry agent (see `threadAgentContextOf` for the dump evidence).
         const agent =
-            record?.agent ?? agentHint ?? this.threadAgentContextOf(session, threadId) ?? session.preset.primary;
+            record?.agent ?? agentHint ?? this.threadAgentContextOf(session, threadId) ?? session.preset.entry;
         const label = this.mintThreadLabel(session, threadId, agentCodeOf(agent));
 
         this.mirrorThreadLabel(session, threadId, label);
@@ -7801,7 +7984,7 @@ export class SessionStore {
     // WHY IT EXISTS. `ensureThreadLabel` derives the two-letter CODE from the conversation's agent,
     // and a conversation `harness.thread()` does not name — the ordinary state of a soft-deleted row
     // (R2 retains it) and of every conversation a restored document carries — used to fall back to
-    // `session.preset.primary`. That minted the PRIMARY agent's code onto conversations that never
+    // `session.preset.entry`. That minted the ENTRY agent's code onto conversations that never
     // ran it, irreversibly: the name lands in the map, on the turn records, and in every `#`
     // reference typed afterwards. The operator's dump shows it at scale (Temp/orch-plan/report.md §1
     // and §2: `threadLabels` reads `IT5`…`IT13` for threads whose `core.threads[].agent` is
@@ -8285,8 +8468,8 @@ export class SessionStore {
     // concurrent submit can see it; the block's own projection continues from the
     // seed recorded for this turn, so it lands on exactly this ordinal.
     //
-    // The legacy path always runs the preset's PRIMARY agent (`session.harness(...)`
-    // calls the entry agent), so its code is known here even with no events yet.
+    // The legacy path always runs the preset's ENTRY agent (`session.harness(...)` is
+    // called with it), so its code is known here even with no events yet.
     //
     // The reservation is deliberately NOT released if the run fails before recording
     // a single event: the turn itself IS published (it stays in the transcript as a
@@ -8294,7 +8477,7 @@ export class SessionStore {
     // label a `#` reference already resolved to. Only an UNPUBLISHED submit rolls its
     // counters back (see enqueue's persistence rollback).
     private reserveLegacyBlockLabel(session: Session): void {
-        const code = agentCodeOf(session.preset.primary);
+        const code = agentCodeOf(session.preset.entry);
         this.reserveConversationOrdinal(session, code, this.nextConversationOrdinal(session, code));
     }
 
@@ -9378,7 +9561,7 @@ export class SessionStore {
     // It becomes an actionable 429; any other harness refusal is a 400.
     private createSubmitThread(session: Session): string {
         try {
-            return session.harness.createThread(session.preset.primary).id;
+            return session.harness.createThread(session.preset.entry).id;
         } catch (error) {
             throw this.threadError(error, 'Could not open a new thread');
         }
@@ -11922,7 +12105,7 @@ export class SessionStore {
         );
     }
 
-    // THE MARK (R2, primary spec: "all turns must be recorded… even deleted marks the
+    // THE MARK (R2, the lead spec: "all turns must be recorded… even deleted marks the
     // thread 'inactive'"). This used to be a PURGE; it is now a soft delete, and the ONLY
     // durable thing it changes is the marker on the conversation's own row:
     //

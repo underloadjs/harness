@@ -93,7 +93,7 @@ const recordOf = (turnEvents: HarnessEvent[], overrides: Partial<SessionTurn> = 
 // The store's own display context: one recorded instruction source, so the `system` segment
 // exists and the "system is never the tail" rule is exercised against a real segment.
 const CONTEXT = {
-    primary: AGENT,
+    entry: AGENT,
     instructionSourcesOf: () => [{ agent: AGENT, instructions: ['Read the notes, then answer.'] }]
 };
 

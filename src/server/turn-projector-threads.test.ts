@@ -76,7 +76,13 @@ const LABELS = (): Map<string, string> =>
 const contextOf = (
     options: { threadIds?: ReadonlyMap<string, string>; labels?: ReadonlyMap<string, string> } = {}
 ): DisplayProjectContext => ({
-    primary: 'lead',
+    entry: 'lead',
+    // B3 R16 — the roster the fold labels with. `entry` decides only which flow is the ROOT one;
+    // every row's `rank` comes from this map (a name it omits resolves to the lowest rank). lead is
+    // Rank A, the member it delegates to is Rank B, and the member TWO levels down is Rank C — the
+    // strictly-descending shape a delegated chain actually runs, and the reason `deep` can never
+    // delegate back up.
+    ranks: { lead: 'A', helper: 'B', deep: 'C' },
     ...(options.labels === undefined ? {} : { threadLabels: options.labels }),
     ...(options.threadIds === undefined ? {} : { invocationThreadIds: options.threadIds })
 });
@@ -155,6 +161,11 @@ const usage = (agent: string, thread?: HarnessEvent['thread']): HarnessEvent => 
     ...(thread === undefined ? {} : { thread })
 });
 
+// A fork of the ROOT run. The summary is what the runtime recorded, so it stays internally true:
+// `rank` is the SOURCE AGENT's rank in the harness (../types `HarnessBranchSummary` — "a branch
+// inherits its source's rank"), and this fixture's source is the entry agent 'lead', which this
+// fold's roster map ranks 'A'. The projection copies the frame's rank verbatim; it never re-derives
+// a label from the agent name or from which flow is the root one.
 const branchStart = (threadId: string | undefined): HarnessEvent => ({
     type: 'branch_start',
     agent: 'lead',
@@ -162,7 +173,7 @@ const branchStart = (threadId: string | undefined): HarnessEvent => ({
         branchId: 'branch-1',
         kind: 'fork',
         agent: 'lead',
-        role: 'subagent',
+        rank: 'A',
         sourceThreadId: '1',
         forkDepth: 1,
         model: 'scripted/test',
@@ -217,7 +228,7 @@ const fold = (events: HarnessEvent[], options: { turn?: SessionTurn; context?: D
 type RowIdentity = {
     id: string;
     parentSectionId?: string;
-    role: string;
+    rank: string;
     agent: string;
     agentLabel: string;
     threadLabel?: string;
@@ -230,7 +241,7 @@ const identityOf = (display: TurnDisplay): RowIdentity[] =>
     display.sections.map((section) => ({
         id: section.id,
         ...(section.parentSectionId === undefined ? {} : { parentSectionId: section.parentSectionId }),
-        role: section.role,
+        rank: section.rank,
         agent: section.agent,
         agentLabel: section.agentLabel,
         ...(section.threadLabel === undefined ? {} : { threadLabel: section.threadLabel }),
@@ -298,7 +309,7 @@ describe('delegated conversation identity (R18)', () => {
         expect(identityOf(result.display())).toEqual([
             {
                 id: 'turn-1:0',
-                role: 'primary',
+                rank: 'A',
                 agent: 'lead',
                 agentLabel: 'IT1',
                 threadLabel: 'IT1',
@@ -309,7 +320,7 @@ describe('delegated conversation identity (R18)', () => {
             {
                 id: 'turn-1:1',
                 parentSectionId: 'turn-1:0',
-                role: 'subagent',
+                rank: 'B',
                 agent: 'helper',
                 agentLabel: 'RR1',
                 threadLabel: 'RR1',
@@ -374,7 +385,7 @@ describe('delegated conversation identity (R18)', () => {
         expect(identityOf(result.display())[1]).toEqual({
             id: 'turn-1:1',
             parentSectionId: 'turn-1:0',
-            role: 'subagent',
+            rank: 'B',
             agent: 'helper',
             agentLabel: 'RR1',
             threadLabel: 'RR1',
@@ -412,10 +423,11 @@ describe('delegated conversation identity (R18)', () => {
             // still names its own conversation: separable by `threadId` regardless. Its own
             // terminal frame closes it, exactly as it would in the normal order.
             ['turn-1:0', 'thread-2', '2', undefined, 'done'],
-            // The turn's own flow is still recognised as the primary root by ROLE, which is
-            // the figure `compiledEntryOf`/`rootSectionOf` check first (../frontend/ui/
-            // turns.ts), so the tile body keeps the main conversation's prose. It stays
-            // open: only the turn's own terminal frame settles it.
+            // The turn's own flow is still recognised as the ROOT row by its identity (it is the
+            // flow the turn's own frames name — `entry` routing, not authority), which is the figure
+            // `compiledEntryOf`/`rootSectionOf` check first (../frontend/ui/turns.ts), so the tile
+            // body keeps the main conversation's prose. It stays open: only the turn's own terminal
+            // frame settles it.
             ['turn-1:1', 'thread-1', '1', undefined, 'streaming']
         ]);
 
@@ -424,12 +436,12 @@ describe('delegated conversation identity (R18)', () => {
         expect(identityOf(result.display())[0]).toMatchObject({
             agentLabel: 'RR1',
             threadLabel: 'RR1',
-            role: 'subagent'
+            rank: 'B'
         });
         expect(identityOf(result.display())[1]).toMatchObject({
             agentLabel: 'IT1',
             threadLabel: 'IT1',
-            role: 'primary'
+            rank: 'A'
         });
     });
 
@@ -456,7 +468,7 @@ describe('delegated conversation identity (R18)', () => {
         expect(identityOf(result.display())).toEqual([
             {
                 id: 'turn-1:0',
-                role: 'primary',
+                rank: 'A',
                 agent: 'lead',
                 agentLabel: 'IT1',
                 threadLabel: 'IT1',
@@ -467,7 +479,7 @@ describe('delegated conversation identity (R18)', () => {
             {
                 id: 'turn-1:1',
                 parentSectionId: 'turn-1:0',
-                role: 'subagent',
+                rank: 'B',
                 agent: 'helper',
                 agentLabel: 'RR1',
                 threadLabel: 'RR1',
@@ -478,7 +490,9 @@ describe('delegated conversation identity (R18)', () => {
             {
                 id: 'turn-1:2',
                 parentSectionId: 'turn-1:1',
-                role: 'subagent',
+                // Rank C, not 'B': the row reports the rank of the agent that RAN it, and the chain
+                // lead → helper → deep descends one rank per level (../shared/turn-display.ts).
+                rank: 'C',
                 agent: 'deep',
                 agentLabel: 'RR2',
                 threadLabel: 'RR2',
@@ -609,7 +623,7 @@ describe('delegated conversation identity (R18)', () => {
     });
 
     it('omits threadId entirely when no join is recorded, so a legacy document is unchanged', () => {
-        const result = fold(clone(DELEGATION), { context: { primary: 'lead' } });
+        const result = fold(clone(DELEGATION), { context: { entry: 'lead' } });
 
         // The root still reports the conversation the RECORD names; the delegated row
         // reports none, and the key is ABSENT rather than `undefined`, so an old frame
@@ -642,7 +656,11 @@ describe('delegated conversation identity (R18)', () => {
 
         expect(withOwner.display().sections[1]).toMatchObject({
             id: 'turn-1:1',
-            role: 'subagent',
+            // Rank A, because a fork inherits its SOURCE agent's rank and this fork's source is the
+            // entry agent (../types `HarnessBranchSummary.rank`). The old fold called this row a
+            // subagent: its rule was "the branch summary's role is primary AND no source thread",
+            // and a singleton label had to make every branch a non-entry.
+            rank: 'A',
             agent: 'lead',
             branchId: 'branch-1',
             threadId: 'thread-1',
@@ -657,6 +675,116 @@ describe('delegated conversation identity (R18)', () => {
         expect(Object.prototype.hasOwnProperty.call(bare.display().sections[1], 'threadId')).toBe(false);
         expect(threadIdPatches(bare.ops, 'turn-1:1')).toEqual([]);
         expect(JOIN().has('branch-1')).toBe(false);
+    });
+
+    // B3 R16 — A BRANCH ROW'S RANK COMES FROM ITS SUMMARY, FOR BOTH BRANCH KINDS.
+    //
+    // The retired rule for a branch row was a compound singleton test: "the summary's role is
+    // `primary` AND it names no source thread". It could only ever describe one privileged flow, and
+    // it mislabelled every branch as soon as the entry agent held something other than the top rank.
+    // These folds use a roster in which the ENTRY agent ('lead') is Rank C and a delegated member
+    // ('helper') holds Rank A — routing and authority are separate facts — so an implementation that
+    // still inferred authority from the root flow, or from the absence of a source thread, fails
+    // here rather than passing by coincidence.
+    it('labels a branch row with the rank its summary states, for a fork and for an autoanswer', () => {
+        const context: DisplayProjectContext = { entry: 'lead', ranks: { lead: 'C', helper: 'A' } };
+
+        const end = (branchId: string): HarnessEvent => ({
+            type: 'branch_end',
+            agent: 'helper',
+            branchId,
+            status: 'completed'
+        });
+
+        // FORK by the Rank A member. The row is Rank A because the summary states the run inherited
+        // Rank A, and the ROOT row is Rank C because that is the rank its own agent holds — even
+        // though it is the flow the turn was submitted to.
+        const fork = fold(
+            [
+                rootStart('1'),
+                {
+                    // The FRAME's agent is the entry agent: a threadless frame from a non-entry
+                    // agent first opens its own inline flow (a tested behavior elsewhere), which
+                    // would add a row this pin is not about. The branch row itself is built from
+                    // the SUMMARY's agent/rank, which is the field under test.
+                    type: 'branch_start',
+                    agent: 'lead',
+                    branch: {
+                        branchId: 'branch-f',
+                        kind: 'fork',
+                        agent: 'helper',
+                        rank: 'A',
+                        sourceThreadId: '1',
+                        forkDepth: 1,
+                        model: 'scripted/test',
+                        tools: []
+                    }
+                },
+                end('branch-f')
+            ],
+            { context }
+        );
+
+        expect(fork.display().sections.map((section) => [section.id, section.agent, section.branchId, section.rank])).toEqual([
+            ['turn-1:0', 'lead', undefined, 'C'],
+            ['turn-1:1', 'helper', 'branch-f', 'A']
+        ]);
+
+        // AUTOANSWER, and deliberately NO `sourceThreadId`: the retired rule read that absence as
+        // "this is the top of the axis". The frame's rank answers instead.
+        const autoanswer = fold(
+            [
+                rootStart('1'),
+                {
+                    type: 'branch_start',
+                    agent: 'lead',
+                    branch: {
+                        branchId: 'branch-a',
+                        kind: 'autoanswer',
+                        agent: 'helper',
+                        rank: 'A',
+                        forkDepth: 0,
+                        model: 'scripted/test',
+                        tools: []
+                    }
+                },
+                end('branch-a')
+            ],
+            { context }
+        );
+
+        expect(autoanswer.display().sections.map((section) => [section.id, section.agent, section.branchId, section.rank])).toEqual([
+            ['turn-1:0', 'lead', undefined, 'C'],
+            ['turn-1:1', 'helper', 'branch-a', 'A']
+        ]);
+
+        // …and the same shape run by the ENTRY agent states its own Rank C. The rank follows the
+        // agent that ran, never the flow that spawned it, and never the entry name.
+        const entryAnswer = fold(
+            [
+                rootStart('1'),
+                {
+                    type: 'branch_start',
+                    agent: 'lead',
+                    branch: {
+                        branchId: 'branch-b',
+                        kind: 'autoanswer',
+                        agent: 'lead',
+                        rank: 'C',
+                        forkDepth: 0,
+                        model: 'scripted/test',
+                        tools: []
+                    }
+                },
+                { type: 'branch_end', agent: 'lead', branchId: 'branch-b', status: 'completed' }
+            ],
+            { context }
+        );
+
+        expect(entryAnswer.display().sections.map((section) => [section.id, section.agent, section.rank])).toEqual([
+            ['turn-1:0', 'lead', 'C'],
+            ['turn-1:1', 'lead', 'C']
+        ]);
     });
 
     it('resolves a steer addressed at a delegated conversation onto that conversation’s own bar', () => {

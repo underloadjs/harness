@@ -215,6 +215,31 @@ export {
     RECORD_MAX_COLLECTION_NAME,
     RECORD_STALE_PAYLOAD_BUDGET_BYTES
 } from './records';
+// The cross-session knowledge engine (T4): the same shape as the records engine — one
+// factory owns every article, the bounds and codes are engine-owned, and persistence is a
+// SUBSCRIBER (`onStoreChange`), never a dependency of this module. See ./knowledge.ts.
+export {
+    createKnowledgeEngine,
+    readKnowledgeStoreState,
+    isKnowledgeRejection,
+    KNOWLEDGE_ERROR_CODES,
+    KNOWLEDGE_UUID_PATTERN,
+    KNOWLEDGE_MAX_ARTICLES,
+    KNOWLEDGE_MAX_PARAGRAPHS,
+    KNOWLEDGE_MAX_TEXT,
+    KNOWLEDGE_MAX_TITLE,
+    KNOWLEDGE_MAX_TAGS,
+    KNOWLEDGE_MAX_TAG,
+    KNOWLEDGE_MAX_NOTE,
+    KNOWLEDGE_MAX_REFS,
+    KNOWLEDGE_MAX_ITEMS,
+    KNOWLEDGE_MAX_SEARCH,
+    KNOWLEDGE_LIST_DEFAULT_LIMIT,
+    KNOWLEDGE_LIST_MAX_LIMIT,
+    KNOWLEDGE_RESPONSE_BUDGET_BYTES,
+    KNOWLEDGE_STALE_PAYLOAD_BUDGET_BYTES
+} from './knowledge';
+export type { KnowledgeErrorCode } from './knowledge';
 // Slash commands. The parser is PURE (no harness, no transport, no Node built-in)
 // so every host resolves one line the same way: `/task add "testing"` becomes
 // `{ name: 'task', args: ['add', 'testing'], rest, input }`. `harness()` owns the

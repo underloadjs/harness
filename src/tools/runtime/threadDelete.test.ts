@@ -133,12 +133,16 @@ describe('threadDelete metadata literal', () => {
 
         // Why the tool exists: reclaiming a one-shot delegation's own thread, and the
         // issue that tracks it (the roster cap is what makes it an availability bug).
-        // The claim is scoped to a delegation FROM A CONVERSATION: a root delegation
-        // reuses the subagent's DEFAULT conversation (`src/harness.ts:10987`,
-        // `defaultThreadOf(brain)`), which this tool refuses to release, so "every
-        // delegation mints its own thread" was promising a slot that never got minted.
+        // The claim is scoped to a delegation FROM A CONVERSATION: a delegation from the
+        // host re-enters the target agent's DEFAULT conversation (`agent:<name>`,
+        // `defaultThreadOf(brain)` at src/harness.ts:14596), which this tool refuses to
+        // release, so "every delegation mints its own thread" was promising a slot that
+        // never got minted. Rank wording (2026-11-18): the description says "that agent's",
+        // not "that subagent's" — the rank model has no subagent role.
         expect(description).toContain('A delegation FROM A CONVERSATION mints its own thread');
-        expect(description).toContain("reuses that subagent's default conversation");
+        expect(description).toContain(
+            "reuses that agent's default conversation (agent:<name>)"
+        );
         expect(description).toContain('issue 0027');
         // Read first: releasing closes the doors, so the answer has to be in hand already.
         expect(description).toContain('read what you still need with threadRead or agentResult first');

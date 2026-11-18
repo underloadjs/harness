@@ -62,7 +62,10 @@ import type { DisplayProjectContext, TurnDisplayOp, TurnRecordStatus, TurnSectio
 import { createTurnProjector, projectTurn } from './turn-projector';
 import type { SessionTurn } from './protocol';
 
-const CONTEXT: DisplayProjectContext = { primary: 'one' };
+// `entry` is routing only (which flow is the turn's ROOT one); the rank every row reports comes
+// from `ranks`. 'one' submits, and BOTH members it delegates to ('two', 'three') sit one rank
+// below it, which is what the DEATH journal actually runs.
+const CONTEXT: DisplayProjectContext = { entry: 'one', ranks: { one: 'A', two: 'B', three: 'B' } };
 
 // One recorded event per 10 ms, exactly as ./turn-projector-restart.test.ts does it, so every
 // span below is an event count.
@@ -232,7 +235,7 @@ const DEATH: HarnessEvent[] = [
 const FACE_BEFORE: Record<string, Record<string, unknown>> = {
     'turn-1:0': {
         id: 'turn-1:0',
-        role: 'primary',
+        rank: 'A',
         agent: 'one',
         agentLabel: '',
         state: 'done',
@@ -245,7 +248,7 @@ const FACE_BEFORE: Record<string, Record<string, unknown>> = {
     'turn-1:1': {
         id: 'turn-1:1',
         parentSectionId: 'turn-1:0',
-        role: 'subagent',
+        rank: 'B',
         agent: 'two',
         agentLabel: '',
         state: 'done', // the lie: this run never reached a terminal frame
@@ -257,7 +260,7 @@ const FACE_BEFORE: Record<string, Record<string, unknown>> = {
     'turn-1:2': {
         id: 'turn-1:2',
         parentSectionId: 'turn-1:0',
-        role: 'subagent',
+        rank: 'B',
         agent: 'two',
         agentLabel: '',
         state: 'done',
@@ -293,7 +296,7 @@ describe('T-W23 — a force-closed section reports its own last activity, and th
         expect(faceOf(killed)).toEqual({
             id: 'turn-1:1',
             parentSectionId: 'turn-1:0',
-            role: 'subagent',
+            rank: 'B',
             agent: 'two',
             agentLabel: '',
             state: 'cancelled',
@@ -347,7 +350,7 @@ describe('T-W23 — a force-closed section reports its own last activity, and th
         expect(faceOf(sectionOf(failedSections, 'turn-1:1'))).toEqual({
             id: 'turn-1:1',
             parentSectionId: 'turn-1:0',
-            role: 'subagent',
+            rank: 'B',
             agent: 'two',
             agentLabel: '',
             state: 'error',

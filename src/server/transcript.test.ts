@@ -186,8 +186,11 @@ const scriptedPreset = (name: string, hold?: () => Promise<void>): Scripted => {
         title: name,
         description: `${name} scripted preset`,
         requiresEndpoint: false,
-        primary: name,
-        subagents: [],
+        // A ONE-member card: `ranks` covers the single member, which is also the entry
+        // (routing). One distinct rank means nobody sits strictly below it, so the runtime
+        // registers no `delegate` row — exactly what the retired `subagents: []` stated (R15).
+        entry: name,
+        ranks: { [name]: 'A' },
         agents: [name],
         tools: [],
         builtin: true,
@@ -211,7 +214,7 @@ const scriptedPreset = (name: string, hold?: () => Promise<void>): Scripted => {
                         }
                     })
                 },
-                primary: name,
+                entry: name,
                 presets: false,
                 report: { progress }
             })
@@ -1225,7 +1228,7 @@ describe('thread transcript read/write (C4)', () => {
     // C8-m3 boundary: keeping the raw record for a DEFAULT conversation must NOT
     // soften the documented strictness of a hand-edited agent transcript. A broken
     // `core.agents[name].messages` in the file is still a refused restore, because a
-    // placeholder there would silently rewrite the session's primary conversation.
+    // placeholder there would silently rewrite the entry agent's conversation.
     it('still drops a session whose DEFAULT transcript was broken by hand in the file', async () => {
         const { root, runtime, sessionId } = await seeded('default-hand-edit');
         runtime.store.dispose();

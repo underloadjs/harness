@@ -119,8 +119,8 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
         agents: ['instruct'],
         tools: ['read'],
         coreTools: ['toolRequest'],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true,
         ...overrides
@@ -642,7 +642,7 @@ it('leaves no endpoint markup in the left rail and no fields in the document whi
     // dropdown is a persistent node too, and it is in NONE of them while the dialog is
     // closed.
     expect([...document.querySelectorAll('select')].map((node) => node.className)).toEqual([
-        'field-input field-select create-primary',
+        'field-input field-select create-entry',
         'field-input field-select create-agent-select'
     ]);
 });

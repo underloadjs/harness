@@ -4,10 +4,11 @@
 // Product rules this component encodes (R2):
 //   - the row replaces the old description wall; each tile shows exactly ONE
 //     human-readable name (the display title, e.g. "Summarizer") instead of a
-//     duplicated slug + title pair, and no role badge. Role is conveyed by the
-//     name colour (primary green, secondary neutral, styles.css) plus the
-//     `aria-pressed` state below, so the control stays compact;
-//   - the tiles form an OVERLAPPING CARD DECK: `[primary] ] ] ]`. One card is
+//     duplicated slug + title pair, and no rank badge word. Authority is conveyed by
+//     the name colour (Rank A green, every other rank neutral, styles.css), by the
+//     `data-rank` hook below, and by the rank readout the stepper carries, so the
+//     control stays compact;
+//   - the tiles form an OVERLAPPING CARD DECK: `[entry] ] ] ]`. One card is
 //     "front" (fully visible, leftmost in the fan) and every other card shows only
 //     its right-hand `--agent-deck-peek` strip, which is a dedicated
 //     `.agent-handle` button carrying the agent's name vertically. CSS does the
@@ -15,17 +16,28 @@
 //     styles.css `.agent-tile`), so DOM order — and therefore the listitem order
 //     `membersOf` returns — is untouched;
 //   - the FRONT card only controls what is VIEWED. Clicking an exposed
-//     strip fronts that card; it does NOT promote it and never sends a team
+//     strip fronts that card; it does NOT change any rank and never sends a team
 //     PATCH (the caller's `onFront` is local UI state only). The front choice is
 //     seeded from `front` and reported back so a rebuild (activity frame, model
 //     PATCH) keeps the same card in front; a remembered name that is no longer a
-//     member falls back to the primary. Fronting stays available while the team is
+//     member falls back to the entry agent. Fronting stays available while the team is
 //     locked, because viewing a frozen agent's model is exactly when it is needed;
-//   - PROMOTION is still the tile's own `.agent-main` button: the row never shows
-//     two primaries, and the caller sends the complete `subagents` list with the
-//     new `primary` so a demotion cannot leave a stale duplicate behind. A hidden
-//     card's promotion button is out of the tab order and covered by the deck, so
-//     promoting is deliberately two steps: front the card, then press its name;
+//   - RANK IS ASSIGNED PER MEMBER (R20). Each tile owns its own `.agent-rank`
+//     stepper: `−`/`+` move THAT member one step of authority (`−` raises it toward
+//     Rank A, `+` lowers it toward Rank Z) and call `onAssignRank(name, rank)` — no
+//     global "make primary" press exists any more, because ANY number of members may
+//     hold a rank, so two tiles can read Rank A at the same time and the row must
+//     never imply a unique top agent. A member whose rank the definition does not
+//     state shows the honest "rank not stated" readout and no stepper effect;
+//   - ENTRY IS A SEPARATE, CLEARLY DISTINCT ACTION (R20). The `.agent-entry` press
+//     makes THAT member the routing/seed agent for a new conversation — it is not an
+//     authority claim and does not touch any rank — and the tile carries
+//     `data-entry="true"` while it holds the role. Exactly one member is the entry
+//     agent; any number may be Rank A. Promotion of the old primary is therefore gone:
+//     the caller sends the complete `entry` + `ranks` pair it wants, and no demotion
+//     of a former leader is implied. A hidden card's controls are out of the tab
+//     order and covered by the deck, so operating one is deliberately two steps: front
+//     the card, then press its control;
 //   - the trailing `+` opens a picker of agents the SERVER advertises. Adding from the
 //     row means choosing an existing agent: its default instruction is shown read-only
 //     here as a preview, and the shared agent dialog (ui/agent-dialog.ts) is where the
@@ -33,9 +45,9 @@
 //   - a member already in the team is visibly disabled in the picker, so a
 //     duplicate cannot be added;
 //   - removing a member is offered on every tile except the last one;
-//   - every tile carries its own model dropdown (R9/R18) placed outside the
-//     promotion button. It is a bare select with no visible "model" label; its
-//     accessible name still carries the agent. It never says "inherit": the
+//   - every tile carries its own model dropdown (R9/R18) placed outside the name
+//     button and the rank stepper. It is a bare select with no visible "model" label;
+//     its accessible name still carries the agent. It never says "inherit": the
 //     no-override choice is labelled with the ACTUAL model it resolves to, and the
 //     provider catalogue follows alphabetically. R2: a saved session's models are
 //     LIVE (main.ts PATCHes /sessions/:id), so the control stays enabled there even
@@ -57,19 +69,30 @@
 // caller so a rebuild cannot reset them mid-interaction.
 //
 // Cross-references:
-//   - src/frontend/contract.ts — primary/subagents accessors
+//   - src/frontend/contract.ts — entry/ranks accessors and the rank ladder helpers
 //   - src/frontend/main.ts — PATCH handling and the session lock (renderAgents)
-//   - src/frontend/styles.css — `.agent-row`, `.agent-tile`, `.agent-picker`
+//   - src/frontend/styles.css — `.agent-row`, `.agent-tile`, `.agent-picker`,
+//     `.agent-rank*`, `.agent-entry`
 
+import type { AgentRank } from '../../types';
 import type { AgentDescriptor } from '../../server/protocol';
+// Rank wording and stepping come from the one place that owns them, so a tile, a
+// dialog tab and the create form can never spell a rank differently.
+import { HIGHEST_RANK, LOWEST_RANK, isAgentRank, rankLabelOf, stepRank } from '../contract';
 // Per-agent dropdowns show the catalogue alphabetically; the global dropdown in
 // main.ts keeps provider order, so the helper is intentionally only used here.
 import { sortModelIds } from './model-order';
 
 export type AgentRowOptions = {
-    // Member names in display order; the primary is also present in this list.
+    // Member names in display order (entry agent first); the entry agent is also
+    // present in this list.
     members: readonly string[];
-    primary: string;
+    // The ROUTING/seed agent of a new conversation. Separate from rank: it says
+    // which member an unfocused submit opens, and it is not an authority claim.
+    entry: string;
+    // R20: the rank configured per member. A member this map omits states NO rank,
+    // and the tile says so instead of inventing one.
+    ranks: Readonly<Record<string, AgentRank>>;
     // Trusted agent library from GET /agents (or the boot fallback).
     agents: readonly AgentDescriptor[];
     // False while a run is in flight or while a saved session's frozen team is on
@@ -77,8 +100,9 @@ export type AgentRowOptions = {
     // visible lock notice and its New session link (the rail owns that action).
     editable: boolean;
     // Per-agent model dropdowns (R9). Every tile gets one, labelled for its own
-    // agent and kept OUTSIDE the promotion button so choosing a model can never
-    // also change the primary. Omitted only by callers that do not know models.
+    // agent and kept OUTSIDE the name button and the rank stepper, so choosing a
+    // model can never also change a rank. Omitted only by callers that do not know
+    // models.
     models?: AgentModelSelect;
     // Agent names whose tile should show the rotating activity ring. Read from the
     // live per-instance set, so a rebuild never loses a running agent.
@@ -91,15 +115,24 @@ export type AgentRowOptions = {
     // across rebuilds (main.ts keeps it in `agentsExpanded`). Optional for callers
     // that do not re-render.
     onToggle?: (open: boolean) => void;
-    // The member whose card is FRONT (fully visible). Omitted means the primary.
-    // This is view-only state: it never changes `primary` and never sends a PATCH.
-    // The caller re-applies it on every rebuild (main.ts `agentFront`) so an
-    // activity repaint or a model PATCH cannot yank a viewed card back.
+    // The member whose card is FRONT (fully visible). Omitted means the entry agent.
+    // This is view-only state: it changes no rank, moves no entry agent, and never
+    // sends a PATCH. The caller re-applies it on every rebuild (main.ts `agentFront`)
+    // so an activity repaint or a model PATCH cannot yank a viewed card back.
     front?: string;
     // Reports the newly fronted member so the caller can remember it. Fronting a
     // card always fires it, even while the team is locked (`editable: false`).
     onFront?: (name: string) => void;
-    onSelectPrimary: (name: string) => void;
+    // R20: assigns ONE member's rank. Per member, never "the" top slot: the caller
+    // receives the letter the reader moved THAT tile to.
+    onAssignRank?: (name: string, rank: AgentRank) => void;
+    // R20: makes ONE member the entry agent. Deliberately a different callback from
+    // `onAssignRank`, because the two facts are independent.
+    onSetEntry?: (name: string) => void;
+    // Opens the configuration surface for a member (the shared agent dialog in the
+    // app shell). Absent for a host with no dialog: the name press then only fronts
+    // the card, which is still the correct focus hand-over.
+    onConfigure?: (name: string) => void;
     onAdd: (name: string) => void;
     onRemove: (name: string) => void;
 };
@@ -330,6 +363,11 @@ const modelSelectFor = (name: string, title: string, models: AgentModelSelect): 
 };
 
 export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
+    // `ranks` is required by the type — the shell always passes the map it read from the card, empty
+    // when the definition states no rank — but it is normalised ONCE here so a caller that knows no
+    // ranks renders honest "rank not stated" tiles instead of throwing on `undefined[...]` inside the
+    // tile body. This is not a default rank: nothing is inferred, the letter simply stays unstated.
+    if (options.ranks === undefined) options.ranks = {};
     const wrapper = el('div', 'agent-row-wrap');
 
     const row = el('div', 'agent-row');
@@ -350,7 +388,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     const teamId = `agent-team-${++nextId}`;
     row.id = teamId;
 
-    const teamLabel = displayTitleOf(agentDetailsOf(options.agents, options.primary));
+    const teamLabel = displayTitleOf(agentDetailsOf(options.agents, options.entry));
     const summary = el('button', 'agent-summary');
     summary.type = 'button';
     summary.setAttribute('aria-controls', teamId);
@@ -454,12 +492,15 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     }
 
     // Member tiles. The whole card is not a button (a remove control and a model
-    // dropdown live inside it), so the primary-selection button and the remove
+    // dropdown live inside it), so the button that picks the agent to talk to and the remove
     // button are siblings inside the top row.
     const active = new Set(options.activity ?? []);
 
     // Everything the front paint needs per tile, collected while building so the
-    // paint never has to query the DOM again.
+    // paint never has to query the DOM again. `controls` is every focusable control
+    // the card owns (name press, entry press, the two rank steps, remove, model
+    // select) — a hidden card has to take ALL of them out of the tab order, not only
+    // the ones it had before ranks existed.
     type DeckEntry = {
         name: string;
         tile: HTMLElement;
@@ -467,6 +508,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         remove: HTMLButtonElement;
         select: HTMLSelectElement | null;
         handle: HTMLButtonElement;
+        controls: HTMLElement[];
     };
     const deck: DeckEntry[] = [];
 
@@ -475,13 +517,13 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     // already-initialised bindings)
     // -----------------------------------------------------------------------
     // Conservative resolution: an omitted (or remembered-but-removed) name falls
-    // back to the primary, so the deck always has exactly one fully visible card.
+    // back to the entry agent, so the deck always has exactly one fully visible card.
     // This is the graceful fallback for R2's "selected member was removed" case;
     // the caller's stale name is simply ignored and can never blank the deck.
     let frontName =
         options.front !== undefined && options.members.includes(options.front)
             ? options.front
-            : options.primary;
+            : options.entry;
 
     // Paint the whole deck from `frontName`. CSS does the geometry purely from
     // `data-front` (styles.css `.agent-tile[data-front='true']` gets `order: -1`
@@ -518,15 +560,14 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
 
             // A card in front offers no handle (it is fully visible, so there is
             // nothing to reveal) and owns the only tabbable controls. A hidden
-            // card keeps its controls in the DOM so promotion/removal handlers are
-            // unchanged, but takes them out of the tab order: they are covered by
-            // the front card and its strip. They are deliberately NOT
+            // card keeps its controls in the DOM so the rank/entry/remove/model
+            // handlers are unchanged, but takes them out of the tab order: they are
+            // covered by the front card and its strip. They are deliberately NOT
             // `aria-hidden`: hiding them would also remove the only description of
-            // a member's model/remove control from a screen reader, and the strips
-            // already give AT a way to bring that card forward.
+            // a member's rank, model or remove control from a screen reader, and the
+            // strips already give AT a way to bring that card forward.
             entry.handle.hidden = isFront;
-            for (const control of [entry.main, entry.remove, entry.select]) {
-                if (control === null) continue;
+            for (const control of entry.controls) {
                 if (isFront) control.removeAttribute('tabindex');
                 else control.tabIndex = -1;
             }
@@ -534,8 +575,8 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
 
         // Focus hand-over after fronting, in preference order, always landing INSIDE
         // the fronted card and never on <body>:
-        //   1. the promotion button — the normal case (editable team); it is the
-        //      card's primary control, so Enter/Space works from there;
+        //   1. the name press — the normal case (editable team); it is the
+        //      card's main control, so Enter/Space works from there;
         //   2. else the model select, when it is live — a frozen session disables the
         //      team controls but NOT the model map (R2), so the card still has a real
         //      enabled control to receive focus;
@@ -562,12 +603,129 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         }
     };
 
+    // The rank readout + stepper for ONE member (R20). This is the whole rank UI:
+    // per member, independent of every other tile, so two tiles can read Rank A at
+    // once and neither one is "the" top agent.
+    //   - `−` moves the member one step HIGHER in authority (Rank D → Rank C);
+    //   - `+` moves it one step LOWER (Rank C → Rank D);
+    //   - the readout states the rank the member actually holds, or the honest
+    //     "rank not stated" when the definition gives it none. A member with no
+    //     stated rank still gets the stepper, because assigning one is exactly how
+    //     that gap is closed (`stepRank` starts from Rank A for an unknown rank).
+    const rankRowFor = (name: string, label: string): HTMLElement => {
+        const stated = isAgentRank(options.ranks[name]) ? options.ranks[name] : undefined;
+        const row = el('div', 'agent-rank');
+        // The hook a test/inspector reads for THIS member's rank. Absent, not
+        // guessed, when the definition states none (styles.css `[data-rank='A']`
+        // paints the Rank A identity colour).
+        if (stated !== undefined) row.dataset.rank = stated;
+
+        const raise = el('button', 'agent-rank-step agent-rank-raise', '−');
+        raise.type = 'button';
+        const lower = el('button', 'agent-rank-step agent-rank-lower', '+');
+        lower.type = 'button';
+
+        // `stepRank(rank, -1)` = one step up in authority, `+1` = one step down. The
+        // target is named in the accessible name so the press states its effect
+        // before it is taken, and a clamp at either end of the ladder is stated too.
+        const nextRaise = stepRank(stated, -1);
+        const nextLower = stepRank(stated, 1);
+        // The clamp reads the canonical ladder ends (./contract.ts `HIGHEST_RANK`/
+        // `LOWEST_RANK`), so this surface cannot disagree with the kernel about where the
+        // ladder stops.
+        const atTop = stated === undefined ? false : stated === HIGHEST_RANK;
+        const atBottom = stated === undefined ? false : stated === LOWEST_RANK;
+
+        raise.setAttribute('aria-label', `Raise ${label} to ${rankLabelOf(nextRaise)}`);
+        lower.setAttribute('aria-label', `Lower ${label} to ${rankLabelOf(nextLower)}`);
+        raise.title = atTop
+            ? `${rankLabelOf(HIGHEST_RANK)} is the highest rank.`
+            : `Move ${label} one step up in authority, to ${rankLabelOf(nextRaise)}.`;
+        lower.title = atBottom
+            ? `${rankLabelOf(LOWEST_RANK)} is the lowest rank.`
+            : `Move ${label} one step down in authority, to ${rankLabelOf(nextLower)}.`;
+        // A member already at the top cannot be raised further, and the disabled
+        // control says so rather than pressing into a no-op.
+        raise.disabled = !options.editable || options.onAssignRank === undefined || atTop;
+        lower.disabled = !options.editable || options.onAssignRank === undefined || atBottom;
+
+        raise.addEventListener('click', () => {
+            if (raise.disabled) return;
+            options.onAssignRank?.(name, nextRaise);
+        });
+        lower.addEventListener('click', () => {
+            if (lower.disabled) return;
+            options.onAssignRank?.(name, nextLower);
+        });
+
+        // The readout is a labelled control group, not a decoration: a screen reader
+        // gets the agent plus its rank in one stop. The RANK hook lives on the row
+        // (`row.dataset.rank` above), so the readout itself carries no state.
+        //
+        // WHY THE UNSHORTENED HONESTY MATTERS: an unranked member is not "unsorted" — the
+        // definition states no letter for it, and the runtime follows from that: nobody can
+        // reach it with `delegate`, and it cannot delegate either (../shared/harness-api.ts
+        // `HarnessCard.ranks`). The tooltip says so, because the stepper invites a press and
+        // the reader should know what assigning a letter actually unlocks.
+        const value = el(
+            'span',
+            'agent-rank-value',
+            stated === undefined ? 'rank not stated' : rankLabelOf(stated)
+        );
+
+        value.title =
+            stated === undefined
+                ? 'This member has no rank, so no agent can delegate to it and it cannot delegate either. Assign a letter to change that.'
+                : `${displayTitleOf(agentDetailsOf(options.agents, name))} may delegate only to a member at a strictly lower rank.`;
+
+        row.append(raise, value, lower);
+
+        return row;
+    };
+
+    // The separate ENTRY control (R20). Distinct from the rank stepper on purpose:
+    // the entry agent is the one a new conversation opens with, and making a member
+    // the entry agent changes NO rank and no authority.
+    const entryActionFor = (name: string, label: string): HTMLElement => {
+        const isEntry = name === options.entry;
+        const button = el('button', 'agent-entry', isEntry ? 'entry' : 'set entry');
+        button.type = 'button';
+        button.dataset.agent = name;
+        // The tile-level hook is set by the caller's loop (styles.css keys the entry
+        // outline off `.agent-tile[data-entry='true']`); the button only states the
+        // toggle itself.
+        button.setAttribute('aria-pressed', isEntry ? 'true' : 'false');
+        button.setAttribute('aria-label', `${isEntry ? 'Entry agent' : `Make ${label} the entry agent`}`);
+        button.title = isEntry
+            ? // Naming what the entry role DOES (and does not) claim is the whole
+              // point: it is routing, not authority, and it says nothing about rank.
+              `${label} is the entry agent: a new conversation starts with it. This is routing, not rank.`
+            : options.onSetEntry === undefined
+              ? 'Choosing the entry agent is not available here.'
+              : `Make ${label} the entry agent, so a new conversation starts with it. Its rank does not change.`;
+        button.disabled = !options.editable || options.onSetEntry === undefined || isEntry;
+        button.addEventListener('click', () => {
+            if (button.disabled) return;
+            options.onSetEntry?.(name);
+        });
+
+        return button;
+    };
+
     for (const name of options.members) {
         const agent = agentDetailsOf(options.agents, name);
-        const isPrimary = name === options.primary;
         const tile = el('article', 'agent-tile');
         tile.dataset.agent = name;
-        tile.dataset.role = isPrimary ? 'primary' : 'secondary';
+        // R20 hooks, both per member: `data-rank` is the authority ladder letter
+        // (absent when the definition states none) and `data-entry` marks the one
+        // routing agent. Neither is a "primary"/"secondary" state. styles.css colours the
+        // ENTRY tile (`.agent-tile[data-entry='true']`, the one member a conversation
+        // starts from — a UNIQUE member, so a single-highlight rule is honest); it does
+        // NOT colour by rank, because any number of members share a letter and a shared
+        // colour would read as "the top agent" all over again.
+        const tileRank = isAgentRank(options.ranks[name]) ? options.ranks[name] : undefined;
+        if (tileRank !== undefined) tile.dataset.rank = tileRank;
+        if (name === options.entry) tile.dataset.entry = 'true';
         tile.setAttribute('role', 'listitem');
 
         // Activity is per agent and read from the live set passed by main.ts.
@@ -580,21 +738,35 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         const main = el('button', 'agent-main');
         main.type = 'button';
         main.disabled = !options.editable;
-        main.setAttribute('aria-pressed', isPrimary ? 'true' : 'false');
         // Exactly one human-readable name (the display title). The slug is kept in
         // `data-agent` for the callbacks and tests but is never displayed, so a
         // tile reads "Summarizer", not "summarizer" + "Summarizer". An unknown
         // descriptor (see agentDetailsOf) or an empty title reads a neutral word (R3).
         const label = displayTitleOf(agent);
 
-        main.title = isPrimary
-            ? 'This agent is the primary (entry) agent.'
-            : `Make ${label} the primary agent; ${teamLabel} becomes a subagent.`;
+        // The press is a VIEW/inspection action, never a promotion: R20 removed the
+        // single "make primary" press, so the name button opens that member's
+        // configuration when the host has one and otherwise just fronts the card.
+        main.setAttribute('aria-label', `Configure ${label} · ${tileRank === undefined ? 'rank not stated' : rankLabelOf(tileRank)}`);
+        main.title = options.onConfigure === undefined
+            ? `View ${label}. Rank and entry are set with the controls on this card.`
+            : `Open ${label}’s configuration. Rank and entry are set with the controls on this card.`;
 
         main.append(el('span', 'agent-tile-name', label));
         main.addEventListener('click', () => {
-            if (!options.editable || isPrimary) return;
-            options.onSelectPrimary(name);
+            if (!options.editable) return;
+            if (options.onConfigure !== undefined) {
+                options.onConfigure(name);
+                return;
+            }
+
+            // No dialog in this host: pressing the name brings the card fully into
+            // view, which is the only promise the control can keep here.
+            if (frontName !== name) {
+                frontName = name;
+                paintFront(true);
+                options.onFront?.(name);
+            }
         });
 
         const remove = el('button', 'agent-remove');
@@ -612,10 +784,12 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         });
 
         const top = el('div', 'agent-tile-top');
-        top.append(main, remove);
+        const rankRow = rankRowFor(name, label);
+        const entryButton = entryActionFor(name, label);
+        top.append(main, entryButton, remove);
 
-        // The model dropdown is a sibling of the promotion button, never inside
-        // it: changing a model must not also promote the agent.
+        // The model dropdown is a sibling of the rank stepper, never inside
+        // it: changing a model must not also move the member's rank.
         const model = modelSelectFor(
             name,
             label,
@@ -647,23 +821,34 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
             options.onFront?.(name);
         });
 
-        tile.append(top, model, handle);
+        tile.append(top, rankRow, model, handle);
         row.append(tile);
+
+        // The select is the only control whose tab stop matters inside the model
+        // row; the wrapper carries no focusable element. The rank row's two steps
+        // and the entry press ARE focusable, so they join the list the front paint
+        // parks out of the tab order on a hidden card.
+        const select = model.querySelector<HTMLSelectElement>('select');
 
         deck.push({
             name,
             tile,
             main,
             remove,
-            // The select is the only control whose tab stop matters inside the model
-            // row; the wrapper carries no focusable element.
-            select: model.querySelector<HTMLSelectElement>('select'),
-            handle
+            select,
+            handle,
+            controls: [
+                main,
+                entryButton,
+                remove,
+                ...Array.from(rankRow.querySelectorAll('button')),
+                ...(select === null ? [] : [select])
+            ]
         });
     }
 
-    // Initial paint: the primary is front unless the caller remembered another
-    // card, and no focus is stolen on page paint.
+    // Initial paint: the entry agent's card is front unless the caller remembered
+    // another card, and no focus is stolen on page paint.
     paintFront();
 
     row.append(addButton);

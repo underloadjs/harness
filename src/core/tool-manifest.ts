@@ -128,7 +128,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "toolRequest",
     metadata: {
         name: "toolRequest",
-        description: "Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example [\"files\", \"list\"], [\"shell\"], or [\"git\", \"diff\"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. A tool the user of THIS conversation has switched off is not listed here at all - not in `enabled`, `tools`, `alreadyAvailable`, or `forbidden` - so no query can find or re-enable it. In a scoped run (a delegation with `scope.tools`), tools outside your run scope are reported under `forbidden` with the allowed list instead of `enabled`: they cannot be enabled or called here, the answer is stable, and requesting one again will not change it - adapt to the allowed tools or report the limitation. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.",
+        description: "Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example [\"files\", \"list\"], [\"shell\"], or [\"git\", \"diff\"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when you have a strictly lower-ranked agent to hand work to; a capability that appears in neither list is genuinely unavailable. A tool the user of THIS conversation has switched off is not listed here at all - not in `enabled`, `tools`, `alreadyAvailable`, or `forbidden` - so no query can find or re-enable it. In a scoped run (a delegation with `scope.tools`), tools outside your run scope are reported under `forbidden` with the allowed list instead of `enabled`: they cannot be enabled or called here, the answer is stable, and requesting one again will not change it - adapt to the allowed tools or report the limitation. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.",
         tags: [
             "discovery",
             "tools",
@@ -1102,15 +1102,363 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
+    name: "knowledge",
+    metadata: {
+        name: "knowledge",
+        description: "Shared reference store: the cross-session knowledge base every thread of this deployment reads and writes — tagged articles of paragraph-addressed text that outlive this session. Six verbs, ONE operation object per call, sent as { operation: { ... } } (or that object's own keys at the top level, which the harness unwraps for you).\n\nDRILL IN, NEVER FLOOD. list and search answer with article METADATA ONLY (id, title, tags, rev, paragraphCount) - never paragraph bodies. Read the outline before you read text, and read text a window at a time:\n  list    { operation: { verb: \"list\" } }  ...  { operation: { verb: \"list\", search: \"render budget\", tag: [\"costs\"], limit: 10, offset: 0 } }\n  search  { operation: { verb: \"search\", query: \"how are token budgets computed\", limit: 20 } }\n  read    { operation: { verb: \"read\", id: \"<article id>\", outline: true } }  ->  every paragraph id with its rev, size and tags, NO text\n          { operation: { verb: \"read\", id: \"<article id>\", paragraphs: [\"<paragraph id>\"] } }  ...  { operation: { verb: \"read\", id: \"<article id>\", from: 0, limit: 5 } }\n  create  { operation: { verb: \"create\", title: \"Token budgets\", tags: [\"costs\"], content: [\"first paragraph\", { text: \"second paragraph\", tags: [\"detail\"], refs: [{ articleId: \"<article id>\", note: \"why\" }] }] } }\n  modify  { operation: { verb: \"modify\", id: \"<article id>\", expects: [{ id: \"<article id>\", rev: 3 }], title: \"New title\", addTags: [\"costs\"], removeTags: [\"old\"], addContent: [\"a new paragraph\"], setParagraphs: [{ id: \"<paragraph id>\", text: \"rewritten\" }], moveParagraphs: [{ id: \"<paragraph id>\", before: \"<paragraph id>\" }], removeParagraphs: [\"<paragraph id>\"] } }\n  remove  { operation: { verb: \"remove\", id: \"<article id>\", expects: [{ id: \"<article id>\", rev: 4 }] } }\n\nTHE RULES, because the engine refuses them all and a refusal names the exact field:\n- IDS ARE UUIDS THE STORE GAVE YOU. Never invent one: an unknown article id is EKNOWLEDGE_NOT_FOUND, and the remedy is always list or search first. A paragraph id comes from read (a page row's paragraphCount only tells you how big the drill in is).\n- WRITES NEED THE TOKEN. modify and remove pass expects: [{ id, rev }] with the rev your last read reported - ONE token, article grain, because a paragraph edit moves the article rev too. A stale token is refused EKNOWLEDGE_REV and the refusal quotes the CURRENT rev and article: re-read, then retry against that rev. A write with no expects still writes, and can overwrite what another thread changed.\n- BOUNDS: 100 articles; 64 paragraphs per article; 4000 characters per paragraph; 200 per title; 500 per reference note; 16 tags per article or paragraph and at most 16 in a \"tag\" filter, at 64 characters each; 16 references per paragraph; 64 entries per list argument, and exactly 1 in expects (one call guards one article). limit is 1-64 on EVERY verb, because one property serves list, search and read and the read window is the tightest (list/search default to 20); search ranks at most the first 50 rows (offset + limit <= 50) while list pages the whole store; read answers at most 64 paragraphs per call.\n- THE RESPONSE CAP CUTS, IT DOES NOT FAIL: 24576 bytes of what you pay for. read reports truncated / budgetTruncated and answers with totalParagraphs; list/search set page.hasMore and page.budgetTruncated, and this tool's own summary says \"projection cut\". Ask for the next window (from/limit, offset) - never retry the same call expecting more.\n- list with NO \"search\" key is an unfiltered listing; the \"search\" KEY is a free-text filter and is NOT the search verb. search needs a non-empty query, and answers matchedIn: \"title\" (the title lane matched, so the text was never scanned for that term) or \"text\".\n- create mints the paragraph ids you see in createdIds, in order; a pinned id in content must be a uuid the store does not already hold. In setParagraphs, ABSENT means UNCHANGED: rewrite text alone and the paragraph keeps its stored tags and refs; send tags: [] or refs: [] to clear them. modify answers one key per KIND of change that happened (changedIds / noopIds / movedIds / createdIds / removedIds / articleFields) and noop: true when nothing moved.\n- remove answers with the deleted article plus danglingRefs, and that list is the WHOLE store's unresolvable reference targets - every link that no longer resolves, including links that were already dangling before this call. Read it as a survey of the base (\"what points at what is missing\"), not as a count of what this removal broke.\n\nCODES: EKNOWLEDGE_INPUT (wrong type, unknown key, impossible combination, missing required key), EKNOWLEDGE_ID (not a uuid, or one id named twice), EKNOWLEDGE_REV (stale expects), EKNOWLEDGE_LIMIT (a bound: store size, text, tags, refs, items, limit, or paged past rank 50), EKNOWLEDGE_REF (a reference target does not exist), EKNOWLEDGE_NOT_FOUND (no such article or paragraph).",
+        tags: [
+            "knowledge",
+            "article",
+            "articles",
+            "search",
+            "read",
+            "edit",
+            "reference"
+        ],
+        parameters: {
+            type: "object",
+            properties: {
+                operation: {
+                    type: "object",
+                    description: "The operation to run. Its verb selects the rules; the engine refuses an unknown key by name rather than dropping it. An omitted operation lists the newest articles.",
+                    properties: {
+                        verb: {
+                            type: "string",
+                            enum: [
+                                "list",
+                                "search",
+                                "read",
+                                "create",
+                                "modify",
+                                "remove"
+                            ],
+                            description: "Which operation. Omitted means \"list\" - the newest articles first. Keys that belong to another verb are refused by name (EKNOWLEDGE_INPUT), never ignored."
+                        },
+                        search: {
+                            type: "string",
+                            description: "list only: case-insensitive substring of a title or paragraph text. Not the search verb; search needs \"query\"."
+                        },
+                        query: {
+                            type: "string",
+                            minLength: 1,
+                            maxLength: 4000,
+                            description: "search only: required, 1-4000 characters — the words to rank against titles and paragraph text. \"list\" takes no query; it has the \"search\" filter key instead."
+                        },
+                        tag: {
+                            type: "array",
+                            items: {
+                                type: "string",
+                                maxLength: 64
+                            },
+                            maxItems: 16,
+                            description: "list/search only: keep articles carrying one of these tags (case-folded). At most 16 entries, 64 characters each — the same 16 an article may carry."
+                        },
+                        limit: {
+                            type: "integer",
+                            minimum: 1,
+                            maximum: 64,
+                            description: "list/search/read: rows (page verbs) or paragraphs (read) per call, 1-64 — one bound, because one property serves all three and the read window is the tightest. list/search default to 20; `search` also keeps offset + limit within the 50-row rank window."
+                        },
+                        offset: {
+                            type: "integer",
+                            minimum: 0,
+                            description: "list/search only: rows to skip. On `search`, offset + limit must stay within the 50-row rank window; `list` has no rank ceiling — it pages the whole store."
+                        },
+                        id: {
+                            type: "string",
+                            description: "read/modify/remove only: the article id, exactly as list, search or create reported it (uuid, case-folded)."
+                        },
+                        paragraphs: {
+                            type: "array",
+                            items: {
+                                type: "string"
+                            },
+                            maxItems: 64,
+                            description: "read only: whole paragraphs by paragraph id (a selection, not a window). Unknown paragraph ids are refused. At most 64."
+                        },
+                        from: {
+                            type: "integer",
+                            minimum: 0,
+                            description: "read only: paragraph index to start the window at (0 is the first)."
+                        },
+                        outline: {
+                            type: "boolean",
+                            description: "read only: answer with one row per paragraph (id, rev, chars, tags) and NO text - the step between a page row and the text itself."
+                        },
+                        title: {
+                            type: "string",
+                            maxLength: 200,
+                            description: "create: required, 1-200 characters. modify: optional replacement title."
+                        },
+                        tags: {
+                            type: "array",
+                            items: {
+                                type: "string",
+                                maxLength: 64
+                            },
+                            maxItems: 16,
+                            description: "create only: at most 16 tags, 64 characters each (case-preserved, matched case-folded)."
+                        },
+                        content: {
+                            type: "array",
+                            items: {
+                                oneOf: [
+                                    {
+                                        type: "string"
+                                    },
+                                    {
+                                        type: "object",
+                                        properties: {
+                                            text: {
+                                                type: "string",
+                                                maxLength: 4000
+                                            },
+                                            tags: {
+                                                type: "array",
+                                                items: {
+                                                    type: "string",
+                                                    maxLength: 64
+                                                },
+                                                maxItems: 16
+                                            },
+                                            refs: {
+                                                type: "array",
+                                                items: {
+                                                    type: "object",
+                                                    properties: {
+                                                        articleId: {
+                                                            type: "string"
+                                                        },
+                                                        paragraphId: {
+                                                            type: "string"
+                                                        },
+                                                        note: {
+                                                            type: "string",
+                                                            maxLength: 500
+                                                        }
+                                                    },
+                                                    required: [
+                                                        "articleId"
+                                                    ],
+                                                    additionalProperties: false
+                                                },
+                                                maxItems: 16
+                                            },
+                                            id: {
+                                                type: "string"
+                                            }
+                                        },
+                                        additionalProperties: false
+                                    }
+                                ]
+                            },
+                            maxItems: 64,
+                            description: "create only: the paragraphs, in order — a bare string, or { text, tags, refs, id }. At most 64; `id` pins an id the store does not hold yet. modify uses addContent instead."
+                        },
+                        addTags: {
+                            type: "array",
+                            items: {
+                                type: "string",
+                                maxLength: 64
+                            },
+                            maxItems: 64,
+                            description: "modify only: tags to add (the result still has to fit 16 tags of 64 characters)."
+                        },
+                        removeTags: {
+                            type: "array",
+                            items: {
+                                type: "string",
+                                maxLength: 64
+                            },
+                            maxItems: 64,
+                            description: "modify only: tags to remove; unknown tags are reported in noopIds-style refusals rather than failing the call."
+                        },
+                        addContent: {
+                            type: "array",
+                            items: {
+                                oneOf: [
+                                    {
+                                        type: "string"
+                                    },
+                                    {
+                                        type: "object",
+                                        properties: {
+                                            text: {
+                                                type: "string",
+                                                maxLength: 4000
+                                            },
+                                            tags: {
+                                                type: "array",
+                                                items: {
+                                                    type: "string",
+                                                    maxLength: 64
+                                                },
+                                                maxItems: 16
+                                            },
+                                            refs: {
+                                                type: "array",
+                                                items: {
+                                                    type: "object",
+                                                    properties: {
+                                                        articleId: {
+                                                            type: "string"
+                                                        },
+                                                        paragraphId: {
+                                                            type: "string"
+                                                        },
+                                                        note: {
+                                                            type: "string",
+                                                            maxLength: 500
+                                                        }
+                                                    },
+                                                    required: [
+                                                        "articleId"
+                                                    ],
+                                                    additionalProperties: false
+                                                },
+                                                maxItems: 16
+                                            },
+                                            id: {
+                                                type: "string"
+                                            }
+                                        },
+                                        additionalProperties: false
+                                    }
+                                ]
+                            },
+                            maxItems: 64,
+                            description: "modify only: paragraphs to APPEND, same item shape as content. At most 64, and the article still has to fit 64 paragraphs."
+                        },
+                        setParagraphs: {
+                            type: "array",
+                            items: {
+                                type: "object",
+                                properties: {
+                                    id: {
+                                        type: "string"
+                                    },
+                                    text: {
+                                        type: "string",
+                                        maxLength: 4000
+                                    },
+                                    tags: {
+                                        type: "array",
+                                        items: {
+                                            type: "string",
+                                            maxLength: 64
+                                        },
+                                        maxItems: 16
+                                    },
+                                    refs: {
+                                        type: "array",
+                                        items: {
+                                            type: "object",
+                                            properties: {
+                                                articleId: {
+                                                    type: "string"
+                                                },
+                                                paragraphId: {
+                                                    type: "string"
+                                                },
+                                                note: {
+                                                    type: "string",
+                                                    maxLength: 500
+                                                }
+                                            },
+                                            required: [
+                                                "articleId"
+                                            ],
+                                            additionalProperties: false
+                                        },
+                                        maxItems: 16
+                                    }
+                                },
+                                required: [
+                                    "id"
+                                ],
+                                additionalProperties: false
+                            },
+                            maxItems: 64,
+                            description: "modify only: rewrite a paragraph by id. `text`, `tags` and `refs` are each optional, and ABSENT means UNCHANGED: send only `text` and the paragraph keeps its stored tags and refs; send `tags: []` or `refs: []` to CLEAR them. A rewrite that changes nothing reports the id in noopIds and bumps no rev. At most 64."
+                        },
+                        moveParagraphs: {
+                            type: "array",
+                            items: {
+                                type: "object",
+                                properties: {
+                                    id: {
+                                        type: "string"
+                                    },
+                                    before: {
+                                        type: "string"
+                                    }
+                                },
+                                required: [
+                                    "id"
+                                ],
+                                additionalProperties: false
+                            },
+                            maxItems: 64,
+                            description: "modify only: MOVE a paragraph before another one (`before` omitted means last). A move bumps no paragraph rev — movedIds is the only place it is visible. At most 64."
+                        },
+                        removeParagraphs: {
+                            type: "array",
+                            items: {
+                                type: "string"
+                            },
+                            maxItems: 64,
+                            description: "modify only: paragraph ids to delete. At most 64."
+                        },
+                        expects: {
+                            type: "array",
+                            items: {
+                                type: "object",
+                                properties: {
+                                    id: {
+                                        type: "string"
+                                    },
+                                    rev: {
+                                        type: "integer",
+                                        minimum: 1
+                                    }
+                                },
+                                required: [
+                                    "id",
+                                    "rev"
+                                ],
+                                additionalProperties: false
+                            },
+                            maxItems: 1,
+                            description: "modify/remove only: [{ id: <article id>, rev: <the rev you last read> }] — one token, article grain. A stale token is refused EKNOWLEDGE_REV with the CURRENT article attached; omit it to write unconditionally and risk another thread."
+                        }
+                    },
+                    additionalProperties: false
+                }
+            },
+            additionalProperties: false
+        },
+        visibility: "searchable"
+    },
+    sourcePath: "tools/runtime/knowledge.tool.ts",
+    label: "tools/runtime/knowledge.tool.ts",
+    origin: "package",
+    group: "runtime",
+    activation: "always",
+    order: 95,
+    sessionBound: true,
+    listed: true,
+    alwaysDeclared: false
+},
+{
     name: "agentManage",
     metadata: {
         name: "agentManage",
-        description: "List every configured agent in this harness session with previews of recent results. Each entry carries the agent's name, role (primary/subagent), model, invocationCount, and up to 5 recent invocations - roots, delegations, and forks - newest first. A result preview is at most 200 characters, flags whether it was truncated, and reports the full contentLength; a running invocation has status \"running\" and no content, and it also reports startedAt (when that run began, as epoch milliseconds) and ageMs (how old it is right now, in milliseconds). Use agentResult with the agent name and optional invocationId to read a full completed result. Only completed answer text is ever exposed here: never system instructions, transcript messages, tool arguments, or tool bodies. The listing also reports `totalResults` (every invocation record this harness still retains, across all agents) and `activeResults` (how many of those are still running). A top-level `truncated: true` is a DIFFERENT fact from a preview's own truncated flag: it means some agent has more retained invocations than the 5 shown here. This tool takes no arguments and has no cursor, so paging is not an option - the remedy is agentResult with an exact invocationId, and an id that was not listed is still in the envelope that created the run: a delegation reports its `invocationId`, a fork reports the branch id that doubles as one, and `agentResult` echoes the id it read.",
+        description: "List every configured agent in this harness session with previews of recent results. Each entry carries the agent's name, rank (one letter of the A-Z authority scale, A highest, and the fact that says which agents it may hand work to), model, invocationCount, and up to 5 recent invocations - roots, delegations, and forks - newest first. A result preview is at most 200 characters, flags whether it was truncated, and reports the full contentLength; a running invocation has status \"running\" and no content, and it also reports startedAt (when that run began, as epoch milliseconds) and ageMs (how old it is right now, in milliseconds). Use agentResult with the agent name and optional invocationId to read a full completed result. Only completed answer text is ever exposed here: never system instructions, transcript messages, tool arguments, or tool bodies. The listing also reports `totalResults` (every invocation record this harness still retains, across all agents) and `activeResults` (how many of those are still running). A top-level `truncated: true` is a DIFFERENT fact from a preview's own truncated flag: it means some agent has more retained invocations than the 5 shown here. This tool takes no arguments and has no cursor, so paging is not an option - the remedy is agentResult with an exact invocationId, and an id that was not listed is still in the envelope that created the run: a delegation reports its `invocationId`, a fork reports the branch id that doubles as one, and `agentResult` echoes the id it read.",
         tags: [
             "agents",
             "results",
             "preview",
-            "subagent",
+            "rank",
             "team",
             "inspect"
         ],
@@ -1141,7 +1489,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
             "result",
             "answer",
             "output",
-            "subagent",
+            "rank",
             "inspect"
         ],
         parameters: {
@@ -1190,12 +1538,12 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "delegate",
     metadata: {
         name: "delegate",
-        description: "Delegate a self-contained task to a configured subagent and return its answer. Only the primary agent can delegate, subagents cannot delegate further, and a harness registers this tool only when it has subagents - a session whose harness has none answers 404. EACH delegation starts a NEW conversation with that subagent: the child sees neither this conversation nor an earlier child's - unless the call comes from the host rather than one of your conversations, and then the child re-enters that subagent's default conversation (`agent:<name>`), where it may remember what it answered for you before - so the brief must carry everything it needs. The envelope names two HANDLES: `threadId` is the conversation the child ran in, so a follow-up goes through threadSend (another message into it) or threadRead (its transcript), and `invocationId` is what agentResult pages by; a finished child stays addressable until it is released with threadDelete. `maxChars` pages the answer (default 8000) - when the page is truncated, continue with agentResult by that `invocationId` and pass `limit`, whose own default is 4000, to keep your page size. `timeoutMs` optionally bounds the child's wall clock (omit it for no limit), and `maxTurns` optionally caps how many model REQUESTS the child may make at 1-64 (its answer must be one of them, so N allows at most N-1 tool rounds; omit it for the harness-wide limit). A child that did not finish keeps its error plus the last assistant TEXT it committed as `partialContent` - the run keeps every turn it committed and its transcript stays readable with threadRead, where only a tool call left without an answer is recorded as interrupted - and `cancelledAtMessage`, which counts committed messages rather than measuring progress. Abandoning a live child with toolCancel does not discard its outcome: the tool message of that call carries the same envelope, built from the child's terminal record - status, any partialContent/cancelledAtMessage - plus callCancelled: true, which marks that you released the call while the child's result stayed readable. The toolCancel result itself is an acknowledgement, not the delegation's answer.",
+        description: "Delegate a self-contained task to a lower-ranked agent and return its answer. Delegation follows the harness RANK model: you may delegate only to an agent ranked strictly below you (a Rank A agent may delegate to Rank B and below), a same-rank or a higher-rank target is refused with an error naming your rank and the legal targets, and a harness registers this tool only while at least one of its agents has a lower-ranked peer - a session whose harness has none answers 404. EACH delegation starts a NEW conversation with that agent: the child sees neither this conversation nor an earlier child's - unless the call comes from the host rather than one of your conversations, and then the child re-enters that agent's default conversation (`agent:<name>`), where it may remember what it answered for you before - so the brief must carry everything it needs. The envelope names two HANDLES: `threadId` is the conversation the child ran in, so a follow-up goes through threadSend (another message into it) or threadRead (its transcript), and `invocationId` is what agentResult pages by; a finished child stays addressable until it is released with threadDelete. `maxChars` pages the answer (default 8000) - when the page is truncated, continue with agentResult by that `invocationId` and pass `limit`, whose own default is 4000, to keep your page size. `timeoutMs` optionally bounds the child's wall clock (omit it for no limit), and `maxTurns` optionally caps how many model REQUESTS the child may make at 1-64 (its answer must be one of them, so N allows at most N-1 tool rounds; omit it for the harness-wide limit). A child that did not finish keeps its error plus the last assistant TEXT it committed as `partialContent` - the run keeps every turn it committed and its transcript stays readable with threadRead, where only a tool call left without an answer is recorded as interrupted - and `cancelledAtMessage`, which counts committed messages rather than measuring progress. Abandoning a live child with toolCancel does not discard its outcome: the tool message of that call carries the same envelope, built from the child's terminal record - status, any partialContent/cancelledAtMessage - plus callCancelled: true, which marks that you released the call while the child's result stayed readable. The toolCancel result itself is an acknowledgement, not the delegation's answer.",
         tags: [
             "agents",
             "delegate",
             "delegation",
-            "subagent",
+            "rank",
             "team"
         ],
         parameters: {
@@ -1203,11 +1551,11 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
             properties: {
                 agent: {
                     type: "string",
-                    description: "Subagent name, one of the session harness allowlist."
+                    description: "Agent name, one of the lower-ranked agents this harness resolved for your rank."
                 },
                 input: {
                     type: "string",
-                    description: "The full brief the subagent should act on."
+                    description: "The full brief the child agent should act on."
                 },
                 maxChars: {
                     type: "integer",
@@ -1217,7 +1565,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                 },
                 requireClarification: {
                     type: "boolean",
-                    description: "When true, refuse the delegation BEFORE the child runs if the brief names no concrete target (file, symbol, URL, or id) or no acceptance criterion. Use it for a write-capable subagent so an under-specified brief cannot spend a run mutating the workspace."
+                    description: "When true, refuse the delegation BEFORE the child runs if the brief names no concrete target (file, symbol, URL, or id) or no acceptance criterion. Use it for a write-capable child so an under-specified brief cannot spend a run mutating the workspace."
                 },
                 timeoutMs: {
                     type: "integer",
@@ -1258,10 +1606,9 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     label: "tools/runtime/delegate.tool.ts",
     origin: "package",
     group: "runtime",
-    activation: "subagents",
+    activation: "delegation",
     mode: "async",
     order: 120,
-    primaryOnly: true,
     answerExtraction: true,
     sessionBound: true,
     listed: true,
@@ -2184,7 +2531,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "threadDelete",
     metadata: {
         name: "threadDelete",
-        description: "Release one FINISHED conversation from this session's roster, from the conversation that owns it. A delegation FROM A CONVERSATION mints its own thread, and a session holds only a bounded number of them, so a one-shot child is work you reclaim yourself (issue 0027): read what you still need with threadRead or agentResult first, then delete it. (A delegation that comes from the host rather than a conversation reuses that subagent's default conversation instead of minting one - and this tool will not release a default, so that child has no slot for you to free.) Releasing is a MARK, not an erasure: the conversation leaves threadList and every agent-facing door, while its transcript and its result records are RETAINED - `removedInvocationIds` names the result rows that stopped being LISTED with it, and `agentResult` still answers an `invocationId` you already hold by that id. `agentManage` no longer counts its run, so read the answer BEFORE you release the thread. Nothing an agent does destroys a conversation: re-deleting a descendant you have already released is not an error - it restates the same receipt and changes nothing - and the only thing that destroys one is deleting the session itself - which keeps a bounded roster of 256 thread records, and past that bound the OLDEST released rows are retired with their transcripts. Pass `thread` for one of YOUR DESCENDANTS that is no longer running: a thread you created, or one created underneath you. Six things are refused: a thread that is RUNNING (stop it first) - the only stop an agent has is `toolCancel` on the call that started that work, a call that must be one YOUR run started, because no thread tool stops a conversation somebody else owns, a finished target that still has a RUNNING descendant (the refusal names the running child, and nothing is half-deleted), this agent's default conversation (agent:<name>), a thread outside your lineage (an ancestor, a sibling, or another agent's conversation is not yours to delete), a fork's `branch-N` id (a branch is an address, not a conversation: it holds no thread slot, so there is nothing to release - it goes when the conversation that forked it is deleted, and the branch ledger keeps only its newest 64 records by default), and any id this session does not have. Deleting cascades, so the finished threads that thread created are removed with it. The receipt reports `deleted` (the id you named), `removedThreadIds` (every id that actually went, the cascaded ones included), `removedInvocationIds` (the result records that went with them, which `agentManage` no longer lists) and `removedBranchIds` (the fork branches released the same way) - an empty array means none went, not that the receipt is silent. Those two id sets mean HID BEHIND the conversation you named, not destroyed: on the first release that is exactly what this call took out of discovery, and a re-delete restates the same two sets, because those conversations and result rows are still hidden. `removedBranchIds` is the one set that means NEWLY UNLISTED BY THIS CALL - a branch lives in a bounded ledger rather than in a conversation, its rows really do go with the first release, so a re-delete honestly reports an empty one.",
+        description: "Release one FINISHED conversation from this session's roster, from the conversation that owns it. A delegation FROM A CONVERSATION mints its own thread, and a session holds only a bounded number of them, so a one-shot child is work you reclaim yourself (issue 0027): read what you still need with threadRead or agentResult first, then delete it. (A delegation that comes from the host rather than a conversation reuses that agent's default conversation (agent:<name>) instead of minting one - and this tool will not release a default, so that child has no slot for you to free.) Releasing is a MARK, not an erasure: the conversation leaves threadList and every agent-facing door, while its transcript and its result records are RETAINED - `removedInvocationIds` names the result rows that stopped being LISTED with it, and `agentResult` still answers an `invocationId` you already hold by that id. `agentManage` no longer counts its run, so read the answer BEFORE you release the thread. Nothing an agent does destroys a conversation: re-deleting a descendant you have already released is not an error - it restates the same receipt and changes nothing - and the only thing that destroys one is deleting the session itself - which keeps a bounded roster of 256 thread records, and past that bound the OLDEST released rows are retired with their transcripts. Pass `thread` for one of YOUR DESCENDANTS that is no longer running: a thread you created, or one created underneath you. Six things are refused: a thread that is RUNNING (stop it first) - the only stop an agent has is `toolCancel` on the call that started that work, a call that must be one YOUR run started, because no thread tool stops a conversation somebody else owns, a finished target that still has a RUNNING descendant (the refusal names the running child, and nothing is half-deleted), this agent's default conversation (agent:<name>), a thread outside your lineage (an ancestor, a sibling, or another agent's conversation is not yours to delete), a fork's `branch-N` id (a branch is an address, not a conversation: it holds no thread slot, so there is nothing to release - it goes when the conversation that forked it is deleted, and the branch ledger keeps only its newest 64 records by default), and any id this session does not have. Deleting cascades, so the finished threads that thread created are removed with it. The receipt reports `deleted` (the id you named), `removedThreadIds` (every id that actually went, the cascaded ones included), `removedInvocationIds` (the result records that went with them, which `agentManage` no longer lists) and `removedBranchIds` (the fork branches released the same way) - an empty array means none went, not that the receipt is silent. Those two id sets mean HID BEHIND the conversation you named, not destroyed: on the first release that is exactly what this call took out of discovery, and a re-delete restates the same two sets, because those conversations and result rows are still hidden. `removedBranchIds` is the one set that means NEWLY UNLISTED BY THIS CALL - a branch lives in a bounded ledger rather than in a conversation, its rows really do go with the first release, so a re-delete honestly reports an empty one.",
         tags: [
             "thread",
             "threads",
@@ -2441,6 +2788,8 @@ export const loadDiscoveredTool = (label: string): Promise<unknown> => {
             return import("../tools/runtime/chapters.tool");
         case "tools/runtime/locations.tool.ts":
             return import("../tools/runtime/locations.tool");
+        case "tools/runtime/knowledge.tool.ts":
+            return import("../tools/runtime/knowledge.tool");
         case "tools/runtime/agentManage.tool.ts":
             return import("../tools/runtime/agentManage.tool");
         case "tools/runtime/agentResult.tool.ts":

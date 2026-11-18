@@ -171,8 +171,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct'],
         tools: ['read'],
         coreTools: ['toolRequest'],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true,
         ...overrides
@@ -603,7 +603,7 @@ const researchSession = (): Record<string, unknown> =>
         id: 's2',
         harness: 'research',
         updatedAt: T + 1_000,
-        harnessDefinition: descriptor({ name: 'research', title: 'Research', agents: ['research'], primary: 'research' })
+        harnessDefinition: descriptor({ name: 'research', title: 'Research', agents: ['research'], entry: 'research' })
     }) as unknown as Record<string, unknown>;
 
 type Call = { url: string; method: string | undefined; body: unknown };
@@ -2260,7 +2260,7 @@ it('leaves the plugins pane when the reader selects another harness', async () =
     // harness with no conversation, so without s2 the second half of this test would have no pane
     // to re-enter.
     const { dialed } = stub({
-        presets: [descriptor(), descriptor({ name: 'research', title: 'Research', agents: ['research'], primary: 'research' })],
+        presets: [descriptor(), descriptor({ name: 'research', title: 'Research', agents: ['research'], entry: 'research' })],
         extraSessions: [researchSession()]
     });
 

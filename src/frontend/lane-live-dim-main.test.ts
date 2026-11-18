@@ -42,8 +42,8 @@ const descriptor = (): HarnessDescriptor =>
         agents: ['instruct'],
         tools: ['read'],
         coreTools: ['read'],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true
     }) as HarnessDescriptor;
@@ -138,7 +138,7 @@ const treeOf = (turnId: string, included: boolean): Response =>
             sections: [
                 {
                     id: `${turnId}:0`,
-                    role: 'primary',
+                    rank: 'A',
                     agent: 'instruct',
                     agentLabel: 'IN',
                     state: 'done',

@@ -1,9 +1,9 @@
 // The trusted agent registry.
 //
 // One place answers "what agents exist, and what are they instructed to do?".
-// The server exposes these as AgentDescriptor values, validates a harness's
-// primary/subagents against them, and builds the actual runtime agents from the
-// same profiles. A client never supplies instruction text.
+// The server exposes these as AgentDescriptor values, validates a harness's configured
+// agents (its `entry` and its `ranks` map name these ids) against them, and builds the
+// actual runtime agents from the same profiles. A client never supplies instruction text.
 //
 // Order matters: the first entries are the real specialist roles a picker should
 // show first, followed by the delegated summarizer. Tests pin the order, so a new

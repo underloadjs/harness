@@ -381,7 +381,7 @@ describe('projectSection - the ONE bar is built from these segments', () => {
     it('keeps both segments in recorded order with every figure intact', () => {
         const wire: WireTurnSection = {
             id: 't1:2',
-            role: 'primary',
+            rank: 'A',
             agent: 'demo',
             agentLabel: 'RR2',
             state: 'done',

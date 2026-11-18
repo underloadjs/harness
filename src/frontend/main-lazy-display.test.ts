@@ -39,8 +39,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct'],
         tools: [],
         coreTools: [],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true,
         ...overrides
@@ -268,7 +268,7 @@ const treeOf = (displayRoute: string): Response => {
             sections: [
                 {
                     id: `${turnId}:0`,
-                    role: 'primary',
+                    rank: 'A',
                     agent: 'instruct',
                     agentLabel: 'IN',
                     state: 'done',

@@ -53,8 +53,8 @@ const descriptor = (name: string, overrides: Partial<HarnessDescriptor> = {}): H
         agents: ['instruct', 'summarizer'],
         tools: [],
         coreTools: ['toolRequest', 'tasks', 'delegate'],
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', summarizer: 'B' },
         builtin: true,
         editable: true,
         ...overrides

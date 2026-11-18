@@ -228,8 +228,11 @@ const probePreset = (): HarnessPreset => ({
     title: 'Probe',
     description: 'Scripted plugin-settings probe preset.',
     requiresEndpoint: false,
-    primary: 'probe',
-    subagents: [],
+    // THE RANK PAIR (clean break): `entry` names the routing agent and `ranks` states its
+    // authority. One member, one rank states directly what the retired `subagents: []`
+    // claimed by absence, and this build REFUSES the old pair at load (./persistence.ts).
+    entry: 'probe',
+    ranks: { probe: 'A' },
     agents: ['probe'],
     tools: [],
     builtin: true,
@@ -247,7 +250,8 @@ const probePreset = (): HarnessPreset => ({
                     stream: scripted([answer('first'), answer('second'), answer('third')])
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
+            ranks: { probe: 'A' },
             presets: false,
             report: {
                 progress,
@@ -1343,7 +1347,8 @@ describe('the live settings provider reaches an existing session', () => {
                         stream: scripted([answer('ok')])
                     })
                 },
-                primary: 'probe'
+                entry: 'probe',
+                ranks: { probe: 'A' }
             },
             SETTINGS,
             () => undefined,

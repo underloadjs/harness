@@ -65,8 +65,11 @@ that list, so a metadata-only entry (or one whose imports would fail) is still
 discoverable — the failure only matters when the body is loaded for execution.
 
 Each discovered row carries `{ name, metadata, sourcePath, label, origin,
-group, activation, mode?, order, pendingOnly?, control?, primaryOnly?,
-answerExtraction?, sessionBound?, listed?, alwaysDeclared? }`. `mode` is the
+group, activation, mode?, order, pendingOnly?, control?,
+answerExtraction?, sessionBound?, listed?, alwaysDeclared? }` — exactly
+`ToolRegistration` plus the resolved row, `src/core/tool-metadata.ts:95-151`. NO field carries
+authority: the rank model REMOVED `primaryOnly` from both types, so a descriptor can no longer
+name the agent allowed to use it (see the policy-flag paragraph below). `mode` is the
 resolved turn policy — WHEN a completion may re-enter the model — bound to
 the published DEFINITION rather than the wire name, and ABSENT when the
 entry declared none so a consumer can tell "defaulted" (the runtime applies
@@ -80,7 +83,7 @@ configuration satisfies, in `order` (scan order):
 | --- | --- |
 | `always` | every harness |
 | `creation` | `toolCreation !== false` |
-| `subagents` | the harness has a non-empty allowlist |
+| `delegation` | the RESOLVED rank map spans two or more DISTINCT letters, i.e. some agent holds a strictly-lower-ranked peer (`rosterHasDelegation`, `src/harness.ts:1579`, honoured at `:1712`) — one letter anywhere means nowhere to delegate, so the tool would only ever answer with a rank refusal |
 | `interaction` | `interaction` is configured |
 | `forks` | `forks.enabled` |
 | `threads` | the session opens its first independent thread |
@@ -103,12 +106,35 @@ request - the gate is activation, never a discovery round. The server mirrors th
 pair with one catalogue module per name (`src/server/harnesses/websearch.ts` and
 `webfetch.ts`), and `describeHarness` advertises each environment name only when that
 catalogue carries an executable definition for it.
+The `knowledge` row (`src/tools/runtime/knowledge.tool.ts`) is the runtime-group
+counterpart of the `download` sentence: `group: runtime`, `activation: always`, `order: 95`
+(after the five per-session stores at 55-90 and before `agentManage` 100 — registration order
+only, which is also the reading order an operator sees when listing `/tools`),
+`sessionBound: true`, `alwaysDeclared: false` and `listed: true`, with
+`visibility: searchable` — so it registers on every harness, is declared only once something
+asks for it by name through `toolRequest`, and appears in the host-wide catalogue.
+`sessionBound` here describes the CALL, not the data: the base is deployment-scoped and is
+never session state, but a tool invocation needs a harness to take the seam from, so a
+session-less call on the global route is refused with the pointer to the session route
+(`src/server/api.ts:2749-2754`) instead of running against a harness that does not exist. It
+needs no closure and no configuration: its state arrives through the `harness.knowledge` seam
+on the `ToolContext` (`src/types/index.ts:4935`), passed by reference from the host, which is
+why its compiled source keeps `dependencies: []` while still writing a durable base
+(`src/tools/runtime/knowledge.tool.ts:953-1004`).
 
 The policy flags are bound to the published **definition object**, not the wire
 name, so replacing a tool publishes an ordinary tool that inherits nothing:
-`primaryOnly` (role gate + declaration filter), `answerExtraction` (delegation
+`answerExtraction` (delegation
 answer parsing), `control` (`cancel`/`fork`/`action` run dispatch), `pendingOnly`
-(declared only while the agent has work in flight).
+(declared only while the agent has work in flight). NOTHING in this list gates by
+authority any more: `primaryOnly` — the role gate that filtered the DECLARATION and refused
+the LAUNCH for one named agent — is deleted from `ToolRegistration` and `DiscoveredTool`
+(`src/core/tool-metadata.ts:95-151`) and from the dispatch path. Rank behaviour is two
+RUNTIME projections over the same registered row, not a descriptor field: `delegate` is
+withheld from a caller with no strictly-lower-ranked target (`rankProjectedDefinitions`,
+`src/harness.ts:1804`, and its `activation: 'delegation'` row above), and `toolCreate` is
+withheld below the `toolCreation` letter (`creationGatedDefinitions`, `:1810`). Every other
+registered tool is declared and callable by EVERY agent, whatever its rank.
 
 `presets: false` filters the `preset` **group** and nothing else; the runtime
 (harness-owned) rows stay registered. Configured `toolSources`, `toolFolders`,
@@ -160,6 +186,40 @@ registered under those names is an ordinary source revision and
 does not inherit the original harness's configured provider closure. Module-local
 provider state is not migrated between revisions. Credentials remain harness
 configuration, never candidate source or source records.
+
+A runtime-group entry reaches its state a third way, and the knowledge entry shows what that
+means for a compiled revision. `tools/runtime/knowledge.tool.ts` has no harness closure and no
+inline data: the base arrives at call time as `context.harness.knowledge`, which the host passed
+by reference, so a source revision of that entry reads and writes the deployment's
+`<databaseRoot>/harness/knowledge/` through the store the process already owns
+(`src/server/knowledge-file-store.ts`, shipped in the same `src/` tree). The limit that comes
+with it is the live-module boundary, not a style choice: a `.tool.ts` resolves `../../core` to
+the framework namespace the compiler assembles by hand, and that namespace covers
+agent/tool/discovery/creation/result-budget/schema-validation/task/profile/chapter/location/
+snapshot/tool-ui/tool-media/tool-text/scheduler/metadata/action/branch/thread — **not**
+`core/knowledge` (`src/core/tool-source.ts:463-499`, `:504-523`). A compiled revision therefore
+cannot import the engine's bounds or its 24576-byte response cap; it restates them as literals,
+and `src/tools/runtime/knowledge.test.ts` pins each literal against the engine's own export
+(`:1043` asserts the figure, `:206-210` asserts the source still does NOT import it) so drift
+fails a test instead of ageing as prose.
+
+The published `parameters` literal is not decoration: it is what `GET /v1/harness/tools` shows a
+model AND the door those arguments pass (`validateSchemaValue`,
+`src/core/schema-validation.ts:122`, reached through `resolveToolParameters` `:334`, runs BEFORE
+`execute`), and the validator implements only `type`/`enum`/bounds/`items`/`required`/
+`additionalProperties:false` — no `if`, `then` or `allOf` (`:122`, `:200`, `:221`). So a
+per-verb difference a flat union schema cannot state has to be resolved on the single shared
+bound, and `knowledge` resolves it in the direction the model can trust: never wider than the
+engine (a bound that admits a call the engine then refuses is a late, confusing refusal), and
+where verbs share a property, the smallest bound that is safe for all of them — `limit` is 64
+because the `read` window is 64 even though the page verbs would take 100
+(`src/core/knowledge.ts:496-507` vs `:467-478`), and the `tag` filter is 16 because the engine
+checks it with the same reader as create's `tags` (`:557-569`, from `:1923`). The one place the
+schema is deliberately TIGHTER is `expects` (1 entry where the engine parses up to 64), because
+one call guards one article and a second token is either a duplicate the engine folds or a
+different article it refuses (`:2020-2036`). The rule itself is stated where the schema is
+written (`src/tools/runtime/knowledge.tool.ts:153-174`) and pinned digit-by-digit, door included,
+in `src/tools/runtime/knowledge.test.ts:342-491`.
 
 ## External tool folders and `toolManage`
 
@@ -585,7 +645,10 @@ It:
 - links the declared runtime dependencies from installed `node_modules` (no
   network; this is **not** a clean `npm install --omit=dev`);
 - imports the copied production entry and creates a scripted, offline harness;
-- verifies startup source records for harness-owned core entries;
+- verifies startup source records for harness-owned core entries — the record family and
+  `knowledge` included, each checked against its `src/tools/runtime/<name>.tool.ts` path, with
+  `dependencies: []` and the exact check list asserted
+  (`STARTUP_SOURCE_ENTRIES`, `scripts/check-package-tools.ts:160-181`, `:797-809`);
 - compiles and invokes an actual shipped app source entry from the copied `src/`;
 - compiles the shipped opt-in web source entries without invoking them (provider
   credentials are a harness configuration concern, not a package-check network

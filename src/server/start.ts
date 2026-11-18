@@ -49,6 +49,12 @@ import {
     HarnessPersistenceError,
     normalizeHarnessDatabaseRoot
 } from './persistence';
+// T7: the knowledge base this listener owns for its database root — the load (before a single
+// session is restored) and the disposal (on close). Both live in ./runtime.ts, which owns the
+// one-entry-per-resolved-root table, so a process that runs the service routes AND a standalone
+// listener over one root shares ONE store instead of opening two writers on one directory.
+import { disposeHarnessKnowledge, harnessKnowledgeOf, prepareHarnessKnowledge } from './runtime';
+import type { KnowledgeStore } from './knowledge-file-store';
 import { createStaticHandler } from './static';
 
 export type StartServerOptions = {
@@ -94,6 +100,17 @@ export type HarnessServer = {
     runtime: ServerRuntimeConfiguration;
     // Present when a database root was supplied; the resolved root and file owner.
     persistence?: HarnessPersistence;
+    // T7: the deployment's DURABLE knowledge base (`<root>/harness/knowledge/`), absent when the
+    // listener has no database root. One per resolved root for the whole process —
+    // ./runtime.ts owns the table — so this is the same store every session's
+    // `harness.knowledge` writes through, and the same object `close()` flushes.
+    //
+    // It hangs off the LISTENER rather than the session on purpose: knowledge outlives every
+    // session, and a session deletion never touches this directory. An embedder that needs the
+    // base between listeners reads it back through `loadKnowledgeFileStore`/this field after a
+    // restart; `close()` disposes it (flush first, exactly once) and the next start loads a
+    // fresh one from the same files.
+    knowledge?: KnowledgeStore;
     // T15: the live update stream mounted at `/v1/harness/stream` on THIS listener (`ws://` on the
     // same host and port as `url`). Exposed so an embedder can publish, count connections, or close
     // it independently of the listener.
@@ -166,6 +183,20 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
     const persistence = root === undefined ? undefined : new HarnessPersistence(root);
     const database = persistence?.load();
 
+    // T7: the knowledge base, loaded BEFORE the SessionStore exists — and therefore before this
+    // listener restores a single session, which is the only ordering that hands a restored
+    // session a DURABLE base. `prepareHarnessKnowledge` is memoized per resolved root
+    // (./runtime.ts), so a process that also runs the service routes awaits the SAME store here
+    // instead of opening a second writer over one directory, and a listener with no database
+    // root gets `undefined` without touching `node:fs` at all: knowledge then lives in memory,
+    // and `harness.knowledge` carries no durability verb to lie with.
+    //
+    // A FAILURE here aborts startup, deliberately and loudly: `loadKnowledgeFileStore` refuses
+    // an unreadable article file or an unknown index version rather than serving an empty base
+    // (./knowledge-file-store.ts, FAILURE POLICY), and an operator who starts a server that
+    // quietly forgot its knowledge would write over the very files it failed to read.
+    const knowledge = root === undefined ? undefined : await prepareHarnessKnowledge(root);
+
     if (database !== undefined && persistence !== undefined) {
         try {
             // T5: the deleted-builtin tombstones are replayed FIRST, so a shipped
@@ -208,7 +239,17 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
             // R1/R3: the standalone listener hands the store the SAME resolved runtime it
             // reports on `startHarnessServer().runtime`, so an operator's
             // HARNESS_THREAD_EXECUTION=worker is what the sessions actually get.
-            runtime
+            runtime,
+            // T7: one base, EVERY session. This is the line that makes a knowledge article
+            // written by session A readable from session B and from the next restart, and the
+            // line a session deletion cannot undo (the base belongs to the listener, not to a
+            // session). It is an ACCESSOR for the same reason ./runtime.ts passes one — the
+            // durable half may land after this store restored its sessions — and it is passed
+            // EVEN WITHOUT a database root, so an in-memory deployment shares one process-wide
+            // engine across its sessions instead of giving each session a private base. The
+            // accessor answers the store as soon as it exists and the shared engine until then;
+            // both are the same object underneath (../runtime.ts `harnessKnowledgeOf`).
+            knowledge: () => harnessKnowledgeOf(root)
         }
     );
 
@@ -335,6 +376,10 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
         stream,
         events,
         ...(persistence === undefined ? {} : { persistence }),
+        // T7: the durable base itself (see `HarnessServer.knowledge`). Absent exactly when the
+        // listener has no database root — the honest answer, and the one the `knowledge` tool
+        // reports through `harness.knowledge`.
+        ...(knowledge === undefined ? {} : { knowledge }),
         close: async (): Promise<void> => {
             // T15: stop the hub -> stream fan-out first, then close every live stream with 1001
             // (`going_away`, "host shutdown while background work drains") BEFORE the listener stops,
@@ -358,6 +403,32 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
             await new Promise<void>((resolve, reject) => {
                 server.close((error) => (error ? reject(error) : resolve()));
             });
+
+            // T7: THE KNOWLEDGE BARRIER, LAST on purpose. The session document is already
+            // durable and the listener no longer accepts a request, so this is the moment at
+            // which nothing can still move an article — a flush earlier could be followed by a
+            // late tool call and would report durability it did not deliver. The trailing
+            // commit timer is `unref()`'d (./knowledge-file-store.ts), so a process that skips
+            // this call may exit with an article still in memory; awaiting it here is what
+            // makes "the server stopped" and "the base is on disk" the same fact.
+            //
+            // Reported, never thrown: the file layer puts a write failure IN the report
+            // (`KnowledgeCommitReport.failure`) and keeps serving reads, and a shutdown that
+            // failed to write a knowledge article must still close the process — the sessions
+            // it drained above are already durable.
+            //
+            // `disposeHarnessKnowledge` then disposes this listener's store EXACTLY ONCE — no
+            // session's `harness.dispose` may do it, because one session's teardown would
+            // unsubscribe the base every other session is still writing (../harness.ts keeps the
+            // matching note) — and evicts the root's entry so a listener restarted in this
+            // process loads a fresh store from the same files instead of disposing a dead one.
+            try {
+                if (knowledge !== undefined) await knowledge.flush();
+
+                await disposeHarnessKnowledge(root);
+            } catch (error) {
+                console.error(`[harness] the knowledge base could not be flushed on close: ${messageOf(error)}`);
+            }
         }
     };
 };

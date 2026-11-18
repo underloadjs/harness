@@ -254,7 +254,7 @@ describe('searchTools', () => {
 // has declared - delegate is the reported case - must say so instead of "no
 // match", without enabling it or spending the discovery cap.
 describe('searchTools with declared core tools', () => {
-    const delegate = make('delegate', ['agents', 'delegate', 'delegation', 'subagent', 'team'], {
+    const delegate = make('delegate', ['agents', 'delegate', 'delegation', 'rank', 'team'], {
         visibility: 'core'
     });
 
@@ -271,7 +271,7 @@ describe('searchTools with declared core tools', () => {
                 {
                     name: 'delegate',
                     description: 'delegate capability.',
-                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                    tags: ['agents', 'delegate', 'delegation', 'rank', 'team']
                 }
             ],
             availableTags: []
@@ -294,7 +294,7 @@ describe('searchTools with declared core tools', () => {
                 {
                     name: 'delegate',
                     description: 'delegate capability.',
-                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                    tags: ['agents', 'delegate', 'delegation', 'rank', 'team']
                 }
             ],
             availableTags: []
@@ -339,7 +339,7 @@ describe('searchTools with declared core tools', () => {
                 {
                     name: 'delegate',
                     description: 'delegate capability.',
-                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                    tags: ['agents', 'delegate', 'delegation', 'rank', 'team']
                 }
             ]
         });
@@ -569,7 +569,7 @@ describe('selectTools', () => {
 describe('selectTools with declared core tools', () => {
     const delegate = make(
         'delegate',
-        ['agents', 'delegate', 'delegation', 'subagent', 'team'],
+        ['agents', 'delegate', 'delegation', 'rank', 'team'],
         { visibility: 'core' }
     );
 
@@ -581,7 +581,7 @@ describe('selectTools with declared core tools', () => {
                 {
                     name: 'delegate',
                     description: 'delegate capability.',
-                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                    tags: ['agents', 'delegate', 'delegation', 'rank', 'team']
                 }
             ]
         });
@@ -595,7 +595,7 @@ describe('selectTools with declared core tools', () => {
                 {
                     name: 'delegate',
                     description: 'delegate capability.',
-                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                    tags: ['agents', 'delegate', 'delegation', 'rank', 'team']
                 }
             ]
         });
@@ -619,7 +619,7 @@ describe('selectTools with declared core tools', () => {
                 {
                     name: 'delegate',
                     description: 'delegate capability.',
-                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                    tags: ['agents', 'delegate', 'delegation', 'rank', 'team']
                 }
             ]
         });

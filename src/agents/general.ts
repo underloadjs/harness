@@ -1,14 +1,16 @@
 // The DEFAULT agent — "General". Same toolbox as every live role, one difference that
 // is a hard rule rather than a preference: it works alone.
 //
-// WHY IT HAS NO SUBAGENTS AT ALL (not just "prefers not to")
-// ----------------------------------------------------------
-// The `general` harness preset is built with `subagents: []`
+// WHY IT HAS NO TEAM AT ALL (not just "prefers not to")
+// -----------------------------------------------------
+// The `general` harness preset is built with NO team, and its entry agent is the only
+// Rank A member, so the resolved roster has nobody ranked below it
 // (../../server/harnesses/presets.ts). `delegate`'s registration gate is
-// `activation: 'subagents'` (../../tools/runtime/delegate.tool.ts), and the runtime
-// refuses the row outright when the allowlist is empty (src/harness.ts:1101-1103 —
-// "No allowlist means nowhere to delegate: the tool would only fail"). So `delegate` is
-// never REGISTERED here, never declared, and `toolRequest` cannot enable it either —
+// `activation: 'delegation'` + `rosterHasDelegation()`
+// (../../tools/runtime/delegate.tool.ts + src/harness.ts), which is false while the
+// roster spans a single rank — "no rank below anybody means nowhere to delegate". So
+// `delegate` is never REGISTERED here, never declared, and `toolRequest` cannot enable
+// it either —
 // discovery only surfaces searchable rows, and delegate stays core-when-registered.
 // The prompt therefore states the rule the runtime already enforces, and adds the one
 // thing it does not: an agent CAN still hand a step away without `delegate`, through
@@ -46,7 +48,7 @@ export const general: AgentProfile = {
     name: 'general',
     title: 'General',
     description:
-        'The default general-purpose agent. It does the whole task itself, start to finish: this harness configures no subagents, so delegate is not even registered and it never splits work out.',
+        'The default general-purpose agent. It does the whole task itself, start to finish: this harness configures no agent ranked below it, so delegate is not even registered and it never splits work out.',
     instruction:
         'You are the General agent, the default. Do every step of the task yourself, in this conversation, and never hand work to another agent.',
     guidelines: [
@@ -55,7 +57,7 @@ export const general: AgentProfile = {
         // The one rule unique to this profile: alone by contract, including the two ways a
         // lone agent could still hand work away — a forked branch, or posting the step into
         // another conversation thread the host happens to have open.
-        'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.',
+        'You work alone: no agent is ranked below you here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.',
         DISCOVERY_GUIDELINE,
         WEB_SEARCH_GUIDELINE,
         // Tool results beat recall, and naming the tool is what makes the answer checkable.

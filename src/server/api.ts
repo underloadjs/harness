@@ -88,9 +88,10 @@
 // from this dispatcher is now always a POLICY refusal that names its reason (a constructed
 // tool with no captured revision, an atomic replace-on-create, a deployment with no live
 // stream) rather than an unimplemented operation. The remaining structural limits are stated
-// by the routes that enforce them: a binding must use its profile's own name, the primary is
-// not detachable at session scope, and a session with live or queued work answers 409 rather
-// than resetting history to make a roster change.
+// by the routes that enforce them: a binding must use its profile's own name, the ENTRY agent is
+// not detachable at session scope (its rank is editable, its membership is not), a binding's
+// "rank" must be one letter of the A-Z authority scale, and a session with live or queued work
+// answers 409 rather than resetting history to make a roster change.
 //
 // Cross-references:
 //   - src/harness.ts            — addAgent / removeAgent / setAgentInstruction and their guards
@@ -233,7 +234,7 @@ import { AgentStateError } from './harnesses/agent-state';
 import type { AgentProfilePatch } from './harnesses/agent-state';
 import { writeHarnessAgentRecords } from './persistence';
 import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
-import { SessionError, SessionStore, recordedStreamText, validateAttachmentsForSubmit } from './sessions';
+import { SessionError, SessionStore, recordedStreamText, validateAttachmentsForSubmit, validateBindingRank } from './sessions';
 import type { EnqueuedTask, SessionRecord, ThreadLaneInfo } from './sessions';
 // R7 (T4b): the display-route inclusion stamp writes the bar's own field, so it is typed with the
 // bar's own model (the fold's output type, which is what `projector.display()` returns).
@@ -2330,12 +2331,18 @@ export const createHarnessApi = ({
     const postHarness: Handler = async (ctx) => {
         const body = requireObjectBody<CreateHarnessRequest>(await ctx.body());
 
+        // B3 CLEAN BREAK: the definition's two axis fields are now `entry` (which member a session
+        // routes an UNFOCUSED submit to) and `ranks` (what each roster member may reach). A client
+        // still sending `primary`/`subagents` lands in the unknown-field refusal below, which names
+        // the accepted set — that is the intended migration signal, not a regression: silently
+        // accepting the old pair would invent authority for a roster the client never ranked.
         requireKnownFields(body, [
             'name',
             'title',
             'description',
-            'primary',
-            'subagents',
+            'agents',
+            'entry',
+            'ranks',
             'agent_models',
             'agent_instructions',
             'agent_colors'
@@ -2345,10 +2352,13 @@ export const createHarnessApi = ({
             throw new HttpError(400, 'A harness definition requires a "name".');
         }
 
-        if (typeof body.primary !== 'string' || body.primary.length === 0) {
-            throw new HttpError(400, 'A harness definition requires a "primary" agent.');
-        }
-
+        // B3/R14 — `entry` is NO LONGER REQUIRED at the edge. It is a ROUTING field with one
+        // legitimate default (the roster's first member), and authority lives in `ranks`, so the
+        // required field is the ROSTER (`agents`) and the registry resolves the rest: an omitted
+        // `entry` takes the first roster name, and an omitted `ranks` is the ordinary team (entry
+        // at 'A', every other member at 'B'). A harness with no roster is refused there because it
+        // could never run a turn (./harnesses/registry.ts `normalizeAgents`).
+        //
         // Semantic validation (known agents, duplicates, reserved names, bounds) belongs to
         // the registry, which throws a `HarnessRegistryError` with the right status. The
         // commit is durable BEFORE the 201 and rolls back on a failed write (T5).
@@ -2357,8 +2367,13 @@ export const createHarnessApi = ({
                 name: body.name,
                 ...(body.title === undefined ? {} : { title: body.title }),
                 ...(body.description === undefined ? {} : { description: body.description }),
-                primary: body.primary,
-                ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
+                // The ROSTER is required on the contract (`CreateHarnessRequest.agents`): a harness
+                // with no member has no entry and no rank, so it could never run a turn. A missing or
+                // empty list is the registry's 400 (`normalizeAgents`), not a silent single-agent
+                // default, so this handler forwards the field as-is.
+                agents: body.agents,
+                ...(body.entry === undefined ? {} : { entry: body.entry }),
+                ...(body.ranks === undefined ? {} : { ranks: body.ranks }),
                 // snake_case at the edge, camelCase in the domain (see NAMING above).
                 ...(body.agent_models === undefined ? {} : { agentModels: body.agent_models }),
                 ...(body.agent_instructions === undefined ? {} : { agentInstructions: body.agent_instructions }),
@@ -2390,8 +2405,9 @@ export const createHarnessApi = ({
         requireKnownFields(body, [
             'title',
             'description',
-            'primary',
-            'subagents',
+            'agents',
+            'entry',
+            'ranks',
             'agent_models',
             'agent_instructions',
             'agent_colors'
@@ -2400,8 +2416,9 @@ export const createHarnessApi = ({
         if (
             body.title === undefined &&
             body.description === undefined &&
-            body.primary === undefined &&
-            body.subagents === undefined &&
+            body.agents === undefined &&
+            body.entry === undefined &&
+            body.ranks === undefined &&
             body.agent_models === undefined &&
             body.agent_instructions === undefined &&
             body.agent_colors === undefined
@@ -2411,12 +2428,21 @@ export const createHarnessApi = ({
 
         // An existing session keeps its frozen copy, so this affects FUTURE sessions only -
         // which is why a saved conversation survives the deletion of its harness.
+        //
+        // `ranks` REPLACES the authority map (./harnesses/registry.ts `normalizeRanks`): a key naming
+        // an agent outside the resulting roster is a 400 rather than a silent drop, a member this
+        // patch removed loses its rank with it, and a member the new map does not name is filled one
+        // rank BELOW the lowest rank the map does state — so the read always returns a COMPLETE map
+        // and the roster read (./api-reads.ts `rankOfMember`) never has to guess. An omitted `ranks`
+        // keeps the surviving members' ranks and fills only newly added ones; an explicit `{}` is the
+        // flat team (every member at one rank, no delegation).
         const preset = await store.mutateRegistry(() =>
             registry.update(ctx.params.harness_name, {
                 ...(body.title === undefined ? {} : { title: body.title }),
                 ...(body.description === undefined ? {} : { description: body.description }),
-                ...(body.primary === undefined ? {} : { primary: body.primary }),
-                ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
+                ...(body.agents === undefined ? {} : { agents: body.agents }),
+                ...(body.entry === undefined ? {} : { entry: body.entry }),
+                ...(body.ranks === undefined ? {} : { ranks: body.ranks }),
                 // Present = REPLACE the map; `{}` is the explicit clear.
                 ...(body.agent_models === undefined ? {} : { agentModels: body.agent_models }),
                 ...(body.agent_instructions === undefined ? {} : { agentInstructions: body.agent_instructions }),
@@ -3224,11 +3250,17 @@ export const createHarnessApi = ({
         // and the `transcript.updated` signal that moves the `transcript` / `transcript_messages`
         // counters and reaches a watching stream (the hub listener above, not a second publish here).
         //
-        // THE TARGET is the entry agent's DEFAULT conversation, `agent:<primary>`: `src/harness.ts` keeps
+        // THE TARGET is the ENTRY agent's DEFAULT conversation, `agent:<entry>`: `src/harness.ts` keeps
         // one per configured agent on a freshly built harness (see the `threads()` note there), so this
-        // row exists on every session this route can create. The primary is read from the definition THIS
-        // session froze (`record.definition.primary`), not from the registry entry, which may have moved
-        // since the create.
+        // row exists on every session this route can create. The entry agent is read from the definition
+        // THIS session froze (`record.definition.entry`), not from the registry entry, which may have
+        // moved since the create.
+        //
+        // B3 R15 — WHY RANK DOES NOT BELONG IN THIS LOOKUP: `entry` is a ROUTING fact (which member an
+        // unfocused submit addresses), and the seed is a transcript for exactly that conversation. The
+        // entry agent may hold any rank in the A-Z scale, and other members may hold the same one, so
+        // neither "is it the top rank" nor "is it the only top-rank member" would pick the right row —
+        // the routing field does, and it always has.
         //
         // REPLACE, not append: the seed is a transcript DOCUMENT, exactly like the PUT it reuses. A
         // client that wants its history in front of the trusted instruction sends a `system` entry too —
@@ -3239,7 +3271,7 @@ export const createHarnessApi = ({
         // closed database root); both map through the outer catch to their own status. The body was
         // already validated, so a malformed seed can never reach here and leave a half-built session.
         if (seed !== undefined) {
-            const seedThreadId = `${THREAD_AGENT_PREFIX}${record.definition.primary}`;
+            const seedThreadId = `${THREAD_AGENT_PREFIX}${record.definition.entry}`;
 
             await store.updateThreadTranscript(record.id, seedThreadId, seed);
 
@@ -3826,7 +3858,7 @@ export const createHarnessApi = ({
     //
     // `presetFromRecord` (./harnesses/registry.ts:686) chooses a session's factory from the
     // RECORDED `template`, and only the 'live' and 'flaky' branches build it from the record's
-    // OWN `primary`/`subagents`/`agentModels`/`agentInstructions` (lines 709-724). The other
+    // OWN `entry`/`ranks`/`agentModels`/`agentInstructions` (lines 709-724). The other
     // two shapes cannot honour a session-local roster at all:
     //   - `template: 'scripted'` (the shipped `demo`, ./harnesses/presets.ts:289) resolves the
     //     shipped factory BY NAME and ignores the saved team (registry.ts:692-708), so a member
@@ -3944,7 +3976,13 @@ export const createHarnessApi = ({
 
         // Closed body: nothing here supplies an implementation, a tool list, or a transport,
         // which is what makes binding an existing trusted profile safe.
-        requireKnownFields(body, ['name', 'profile', 'model', 'instruction', 'role']);
+        // B3 R14/R15 CLEAN BREAK: the field is `rank`, one letter of the A-Z authority scale. The
+        // OLD field `role` is not accepted at all — it lands in the unknown-field refusal below —
+        // and the scale itself is checked by the ONE validator (./sessions.ts
+        // `validateBindingRank`, whose message names the accepted letters and never guesses a
+        // default). Calling it HERE, before the durability and idle gates, keeps the established
+        // precedence: an invalid body answers 400 on ANY session, not 409 about a busy one.
+        requireKnownFields(body, ['name', 'profile', 'model', 'instruction', 'rank']);
 
         for (const field of ['name', 'profile', 'model', 'instruction'] as const) {
             const value = body[field];
@@ -3954,16 +3992,16 @@ export const createHarnessApi = ({
             }
         }
 
-        if (body.role !== undefined && body.role !== 'primary' && body.role !== 'subagent') {
-            throw new HttpError(400, '"role" must be "primary" or "subagent".');
-        }
+        // An omitted rank is NOT a 400: it means "no authority requested", and the store gives the
+        // binding the lowest rank (./sessions.ts `defaultBindingRank`).
+        const bindingRank = validateBindingRank(body.rank);
 
         // T28: BODY validation keeps precedence over the durability gate below. The store is
         // still the authority (./sessions.ts:4744-4761 owns this rule and its exact wording);
         // this mirror exists only so an invalid binding answers 400 on ANY session, instead of a
         // 409 about a harness template the client cannot change. A blank name is mirrored for the
         // same reason. The store's remaining semantic refusals (already a member, roster full,
-        // retired profile, primary role, the idle gate) all stay the store's.
+        // retired profile, the idle gate) all stay the store's.
         const bindingName = typeof body.name === 'string' ? body.name.trim() : '';
 
         if (bindingName.length === 0) {
@@ -3978,7 +4016,7 @@ export const createHarnessApi = ({
             // The alias case the contract mentions: the roster key must BE the trusted profile id,
             // because that is what a restart resolves through `agentFromProfile(name)`
             // (./harnesses/toolbox.ts) and the durable preset record carries no alias map
-            // (`HarnessPresetRecord` = primary / subagents / agents / agentModels /
+            // (`HarnessPresetRecord` = entry / ranks / agents / agentModels /
             // agentInstructions, ./persistence.ts).
             throw new HttpError(
                 400,
@@ -3993,7 +4031,9 @@ export const createHarnessApi = ({
         // The store owns every semantic refusal and states it as a SessionError the dispatcher
         // maps to its own status: 400 blank/identity mismatch/oversized instruction (and, R7, an
         // unusable session-defined name), 409 already a member (including a case-only clash),
-        // roster full, retired profile, primary role, or a session with live/queued work.
+        // roster full, retired profile, or a session with live/queued work. The rank of a binding is
+        // NOT a structural refusal any more: any letter binds, several members may share one, and
+        // the entry agent may hold any rank (B3 R15).
         //
         // R7: a name that is NOT a catalogue profile is no longer a 404. It creates a
         // SESSION-DEFINED agent — its own model and instruction, durable in the session's preset
@@ -4004,7 +4044,7 @@ export const createHarnessApi = ({
             profile: body.profile,
             model: body.model,
             instruction: body.instruction,
-            role: body.role
+            rank: bindingRank
         });
 
         const name = typeof body.name === 'string' ? body.name.trim() : '';

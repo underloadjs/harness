@@ -131,8 +131,8 @@ const card: HarnessCard = {
     title: 'Demo',
     description: 'demo preset',
     requires_endpoint: false,
-    primary: 'instruct',
-    subagents: [],
+    entry: 'instruct',
+    ranks: { instruct: 'A' },
     agents: ['instruct'],
     tools: ['read'],
     builtin: true,
@@ -823,8 +823,8 @@ describe('loadBootstrap', () => {
                     title: 'Demo',
                     description: 'demo preset',
                     requiresEndpoint: false,
-                    primary: 'instruct',
-                    subagents: [],
+                    entry: 'instruct',
+                    ranks: { instruct: 'A' },
                     agents: ['instruct'],
                     tools: ['read'],
                     builtin: true,
@@ -1133,18 +1133,18 @@ describe('harness mutations', () => {
 
         expect((await module.listAgents()).items).toEqual([agentRow]);
         expect(
-            await module.createHarness({ name: 'release-captain', title: 'Release captain', primary: 'instruct', subagents: ['helper'] })
+            await module.createHarness({ name: 'release-captain', title: 'Release captain', agents: ['instruct', 'helper'], entry: 'instruct', ranks: { helper: 'B' }})
         ).toEqual(custom);
-        expect(await module.updateHarness('a/b', { primary: 'helper', subagents: ['instruct'] })).toEqual(custom);
+        expect(await module.updateHarness('a/b', { entry: 'helper', ranks: { instruct: 'B' }})).toEqual(custom);
 
         expect(calls.map((call) => [call.method, call.url, call.body])).toEqual([
             ['GET', '/v1/harness/agents?limit=25', undefined],
             [
                 'POST',
                 '/v1/harness/harnesses',
-                { name: 'release-captain', title: 'Release captain', primary: 'instruct', subagents: ['helper'] }
+                { name: 'release-captain', title: 'Release captain', agents: ['instruct', 'helper'], entry: 'instruct', ranks: { helper: 'B' }}
             ],
-            ['PATCH', '/v1/harness/harnesses/a%2Fb', { primary: 'helper', subagents: ['instruct'] }]
+            ['PATCH', '/v1/harness/harnesses/a%2Fb', { entry: 'helper', ranks: { instruct: 'B' }}]
         ]);
     });
 });
@@ -1621,8 +1621,8 @@ describe('descriptor rows', () => {
         title: 'Painted',
         description: 'A harness with configured colours.',
         requires_endpoint: true,
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         agents: ['instruct', 'summarizer'],
         tools: ['read'],
         builtin: true,

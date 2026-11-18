@@ -464,10 +464,10 @@ describe('delegated child ownership after abort (P2-A)', () => {
             yield { type: 'done', stopReason: 'stop', toolCalls: [] };
         };
 
-        let primaryTurn = 0;
+        let leadTurn = 0;
         let delegateCalls = 0;
-        const primaryStream: HarnessStream = async function* primaryStream() {
-            const turn = primaryTurn++;
+        const leadStream: HarnessStream = async function* leadStream() {
+            const turn = leadTurn++;
 
             if (turn === 0) {
                 delegateCalls++;
@@ -481,7 +481,7 @@ describe('delegated child ownership after abort (P2-A)', () => {
             }
 
             if (turn === 1) {
-                for (const frame of answer('primary-paused')) yield frame;
+                for (const frame of answer('lead-paused')) yield frame;
                 return;
             }
 
@@ -490,11 +490,11 @@ describe('delegated child ownership after abort (P2-A)', () => {
 
         const writer = harness({
             agents: {
-                primary: agent({ model: 'test/model', stream: primaryStream }),
+                lead: agent({ model: 'test/model', stream: leadStream }),
                 child: agent({ model: 'test/model', stream: childStream })
             },
-            primary: 'primary',
-            subagents: ['child'],
+            entry: 'lead',
+            ranks: { lead: 'A', child: 'B' },
             presets: false,
             report: {
                 progress: (event) => {
@@ -544,7 +544,7 @@ describe('delegated child ownership after abort (P2-A)', () => {
         expect(writer.agents.child.messages).toMatchObject([{ role: 'user', content: 'one' }]);
         // Issue 0036 R1 turns this into a growth check, and the intent survives exactly:
         // the frames recorded after the abort still belong to the child NOWHERE, and the
-        // primary's transcript is the retained cut-off work plus the clean second run —
+        // the entry agent's transcript is the retained cut-off work plus the clean second run —
         // nothing from the late child. Re-captured from an actual run: the prompt, the
         // delegation turn whose two calls were never answered (so each carries ONE
         // synthesized interrupted marker, which is what keeps the tail replayable), the
@@ -573,7 +573,7 @@ describe('delegated child ownership after abort (P2-A)', () => {
                 name: 'delegate',
                 content: expect.stringContaining('cancelled or interrupted')
             },
-            { role: 'assistant', content: 'primary-paused' },
+            { role: 'assistant', content: 'lead-paused' },
             { role: 'user', content: 'next' },
             { role: 'assistant', content: 'second-root-answer' }
         ]);
@@ -744,7 +744,7 @@ describe('tool-call id integrity (P2-B)', () => {
 describe('preemptive cancellation of a stuck child (T15)', () => {
     it('releases the child slot so restore, a new root run, and a new delegation all proceed', async () => {
         const events: HarnessEvent[] = [];
-        let primaryTurn = 0;
+        let leadTurn = 0;
         let childStarts = 0;
 
         const childStream: HarnessStream = async function* childStream() {
@@ -763,8 +763,8 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
             }
         ];
 
-        const primaryStream: HarnessStream = async function* primaryStream() {
-            const turn = primaryTurn++;
+        const leadStream: HarnessStream = async function* leadStream() {
+            const turn = leadTurn++;
             if (turn === 0) {
                 for (const frame of delegate('d1')) yield frame;
                 return;
@@ -786,11 +786,11 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
 
         const writer = harness({
             agents: {
-                primary: agent({ model: 'test/model', stream: primaryStream }),
+                lead: agent({ model: 'test/model', stream: leadStream }),
                 child: agent({ model: 'test/model', stream: childStream })
             },
-            primary: 'primary',
-            subagents: ['child'],
+            entry: 'lead',
+            ranks: { lead: 'A', child: 'B' },
             presets: false,
             report: { progress: (event) => void events.push(event) }
         });
@@ -821,7 +821,7 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
             { role: 'user', content: 'work' }
         ]);
 
-        // An unrelated root run of the primary proceeds.
+        // An unrelated root run of the entry agent proceeds.
         const second = await writer('next');
         expect(second.content).toBe('PRIMARY-2');
 
@@ -851,7 +851,7 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
         const secondGate = deferred<void>();
         const events: HarnessEvent[] = [];
         let childStarts = 0;
-        let primaryTurn = 0;
+        let leadTurn = 0;
         let abortIndex = 0;
 
         const childStream: HarnessStream = async function* childStream() {
@@ -880,8 +880,8 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
             }
         ];
 
-        const primaryStream: HarnessStream = async function* primaryStream() {
-            const turn = primaryTurn++;
+        const leadStream: HarnessStream = async function* leadStream() {
+            const turn = leadTurn++;
             if (turn === 0) {
                 for (const frame of delegate('d1', 'one')) yield frame;
                 return;
@@ -899,11 +899,11 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
 
         const writer = harness({
             agents: {
-                primary: agent({ model: 'test/model', stream: primaryStream }),
+                lead: agent({ model: 'test/model', stream: leadStream }),
                 child: agent({ model: 'test/model', stream: childStream })
             },
-            primary: 'primary',
-            subagents: ['child'],
+            entry: 'lead',
+            ranks: { lead: 'A', child: 'B' },
             presets: false,
             report: { progress: (event) => void events.push(event) }
         });

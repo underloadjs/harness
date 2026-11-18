@@ -9,6 +9,7 @@ import type {
     Harness,
     HarnessDiagnosticEvent,
     HarnessInteractionConfiguration,
+    HarnessKnowledge,
     HarnessPluginSettingsProvider,
     HarnessProgress,
     HarnessStateChangeEvent,
@@ -16,6 +17,11 @@ import type {
     Tool,
     ToolVisibility
 } from '../../harness';
+// THE RANK MODEL (B-series): a harness definition states an ENTRY agent (routing)
+// plus a RANK MAP (authority). `AgentRank` is the A–Z letter union owned by
+// ../types/index.ts (`AgentRank` / `AGENT_RANKS` / `rankIndexOf` / `isLowerRank`);
+// this layer only stores and projects it, never re-derives the ordering.
+import type { AgentRank } from '../../types';
 
 // The provider settings a caller can change per session.
 //
@@ -131,24 +137,58 @@ export type HarnessPresetReport = {
     // callback (the same rule as `stateChange`), so a sink that cannot allocate a string cannot
     // take a conversation down with it.
     diagnostic?: (event: HarnessDiagnosticEvent) => void;
+    // T7: the host's CROSS-SESSION knowledge base, forwarded on the identical top-level rule
+    // `pluginSettings` and `toolSettings` use (it is a `HarnessConfiguration` field,
+    // ../types `HarnessConfiguration.knowledge`): presence means this harness writes through
+    // the deployment's base, absence means the library builds its own in-memory engine.
+    //
+    // WHY IT RIDES THIS ARGUMENT rather than being a field of the preset: knowledge is a
+    // DEPLOYMENT fact (one store per resolved database root, ./runtime.ts), while a preset is a
+    // reusable FACTORY shared by every session of that deployment. Baking it into the preset
+    // would put the process's store in a closure the registry copies around.
+    //
+    // A LIVE OBJECT CROSSING A WORKER BOUNDARY IS THE KNOWN LIMIT, and it is the same one the
+    // two providers above document: a lane WORKER REPLICA cannot receive this reference through
+    // `worker_threads`, so a replica runs on its own in-memory engine until a per-worker store
+    // is plumbed (the blueprint would carry the ROOT and the worker would load it, exactly as
+    // `laneToolSettingsProvider` rebuilds the provider from the shipped NAME LIST).
+    knowledge?: HarnessKnowledge;
 };
 
 // One named harness in the catalogue.
 export type HarnessPreset = {
-    // Harness name, which is also the entry agent's name.
+    // Harness name, which is also the entry agent's name by convention (a
+    // user-created harness may name its entry anything inside its own roster).
     name: string;
     // Human title shown in the UI and CLI listing.
     title: string;
     description: string;
-    // Live presets need a base URL; the scripted demo does not.
+    // Live presets need a base URL; a scripted fixture does not.
     requiresEndpoint: boolean;
-    // The entry agent (explicit, never inferred from key order).
-    primary: string;
-    // The delegation allowlist. Empty for a single-agent harness; Research names
-    // `summarizer`. This is exposed so a descriptor can report the actual core
-    // tool set (delegate exists only when there is somewhere to delegate).
-    subagents: readonly string[];
-    // Declared for display only — the harness registry is the source of truth.
+    // THE ENTRY AGENT (routing, not authority): the agent an unfocused submit opens
+    // a conversation for. Explicit, never inferred from key order on the WIRE, but
+    // it is always a member of `agents`. It replaces the old `primary`, and it is
+    // NOT an authority concept: an entry agent holds whatever rank `ranks` gives it,
+    // and a harness may hold any number of Rank A agents.
+    entry: string;
+    // THE RANK MAP (authority): agent id → A–Z rank letter, `A` highest. Delegation
+    // is derived purely from it — an agent may delegate only to a STRICTLY lower
+    // rank, so a same-rank peer is not a target and an upward target is refused
+    // (../types/index.ts `isLowerRank`). Keys name members, and a stored preset's map
+    // covers EVERY member: ./registry.ts resolves a sparser request into this map with
+    // the kernel's own fill rule (./toolbox.ts `resolveRosterRanks`), so what a card
+    // advertises is exactly what the harness runs — never a subset the client happened
+    // to write. There is NO `subagents` allowlist any more: the
+    // allowlist was rank-derived all along, and the ranks say it outright.
+    //
+    // `coreTools` projects `delegate` exactly when this map holds TWO OR MORE
+    // DISTINCT rank letters (./toolbox.ts `coreToolNames`), because a single-rank
+    // roster has no strictly-lower target to hand work to.
+    ranks: Readonly<Record<string, AgentRank>>;
+    // THE ROSTER, in declaration order. ORDER IS LOAD-BEARING: the first name is
+    // the entry default when `entry` is omitted on create/PATCH (./registry.ts), so
+    // a roster is never an unordered bag of names. Declared for display on a
+    // preset — the harness registry is the source of truth for what a session runs.
     agents: readonly string[];
     tools: readonly string[];
     // Declared tools that only exist when the host configured their credential
@@ -166,7 +206,7 @@ export type HarnessPreset = {
     environmentTools?: readonly string[];
     // Per-agent model overrides (R9): agent id → model id. A member that is absent
     // falls back to `RunnerSettings.model`, so a harness can swap the model of one
-    // agent (the summarizer on a small model, the primary on a large one) without
+    // agent (the summarizer on a small model, the entry agent on a large one) without
     // touching the others. Only ids are overridable — never a provider, base URL,
     // or credential. Empty/absent means "the session model for every member".
     agentModels?: Readonly<Record<string, string>>;

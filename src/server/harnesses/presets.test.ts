@@ -10,20 +10,25 @@
 //     (../../agents/index.ts). The scripted demo and the flaky example are presets too,
 //     but T5 un-shipped them — they stay available through FIXTURE_PRESETS/
 //     PRODUCTION_WITH_FIXTURES so a host or a test injects them explicitly;
-//   - `general` is the DEFAULT card (it is `presets[0]` and `DEFAULT_CLI_PRESET`) and the
-//     ONLY live preset with no team: `subagents: []`, which means `delegate` is never
-//     even REGISTERED for it (src/harness.ts `activation: 'subagents'`), so it is absent
-//     from the registry, from the declarations, and from the descriptor's coreTools;
+//   - `general` is the DEFAULT card (it is `presets[0]` and `DEFAULT_CLI_PRESET`) and one
+//     of the two presets whose roster holds a SINGLE rank: `ranks: { general: 'A' }` over one
+//     member. Delegation is strictly downward, so with nobody below it the kernel registers no
+//     `delegate` row at all (src/harness.ts `rosterHasDelegation()`) — the tool is absent from
+//     the registry, from the declarations, and from the descriptor's coreTools;
 //   - every real preset registers the exact same tool keys, configured and keyless —
 //     package coding tools, the app tools, search when a key resolves, then the
 //     harness core tools; the only difference is `delegate`, which the default card lacks;
-//   - `teamOf()` derives every built-in allowlist from ONE list, minus the primary and
-//     minus `planner`/Manager — a Manager refuses to run as a delegate
-//     (../../agents/planner.ts), so a shipped team never offers a member that would
-//     refuse it — then adds `summarizer` so the `textSummarize` delegated path keeps working;
+//   - every card states its OWN roster and RANK MAP from literals — the rank pass deleted
+//     `teamOf()` and the derivation it hid. The shipped shape is uniform: the ENTRY agent
+//     first, then every other real role except `planner`/Manager, then `summarizer` last. The
+//     Manager is excluded because its profile refuses to run as a delegate
+//     (../../agents/planner.ts), and the summarizer is last so the `textSummarize` delegated
+//     path keeps finding it at call time; authority is `A` for the entry and `B` for every
+//     member below it — TWO distinct letters on a team card, which is what registers
+//     `delegate`, and one on the two single-agent cards, which is what does not;
 //   - the delegation wording lives in ONE shared guideline line (../../agents/guidelines.ts)
-//     that the six team roles compose verbatim, and the default profile carries no
-//     delegation line at all because it has no subagents;
+//     that the six team roles compose verbatim, and the default profile carries no delegation
+//     line at all because its roster has one rank and therefore no `delegate` row;
 //   - every profile-built agent is seeded with exactly ONE system message: the
 //     identity sentence and the guidelines joined into a single prompt by
 //     `agentInstruction()` (../../agents/index.ts), because two seeded `system`
@@ -45,6 +50,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent } from '../../harness';
 import type { HarnessProgress, HarnessStreamEvent, HarnessStreamRequest } from '../../harness';
+// THE RANK PRIMITIVES. `isLowerRank` is the kernel's own delegation predicate
+// (../../types/index.ts:1539), and it is the ONLY way this suite can ask "who may this agent
+// reach?" without re-implementing a rule that lives in the kernel — `Harness.subagents` is gone,
+// so a target list is a projection over `Harness.ranks` (../../types/index.ts:5017).
+import type { AgentRank } from '../../types';
+import { isLowerRank } from '../../types';
 import { createToolboxHarness } from './toolbox';
 import {
     createHarnessRegistry,
@@ -57,8 +68,7 @@ import {
     PRESET_ALIASES,
     PRESET_MAX_ITERATIONS,
     SHARED_TOOL_NAMES,
-    SPECIALIST_AGENT_NAMES,
-    teamOf
+    SPECIALIST_AGENT_NAMES
 } from './index';
 import { FIXTURE_PRESETS, PRODUCTION_WITH_FIXTURES } from './fixture-presets.test-support';
 import { AGENT_PROFILE_NAMES, AGENT_PROFILES, agentInstruction } from '../../agents';
@@ -208,6 +218,7 @@ const CORE = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult'
 ];
@@ -226,31 +237,52 @@ const HARNESS_OWNED = [...CORE, 'threadFork', 'toolCancel'];
 const TEAMED = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'debugger'] as const;
 
 // One live card, spelled out from the metadata the descriptor publishes. `team` is the
-// literal allowlist (pinned independently against `teamOf` in the team test), so this
-// helper cannot paper over a card that drifted from the derivation.
+// literal roster BELOW the entry agent — written here as data, never derived — so this
+// helper cannot paper over a card whose roster, routing agent, or rank map drifted from the
+// shipped shape.
 const card = (name: string, team: readonly string[]) => ({
     name,
-    primary: name,
-    subagents: [...team],
+    // ROUTING, stated independently of the roster: this card's entry agent is its own role, and
+    // ./presets.ts writes that fact even though it is also `agents[0]`.
+    entry: name,
+    // AUTHORITY: the entry at the top of the ladder, every team member ONE rank below it. The
+    // map is written for the whole roster — ./registry.ts resolves every request to that shape,
+    // so a card that left a member out would be the anomaly, not the norm.
+    ranks: { [name]: 'A', ...Object.fromEntries(team.map((member) => [member, 'B'])) },
     agents: [name, ...team],
     tools: TOOLBOX,
     environmentTools: ['search', 'fetch']
 });
 
+// The agents one caller may delegate to, derived from the RANKS the RUNNING harness publishes
+// (`Harness.ranks`, ../../types/index.ts:5017): every member STRICTLY below the caller, in
+// registration order. The rank pass deleted `Harness.subagents`, so this projection — written
+// with the kernel's own `isLowerRank`, not a re-spelled comparison — is how the suite asks what
+// a card can actually reach, and it is the same set the `delegate` refusal names.
+const delegableFrom = (ranks: Readonly<Record<string, AgentRank>>, caller: string): string[] =>
+    Object.keys(ranks).filter((name) => isLowerRank(ranks[name], ranks[caller]));
+
 // The ONE delegation line the six team roles compose verbatim (../../agents/guidelines.ts
-// `DELEGATION_GUIDELINE`). The gate itself — primary-only, one level deep, registered only
-// with subagents — is carried by the tool declaration, so this line only carries the three
-// policies no schema can say. It is pinned as a literal so a rewording in the source is a
-// visible diff here instead of a silent pass.
+// `DELEGATION_GUIDELINE`). The gate itself — one level deep, strictly downward, registered only
+// when the roster spans two or more ranks — is carried by the tool declaration, so this line
+// only carries the policies no schema can say. It is pinned as a literal so a rewording in the
+// source is a visible diff here instead of a silent pass. The wording names "the agent you
+// delegate to" rather than a role: in the rank model a JUNIOR agent with juniors of its own
+// holds the tool too, so the line has to read correctly for anyone who has the row.
 const DELEGATION_LINE =
-    'When you delegate, give ONE target a self-contained brief because a subagent never sees this conversation and every delegation starts a NEW one, verify its answer before relying on it, and continue a child you already used with threadSend on the threadId it returned rather than assuming it remembers the last brief.';
+    'When you delegate, give ONE target a self-contained brief because the agent you delegate to never sees this conversation and every delegation starts a NEW one, verify its answer before relying on it, and continue a child you already used with threadSend on the threadId it returned rather than assuming it remembers the last brief.';
 
 // The default card's replacement for that line (../../agents/general.ts): alone by
 // contract, with BOTH loopholes a lone agent could still use to hand a step away closed
 // in the same breath — `threadFork` (spawns a branch) and `threadSend` (posts the step
 // into another conversation the host happens to have open).
+//
+// THE RANK WORDING: the condition is no longer "no subagent exists here" but "no agent is
+// RANKED BELOW you" — the roster has one rank, so `delegate` is never registered (the same
+// fact the runtime gate states: `rosterHasDelegation()` in ../../harness.ts). The literal is
+// pinned here so the prompt and the product contract move together.
 const LONE_LINE =
-    'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.';
+    'You work alone: no agent is ranked below you here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.';
 
 afterEach(() => {
     vi.unstubAllEnvs();
@@ -294,7 +326,10 @@ describe('preset catalogue', () => {
         // seven rows are exactly the roles, in the shipped order.
         expect(presets.slice(0, 7).map((preset) => preset.name)).toEqual([...REAL]);
         expect(presets.at(-1)?.name).toBe('chat');
-        expect(presets.at(-1)?.primary).toBe('general');
+        // Issue 0005-D reuses the trusted `general` profile rather than adding a role, so the
+        // tool-less card ROUTES to `general` and ranks it alone — one member, one rank.
+        expect(presets.at(-1)?.entry).toBe('general');
+        expect(presets.at(-1)?.ranks).toEqual({ general: 'A' });
 
         // The UI selects the first descriptor at boot and the CLI uses it with no
         // `--preset`, so the first card must be the default real harness — the two
@@ -330,8 +365,9 @@ describe('preset catalogue', () => {
         expect(PRESET_MAX_ITERATIONS).toBe(Number.POSITIVE_INFINITY);
     });
 
-    it('derives one team per primary: every other real role except the Manager, then the summarizer', () => {
-        // The ONE list every team is derived from, in catalogue order (default first).
+    it('states one roster and rank map per card, and derives nothing from position', () => {
+        // The ONE list the shipped rosters are built from, in catalogue order (default first).
+        // Its name predates the rank model; what it selects is still WHO may appear in a team.
         expect([...SPECIALIST_AGENT_NAMES]).toEqual([
             'general',
             'instruct',
@@ -342,53 +378,90 @@ describe('preset catalogue', () => {
             'debugger'
         ]);
 
-        // Exact expansion per primary: SPECIALIST order minus the primary minus
-        // `planner`/Manager, then `summarizer` last. `planner` is excluded from every
-        // built-in team because it refuses to run as a delegate (../../agents/planner.ts
-        // and the note above each card in ./presets.ts); `general` IS a legal target for
-        // the other primaries even though its OWN card has no team.
-        expect(REAL.map((primary) => [primary, teamOf(primary)])).toEqual([
-            ['general', ['instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
-            ['instruct', ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
-            ['research', ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer']],
-            ['workspace', ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer']],
-            ['reviewer', ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer']],
-            ['planner', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
-            ['debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']]
+        // THE ROSTER, card by card, exactly as ./presets.ts writes it: the ENTRY agent first,
+        // then every other real role minus `planner`/Manager, then `summarizer` last. `planner`
+        // is excluded from every other card because its profile refuses to run as a delegate
+        // (../../agents/planner.ts and the note above each card); `general` IS a legal target for
+        // the other roles even though its OWN card has nobody below it. Order is load-bearing
+        // twice over — it is the entry DEFAULT, and it is the order `GET /harnesses` reports —
+        // so it is pinned whole rather than as a set.
+        expect(presets.map((preset) => [preset.name, preset.entry, preset.agents])).toEqual([
+            ['general', 'general', ['general']],
+            ['instruct', 'instruct', ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['research', 'research', ['research', 'general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['workspace', 'workspace', ['workspace', 'general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer']],
+            ['reviewer', 'reviewer', ['reviewer', 'general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer']],
+            ['planner', 'planner', ['planner', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['debugger', 'debugger', ['debugger', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']],
+            ['chat', 'general', ['general']]
         ]);
 
-        // The exclusion, stated twice so a one-sided edit cannot pass: no built-in team
-        // offers the Manager, and a primary is never inside its own team.
-        expect(REAL.map((primary) => teamOf(primary).includes('planner'))).toEqual(
-            REAL.map(() => false)
-        );
-        expect(REAL.map((primary) => teamOf(primary).includes(primary))).toEqual(
-            REAL.map(() => false)
-        );
+        // THE RANK LETTERS, read in roster order. One `A` at the head of every team card and `B`
+        // for each member below it; the two single-agent cards are a bare `A`, which is the
+        // honest statement "nobody here delegates" (what the retired `subagents: []` claimed)
+        // rather than a field left unset. `planner` is the one card with SEVEN juniors — it is
+        // the only role excluded from every other roster.
+        expect(presets.map((preset) => [preset.name, preset.agents.map((agent) => preset.ranks[agent]).join('')])).toEqual([
+            ['general', 'A'],
+            ['instruct', 'ABBBBBB'],
+            ['research', 'ABBBBBB'],
+            ['workspace', 'ABBBBBB'],
+            ['reviewer', 'ABBBBBB'],
+            ['planner', 'ABBBBBBB'],
+            ['debugger', 'ABBBBBB'],
+            ['chat', 'A']
+        ]);
 
-        // `summarizer` is in every derived team — the `textSummarize` delegated path
-        // looks that id up at call time.
-        expect(REAL.map((primary) => teamOf(primary).at(-1))).toEqual(
-            REAL.map(() => 'summarizer')
+        // The three invariants a one-sided edit could break, each pinned directly:
+        //   1. the rank map keys the roster EXACTLY — no rank for an agent this harness does not
+        //      select, and no member left without one (a card and a runtime that disagree about
+        //      who can delegate is the failure this guard exists for);
+        //   2. `entry` is `agents[0]` on every shipped card — stated independently in the source,
+        //      and equal here by construction of the catalogue, not by a derivation;
+        //   3. no card names `planner` except its own, and a card never ranks itself below itself.
+        expect(
+            presets.map(
+                (preset) =>
+                    Object.keys(preset.ranks).sort().join(',') === [...preset.agents].sort().join(',')
+            )
+        ).toEqual(presets.map(() => true));
+        expect(presets.map((preset) => preset.agents[0] === preset.entry)).toEqual(
+            presets.map(() => true)
         );
+        expect(
+            presets
+                .filter((preset) => preset.name !== 'planner')
+                .map((preset) => preset.agents.includes('planner'))
+        ).toEqual(presets.filter((preset) => preset.name !== 'planner').map(() => false));
+
+        // `summarizer` is LAST in every shipped team card — the `textSummarize` delegated path
+        // looks that id up at call time, and the two single-agent cards have no juniors at all.
+        expect(TEAMED.map((name) => presetOf(name).agents.at(-1))).toEqual(
+            TEAMED.map(() => 'summarizer')
+        );
+        expect(presets.filter((preset) => !TEAMED.some((name) => name === preset.name)).map((preset) => Object.keys(preset.ranks))).toEqual([
+            ['general'],
+            ['general']
+        ]);
     });
 
-    it('declares explicit primary/subagents and the shared tool list on real presets', () => {
-        // Cards are spelled out from literals, not from `teamOf`, so a card that stops
-        // agreeing with the derivation fails HERE as well as in the team test.
+    it('declares an explicit entry, rank map, roster and tool list on every real preset', () => {
+        // Cards are spelled out from literals, with nothing derived: the roster, the routing
+        // agent, and the authority map are three facts each card states on its own, and this is
+        // where a card that stopped agreeing with the shipped shape fails.
         expect(
             presets.map((preset) => ({
                 name: preset.name,
-                primary: preset.primary,
-                subagents: preset.subagents,
+                entry: preset.entry,
+                ranks: preset.ranks,
                 agents: preset.agents,
                 tools: preset.tools,
                 environmentTools: preset.environmentTools
             }))
         ).toEqual([
-            // THE DEFAULT CARD: the only live preset with an empty allowlist. That is a
-            // load-bearing choice, not an omission — `delegate` registers only when the
-            // allowlist is non-empty, so this harness never declares the tool.
+            // THE DEFAULT CARD: a one-member roster at one rank. That is a load-bearing choice,
+            // not an omission — delegation is strictly downward, so `delegate` is never even
+            // registered here, and no `core_tools` list may advertise it.
             card('general', []),
             card('instruct', ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']),
             card('research', ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer']),
@@ -403,8 +476,10 @@ describe('preset catalogue', () => {
             // (asserted in the chat test below).
             {
                 name: 'chat',
-                primary: 'general',
-                subagents: [],
+                // Issue 0005-D: the tool-less card runs the trusted `general` profile, so it
+                // routes to `general` and ranks it alone — no juniors, therefore no `delegate`.
+                entry: 'general',
+                ranks: { general: 'A' },
                 agents: ['general'],
                 tools: [],
                 environmentTools: undefined
@@ -419,8 +494,8 @@ describe('preset catalogue', () => {
         expect(
             FIXTURE_PRESETS.map((preset) => ({
                 name: preset.name,
-                primary: preset.primary,
-                subagents: preset.subagents,
+                entry: preset.entry,
+                ranks: preset.ranks,
                 agents: preset.agents,
                 environmentTools: preset.environmentTools,
                 template: preset.template
@@ -428,16 +503,16 @@ describe('preset catalogue', () => {
         ).toEqual([
             {
                 name: 'demo',
-                primary: 'general',
-                subagents: [],
+                entry: 'general',
+                ranks: { general: 'A' },
                 agents: ['general'],
                 environmentTools: undefined,
                 template: 'scripted'
             },
             {
                 name: 'flaky',
-                primary: 'general',
-                subagents: [],
+                entry: 'general',
+                ranks: { general: 'A' },
                 agents: ['general'],
                 // The factory opts into search AND webfetch through
                 // createToolboxHarness, so the metadata says so too
@@ -502,8 +577,8 @@ describe('preset catalogue', () => {
                 name,
                 title: definition.title,
                 requiresEndpoint: definition.requiresEndpoint,
-                primary: definition.primary,
-                subagents: definition.subagents,
+                entry: definition.entry,
+                ranks: definition.ranks,
                 agents: definition.agents,
                 environmentTools: definition.environmentTools,
                 template: definition.template
@@ -513,8 +588,12 @@ describe('preset catalogue', () => {
                 name: 'instruct',
                 title: 'Instruct',
                 requiresEndpoint: true,
-                primary: 'instruct',
-                subagents: [],
+                // The three rows are restated in the CURRENT vocabulary — the rank pass renamed
+                // the fields rather than translating them, so a pre-T3 snapshot has to be spelled
+                // as `entry` + `ranks` like any other definition. A single-member roster is one
+                // rank, which is what the old empty `subagents` list meant.
+                entry: 'instruct',
+                ranks: { instruct: 'A' },
                 agents: ['instruct'],
                 environmentTools: ['search'],
                 template: 'live'
@@ -523,8 +602,10 @@ describe('preset catalogue', () => {
                 name: 'research',
                 title: 'Research',
                 requiresEndpoint: true,
-                primary: 'research',
-                subagents: ['summarizer'],
+                entry: 'research',
+                // The one legacy row with a junior: `research` on top, `summarizer` one below,
+                // which is exactly the two-rank span that registers `delegate`.
+                ranks: { research: 'A', summarizer: 'B' },
                 agents: ['research', 'summarizer'],
                 environmentTools: ['search'],
                 template: 'live'
@@ -533,8 +614,8 @@ describe('preset catalogue', () => {
                 name: 'workspace',
                 title: 'Workspace (coding)',
                 requiresEndpoint: true,
-                primary: 'workspace',
-                subagents: [],
+                entry: 'workspace',
+                ranks: { workspace: 'A' },
                 agents: ['workspace'],
                 environmentTools: ['search'],
                 template: 'live'
@@ -564,8 +645,8 @@ describe('one toolbox, different agents', () => {
         vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
         vi.stubEnv('TAVILY_API_KEY', '');
 
-        // Identical by construction: preset.tools is the same table, every TEAMED preset
-        // declares subagents (so delegate exists), and the only other difference is the
+        // Identical by construction: preset.tools is the same table, every TEAMED preset states
+        // two distinct ranks (so `delegate` exists), and the only other difference is the
         // example's testFlaky. W4: the toolbox factory also opts into webfetch, so fetch
         // is registered right after the configured search and stays SEARCHABLE (it is not
         // in CORE).
@@ -603,10 +684,12 @@ describe('one toolbox, different agents', () => {
     }, HARNESS_BUILD_TIMEOUT);
 
     it('omits delegate from the default card while every other row stays identical', () => {
-        // THE load-bearing difference, pinned in both key states: `subagents: []` means
-        // the kernel never registers `delegate` (src/harness.ts `activation: 'subagents'`),
-        // so the row is absent from the registry rather than merely undeclared —
-        // `toolRequest` cannot surface it either, because discovery only lists rows.
+        // THE load-bearing difference, pinned in both key states: the default card's rank map holds
+        // ONE letter (`{ general: 'A' }`), so the kernel never registers `delegate`
+        // (src/harness.ts `activation: 'delegation'` — two or more distinct rank letters are what
+        // arm it), which is the rank-model statement of the retired `subagents: []`. The row is
+        // therefore absent from the registry rather than merely undeclared — `toolRequest` cannot
+        // surface it either, because discovery only lists rows.
         vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
         vi.stubEnv('TAVILY_API_KEY', '');
         expect(registeredTools('general')).toEqual([
@@ -628,10 +711,14 @@ describe('one toolbox, different agents', () => {
             'fetch'
         ]);
 
-        // One agent, no subagent map, and therefore no summarizer to delegate to either.
+        // One agent at one rank — so there is nobody strictly below it, and the kernel registers
+        // no `delegate` row. `Harness.ranks` is the runtime's own resolved map
+        // (../../types/index.ts:5017); the rank pass deleted `Harness.subagents`, so this is the
+        // statement that replaces "an empty allowlist".
         const harness = presetOf('general').create(SETTINGS, progress);
         expect(Object.keys(harness.agents)).toEqual(['general']);
-        expect(Object.keys(harness.subagents)).toEqual([]);
+        expect(harness.ranks).toEqual({ general: 'A' });
+        expect(delegableFrom(harness.ranks, 'general')).toEqual([]);
         expect(harness.tools.delegate).toBeUndefined();
         expect(harness.agents.summarizer).toBeUndefined();
 
@@ -671,15 +758,16 @@ describe('one toolbox, different agents', () => {
 
         const chat = presetOf('chat').create(SETTINGS, progress);
 
-        // No delegation (empty team), no workspace rows, no environment rows. Absence is
-        // asserted on the exact keys, not on a count.
+        // No delegation (one member at one rank), no workspace rows, no environment rows.
+        // Absence is asserted on the exact keys, not on a count.
         expect(chat.tools.delegate).toBeUndefined();
         expect(chat.tools.read).toBeUndefined();
         expect(chat.tools.write).toBeUndefined();
         expect(chat.tools.search).toBeUndefined();
         expect(chat.tools.fetch).toBeUndefined();
         expect(Object.keys(chat.agents)).toEqual(['general']);
-        expect(Object.keys(chat.subagents)).toEqual([]);
+        expect(chat.ranks).toEqual({ general: 'A' });
+        expect(delegableFrom(chat.ranks, 'general')).toEqual([]);
 
         // The kernel-owned bootstrap pair is still CORE, so `toolRequest` remains the model's
         // documented way to unlock a tool later — the escape hatch the issue keeps open.
@@ -749,8 +837,10 @@ describe('one toolbox, different agents', () => {
                         }
                     })
                 },
-                primary: 'general',
-                subagents: [],
+                // R1/R6 — one member at ONE rank: the map states outright that this card delegates
+                // nothing, so the kernel registers no `delegate` row for it.
+                entry: 'general',
+                ranks: { general: 'A' },
                 sharedToolbox: false
             },
             SETTINGS,
@@ -781,8 +871,8 @@ describe('one toolbox, different agents', () => {
                         }
                     })
                 },
-                primary: 'general',
-                subagents: []
+                entry: 'general',
+                ranks: { general: 'A' }
             },
             SETTINGS,
             progress
@@ -800,8 +890,10 @@ describe('one toolbox, different agents', () => {
         expect((AGENT_PROFILES as Record<string, unknown>).chat).toBeUndefined();
         expect(AGENT_PROFILE_NAMES).not.toContain('chat');
         expect(SPECIALIST_AGENT_NAMES).not.toContain('chat');
-        // A team is built from agent profiles, so the new card cannot appear inside one.
-        expect(REAL.map((primary) => teamOf(primary).includes('chat'))).toEqual(REAL.map(() => false));
+        // A roster is built from agent profiles, so the new card cannot appear inside one.
+        expect(
+            presets.filter((preset) => preset.name !== 'chat').map((preset) => preset.agents.includes('chat'))
+        ).toEqual(presets.filter((preset) => preset.name !== 'chat').map(() => false));
 
         // The card is distinct from the default in the one way that matters to the user: its
         // name, its title, and the fact that it declares no tools.
@@ -966,7 +1058,7 @@ describe('one toolbox, different agents', () => {
         // test in this file at 2706 ms uncontended; see HARNESS_BUILD_TIMEOUT.
     }, HARNESS_BUILD_TIMEOUT);
 
-    it('gives each real preset distinct instructions and the right subagents', () => {
+    it('gives each real preset distinct instructions and the right delegation targets', () => {
         const instructions = REAL.map((name) => instructionOf(name, name));
 
         // Each real preset runs the WHOLE prompt its profile composes, verbatim: the
@@ -997,12 +1089,14 @@ describe('one toolbox, different agents', () => {
             'You compress technical notes into at most two sentences.\n\nGuidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
         );
 
-        // Every preset has exactly its team; the primary is never a subagent. The
-        // default card's entry is the contract, not an omission: empty team, one agent.
+        // Every preset reaches exactly its roster below the entry agent, and the entry agent is
+        // never one of its own targets (a same-rank peer is not a target — `isLowerRank` is
+        // strict). The default card's empty target list is the contract, not an omission: one
+        // member, one rank.
         expect(
             REAL.map((name) => {
                 const harness = presetOf(name).create(SETTINGS, progress);
-                return [name, Object.keys(harness.subagents), Object.keys(harness.agents)];
+                return [name, delegableFrom(harness.ranks, name), Object.keys(harness.agents)];
             })
         ).toEqual([
             ['general', [], ['general']],
@@ -1018,19 +1112,20 @@ describe('one toolbox, different agents', () => {
     }, HARNESS_BUILD_TIMEOUT);
 
     it('composes one shared delegation line for the team roles, and none on the default card', () => {
-        // The six roles that may delegate all compose the SAME line (no per-role
-        // paraphrase that can drift), and that line reads correctly for a primary (it has
-        // the tool) and for a subagent (it never does — `primaryOnlyDefinitions` in
-        // src/harness.ts). The GATE itself — primary-only, one level deep, registered only
-        // with subagents — is declared by the tool, not repeated here.
+        // The six roles that may delegate all compose the SAME line (no per-role paraphrase
+        // that can drift), and that line has to read correctly for EVERY agent that holds the
+        // row: a Rank A agent with juniors, and a junior that has juniors of its own — rank is
+        // intrinsic, so delegation is one level deep per call and strictly downward, and the row
+        // exists wherever the roster spans two or more ranks. The GATE itself is declared by the
+        // tool, not repeated here, which is why the line names no role.
         for (const name of TEAMED) {
             const block = AGENT_PROFILES[name].guidelines.join('\n');
 
             expect(block).toContain(DELEGATION_LINE);
         }
 
-        // The default card carries no delegation wording at all, because its harness has
-        // no subagents and therefore no `delegate` row to describe. Instead it states the
+        // The default card carries no delegation wording at all, because its roster holds one
+        // rank and therefore has no `delegate` row to describe. Instead it states the
         // rule the runtime enforces, plus the fork loophole the runtime leaves open.
         const loneBlock = AGENT_PROFILES.general.guidelines.join('\n');
 
@@ -1057,42 +1152,102 @@ describe('one toolbox, different agents', () => {
         );
         expect(plannerPlan).toContain('never do a step yourself');
 
-        // ROUTING NAMES NO UNREACHABLE ID. The delegate `agent` enum IS the session
-        // allowlist (src/harness.ts), so every id the prompt offers has to be a member of
-        // the Manager's own built-in team — and `planner` itself never is, which is what
-        // the exclusion in `teamOf` guarantees.
+        // ROUTING NAMES NO UNREACHABLE ID. The delegate `agent` enum IS the reachable set
+        // (src/harness.ts derives it from the ranks), so every id the prompt offers has to be a
+        // member STRICTLY below the Manager in its own roster — and `planner` itself never is,
+        // because a same-rank peer is not a target and the card holds nobody at its own level.
         const routingIds = ['research', 'workspace', 'reviewer', 'debugger', 'general', 'summarizer'];
 
         expect(plannerPlan).toContain(
             'Delegate every step to the narrowest id that fits: research to investigate, workspace to implement, reviewer to challenge, debugger to stress-test, general for a whole self-contained job, summarizer to condense.'
         );
-        expect(routingIds.map((id) => teamOf('planner').includes(id))).toEqual(
+        const plannerTargets = delegableFrom(presetOf('planner').ranks, 'planner');
+
+        expect(routingIds.map((id) => plannerTargets.includes(id))).toEqual(
             routingIds.map(() => true)
         );
-        expect(teamOf('planner').includes('planner')).toBe(false);
+        expect(plannerTargets.includes('planner')).toBe(false);
 
         // The stale promise from the five-role roster stays gone: the Manager must not
         // tell its caller to route to an id its team cannot reach.
         expect(plannerPlan).not.toContain('instruct for general work');
     });
 
-    it('exposes each team preset team as the valid delegation ids', () => {
-        // The runtime declaration's `agent` enum IS the allowlist, so a Manager can only
-        // name agents that exist in its team. The default card is not in this loop
-        // because it has no `delegate` tool to inspect — asserted right below.
-        const enums = TEAMED.map((name) => {
-            const parameters = presetOf(name).create(SETTINGS, progress).tools.delegate
+    it('exposes the rank-lowered roster of each team card as the valid delegation ids', () => {
+        // TWO DIFFERENT SETS, and the rank pass is what separates them:
+        //   - the SCHEMA `agent` enum is the WHOLE roster in registration order (the entry
+        //     agent first, then the rest of the card's roster in declaration order). It is
+        //     deliberately permissive (../../harness.ts `widenDelegateEnum`, and the note above
+        //     `delegateDeclarationFor`): a narrow enum answers a wrong guess with
+        //     `$.agent must be one of: "editor"`, which cannot name a RANK, so the model would
+        //     learn which names exist without learning why its choice was wrong;
+        //   - the LEGAL set is the rank projection — the members STRICTLY below the caller —
+        //     which is what the per-caller DESCRIPTION states and what `delegateFor` enforces,
+        //     naming both ranks and the legal targets when the guess misses.
+        // The default card is not in this loop because it has no `delegate` tool to inspect —
+        // asserted right below.
+        //
+        // ONE harness build per card, THREE readings of it, so the card, the runtime ranks, and
+        // the declared schema cannot drift apart unnoticed: the enum as an exact literal list,
+        // the rank projection as an exact literal list, and the runtime map against the card's
+        // map (which is what `resolveRosterRanks` promised).
+        const rows = TEAMED.map((name) => {
+            const harness = presetOf(name).create(SETTINGS, progress);
+            const parameters = harness.tools.delegate
                 .parameters as { properties: { agent: { enum?: readonly string[] } } };
-            return [name, parameters.properties.agent.enum];
+
+            return {
+                name,
+                declared: parameters.properties.agent.enum ?? [],
+                fromRanks: delegableFrom(harness.ranks, name),
+                // The harness's own resolved map, as key order (registration order).
+                runtimeRanksKeys: Object.keys(harness.ranks),
+                runtimeRanks: harness.ranks
+            };
         });
 
-        expect(enums).toEqual(TEAMED.map((name) => [name, teamOf(name)]));
+        // THE ENUM = THE FULL ROSTER, entry first. The entry agent appears in its own enum,
+        // and every card appears in its own list: delegating to yourself is refused at CALL
+        // time by the rank rule (a same-rank peer is not below you), not by the schema.
+        expect(rows.map((row) => [row.name, [...row.declared]])).toEqual([
+            ['instruct', ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['research', ['research', 'general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['workspace', ['workspace', 'general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer']],
+            ['reviewer', ['reviewer', 'general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer']],
+            ['planner', ['planner', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['debugger', ['debugger', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']]
+        ]);
 
-        // Widest allowlist in the product: the Manager is the only primary whose team
-        // holds all six other roles, because it is excluded from every OTHER team.
-        expect(enums[4][1]).toEqual(['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']);
-        // A peer team never offers the Manager back.
-        expect(enums[5][1]).toEqual(['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']);
+        // THE LEGAL SET = every member except the entry agent. On these shipped cards the entry
+        // is the only Rank A member, so the projection is exactly the enum without it — and the
+        // entry agent is the ONLY name the enum offers that the card cannot delegate to.
+        expect(rows.map((row) => [row.name, row.fromRanks])).toEqual([
+            ['instruct', ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['research', ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['workspace', ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer']],
+            ['reviewer', ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer']],
+            ['planner', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']]
+        ]);
+        expect(rows.map((row) => [...row.declared].filter((id) => !row.fromRanks.includes(id)))).toEqual(
+            TEAMED.map((name) => [name])
+        );
+
+        // The schema is not a second opinion about legality: it is a superset that still cannot
+        // name an agent outside this harness, and the runtime's resolved map is exactly the
+        // card's map (the rank map the card declares is the map the harness runs with).
+        expect(rows.map((row) => [...row.declared].sort())).toEqual(
+            rows.map((row) => [...row.runtimeRanksKeys].sort())
+        );
+        expect(rows.map((row) => [row.name, row.runtimeRanks])).toEqual(
+            TEAMED.map((name) => [name, presetOf(name).ranks])
+        );
+
+        // Widest LEGAL set in the product: the Manager is the only card whose roster holds
+        // all six other roles, because it is excluded from every OTHER roster.
+        expect(rows[4].fromRanks).toEqual(['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']);
+        // A peer roster never offers the Manager back — it is not in that roster at all.
+        expect(rows[5].fromRanks).toEqual(['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']);
 
         expect(presetOf('general').create(SETTINGS, progress).tools.delegate).toBeUndefined();
         // 7 harness builds (6 TEAMED + the default-card re-check) — see HARNESS_BUILD_TIMEOUT.
@@ -1171,10 +1326,14 @@ describe('summarize under one shared toolbox', () => {
     it('condenses locally when the harness has no summarizer agent', async () => {
         // A user-created single-agent harness: the shared toolbox is there, but with
         // no `summarizer` member (every shipped TEAMED preset includes one; the default
-        // card does not, because it has no team at all).
+        // card does not, because its roster has nobody below it at all). One roster member,
+        // so the rank map resolves to a single `A` and no `delegate` row exists.
         const harness = createHarnessRegistry()
-            .create({ name: 'solo', primary: 'instruct' })
+            .create({ name: 'solo', agents: ['instruct'] })
             .create(SETTINGS, progress);
+
+        expect(harness.ranks).toEqual({ instruct: 'A' });
+        expect(harness.tools.delegate).toBeUndefined();
 
         // Direct tool call: the same path a model call takes after discovery.
         expect(await harness.tools.textSummarize('First sentence. Second sentence. Third sentence.')).toBe(
@@ -1191,7 +1350,7 @@ describe('summarize under one shared toolbox', () => {
             expect(presetOf(name).create(SETTINGS, progress).agents.summarizer).toBeDefined();
         }
 
-        // `subagents: []` on the default card also removes the summarizer, so its
+        // The default card's single-rank roster also removes the summarizer, so its
         // `textSummarize` call takes the local-condensation branch — the same branch the
         // two fixtures take. Absence asserted exactly, not "may be undefined".
         for (const name of ['general', 'demo', 'flaky']) {

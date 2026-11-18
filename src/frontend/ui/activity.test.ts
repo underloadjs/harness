@@ -203,11 +203,13 @@ describe('paintActivity', () => {
     const row = (activity: readonly string[]): HTMLElement =>
         createAgentRow({
             members: ['instruct', 'helper'],
-            primary: 'instruct',
+            entry: 'instruct',
+            // The row states a rank per member; this test only paints activity rings, so the
+            // ladder is the plain two-rank team the tile would show anyway.
+            ranks: { instruct: 'A', helper: 'B' },
             agents: [],
             editable: true,
             activity,
-            onSelectPrimary: () => undefined,
             onAdd: () => undefined,
             onRemove: () => undefined
         });
@@ -273,7 +275,7 @@ describe('N3 interaction and branch frames', () => {
         branchId,
         kind,
         agent,
-        role: 'subagent' as const,
+        rank: 'B' as const,
         forkDepth: 1,
         model: 'm1',
         tools: []

@@ -139,7 +139,7 @@ const displayOf = (turnId: string): TurnDisplayResponse => ({
         sections: [
             {
                 id: `${turnId}:0`,
-                role: 'primary',
+                rank: 'A',
                 agent: 'narrator',
                 agentLabel: 'RR1',
                 state: 'done',

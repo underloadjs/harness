@@ -104,8 +104,11 @@ const presetOf = (name: string, create: HarnessPreset['create']): HarnessPreset 
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: [],
+    // A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: name,
+    ranks: { [name]: 'A' },
     agents: [name],
     tools: [],
     builtin: true,
@@ -125,7 +128,7 @@ const idlePreset = (): HarnessPreset =>
                     stream: answerStream('quiet')
                 })
             },
-            primary: 'idle',
+            entry: 'idle',
             presets: false,
             report: {
                 progress,
@@ -183,7 +186,7 @@ const gatedPreset = (): {
                     }
                 })
             },
-            primary: 'gated',
+            entry: 'gated',
             presets: false,
             report: {
                 progress,
@@ -383,7 +386,7 @@ describe('T13 legacy stream ordering (P3)', () => {
                         stream: answerStream('quiet')
                     })
                 },
-                primary: 'concurrent',
+                entry: 'concurrent',
                 presets: false,
                 report: {
                     progress,

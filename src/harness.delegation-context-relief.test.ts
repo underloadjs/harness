@@ -28,7 +28,7 @@
 // that is still running when that run reports `depth >= 2` (./plugins/context-compaction.plugin.ts
 // `turnAfter`), and a delegated child of a HOST-thread parent is exactly that
 // (./harness.compaction-delegation.test.ts:671 pins `run.started:<child>:researcher:d2`). From the
-// primary's own DEFAULT conversation the child run is `d1`, the nudge arrives as a separate
+// entry agent's own DEFAULT conversation the child run is `d1`, the nudge arrives as a separate
 // out-of-band run, and the summarize turn terminates it — the main-thread half that is deliberately
 // UNCHANGED. So a mid-task compaction is only reachable here through `createThread`.
 //
@@ -52,6 +52,9 @@ import type {
     HarnessStreamEvent,
     HarnessStreamRequest
 } from '@underload/harness';
+// Rank letters for the fan-out roster below come from the kernel's own type, the same
+// relative specifier ./harness.delegation.test.ts:54 uses.
+import type { AgentRank } from './types';
 
 // The protocol strings are imported, never re-pasted, so a protocol change moves these pins too.
 import { COMPACTION_INSTRUCTION } from './plugins/context-compaction.plugin';
@@ -332,8 +335,8 @@ describe('a compacting child answers its spawner with the task answer (T6 D-1)',
                 }),
                 researcher: agent({ model: MODEL, stream: childStream })
             },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             tools: { seed: seedTool() },
             pluginSettings: summarizeSettings(LIMIT),
             presets: false
@@ -463,8 +466,8 @@ describe('a compacting child answers its spawner with the task answer (T6 D-1)',
                 }),
                 researcher: agent({ model: MODEL, stream: childStream })
             },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             tools: { seed: seedTool() },
             pluginSettings: summarizeSettings(LIMIT),
             presets: false
@@ -577,8 +580,8 @@ describe('a compacting child answers its spawner with the task answer (T6 D-1)',
                 }),
                 researcher: agent({ model: MODEL, stream: childStream })
             },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             tools: { seed: seedTool() },
             // The helper's `headroomRatio: 0` is what makes this control work: with the declared
             // 0.15 the child's opening round would already be over the buffered trigger, the pass
@@ -630,8 +633,8 @@ describe('a compacting child answers its spawner with the task answer (T6 D-1)',
                     stream: scripted([callTool('k1', 'seed', '{}', WORKING), answer(SUMMARY), answer(REAL_ANSWER)], childSeen)
                 })
             },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             tools: { seed: seedTool() },
             pluginSettings: summarizeSettings(LIMIT),
             presets: false
@@ -767,7 +770,15 @@ const fanout = (children: number, payloadChars: number) => {
         });
     });
 
-    const lead = harness({ primary: 'lead', subagents: names, agents, presets: false });
+    // Rank roster: `lead` is the Rank A entry and EVERY fanned-out child is Rank B. The map
+    // is built for every name on purpose — `ranks` REPLACES the whole map, and a child left
+    // out of it silently takes the fallback rank (one below the lowest rank written), so an
+    // omitted name would still be reachable but would no longer be pinned as a Rank B peer of
+    // its siblings. The fan-out under test is one Rank A caller over N Rank B children.
+    const ranks: Record<string, AgentRank> = { lead: 'A' };
+    for (const name of names) ranks[name] = 'B';
+
+    const lead = harness({ entry: 'lead', ranks, agents, presets: false });
 
     // The parent's own conversation id, READ back rather than invented (the runtime's rule).
     const leadThread = () => (lead.threads() as any[]).find((record) => record.agent === 'lead');

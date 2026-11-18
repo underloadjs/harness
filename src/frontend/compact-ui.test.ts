@@ -67,8 +67,8 @@ const bootstrap = {
             agents: ['instruct'],
             tools: [],
             coreTools: ['toolRequest'],
-            primary: 'instruct',
-            subagents: [],
+            entry: 'instruct',
+            ranks: { instruct: 'A' },
             builtin: true,
             editable: true
         }
@@ -622,7 +622,7 @@ it('keeps the agent configuration reachable from the composer button at every wi
     // This test is about the composer's agent button and the dialog it opens, not about the
     // session-scoped panes, so it boots the way this file always did: a harness with NO
     // conversation. The dialog therefore edits the harness TEMPLATE — which is the state whose
-    // remove/promote/`[+]` rules are pinned below; a saved conversation edits its own frozen
+    // entry-move/remove/`[+]` rules are pinned below; a saved conversation edits its own frozen
     // roster instead (./main.ts `ensureSession`'s note, pinned in the agent-dialog suite).
     await bootWith([]);
 
@@ -654,14 +654,14 @@ it('keeps the agent configuration reachable from the composer button at every wi
         'Model for Instruct'
     );
 
-    // The only agent is the primary, so it cannot leave the team (the same rule the
+    // The only agent is the entry agent, so it cannot leave the team (the same rule the
     // desktop deck enforced with a disabled remove button), stated on the control
     // rather than in a paragraph, and `[+]` has nothing left to offer.
     expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true);
     expect(byClass('.agent-dialog-remove', 'button').title).toBe(
-        'The primary agent is always part of the team.'
+        'The entry agent is always part of the team: every harness needs an entry point.'
     );
-    expect(byClass('.agent-dialog-promote', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-entry', 'button').disabled).toBe(true);
     expect(byClass('.agent-dialog-add', 'button').disabled).toBe(true);
     expect(byClass('.agent-dialog-add', 'button').title).toBe(
         'Every agent the server offers is already on this team.'

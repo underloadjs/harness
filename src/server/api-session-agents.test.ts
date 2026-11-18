@@ -7,7 +7,8 @@
 //   2. `PATCH .../agents/{id} {instruction}` changes ONLY the leading system block of that one
 //      member — the rest of its transcript is byte-identical afterwards, which is the whole
 //      point of not resetting history to retune a prompt;
-//   3. protection and isolation: the primary cannot be detached, a non-member is a 404, a
+//   3. protection and isolation: the ENTRY AGENT cannot be detached (entry, not rank, is the
+//      structural rule — R15), a non-member is a 404, a
 //      binding does not leak into another session of the same store, and a retired profile
 //      cannot be newly selected;
 //   4. DURABILITY, the part every earlier in-memory test could fake: a SECOND process opened
@@ -40,7 +41,7 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { agent, harness } from '../harness';
+import { AGENT_RANKS, agent, harness } from '../harness';
 import { agentInstruction } from '../agents';
 import { effectiveAgentProfile } from './harnesses/agent-state';
 import { createHarnessRegistry } from './harnesses';
@@ -111,10 +112,11 @@ const readDocument = (root: string): Record<string, any> => readPersistedDocumen
 //
 // WHY A CUSTOM NARROW PRESET, AND WHY `template: 'live'`
 // ------------------------------------------------------
-// Every SHIPPED live preset's team is `teamOf(primary)` — every other role plus the summarizer
-// (./harnesses/presets.ts:132) — so a session created from the shipped catalogue already contains
-// every trusted profile and there is nothing left to bind. A one-member preset makes the bind a
-// real roster change.
+// Every SHIPPED live preset states its roster explicitly, and each delegating card's roster is
+// every other role plus the summarizer (./harnesses/presets.ts:57-70) — so a session created from
+// the shipped catalogue already contains every trusted profile and there is nothing left to bind.
+// A one-member preset makes the bind a real roster change, and its `ranks` map states the lone
+// member at Rank A, because the authority map is required and complete (./harnesses/types.ts).
 //
 // `template: 'live'` is what makes the durability half testable at all: a session-local binding
 // is durable inside the session's own preset copy, and `presetFromRecord` can only rebuild a team
@@ -128,8 +130,8 @@ const narrowPreset = (agentColors?: Record<string, string>): HarnessPreset => ({
     description: 'Single-role fixture for the session binding contract.',
     requiresEndpoint: false,
     template: 'live',
-    primary: 'instruct',
-    subagents: [],
+    entry: 'instruct',
+    ranks: { instruct: 'A' },
     agents: ['instruct'],
     tools: [],
     builtin: false,
@@ -152,7 +154,7 @@ const narrowPreset = (agentColors?: Record<string, string>): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'instruct',
+            entry: 'instruct',
             presets: false,
             report: { progress }
         })
@@ -217,15 +219,16 @@ describe('session agent bindings', () => {
         expect(bound.status).toBe(201);
 
         // The exact row, every field named. `origin` is what separates this member from the ones
-        // the definition shipped, `role: subagent` is the structural consequence of the primary
-        // staying put, and `inherited_model` is the CREATION baseline (the session's model), not
-        // the override — which is the distinction the contract's `inherited_model` exists for.
+        // the definition shipped, `rank: 'B'` is the rank the KERNEL resolved for a member added with
+        // no rank of its own (one below the lowest stated rank — ../harness.ts, and the letter this
+        // session's own copy records), and `inherited_model` is the CREATION baseline (the session's
+        // model), not the override — which is the distinction the contract's `inherited_model` exists for.
         const { revision, instruction_chars, guidelines_count, restorable, ...binding } = bound.body.agent;
 
         expect(binding).toEqual({
             agent_id: BINDING,
             profile: BINDING,
-            role: 'subagent',
+            rank: 'B',
             origin: 'session',
             model: 'scripted/bound',
             inherited_model: 'scripted/first',
@@ -325,7 +328,7 @@ describe('session agent bindings', () => {
         expect(Object.hasOwn(bound.body.agent, 'color')).toBe(false);
 
         // The live brain carries the swatch, verbatim (stored trimmed, casing preserved), and the
-        // member the map omits — this fixture's primary — carries NO key at all.
+        // member the map omits — this fixture's entry agent — carries NO key at all.
         const record = store.liveSession(sessionId);
 
         expect(record.harness.agents[BINDING].color).toBe('#22d3ee');
@@ -376,8 +379,8 @@ describe('session agent bindings', () => {
         // profile, then committed turns. `messages` is the live array the handle exposes, so the
         // store's edit and this assertion read the same object.
         const record = store.liveSession(sessionId);
-        const primary = record.definition.primary as string;
-        const brain = record.harness.agents[primary];
+        const entryAgent = record.definition.entry as string;
+        const brain = record.harness.agents[entryAgent];
         const seededInstructionLength = brain.instructions.length;
 
         brain.user('What changed?');
@@ -386,7 +389,7 @@ describe('session agent bindings', () => {
         const history = JSON.parse(JSON.stringify(brain.messages)) as unknown[];
 
         const patched = jsonOf(
-            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/${primary}`, {
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/${entryAgent}`, {
                 instruction: 'Answer in exactly two sentences.'
             })
         );
@@ -401,7 +404,10 @@ describe('session agent bindings', () => {
         // helper that decides this is `agentInstruction` (src/agents/index.ts) — the same call a
         // restart feeds the raw override through, so live and rebuilt agree character for
         // character.
-        const composed = agentInstruction(effectiveAgentProfile(primary)!, 'Answer in exactly two sentences.');
+        const composed = agentInstruction(
+            effectiveAgentProfile(entryAgent)!,
+            'Answer in exactly two sentences.'
+        );
 
         expect(brain.instructions).toEqual([composed]);
         expect(brain.instructions).toEqual(['Answer in exactly two sentences.']);
@@ -415,25 +421,27 @@ describe('session agent bindings', () => {
         // `null` clears the session override and restores the deployment's effective profile
         // text, which is the same string the next build composes from the same profile.
         const cleared = jsonOf(
-            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/${primary}/instruction`, {
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/${entryAgent}/instruction`, {
                 instruction: null
             })
         );
 
         expect(cleared.status).toBe(200);
-        expect(cleared.body.instruction).toBe(agentInstruction(effectiveAgentProfile(primary)!));
-        expect(brain.messages[0].content).toBe(agentInstruction(effectiveAgentProfile(primary)!));
+        expect(cleared.body.instruction).toBe(agentInstruction(effectiveAgentProfile(entryAgent)!));
+        expect(brain.messages[0].content).toBe(agentInstruction(effectiveAgentProfile(entryAgent)!));
     });
 
-    it('refuses to detach the primary, an unknown member, or a retired profile', async () => {
+    it('refuses to detach the entry agent, an unknown member, or a retired profile', async () => {
         const { api, registry, store } = openInMemory();
         const sessionId = await createSession(api);
-        const primary = store.liveSession(sessionId).definition.primary as string;
+        const entryAgent = store.liveSession(sessionId).definition.entry as string;
 
-        const protectedPrimary = jsonOf(await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${primary}`));
+        const protectedEntry = jsonOf(
+            await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${entryAgent}`)
+        );
 
-        expect(protectedPrimary.status).toBe(409);
-        expect(protectedPrimary.body.error.message).toContain('entry point');
+        expect(protectedEntry.status).toBe(409);
+        expect(protectedEntry.body.error.message).toContain('entry point');
 
         expect((await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/nobody`)).status).toBe(404);
 
@@ -465,6 +473,104 @@ describe('session agent bindings', () => {
         expect(roster.body.total).toBe(1);
     });
 
+    // R15 — AUTHORITY IS RANK-GOVERNED, DETACHABILITY IS ENTRY-GOVERNED, and the two are
+    // independent facts. The retired axis fused them: "the primary" was simultaneously the
+    // top of the hierarchy and the protected member, so a second top-rank member was
+    // unrepresentable and protection was a rank rule. On this axis each half is pinned
+    // separately:
+    //   - several members may hold Rank A at once, entry agent included, and the roster, the
+    //     live definition and the durable preset copy all state the same letters;
+    //   - a Rank A member that is not the entry point DETACHES, while the entry agent is
+    //     refused by MEMBERSHIP while holding that very letter;
+    //   - a detach deletes the departed member's rank with it, so a removed agent can never
+    //     keep authority in a restored document (./sessions.ts `applyBindingMaps`);
+    //   - a letter outside the scale is a 400 that names the letters, refused before the
+    //     durability and idle gates (./sessions.ts `validateBindingRank`), and the roster is
+    //     left exactly as it was.
+    it('binds several members at Rank A, guards only the entry agent, and refuses an unusable rank', async () => {
+        const { api, store } = openInMemory();
+        const sessionId = await createSession(api);
+
+        // The fixture roster is one member, and it is the entry agent, at Rank A.
+        const entryAgent = store.liveSession(sessionId).definition.entry as string;
+
+        expect(store.liveSession(sessionId).definition.agents).toEqual([entryAgent]);
+        expect(store.liveSession(sessionId).definition.ranks).toEqual({ [entryAgent]: 'A' });
+
+        // Two bindings, each explicitly Rank A — the same letter the entry agent holds.
+        const first = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: BINDING, rank: 'A' })
+        );
+        const second = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'reviewer', rank: 'A' })
+        );
+
+        expect(first.status).toBe(201);
+        expect(second.status).toBe(201);
+        expect(first.body.agent.rank).toBe('A');
+        expect(second.body.agent.rank).toBe('A');
+
+        // The roster read states all three letters, and only the entry agent is protected:
+        // `deletable` is the entry rule surfaced as a flag, never a rank comparison.
+        const roster = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(roster.body.total).toBe(3);
+        expect(
+            roster.body.agents.map((row: Record<string, any>) => [row.agent_id, row.rank, row.deletable])
+        ).toEqual([
+            [entryAgent, 'A', false],
+            [BINDING, 'A', true],
+            ['reviewer', 'A', true]
+        ]);
+
+        // The frozen session definition carries the same map, so a client comparing the roster
+        // against the definition it was built from cannot be told two different stories.
+        const definition = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/definition`));
+
+        expect(definition.body.definition.entry).toBe(entryAgent);
+        expect(definition.body.definition.ranks).toEqual({
+            [entryAgent]: 'A',
+            [BINDING]: 'A',
+            reviewer: 'A'
+        });
+
+        // A Rank A member that is not the entry point detaches cleanly, and its rank goes with
+        // it — the surviving map is exactly the two members that remain.
+        const detached = jsonOf(await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${BINDING}`));
+
+        expect(detached.status).toBe(200);
+        expect(detached.body.detached_threads).toBe(0);
+        expect(store.liveSession(sessionId).definition.agents).toEqual([entryAgent, 'reviewer']);
+        expect(store.liveSession(sessionId).definition.ranks).toEqual({ [entryAgent]: 'A', reviewer: 'A' });
+
+        // The entry agent is refused FOR BEING THE ENTRY POINT, letter included: it holds the
+        // same Rank A the detached member held, and the refusal says its rank can change while
+        // its membership cannot.
+        const protectedEntry = jsonOf(
+            await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${entryAgent}`)
+        );
+
+        expect(protectedEntry.status).toBe(409);
+        expect(protectedEntry.body.error.message).toBe(
+            `Agent "${entryAgent}" is the entry agent of session "${sessionId}" and cannot be detached; every session needs an entry point. Its rank can change, its membership cannot.`
+        );
+
+        // A rank the scale does not contain is refused out loud, naming every letter it accepts,
+        // and the refusal is not persisted — no partial rank, no phantom member.
+        const unusable = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'research', rank: 'AA' })
+        );
+
+        expect(unusable.status).toBe(400);
+        expect(unusable.body.error.message).toBe(
+            `An agent binding takes a "rank": one letter of the authority scale, ${AGENT_RANKS.join(
+                ', '
+            )}. The rank is what decides what the agent may reach; the roster alone does not.`
+        );
+        expect(store.liveSession(sessionId).definition.agents).toEqual([entryAgent, 'reviewer']);
+        expect(store.liveSession(sessionId).definition.ranks).toEqual({ [entryAgent]: 'A', reviewer: 'A' });
+    });
+
     it('restarts from disk with the binding, the instruction, the title, and the operator defaults', async () => {
         const root = tempRoot('restart');
         const persistence = new HarnessPersistence(root);
@@ -491,7 +597,11 @@ describe('session agent bindings', () => {
         const stored = document.sessions[0];
 
         expect(stored.sessionAgents).toEqual([BINDING]);
-        expect(stored.preset.subagents).toContain(BINDING);
+        // The session's own preset copy carries the RESOLVED authority map — the entry agent at
+        // Rank A exactly as the fixture states it, and the bound member one below, which is the
+        // letter the runtime resolved and the store recorded verbatim (./sessions.ts
+        // `addSessionAgent` reads it back off `harness.ranks`).
+        expect(stored.preset.ranks).toEqual({ instruct: 'A', [BINDING]: 'B' });
         expect(stored.preset.agentInstructions[BINDING]).toBe('Compress the answer into one paragraph.');
         expect(stored.definition.agents).toContain(BINDING);
         // T27 (persistence): the serializer has always written the title and the operator
@@ -521,7 +631,7 @@ describe('session agent bindings', () => {
         const restored = roster.body.agents.find((entry: Record<string, any>) => entry.agent_id === BINDING);
 
         expect(restored).toBeDefined();
-        expect(restored).toMatchObject({ origin: 'session', role: 'subagent', model: 'scripted/bound' });
+        expect(restored).toMatchObject({ origin: 'session', rank: 'B', model: 'scripted/bound' });
 
         // The rebuilt brain runs the overridden text, not the shipped profile: proof that the
         // durable override went through the same composition the session was first built with.
@@ -536,19 +646,20 @@ describe('session agent bindings', () => {
         expect(live.instructions).toEqual(['Compress the answer into one paragraph.']);
 
         // The exact restored roster. `inherited_model` is still the session's own model (the
-        // binding did not rewrite the creation-time baseline), and the original member is still
-        // the only primary — a round trip replaces the roster, it does not append to it.
-        const primary = store.liveSession(sessionId).definition.primary as string;
+        // binding did not rewrite the creation-time baseline), and the member the definition NAMES
+        // as the entry point is still the one that survives a round trip — a restart replaces the
+        // roster, it does not append to it, and rank travels with the member.
+        const entryAgent = store.liveSession(sessionId).definition.entry as string;
 
         expect(roster.body.total).toBe(2);
         expect(roster.body.agents.map((entry: Record<string, any>) => entry.agent_id)).toEqual([
-            primary,
+            entryAgent,
             BINDING
         ]);
         expect(restored.inherited_model).toBe('scripted/first');
         expect(
-            roster.body.agents.find((entry: Record<string, any>) => entry.agent_id === primary)
-        ).toMatchObject({ role: 'primary', origin: 'definition', deletable: false });
+            roster.body.agents.find((entry: Record<string, any>) => entry.agent_id === entryAgent)
+        ).toMatchObject({ rank: 'A', origin: 'definition', deletable: false });
     });
 
     it('answers 409 rather than resetting history while the session has live work', async () => {
@@ -569,7 +680,7 @@ describe('session agent bindings', () => {
         expect(bound.body.error.message).toContain('queued work');
 
         const patched = jsonOf(
-            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/${store.liveSession(sessionId).definition.primary}`, {
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/${store.liveSession(sessionId).definition.entry}`, {
                 instruction: 'later'
             })
         );
@@ -615,7 +726,7 @@ describe('session agent bindings', () => {
         expect(binding).toEqual({
             agent_id: CUSTOM,
             profile: CUSTOM,
-            role: 'subagent',
+            rank: 'B',
             origin: 'session',
             model: 'scripted/local',
             inherited_model: 'scripted/first',
@@ -642,7 +753,7 @@ describe('session agent bindings', () => {
         // `agentInstructions` entry, which is why the row above says `session` and not `harness`.
         expect(record.preset.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
         expect(record.preset.agentInstructions).toBeUndefined();
-        expect(record.preset.subagents).toEqual([CUSTOM]);
+        expect(record.preset.ranks).toEqual({ instruct: 'A', [CUSTOM]: 'B' });
         expect(record.definition.agents).toEqual(['instruct', CUSTOM]);
 
         // The instruction subresource states the same text, with no guideline layer.
@@ -828,7 +939,7 @@ describe('session agent bindings', () => {
         const stored = readDocument(root).sessions[0];
 
         expect(stored.sessionAgents).toEqual([CUSTOM]);
-        expect(stored.preset.subagents).toEqual([CUSTOM]);
+        expect(stored.preset.ranks).toEqual({ instruct: 'A', [CUSTOM]: 'B' });
         expect(stored.preset.customAgents).toEqual({ [CUSTOM]: CUSTOM_BASE });
         expect(stored.preset.agentInstructions).toEqual({ [CUSTOM]: override });
         expect(stored.definition.agents).toEqual(['instruct', CUSTOM]);
@@ -845,7 +956,7 @@ describe('session agent bindings', () => {
             agent_id: CUSTOM,
             profile: CUSTOM,
             origin: 'session',
-            role: 'subagent',
+            rank: 'B',
             model: 'scripted/local',
             instruction_source: 'session',
             has_instruction_override: true,
@@ -1034,11 +1145,11 @@ describe('session agent bindings', () => {
 
         // A catalogue profile spelled differently collides too: `Instruct` is not a profile id,
         // and inventing a look-alike of the entry point would be a silent roster surprise.
-        const primaryClash = jsonOf(
+        const entryNameClash = jsonOf(
             await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'Instruct' })
         );
 
-        expect(primaryClash.status).toBe(409);
+        expect(entryNameClash.status).toBe(409);
 
         // The roster every refusal left behind, exactly — and the one member that was accepted
         // carries the deterministic default sentence, because no instruction was supplied.

@@ -262,6 +262,7 @@ describe('toolCreate', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -339,9 +340,11 @@ describe('toolCreate', () => {
         // toolList, toolManage, toolCreate, the four record tools,
         // agentManage/agentResult, threadFork, and the pending-only toolCancel)
         // plus the 32 creations.
-        // 46, not 45: the record engine added ONE core tool (`records`) ahead of its
-        // four wrappers, and the created-tool budget is unchanged.
-        expect(Object.keys(writer.tools)).toHaveLength(46);
+        // 47, not 46: the record engine added ONE core tool (`records`) ahead of its
+        // four wrappers, the cross-session `knowledge` row adds one more (order 95,
+        // src/tools/runtime/knowledge.tool.ts:503), and the created-tool budget is
+        // unchanged.
+        expect(Object.keys(writer.tools)).toHaveLength(47);
         expect(() =>
             writer.createTool({
                 name: 'generated32',

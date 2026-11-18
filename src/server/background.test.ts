@@ -175,8 +175,10 @@ const presetOf = (name: string, create: HarnessPreset['create']): HarnessPreset 
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: [],
+    // THE RANK PAIR (clean break): one member, one rank. `entry` routes and `ranks` states
+    // the authority the retired `subagents: []` used to imply by absence.
+    entry: name,
+    ranks: { [name]: 'A' as const },
     agents: [name],
     tools: [],
     builtin: true,
@@ -258,7 +260,11 @@ const FORWARDED_MEMBERS = [
     'name',
     'agent',
     'agents',
-    'subagents',
+    // The roster axis this hybrid must forward: the rank pass replaced the `subagents`
+    // allowlist with `Harness.ranks` (../../types `Harness.ranks`), and the forwarding loop
+    // below copies descriptors BY NAME and skips an absent one. Leaving `subagents` here
+    // would silently forward nothing and hand the server a handle with no `ranks` at all.
+    'ranks',
     'tools',
     'plugins',
     'createTool',
@@ -332,7 +338,8 @@ const createLifecycleFixture = (): LifecycleFixture => {
                     }
                 })
             },
-            primary: NAME,
+            entry: NAME,
+            ranks: { [NAME]: 'A' as const },
             presets: false
         });
 

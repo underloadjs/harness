@@ -3,7 +3,7 @@
 // WHY THIS FILE EXISTS. `create` seeds a brand-new session with every name the kernel can
 // switch (src/server/sessions.ts `buildHarness(preset, settings, ..., { enableAllTools: true })`,
 // ../types/index.ts `HarnessConfiguration.enableAllTools`), so a persisted
-// `core.discovery.enabled` is ~22 names on the FIRST save rather than the handful a couple of
+// `core.discovery.enabled` is ~23 names on the FIRST save rather than the handful a couple of
 // `toolRequest` rounds used to leave behind. The kernel refuses an enabled name the rebuilt
 // harness does not register:
 //   `Snapshot discovery names "X", which is not registered in this harness.`
@@ -110,10 +110,13 @@ const toolboxPreset = (): HarnessPreset => ({
     title: 'Toolbox',
     description: 'Shared-toolbox fixture: the real production rows, scripted model.',
     requiresEndpoint: false,
-    primary: 'boss',
-    // A non-empty allowlist is what makes `delegate` register as a core declaration, i.e. the
-    // protected row the original report clicked.
-    subagents: ['helper'],
+    entry: 'boss',
+    // TWO DISTINCT RANK LETTERS are what makes `delegate` register as a core declaration, i.e.
+    // the protected row the original report clicked (`ranksDeclareDelegation`,
+    // ./harnesses/toolbox.ts:289). The rank map REPLACES the retired `subagents` allowlist, and it
+    // REPLACES the whole map rather than merging into a default, so the entry agent's own rank is
+    // stated here explicitly instead of implied by `primary`.
+    ranks: { boss: 'A', helper: 'B' },
     agents: ['boss', 'helper'],
     tools: SHARED_TOOL_NAMES,
     environmentTools: ['search', 'fetch'],
@@ -134,8 +137,10 @@ const toolboxPreset = (): HarnessPreset => ({
                         stream: answerStream('ok')
                     })
                 },
-                primary: 'boss',
-                subagents: ['helper']
+                entry: 'boss',
+                // The same map the preset declares above, handed to the factory so the built
+                // harness and the card descriptor cannot disagree about whether `delegate` exists.
+                ranks: { boss: 'A', helper: 'B' }
             },
             settings,
             progress,
@@ -153,8 +158,12 @@ const barePreset = (): HarnessPreset => ({
     title: 'Bare',
     description: 'Tool-less fixture: created tools only.',
     requiresEndpoint: false,
-    primary: 'solo',
-    subagents: [],
+    // A SINGLE-RANK roster: one member, one rank letter, so there is no strictly-lower target
+    // anywhere and `delegate` never registers for this card. That is the rank-model statement of
+    // the retired `subagents: []` (./harnesses/toolbox.ts `ranksDeclareDelegation`), and it keeps
+    // the fixture's "no delegation surface" behaviour the tests below rely on.
+    entry: 'solo',
+    ranks: { solo: 'A' },
     agents: ['solo'],
     tools: [],
     builtin: false,
@@ -168,7 +177,10 @@ const barePreset = (): HarnessPreset => ({
                     stream: answerStream('ok')
                 })
             },
-            primary: 'solo',
+            entry: 'solo',
+            // Explicit single rank, same statement as the preset map above: one letter means no
+            // delegation, so this card never advertises or registers `delegate`.
+            ranks: { solo: 'A' },
             presets: false,
             // Forwarded UNMODIFIED so the store's persistence observer is attached, which is
             // what makes `createdTools` and the enabled set durable in the record below.
@@ -192,6 +204,7 @@ const ENABLED_NAMES = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'threadFork',
@@ -208,7 +221,7 @@ const ENABLED_NAMES = [
     'textSummarize'
 ];
 
-// The same toolbox as the ROW LIST, in the server's own order: the 22 capped names above plus the
+// The same toolbox as the ROW LIST, in the server's own order: the 23 capped names above plus the
 // ten that hold no `maxEnabledTools` slot. T6 states the row's `enabled` as the CALL AXIS, so every
 // one of these is `true` on a seeded session that has switched nothing off — the ten slotless names
 // are in context through their declaration list, not through a slot the seed filled.
@@ -223,6 +236,7 @@ const ROW_ORDER = [
     'profiles',
     'chapters',
     'locations',
+    'knowledge',
     'agentManage',
     'agentResult',
     'delegate',
@@ -378,7 +392,7 @@ describe('a stale enabled tool name is tolerated on restore (R1 seed)', () => {
 
         tamperDiscovery(root, sessionId, 'commandRun');
 
-        // The tampered document is the shape a real stale record has: 22 live names plus one
+        // The tampered document is the shape a real stale record has: 23 live names plus one
         // that resolves nowhere.
         expect(readDocument(root).sessions[0].core.discovery?.enabled).toEqual([...ENABLED_NAMES, 'commandRun']);
 
@@ -393,7 +407,7 @@ describe('a stale enabled tool name is tolerated on restore (R1 seed)', () => {
         expect(enabledOf(second, sessionId)).toEqual(ENABLED_NAMES);
 
         // The rows the pane renders state the same fact from the other side: every row this build
-        // registers is still ON — all 32, not just the 22 capped ones, because T6's `enabled` is the
+        // registers is still ON — all 33, not just the 23 capped ones, because T6's `enabled` is the
         // call axis and the ten slotless names are callable through their declaration list — and a
         // name this build does not register is not a row at all.
         const rows = await rowsOf(second, sessionId);

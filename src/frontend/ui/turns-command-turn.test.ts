@@ -105,7 +105,7 @@ describe('server command turn', () => {
         ]);
 
         // The board's own tally agrees: one tool, one agent, nothing failed.
-        expect(turn.summary()).toEqual({ agents: 1, tools: 1, primary: 'instruct' });
+        expect(turn.summary()).toEqual({ agents: 1, tools: 1, rootAgent: 'instruct' });
     });
 
     it('binds the optimistic submit tile to the settled command record (POST /tasks answer)', () => {

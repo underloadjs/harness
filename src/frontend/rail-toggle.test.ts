@@ -66,8 +66,8 @@ const bootstrap = {
             agents: ['instruct'],
             tools: [],
             coreTools: ['toolRequest', 'toolCreate', 'tasks'],
-            primary: 'instruct',
-            subagents: [],
+            entry: 'instruct',
+            ranks: { instruct: 'A' },
             builtin: true,
             editable: true
         }

@@ -43,6 +43,13 @@ import {
     splitHarnessSessionRecord
 } from '../persistence';
 import type { HarnessDatabase } from '../persistence';
+// The snapshot version a session's `core` must carry, asserted by the loader this client's
+// commits are read back through (../persistence.ts `requireCoreSnapshotVersion` ->
+// ../../core/snapshot.ts `HARNESS_SNAPSHOT_VERSION`). These suites only ever WRITE shards and
+// prove a plain `HarnessPersistence.load()` can read them, so their hand-built cores used to
+// carry an arbitrary `version: 1`; that number is now part of the read contract, and pinning
+// the constant keeps this file honest the day the kernel bumps the snapshot.
+import { HARNESS_SNAPSHOT_VERSION } from '../../core/snapshot';
 import {
     HarnessIoError,
     IO_WORKER_PACKAGE_SPECIFIER,
@@ -99,8 +106,20 @@ const PRESET = {
     title: 'Live',
     description: 'd',
     requiresEndpoint: false,
-    primary: 'a',
-    subagents: [],
+    // R11's clean break, stated in the STORED shape: `entry` (the routing agent) and `ranks`
+    // (agent id -> rank letter) replace the retired `primary`/`subagents` pair, and the reader
+    // REQUIRES both (../persistence.ts `readPresetRecord`/`readDescriptor`), refusing the old keys
+    // outright rather than translating them. A fixture that still wrote `primary` would be rejected
+    // by the store's own reader before the durability behaviour under test could run at all.
+    entry: 'a',
+    // `as const` keeps the rank letter a LITERAL. PRESET is declared on its own and only ever
+    // SPREAD into the session row below (`preset: { ...PRESET }`), so `ranks` gets no contextual
+    // type from `HarnessPresetRecord` and a bare 'A' would widen to `string`, which
+    // `Record<string, AgentRank>` refuses (../types/index.ts:1469 `AgentRank` is the A–Z letter
+    // union; ../persistence.ts:294 is the field). This is the same reason `template` below carries
+    // `as const`, and the spelling the sibling suites already use for the same reason
+    // (../background.test.ts:181, ../../harness.thread-epoch.test.ts:132).
+    ranks: { a: 'A' as const },
     agents: ['a'],
     tools: [],
     builtin: true,
@@ -113,8 +132,11 @@ const DEFINITION = {
     title: 'Live',
     description: 'd',
     requiresEndpoint: false,
-    primary: 'a',
-    subagents: [],
+    entry: 'a',
+    // `as const` for the same reason as PRESET above: DEFINITION is spread into the row's
+    // `definition` field, so `ranks` must keep the literal type to satisfy
+    // `HarnessDescriptor.ranks: Record<string, AgentRank>` (../persistence.ts `readDescriptor`).
+    ranks: { a: 'A' as const },
     agents: ['a'],
     tools: [],
     builtin: true,
@@ -153,7 +175,9 @@ const document = (marker: string, events = 0): HarnessDatabase => ({
             ],
             queue: [],
             core: {
-                version: 1,
+                // NOT a free number any more: the loader asserts the snapshot version (see the
+                // import of `HARNESS_SNAPSHOT_VERSION` above).
+                version: HARNESS_SNAPSHOT_VERSION,
                 agents: {},
                 memory: {},
                 threads: [{ id: 'thread-1', title: 't', messages: [{ role: 'user', text: `transcript-${marker}` }] }]
@@ -1011,7 +1035,7 @@ describe('worker-mode skip and removal', () => {
             ...document(id).sessions[0],
             id,
             core: {
-                version: 1,
+                version: HARNESS_SNAPSHOT_VERSION,
                 agents: {},
                 memory: {},
                 threads: threads.map((threadId) => ({ id: threadId, title: 't', messages: [{ role: 'user', text: `transcript-${threadId}` }] }))

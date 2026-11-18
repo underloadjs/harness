@@ -695,7 +695,7 @@ const tree = (nodes: unknown[]): TurnDisplay =>
         sections: [
             {
                 id: 't1:0',
-                role: 'primary',
+                rank: 'A',
                 agent: 'instruct',
                 agentLabel: 'RR1',
                 state: 'streaming',

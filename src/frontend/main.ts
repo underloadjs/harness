@@ -113,7 +113,7 @@ import type {
     SessionViewSummary,
     ToolDescriptor
 } from '../server/protocol';
-import type { HarnessUsage } from '../types';
+import type { AgentRank, HarnessUsage } from '../types';
 import type { DisplayStep, TurnDisplayOp, TurnSummary, TurnStepDetail, TurnBlockDetail } from '../shared/turn-display';
 // The pending-tool figure a cold display tree states per section (./view-api.ts
 // `readTurnDisplayWithPending`), seeded into the store as the `pending:set` ops it
@@ -310,10 +310,11 @@ import {
     frameUsageOf,
     frozenDefinitionOf,
     instructionsForMembers,
+    delegateTargetsOf,
+    entryOf,
     membersOf,
     modelsForMembers,
-    primaryOf,
-    subagentsOf,
+    ranksOf,
     uniqueNames
 } from './contract';
 import { createCreateHarnessPanel } from './ui/create-harness';
@@ -1631,10 +1632,11 @@ const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
         },
         { label: 'Remove a task (edit id)', value: { remove: ['<id from the list above>'] } }
     ],
-    // delegate has NO static preset: its only valid target is one of the PLAYGROUND
-    // harness's subagents, and a hard-coded id (the old 'summarizer' one) was wrong
-    // for every harness that does not configure it. The runner builds those presets
-    // from `delegateTargets` at show time (see `presetsFor` below).
+    // delegate has NO static preset: its only valid target is an agent the PLAYGROUND
+    // harness ranks BELOW the agent the playground plays, and a hard-coded id (the old
+    // 'summarizer' one) was wrong for every harness that does not configure it. The
+    // runner builds those presets from `delegateTargets` at show time (see `presetsFor`
+    // below), which is where the rank rule becomes visible to the reader.
     timeNow: [{ label: 'UTC', value: 'UTC' }],
     textCount: [{ label: 'A sentence', value: 'The harness finds tools by tag before it uses them.' }],
     diceRoll: [
@@ -1690,8 +1692,9 @@ const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
     // agentManage and threadList take no arguments; both are the discovery step whose
     // answer supplies the ids the id-based presets below need.
     agentManage: [{ label: 'Recent invocations', value: {} }],
-    // `agent` must be an agent THIS harness configures, so the runner builds these
-    // presets from the playground harness's subagent list (see `presetsFor`).
+    // `agent` must be an agent THIS harness configures AND that sits at a strictly
+    // lower rank, so the runner builds these presets from the playground harness's
+    // delegation list (see `presetsFor`).
     agentResult: [],
     threadList: [{ label: 'Thread roster', value: {} }],
     threadSend: [
@@ -1916,7 +1919,11 @@ const PRESET_LIMIT = 4;
 // schema-derived fallback — so EVERY listed tool offers at least one named, valid
 // starting value, even a tool nobody curated (a runtime tool, or one a harness added).
 //
-// `playgroundAgents` is the subagent allowlist of the harness the PLAYGROUND picked (R7).
+// `playgroundAgents` is the DELEGATION list of the harness the PLAYGROUND picked (R7 +
+// R20): every agent that sits at a strictly LOWER rank than the agent the playground
+// plays. Rank A cannot delegate to Rank A, so this list — not the whole team — is what
+// the runner may name.
+//
 // delegate and agentResult are the two tools whose target must name a configured agent,
 // so their presets are built from that list at show time — the selected conversation's
 // frozen team is irrelevant here, and a hard-coded agent name would be invalid for most
@@ -1938,10 +1945,10 @@ const presetsFor = (
     }
 
     if (entry.name === 'agentResult') {
-        // `agent` must be a configured subagent, so offer one preset per real target and
-        // keep the paging shape reachable. With no subagents there is no valid target:
-        // the reader gets the clearly-marked placeholder to edit rather than a name this
-        // harness does not have.
+        // `agent` must be a lower-ranked configured agent, so offer one preset per real
+        // target and keep the paging shape reachable. With no lower-ranked agent there is
+        // no valid target: the reader gets the clearly-marked placeholder to edit rather
+        // than a name this harness cannot delegate to.
         const targets: ToolPreset[] = playgroundAgents.slice(0, PRESET_LIMIT - 1).map((agent) => ({
             label: `Read ${agent}`,
             value: { agent }
@@ -1979,10 +1986,11 @@ const presetsFor = (
 // in this module: the runner must not own the temporary context, and it must not guess
 // a session id.
 //
-// `delegateTargets` reads the SUBAGENT allowlist of the harness the playground picked.
-// delegate is the one core tool whose validity depends on that harness's configuration:
-// it is only registered when the harness declares subagents, so the runner must not
-// offer a preset naming an agent that harness does not have.
+// `delegateTargets` reads the DELEGATION list of the harness the playground picked, i.e.
+// strictly the agents RANKED BELOW the one the playground plays (R20). delegate is the
+// one core tool whose validity depends on that harness's configuration: it is only
+// registered when the harness has a lower-ranked agent to delegate to, so the runner must
+// not offer a preset naming an agent that harness cannot delegate to.
 //
 // There is NO panel routing any more: a playground call belongs to the temporary
 // context, so its declarative panels are shown in the response box (R21.3 panels never
@@ -2283,9 +2291,10 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     };
 
     // Delegation is the one core tool whose VALIDITY depends on the harness the
-    // playground picked: the server registers delegate only when that harness declares
-    // subagents, so a hard-coded target (the old 'summarizer' one) named an agent most
-    // harnesses do not have.
+    // playground picked AND on the rank ladder it configures: the server registers
+    // delegate only when some agent sits below the one the playground plays, so a
+    // hard-coded target (the old 'summarizer' one) named an agent most harnesses do not
+    // have (R20).
     //
     // `delegateKey` is the target list last painted (undefined = nothing painted yet),
     // so an ordinary `sync()` (called before every call and after every context change)
@@ -2313,8 +2322,11 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
         }
 
         note.textContent = noTargets
-            ? 'Core tool — the playground harness declares no subagents, so delegation is not available in its session. Add an agent to that team to enable one-level delegation.'
-            : `Core tool — it runs in the playground’s temporary session and hands ONE subagent a self-contained brief. Targets for the playground harness: ${targets.join(', ')}. Subagents cannot delegate further.`;
+            ? // R20: the reason names the rule, so an empty list is not read as "no agents
+              // exist". A Rank A playground agent with only Rank A teammates has nothing
+              // legal to delegate to.
+              'Core tool — no agent in the playground harness sits at a rank below the one you are playing, so delegation is not available in its session. Give a team member a lower rank to enable delegation.'
+            : `Core tool — it runs in the playground’s temporary session and hands ONE lower-ranked agent a self-contained brief. Targets for the playground harness: ${targets.join(', ')}. An agent may delegate only to a strictly lower rank.`;
 
         return noTargets;
     };
@@ -2546,7 +2558,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                 entry.availability?.state === 'unconfigured'
                     ? (entry.availability.hint ?? '')
                     : noDelegateTargets
-                      ? 'Not available for the playground harness: it declares no subagents, so delegate is not registered in its session.'
+                      ? 'Not available for the playground harness: no agent sits at a rank below the one you are playing, so delegate is not registered in its session.'
                       : '';
             availabilityNote.hidden = !unavailable && !noDelegateTargets;
 
@@ -6520,17 +6532,20 @@ const runner = createToolRunner({
         };
     },
     ensureSession: ensurePlaygroundSession,
-    // delegate is only registered when the harness declares subagents, so the runner
-    // asks the PLAYGROUND harness for its real allowlist (R7) — the selected
-    // conversation's frozen team is irrelevant here. A harness with none cannot offer a
-    // callable delegation.
+    // delegate is only registered when the harness has someone BELOW the playing agent
+    // to delegate to, so the runner asks the PLAYGROUND harness for its real rank-filtered
+    // list (R7 + R20) — the selected conversation's frozen team is irrelevant here. The
+    // playground plays its harness's ENTRY agent (that is the agent its temporary session
+    // opens), so the targets are the agents ranked strictly below THAT agent: same-rank
+    // and higher-rank teammates are excluded, which is the rank rule made visible.
     delegateTargets: () => {
         const harness = playground.harness ?? playgroundHarness();
         if (harness === undefined) return [];
 
         const descriptor = descriptorFor(harness);
+        if (descriptor === undefined) return [];
 
-        return descriptor === undefined ? [] : subagentsOf(descriptor);
+        return delegateTargetsOf(descriptor, entryOf(descriptor));
     },
     refreshSession: async (sessionId) => {
         // Re-read the playground's OWN snapshot. The answer is never applied to an
@@ -7222,11 +7237,12 @@ const renderHarnessChrome = (): void => {
     const display = instance.frozen ?? instance.descriptor;
 
     // The playground runner lives on the tools view and builds its delegate presets
-    // from the PLAYGROUND harness's allowlist (see createToolRunner.paintDelegate). A
-    // team edit can land on that harness from this very chrome, so re-sync it: the
-    // preset becomes callable the moment a subagent exists, and stops being offered
-    // when the last one is removed. The runner only rewrites its argument box when the
-    // target list actually changed, so this is a no-op for an untouched team.
+    // from the PLAYGROUND harness's delegation allowlist (see createToolRunner.paintDelegate).
+    // A team edit can land on that harness from this very chrome, so re-sync it: the
+    // preset becomes callable the moment an agent gains a strictly lower-ranked peer, and
+    // stops being offered when the last such peer is removed or re-ranked to equal. The
+    // runner only rewrites its argument box when the target list actually changed, so this
+    // is a no-op for an untouched team.
     runner.sync();
 
     // While the tools view owns the centre, the head describes the list (or the
@@ -7336,7 +7352,8 @@ const paintAgentSlot = (instance: Instance, fromGesture = false): void => {
 
 // One derived description of the agent UI for the selected instance. Both the
 // composer button and the dialog read from it, so the two can never disagree about
-// the team, the primary, the lock reason or the effective model map.
+// the team, the entry agent, the rank of each member, the lock reason or the
+// effective model map.
 
 // The per-agent INSTRUCTION map this browser believes is STORED, in precedence order:
 // whatever the document states wins per key (an unredacted server, or a frozen definition
@@ -7395,7 +7412,12 @@ const storedColorsOf = (display: HarnessDescriptor, instance: Instance): Record<
 type AgentView = {
     display: HarnessDescriptor;
     members: string[];
-    primary: string;
+    // R20: the agent a new conversation starts with (routing). NOT an authority claim:
+    // the entry agent may hold any rank, and several members may hold Rank A.
+    entry: string;
+    // R20: the rank configured per member (agent id -> letter). A member the map omits
+    // states no rank, which the surfaces render honestly instead of inventing 'A'.
+    ranks: Record<string, AgentRank>;
     locked: boolean;
     // TEAM editing (promotion/add/remove) plus the instruction editor. R5/R6 (T7b): a saved
     // session is NOT locked any more — it edits its OWN team, models and prompts. Only an
@@ -7421,13 +7443,20 @@ type AgentView = {
     //     models and prompts; 'harness' edits the template new sessions start from.
     //   - `allowCustom` offers the `[+]` "New agent" name field (R7) — only a session
     //     accepts an agent the catalogue never advertised.
-    //   - `canPromote` is false for a saved conversation: its entry agent is fixed
-    //     server-side, so the control must not arm a promotion that cannot be written.
+    //   - `canSetEntry` is false for a saved conversation: its ENTRY agent is fixed
+    //     server-side (the entry agent is the member no session write can detach), so
+    //     the control must not arm a move that cannot be written.
+    //   - `canAssignRanks` is false for a saved conversation for the same reason on the
+    //     rank side: the roster route states no rank write for an EXISTING member, so a
+    //     session runs the ranks its harness template defines. An agent this conversation
+    //     ADDS does carry a rank in its create, which is why the dialog's add flow keeps
+    //     the drafted rank (see `applySessionConfiguration`).
     //   - `threadAgents` names the agents a conversation in this session already runs
     //     (R6); each keeps its tab but cannot be removed.
     scope: 'session' | 'harness';
     allowCustom: boolean;
-    canPromote: boolean;
+    canSetEntry: boolean;
+    canAssignRanks: boolean;
     threadAgents: string[];
     // The model a no-override choice resolves to (rendered as an id, never
     // "inherit"); '' means "not known", which the select states honestly.
@@ -7505,8 +7534,8 @@ const agentViewOf = (instance: Instance): AgentView => {
     // is the typed model, else the server default (what mergeSettings applies to a
     // blank request).
     //
-    // For a saved chat, `snapshot.model` is the PRIMARY's effective model, which is
-    // not necessarily the session settings model when the primary has an override.
+    // For a saved chat, `snapshot.model` is the ENTRY agent's effective model, which is
+    // not necessarily the session settings model when that agent has an override.
     // Use a member that has no frozen override instead: its effective model is the
     // session model. If every member is overridden (or an older snapshot has no
     // effective map), the fallback is unknown and the option says so rather than
@@ -7518,7 +7547,7 @@ const agentViewOf = (instance: Instance): AgentView => {
               .filter((name) => frozenOverrides[name] === undefined)
               // The live effective map is authoritative. A legacy snapshot
               // without it can only name the session model when nothing was
-              // overridden (otherwise `snapshot.model` may be the primary's
+              // overridden (otherwise `snapshot.model` may be the entry agent's
               // override, not the settings model).
               .map(
                   (name) =>
@@ -7547,7 +7576,11 @@ const agentViewOf = (instance: Instance): AgentView => {
     return {
         display,
         members,
-        primary: primaryOf(display),
+        entry: entryOf(display),
+        // R20: every member's rank comes from the ONE definition the view is built from
+        // (the frozen definition for a saved conversation, the template otherwise), so a
+        // tile, a dialog tab and the delegation filter can never disagree.
+        ranks: ranksOf(display),
         locked,
         editable,
         models,
@@ -7557,10 +7590,12 @@ const agentViewOf = (instance: Instance): AgentView => {
         scope: locked ? 'session' : 'harness',
         // R7: only a session can gain an agent the catalogue never advertised; R5: only a
         // template (no session) can move its entry agent, because a saved conversation's
-        // primary is fixed server-side (../shared/harness-api.ts `CreateSessionAgentRequest`
-        // cannot demote the entry point).
+        // entry agent is fixed server-side (../shared/harness-api.ts `CreateSessionAgentRequest`
+        // cannot demote the entry point, and the entry agent is the member no session write
+        // can detach).
         allowCustom: locked,
-        canPromote: !locked,
+        canSetEntry: !locked,
+        canAssignRanks: !locked,
         threadAgents,
         hint
     };
@@ -7639,14 +7674,16 @@ const agentModelSelectOf = (view: AgentView) => ({
 // and hold on a touch device opens the same dialog. `hint` is still the tooltip, never a
 // disabled state — models and instructions must stay reachable while the TEAM is locked.
 //
-// `primary` here is the RESOLVED selection, not `view.primary`: the chip, the routing
-// label and `run()` all read `selectedAgentOf` + `agentSendPlanOf`, which is the only thing
-// that can keep the promise the control makes ("the next message goes to this agent").
+// `agent` here is the RESOLVED selection, not `view.entry`: the chip, the routing label
+// and `run()` all read `selectedAgentOf` + `agentSendPlanOf`, which is the only thing that
+// can keep the promise the control makes ("the next message goes to this agent"). The prop
+// is called `agent`, not after any team role, because pressing it never claims a rank or
+// the entry role — it only names who answers next.
 const renderAgentControl = (view: AgentView, instance: Instance): AgentControl => {
     const blocked = agentCycleBlockOf(view);
 
     return createAgentControl({
-        primary: selectedAgentOf(instance),
+        agent: selectedAgentOf(instance),
         agents: agentLibrary,
         activity: [...instance.activity],
         device: pointerDevice(),
@@ -7667,12 +7704,14 @@ const renderAgentControl = (view: AgentView, instance: Instance): AgentControl =
 // ---------------------------------------------------------------------------
 //
 // Cycling an agent is deliberately NOT a write. The team is what the server owns
-// (`primary` + `subagents`, or a session's own roster), and the R11 contract still holds:
-// one stray press must never promote an agent. What cycling changes is which MEMBER of
-// that team runs the NEXT message, and that is expressible with the wire that already
-// exists — threads never change owner, so a turn submitted into a thread owned by agent X
-// runs as X (src/server/sessions.ts:1545-1549). The selection therefore lives in the
-// browser until the send commits it (D2/D3), and there is nothing to roll back.
+// (`entry` + `ranks`, or a session's own roster), and the R11 contract still holds: one
+// stray press must never change a rank or move the entry agent. What cycling changes is
+// which MEMBER of that team runs the NEXT message, and that is expressible with the wire
+// that already exists — threads never change owner, so a turn submitted into a thread owned
+// by agent X runs as X (src/server/sessions.ts:1545-1549). The selection therefore lives in
+// the browser until the send commits it (D2/D3), and there is nothing to roll back. A cycle
+// deliberately ignores ranks: any member may run the next message regardless of its letter,
+// because the composer is threading, not delegating, so the rank gate does not apply here.
 
 // F4: the sentence a cycle speaks, and the ONE writer of the cycle region.
 //
@@ -7684,7 +7723,7 @@ const renderAgentControl = (view: AgentView, instance: Instance): AgentControl =
 //     The position cannot: `cycleAgentSelection` never returns the same member twice in a
 //     row. Same trick ui/context-bar.ts:759 uses for the segment under the keyboard, whose
 //     label carries `focused`/`total`;
-//   - the ORDER of the cycle is itself a promise (D1: entry agent first, then the subagents
+//   - the ORDER of the cycle is itself a promise (D1: entry agent first, then every other
 //     in the order the definition lists them), so "2 of 3" says how far along the team the
 //     reader is and that another `Tab` wraps around.
 //
@@ -7710,7 +7749,7 @@ const agentCycleSay = (sentence: string): void => {
 // cheap: the routing label resolves it on EVERY keystroke, where building a whole
 // `AgentView` would be waste.
 const agentMembersOf = (instance: Instance): string[] => membersOf(instance.frozen ?? instance.descriptor);
-const agentPrimaryOf = (instance: Instance): string => primaryOf(instance.frozen ?? instance.descriptor);
+const agentEntryOf = (instance: Instance): string => entryOf(instance.frozen ?? instance.descriptor);
 
 // The agent the next send will run: the pending selection while it still names a member
 // of THIS conversation's team, else the entry agent. A name the roster no longer carries (the
@@ -7719,14 +7758,14 @@ const agentPrimaryOf = (instance: Instance): string => primaryOf(instance.frozen
 // cannot disagree with each other about a selection that no longer exists.
 const selectedAgentOf = (instance: Instance): string => {
     const pending = instance.agentSelection;
-    if (pending === undefined) return agentPrimaryOf(instance);
+    if (pending === undefined) return agentEntryOf(instance);
     if (agentMembersOf(instance).includes(pending)) return pending;
 
     // F4: the announced agent no longer exists, so there is nothing left to announce.
     instance.agentSelection = undefined;
     agentCycleSay('');
 
-    return agentPrimaryOf(instance);
+    return agentEntryOf(instance);
 };
 
 // A selection belongs to ONE conversation. Called wherever a card starts pointing at a
@@ -7760,7 +7799,7 @@ type AgentSendPlan = {
 // The agent a send WOULD run with NO composer selection: the focused conversation's owner
 // when one is open (continue/steer keeps running that thread's agent), the team's entry
 // agent when nothing is focused (an unfocused submit opens a thread owned by the frozen
-// primary, src/server/sessions.ts:9379-9385), and `undefined` when a conversation IS focused
+// entry agent, src/server/sessions.ts:9379-9385), and `undefined` when a conversation IS focused
 // but this snapshot's roster does not describe its owner.
 //
 // That third case is F3, and `undefined` is the honest answer: `resolveSubmitTarget`
@@ -7770,7 +7809,7 @@ type AgentSendPlan = {
 // not know which one — so a pending selection must NOT mint a rival thread. The plan reads
 // `undefined` as "nothing to commit", which is also what makes the painted line agree.
 const defaultAgentOf = (instance: Instance, threadId?: string): string | undefined => {
-    if (threadId === undefined) return agentPrimaryOf(instance);
+    if (threadId === undefined) return agentEntryOf(instance);
 
     return instance.threads.find((thread) => thread.id === threadId)?.agent;
 };
@@ -7817,8 +7856,9 @@ const agentTitleOf = (name: string): string => {
 };
 
 // Move the pending selection through the roster in server-declared order (D1:
-// `membersOf` = entry agent first, then the subagents exactly as the definition lists
-// them — the same order the agent dialog's tabs use). Wrap-around in both directions.
+// `membersOf` = entry agent first, then every other member exactly as the definition lists
+// them — the same order the agent dialog's tabs use). Ranks are NOT the cycle order: two
+// Rank A members sit wherever the definition put them. Wrap-around in both directions.
 //
 // Returns true when the keystroke was CONSUMED, which is what tells the `Tab` leg below
 // whether to `preventDefault`; false means "leave it to the browser", and that is the
@@ -7870,18 +7910,23 @@ const agentDialogOptionsOf = (view: AgentView, instance: Instance) => {
 
     return {
         members: view.members,
-        primary: view.primary,
+        entry: view.entry,
+        // R20: the rank each member holds, so the dialog's badges and steppers paint the
+        // same ladder the deck and the delegation filter use.
+        ranks: view.ranks,
         agents: agentLibrary,
         editable: view.editable,
         models: agentModelSelectOf(view),
         instructions: view.instructions,
-        // R5/R6/R7: the capability flags the dialog renders from — where a save lands, whether
-        // `[+]` may take a typed name, whether `Make primary` exists here, and which members
-        // a conversation already runs. Derived in `agentViewOf` so the composer's tooltip, the
-        // dialog's controls and `applyAgentConfiguration`'s writes all read ONE answer.
+        // R5/R6/R7 + R20: the capability flags the dialog renders from — where a save
+        // lands, whether `[+]` may take a typed name, whether `Set as entry` and the rank
+        // stepper exist here, and which members a conversation already runs. Derived in
+        // `agentViewOf` so the composer's tooltip, the dialog's controls and
+        // `applyAgentConfiguration`'s writes all read ONE answer.
         scope: view.scope,
         allowCustom: view.allowCustom,
-        canPromote: view.canPromote,
+        canSetEntry: view.canSetEntry,
+        canAssignRanks: view.canAssignRanks,
         threadAgents: view.threadAgents,
         // A selection that moves onto an agent the catalog detail walk never covered (a `[+]`
         // addition) asks for its default text on that explicit action. A no-op once
@@ -7905,7 +7950,11 @@ const agentDialogOptionsOf = (view: AgentView, instance: Instance) => {
 const agentDialogSignatureOf = (view: AgentView): string =>
     JSON.stringify({
         members: view.members,
-        primary: view.primary,
+        entry: view.entry,
+        // R20: a rank-only change is part of what the dialog paints (every badge, note and
+        // stepper states a letter), so it has to move the signature or an open dialog would
+        // keep the old letters on screen.
+        ranks: view.ranks,
         editable: view.editable,
         models: view.models,
         instructions: view.instructions,
@@ -7921,7 +7970,8 @@ const agentDialogSignatureOf = (view: AgentView): string =>
         // from team` press the server is about to refuse with 409.
         scope: view.scope,
         allowCustom: view.allowCustom,
-        canPromote: view.canPromote,
+        canSetEntry: view.canSetEntry,
+        canAssignRanks: view.canAssignRanks,
         threadAgents: view.threadAgents,
         agents: agentLibrary.map((agent) => agent.name)
     });
@@ -8414,15 +8464,15 @@ const forceRefreshAgentDialog = (): void => {
 // The one agent write path (T3 transactional configuration)
 // ---------------------------------------------------------------------------
 //
-// The dialog hands over DELTAS and the promotion it represents. This function is the
-// only place that turns them into a request, which is what keeps the two server
-// surfaces honest:
+// The dialog hands over DELTAS plus the entry-agent move and the rank assignments it
+// represents. This function is the only place that turns them into a request, which is
+// what keeps the two server surfaces honest:
 //
 //   - NO SESSION YET — one atomic PATCH /harnesses/:name carrying the complete
-//     `primary` + `subagents` + `agentModels` + `agentInstructions`. One request, so
-//     a promotion and a model/instruction edit can never land as two partially
-//     applied writes, and the demoted old primary survives as a secondary exactly
-//     once (no stale duplicate).
+//     `entry` + `ranks` + `agentModels` + `agentInstructions`. One request, so a rank
+//     change and a model/instruction edit can never land as two partially applied
+//     writes, and the team the request describes is stated COMPLETELY (`ranks` covers
+//     every surviving member, so a member this patch drops cannot keep a stale letter).
 //   - A SAVED SESSION (T7b, R5/R6/R7) — the conversation's OWN team, prompts and live
 //     models, written through `POST/PATCH/DELETE /sessions/{id}/agents...`. The harness
 //     template is never touched, so nothing this reader does can change the sessions the
@@ -8441,7 +8491,11 @@ const applyAgentConfiguration = async (
     const view = agentViewOf(instance);
     const display = view.display;
     const members = view.members;
-    const busy = changes.primary !== undefined || changes.add.length > 0 || changes.remove.length > 0;
+    // R20: the three things that can move the TEAM shape are an entry move, a rank
+    // assignment, and an add/remove. Rank work counts as busy because it restates the
+    // ladder, not just a per-agent side map.
+    const rankWork = Object.keys(changes.ranks ?? {}).length > 0;
+    const busy = changes.entry !== undefined || rankWork || changes.add.length > 0 || changes.remove.length > 0;
 
     // A second save while one PATCH is in flight is refused, not queued: the first
     // request already carries every draft the dialog holds right now.
@@ -8475,16 +8529,32 @@ const applyAgentConfiguration = async (
         };
     }
 
-    const primary = changes.primary ?? primaryOf(display);
+    // R20: the ENTRY agent is the routing choice, and it is the only one the request
+    // states by name. Ranks are a per-member map, so no member is "the" leader and any
+    // number may hold the same letter.
+    const entry = changes.entry ?? entryOf(display);
 
-    // Membership: removing is opt-IN, adding is what a promotion of an outside agent
-    // implies. Nothing else moves, so the current team can never shrink by accident
-    // and the new primary is never listed as its own subagent.
+    // Membership: removing is opt-IN, adding is what naming an outside agent as the next
+    // entry agent implies. Nothing else moves, so the current team can never shrink by
+    // accident, and the entry agent is never listed twice.
     const kept = members.filter((name) => !changes.remove.includes(name));
     const added = changes.add.filter((name) => !kept.includes(name));
-    const nextMembers = uniqueNames([primary, ...kept.filter((name) => name !== primary), ...added]);
+    const nextMembers = uniqueNames([entry, ...kept.filter((name) => name !== entry), ...added]);
 
-    if (!nextMembers.includes(primary)) return { applied: false, message: 'A harness needs a primary agent.' };
+    if (!nextMembers.includes(entry)) return { applied: false, message: 'A harness needs an entry agent.' };
+
+    // R20: the rank map the PATCH restates = the ladder this view renders, overlaid with
+    // ONLY the ranks the reader moved, then filtered to the final member set. Restating
+    // the whole map (rather than only the deltas) is what makes a rank change atomic: the
+    // server replaces `ranks`, so sending one letter alone would wipe every other
+    // member's. Filtering is what stops a removed member keeping a stale letter.
+    const ranks: Record<string, AgentRank> = {};
+
+    for (const name of nextMembers) {
+        const drafted = changes.ranks?.[name];
+        const rank = drafted ?? view.ranks[name];
+        if (rank !== undefined) ranks[name] = rank;
+    }
 
     // Merge the deltas onto the stored maps. An explicit '' clears a key, which is how the dialog
     // drops an agent's stored prompt (R4: the one box, cleared by hand) or chooses the default
@@ -8535,9 +8605,17 @@ const applyAgentConfiguration = async (
     // (`modelsForMembers(agentModelsOf(display), members)`) was a frame that omits the field, so
     // it read "nothing is overridden" for a template that does override something, and a genuine
     // clear was refused as a no-op.
+    // Key order is NOT a difference: `ranks` is built in member order and
+    // `view.ranks` in wire order, so both sides are compared through ONE canonical
+    // spelling. Without this a rank-only-equivalent draft would report "changed" and
+    // fire a pointless PATCH.
+    const ranksText = (map: Readonly<Record<string, AgentRank>>): string =>
+        JSON.stringify(Object.keys(map).sort().map((name) => [name, map[name]]));
+
     if (
-        primary === primaryOf(display) &&
+        entry === entryOf(display) &&
         JSON.stringify(nextMembers) === JSON.stringify(members) &&
+        ranksText(ranks) === ranksText(view.ranks) &&
         JSON.stringify(nextModels) === JSON.stringify(view.models) &&
         JSON.stringify(nextInstructions) ===
             JSON.stringify(view.instructions) &&
@@ -8546,7 +8624,7 @@ const applyAgentConfiguration = async (
         return { applied: false, message: 'Nothing changed.' };
     }
 
-    return await patchAgents(primary, nextMembers, nextModels, nextInstructions);
+    return await patchAgents(entry, ranks, nextMembers, nextModels, nextInstructions);
 };
 
 // ---------------------------------------------------------------------------
@@ -8565,11 +8643,13 @@ const applyAgentConfiguration = async (
 // a create receipt states ONE binding, not the team (../shared/harness-api.ts:974-1026).
 //
 // WHY EACH BODY LOOKS THE WAY IT DOES:
-//   - an added member carries its model and its complete prompt in the CREATE, so a `[+]` pick
-//     with a typed instruction is one request, not three (../shared/harness-api.ts:982-1000 —
-//     a catalogue name BINDS that profile, any other name CREATES a session-defined agent whose
-//     whole prompt is the `instruction` supplied, defaulting to the session model and an
-//     identity sentence);
+//   - an added member carries its model, its RANK and its complete prompt in the CREATE, so a
+//     `[+]` pick with a typed instruction is one request, not three (R20: the binding input
+//     accepts a rank, which is the ONE rank write a session has — an EXISTING member keeps the
+//     letter its harness template defines, and `existingRankWork` above refuses that draft
+//     instead of dropping it. ../shared/harness-api.ts:982-1000 — a catalogue name BINDS that
+//     profile, any other name CREATES a session-defined agent whose whole prompt is the
+//     `instruction` supplied, defaulting to the session model and an identity sentence);
 //   - a prompt is sent VERBATIM. Since T6 an instruction override IS the complete system prompt
 //     (the guidelines are defaults, not an appended layer), so the text in the box is exactly
 //     what the agent runs;
@@ -8598,11 +8678,26 @@ const applySessionConfiguration = async (
     // text it just wrote (the model PATCH answer is already the newest authority for its field).
     const rosterMoved = removals.length > 0 || additions.length > 0;
 
-    // R5: a saved conversation keeps the entry agent it started with — `canPromote: false`
-    // already disables the control, so this is the guard against a stale or foreign caller
-    // rather than the reader's normal path.
-    if (changes.primary !== undefined && changes.primary !== view.primary) {
-        return { applied: false, message: 'The primary agent is fixed for a saved conversation.' };
+    // R5: a saved conversation keeps the ENTRY agent it started with — `canSetEntry:
+    // false` already disables the control, so this is the guard against a stale or
+    // foreign caller rather than the reader's normal path. R20: the entry agent is also
+    // the one member a session can never detach, so the refusal says so.
+    if (changes.entry !== undefined && changes.entry !== view.entry) {
+        return { applied: false, message: 'The entry agent is fixed for a saved conversation.' };
+    }
+
+    // R20: a saved conversation runs the RANKS its harness template defines. The roster
+    // route states a rank only for a member this conversation ADDS, so a rank draft on
+    // an existing member has no route to land on and is refused with the reason, rather
+    // than silently dropped on the floor.
+    const rankEntries = Object.entries(changes.ranks ?? {});
+    const existingRankWork = rankEntries.filter(([name]) => existing.includes(name) && !additions.includes(name));
+
+    if (existingRankWork.length > 0) {
+        return {
+            applied: false,
+            message: 'A saved conversation keeps the ranks its harness template defines; start a new session to change them.'
+        };
     }
 
     if (!teamWork && drafted.length === 0) return { applied: false, message: 'Nothing changed.' };
@@ -8642,14 +8737,19 @@ const applySessionConfiguration = async (
         // 1. Removals.
         for (const name of removals) await deleteSessionAgent(sessionId, name);
 
-        // 2. Additions, each carrying its own model and complete prompt.
+        // 2. Additions, each carrying its own model, RANK and complete prompt.
         for (const name of additions) {
             const model = (changes.models[name] ?? '').trim();
             const instruction = (changes.instructions[name] ?? '').trim();
+            // R20: the rank the reader assigned to THIS new member rides its create. An
+            // agent added without one inherits the session's roster default, so the field
+            // is omitted rather than invented here.
+            const rank = changes.ranks?.[name];
 
             await createSessionAgent(sessionId, {
                 name,
                 profile: name,
+                ...(rank === undefined ? {} : { rank }),
                 ...(model.length === 0 ? {} : { model }),
                 ...(instruction.length === 0 ? {} : { instruction })
             });
@@ -8740,18 +8840,27 @@ const applySessionConfiguration = async (
     }
 };
 
-// Send the complete team on every change: `primary` plus every other member as
-// `subagents`. That is what makes a demotion atomic — the old primary is listed
-// as a secondary exactly once and no stale duplicate can survive.
+// Send the complete team on every change: the ROSTER, the ENTRY agent, and the RANK of
+// every member that has one. That is what makes a rank change atomic — the server replaces
+// the roster, the entry, and the whole map, so one restated letter at a time would silently
+// drop everybody else's, and a member this patch removes can never keep a stale entry
+// behind. A member with NO stated rank is left out of the map on purpose: the server places
+// it one rank below the lowest rank the map does state
+// (../shared/harness-api.ts:808-816), which is the bottom of this team's ladder.
+//
+// `entry` is routing, not authority (R20): naming an agent the entry agent says which
+// member a new conversation starts with, and it moves nobody's rank. Any number of
+// members may hold the same rank, so nothing here demotes a former leader.
 //
 // `models` and `instructions` are the COMPLETE maps the caller wants stored. The
 // server replaces each map with what it receives, so every mutation sends the whole
-// map (promotion keeps each member's entry, add leaves the new member inheriting,
+// map (an entry move keeps each member's entry, add leaves the new member inheriting,
 // and remove drops the removed member's key via `modelsForMembers` /
 // `instructionsForMembers` — the server offers the same guarantee, but a complete
 // map never depends on it).
 const patchAgents = async (
-    primary: string,
+    entry: string,
+    ranks: Readonly<Record<string, AgentRank>>,
     members: readonly string[],
     models: Readonly<Record<string, string>>,
     instructions: Readonly<Record<string, string>>,
@@ -8769,13 +8878,21 @@ const patchAgents = async (
 
     const display = instance.frozen ?? instance.descriptor;
     const unique = uniqueNames(members);
-    const nextPrimary = unique.includes(primary) ? primary : unique[0];
+    const nextEntry = unique.includes(entry) ? entry : unique[0];
 
-    if (nextPrimary === undefined) {
+    if (nextEntry === undefined) {
         return { applied: false, message: 'A harness needs at least one agent.' };
     }
 
-    const subagents = unique.filter((name) => name !== nextPrimary);
+    // R20: the rank map is restated in MEMBER ORDER and only for members that survive,
+    // so the body always describes the team the request creates (a key for a removed
+    // agent would be a 400 against the final member set).
+    const nextRanks: Record<string, AgentRank> = {};
+
+    for (const name of unique) {
+        const rank = ranks[name];
+        if (rank !== undefined) nextRanks[name] = rank;
+    }
     const includeModels = Object.keys(models).length > 0;
     const includeInstructions = Object.keys(instructions).length > 0;
     // T3: `{}` is meaningful and must still be SENT when an override is being cleared — an
@@ -8807,8 +8924,14 @@ const patchAgents = async (
         // `descriptorOf` (./api.ts:1203), which already maps the snake fields, so nothing else
         // in the write path needed to change.
         const updated = await updateHarness(display.name, {
-            primary: nextPrimary,
-            subagents,
+            // The ROSTER travels with the entry move and the rank map: `agents` REPLACES the
+            // roster on this route (../shared/harness-api.ts:804-805), and an omitted field
+            // keeps the stored one — so a member this dialog added would vanish on save while
+            // the on-screen team still showed it. Order is the shell's member order (entry
+            // first), which is also the order `nextRanks` was built in.
+            agents: [...unique],
+            entry: nextEntry,
+            ranks: nextRanks,
             ...(sendsModels ? { agent_models: models } : {}),
             ...(sendsInstructions ? { agent_instructions: instructions } : {})
         });
@@ -15500,8 +15623,8 @@ const run = async (): Promise<void> => {
     // proof of that: it is set by `cycleAgentSelection` and cleared by `selectedAgentOf` when
     // the name is no longer a member of the roster, so an unset selection means "nobody
     // touched the chip" and the request stays byte-identical to the pre-feature body. That
-    // gate matters whenever a conversation is focused: its owner is often a SUBAGENT while the
-    // team's entry agent is not, and comparing the two alone would read an untouched composer
+    // gate matters whenever a conversation is focused: its owner is often a member that
+    // is NOT the team's entry agent, and comparing the two alone would read an untouched composer
     // as a switch and open a stray thread (the focused thread already runs that agent).
     const plan = agentSendPlanOf(instance, target.threadId);
     const selectedAgent = plan.selected;
@@ -15617,7 +15740,7 @@ const run = async (): Promise<void> => {
                 // this a screen reader stays on the sentence for an agent that is no longer
                 // selected, and the region would still be holding that stale string when the
                 // reader cycles back to it later.
-                agentCycleSay(agentCycleSentenceOf(agentMembersOf(instance), agentPrimaryOf(instance)));
+                agentCycleSay(agentCycleSentenceOf(agentMembersOf(instance), agentEntryOf(instance)));
             }
         }
 
@@ -16328,7 +16451,7 @@ const boot = async (): Promise<void> => {
         // T3 (zero-harness boot): a RESOLVED bootstrap that reports ZERO harnesses is a
         // healthy server, not an offline one. The tool catalogue, the agent library and the
         // session directory all came back, and `POST /v1/harness/harnesses` needs no
-        // pre-existing harness (its primary only has to be a known agent), so an empty
+        // pre-existing harness (its entry agent only has to be a known agent), so an empty
         // catalogue must boot exactly like a normal one: `booted = true`, the same control
         // painting, and the empty-catalogue UI the live delete-all path already lands in
         // (`applyHarnessRemoved`). Bailing out into `showOffline` here is what made a

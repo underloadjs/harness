@@ -171,6 +171,12 @@ const STARTUP_SOURCE_ENTRIES = {
     profiles: 'tools/runtime/profiles.tool.ts',
     chapters: 'tools/runtime/chapters.tool.ts',
     locations: 'tools/runtime/locations.tool.ts',
+    // The cross-session knowledge base (T6/T7): `activation: 'always'` and
+    // `alwaysDeclared: false` (src/tools/runtime/knowledge.tool.ts:503-510), so it
+    // registers from source at startup exactly like the record family. Without this
+    // row its source record would be the one startup registration this gate never
+    // looks at — the silent coverage loss the header above warns about.
+    knowledge: 'tools/runtime/knowledge.tool.ts',
     agentManage: 'tools/runtime/agentManage.tool.ts',
     agentResult: 'tools/runtime/agentResult.tool.ts'
 };

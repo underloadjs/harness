@@ -139,7 +139,7 @@ const taskPage = (
 });
 
 // One stored record as the COMMAND door writes it. Attribution comes from the
-// caller: `executeTool` hands the tool the harness's primary (`writer`) and NO
+// caller: `executeTool` hands the tool the harness's entry agent (`writer`) and NO
 // threadId, so `updatedBy` is set and `updatedThreadId` is absent entirely.
 // `rev` is the content revision — 1 on add, +1 only for a real text/completed
 // change, never for a claim.
@@ -492,7 +492,7 @@ describe('/task', () => {
 
         // `/task add "testing"` — the quoted phrase is ONE task text. An ADD is not
         // a guarded write (there is no prior record), so it needs no token; `rev`
-        // starts at 1 and the primary is credited because executeTool has one.
+        // starts at 1 and the entry agent is credited because executeTool has one.
         //
         // R1: exactly one record was created, so the same record also answers as
         // `entry` beside the page.
@@ -594,7 +594,7 @@ describe('/task', () => {
         await writer.executeCommand('/task complete 1');
         await writer.executeCommand('/task remove 1');
 
-        // The change feed is the proof. THREE events, all attributed to the primary
+        // The change feed is the proof. THREE events, all attributed to the entry agent
         // (executeTool's context), and the two guarded writes landed on the first
         // try — a blind write would have been refused with `guarded write: pass
         // expects [...]` and recorded nothing. The command's internal revision reads
@@ -953,7 +953,7 @@ describe('snapshot isolation', () => {
         const snapshot: HarnessSnapshot = first.snapshot();
 
         // T1: a persisted record carries its content revision and its attribution
-        // (`updatedBy` is the primary, because a command writes through
+        // (`updatedBy` is the entry agent, because a command writes through
         // executeTool), and the store's event revision rides along in `storeRev`.
         expect(snapshot.records.collections.tasks.items).toEqual([record('1', 'only here', false, 1)]);
         expect(snapshot.records.collections.tasks.storeRev).toBe(1);

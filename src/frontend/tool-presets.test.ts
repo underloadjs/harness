@@ -404,8 +404,10 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct', 'research', 'workspace'],
         tools: [],
         coreTools: [],
-        primary: 'instruct',
-        subagents: ['research', 'workspace'],
+        // Instruct routes at Rank A; research and workspace sit strictly below it, so they are
+        // the only agents `delegate`/`agentResult` may name for this harness.
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'research': 'B', 'workspace': 'B' },
         builtin: true,
         editable: true,
         ...overrides
@@ -425,7 +427,14 @@ const snapshot = (): SessionSnapshot =>
 
 type Call = { url: string; method: string | undefined; body: unknown };
 
-const boot = async (subagents: readonly string[] = ['research', 'workspace']): Promise<Call[]> => {
+// The playground harness as the RANK model states it. `lowerRanks` names the teammates that
+// sit one rank below Instruct — the delegation targets the presets are built from — so
+// `boot([])` describes a team with nothing below its entry agent, which is what removes the
+// dynamic presets rather than a subagent list the wire no longer sends.
+const boot = async (lowerRanks: readonly string[] = ['research', 'workspace']): Promise<Call[]> => {
+    const playgroundRanks: Record<string, 'A' | 'B'> = { instruct: 'A' };
+
+    for (const agent of lowerRanks) playgroundRanks[agent] = 'B';
     const calls: Call[] = [];
 
     vi.stubGlobal(
@@ -438,7 +447,12 @@ const boot = async (subagents: readonly string[] = ['research', 'workspace']): P
             if (url === '/api') {
                 return json({
                     rootPath: '/api',
-                    presets: [descriptor({ subagents: [...subagents] })],
+                    presets: [
+                        descriptor({
+                            agents: ['instruct', ...lowerRanks],
+                            ranks: playgroundRanks
+                        })
+                    ],
                     tools: TOOLS,
                     defaults: { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false },
                     // T4: the ⚒ pane describes the CONVERSATION on screen, and main.ts hides both
@@ -605,8 +619,8 @@ it('marks every runtime-id preset as an edit, and never invents a real-looking i
         }
     }
 
-    // `agentResult` is the dynamic case: its targets come from the playground harness, so
-    // a real subagent gets a ready-to-run preset and the unknown-agent shape stays a
+    // `agentResult` is the dynamic case: its targets come from the playground harness, so a
+    // real lower-ranked member gets a ready-to-run preset and the unknown-agent shape stays a
     // labelled placeholder.
     const withAgents = await presetsFor('agentResult');
     expect(withAgents.map((button) => button.textContent)).toEqual([
@@ -618,8 +632,9 @@ it('marks every runtime-id preset as an edit, and never invents a real-looking i
 });
 
 it('builds dynamic presets from the playground harness roster only', async () => {
-    // A harness with NO subagents: `agentResult` has no valid target, so only the clearly
-    // marked placeholder shape is offered (never `research`, which this harness lacks).
+    // A harness with NOTHING below its entry agent: `agentResult` has no valid target, so only
+    // the clearly marked placeholder shape is offered (never `research`, which this harness
+    // cannot delegate to).
     await boot([]);
 
     const buttons = await presetsFor('agentResult');

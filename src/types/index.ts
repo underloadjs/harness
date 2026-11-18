@@ -1039,8 +1039,8 @@ export type ToolSearchResult = {
     //
     // Present only when at least one core tool matches, so an ordinary result keeps
     // its old exact shape. The harness supplies only the core tools VISIBLE to the
-    // calling agent (delegate is excluded for subagents, toolCreate under the
-    // 'primary' policy too), which is what keeps this list honest rather than a
+    // calling agent (delegate is omitted for an agent with no lower-ranked peer,
+    // toolCreate under a rank-limited policy too), which is what keeps this list honest
     // registry dump.
     alreadyAvailable?: ToolMatch[];
     // T11 (RR4 loop): matches the CALLER'S RUN cannot use because its delegation scope
@@ -1433,14 +1433,130 @@ export type HarnessToolCallOptions = {
     toolScope?: readonly string[];
 };
 
-// Who may create tools at runtime (R12). See HarnessConfiguration.toolCreation:
-// 'all' (default, every agent), 'primary' (primary only; subagents neither see
-// nor can call the tool), false (no model-facing toolCreate at all — the host
-// `harness.toolCreate()` path remains available).
-export type ToolCreationPolicy = 'all' | 'primary' | false;
+// ---------------------------------------------------------------------------
+// Agent ranking — THE delegation vocabulary (rank model, 2026-11-18)
+// ---------------------------------------------------------------------------
+// THE MODEL IN ONE PARAGRAPH
+// --------------------------
+// Every agent a harness runs holds exactly ONE rank. `'A'` is the highest and
+// `'Z'` the lowest; a real roster never gets past `'C'` or `'D'`. Ranks replace
+// the old `primary`/`subagent`/`secondary` wording entirely — there is NO
+// singleton "primary agent" any more: a harness may hold any number of Rank A
+// agents, and what an agent may DO is a function of its rank and nothing else.
+//
+//   - TOOLS ARE NEVER RANK-GATED. Every agent has access to every registered
+//     tool; the only gates left are discovery, the per-run `scope.tools`
+//     allowlist, the session's withheld set, the global (provider) disable and
+//     the enabled-tool cap. Rank never removes a tool from an agent.
+//   - DELEGATION IS RANK-GATED, strictly downward: an agent may delegate only to
+//     a registered agent whose rank is STRICTLY LOWER than its own. A Rank A
+//     agent delegates to "Rank B and below"; A→A and B→B are refused, and so is
+//     every upward target. Chains are therefore bounded by the number of DISTINCT
+//     configured ranks (A→B→C needs three), and the kernel caps nesting at that
+//     count, hard-capped at 26.
+//   - THREADS ARE NOT RANK-GATED. Threading is parallel work by the SAME agent,
+//     not delegation to another one, so `createThread`/`api.threads.*` and the
+//     lineage rules never consult rank. A thread, branch, fork, or restored
+//     conversation only PROPAGATES the source agent's rank downward.
+//
+// WHY A 26-MEMBER UNION INSTEAD OF A NUMBER
+// -----------------------------------------
+// The rank letter is what a MODEL reads (tool descriptions, agent listings, error
+// messages), it is what a config author writes (`ranks: { reviewer: 'B' }`), and
+// it is what a persisted record stores. A closed letter union gives all three the
+// same spelling and makes an out-of-range rank a compile error at the boundary
+// that invents one; `rankIndexOf` is the single place the ordering is defined.
+export type AgentRank =
+    | 'A'
+    | 'B'
+    | 'C'
+    | 'D'
+    | 'E'
+    | 'F'
+    | 'G'
+    | 'H'
+    | 'I'
+    | 'J'
+    | 'K'
+    | 'L'
+    | 'M'
+    | 'N'
+    | 'O'
+    | 'P'
+    | 'Q'
+    | 'R'
+    | 'S'
+    | 'T'
+    | 'U'
+    | 'V'
+    | 'W'
+    | 'X'
+    | 'Y'
+    | 'Z';
 
-// What a delegation hands back to the primary agent: the subagent's answer, not
-// its transcript (history stays with the subagent).
+// The union as DATA, highest rank first. Every consumer that has to ENUMERATE
+// ranks (a validator, a config resolver computing "one rank below", a UI drawing
+// a rank column) reads this table rather than re-listing letters, so the ordering
+// below is the ONE ordering in the package.
+export const AGENT_RANKS: readonly AgentRank[] = [
+    'A',
+    'B',
+    'C',
+    'D',
+    'E',
+    'F',
+    'G',
+    'H',
+    'I',
+    'J',
+    'K',
+    'L',
+    'M',
+    'N',
+    'O',
+    'P',
+    'Q',
+    'R',
+    'S',
+    'T',
+    'U',
+    'V',
+    'W',
+    'X',
+    'Y',
+    'Z'
+];
+
+// The ordinal of a rank: 0 = 'A' (highest), 25 = 'Z' (lowest). A LARGER index is
+// a LOWER rank, which is the direction every comparison in the kernel uses.
+export const rankIndexOf = (rank: AgentRank): number => AGENT_RANKS.indexOf(rank);
+
+// THE delegation predicate, in the direction a caller asks it: may `candidate`
+// receive a delegation FROM `caller`? True only when `candidate` is STRICTLY
+// lower-ranked, so `isLowerRank('A', 'A')` and `isLowerRank('A', 'B')` are both
+// false. Kept as a named predicate rather than an inline index comparison because
+// the strictness is the rule: a same-rank peer is not a subordinate.
+export const isLowerRank = (candidate: AgentRank, caller: AgentRank): boolean =>
+    rankIndexOf(candidate) > rankIndexOf(caller);
+
+// The UNTRUSTED-INPUT guard for a rank: config (`HarnessConfiguration.ranks`), a
+// snapshot document, a wire body, or a tool argument. `AGENT_RANKS` is a `readonly
+// AgentRank[]`, so `includes` cannot be called with an `unknown` — this is the one
+// place that narrowing happens, and every boundary validator routes through it
+// instead of re-spelling the letter set.
+export const isAgentRank = (value: unknown): value is AgentRank =>
+    typeof value === 'string' && (AGENT_RANKS as readonly string[]).includes(value);
+
+// Who may create tools at runtime (R12). See HarnessConfiguration.toolCreation:
+// 'all' (default, every agent), a rank LETTER (that rank and every rank toward A
+// may create — `'A'` is the faithful replacement for the removed `'primary'`, and
+// an agent of a lower rank neither sees nor can call the tool), or false (no
+// model-facing toolCreate at all — the host `harness.toolCreate()` path remains
+// available).
+export type ToolCreationPolicy = 'all' | false | AgentRank;
+
+// What a delegation hands back to its caller: the child agent's answer, not its
+// transcript (history stays with the child).
 //
 // IDENTITY (T28). The result used to be `{ agent, content }`, which carried no way to
 // correlate it with a thread or an invocation: a caller had to call `threadList` and
@@ -1639,15 +1755,16 @@ export type HarnessForkResult = {
     content: string;
 };
 
-// The public, bounded description of one branch. `role` is the source agent's
-// role in the harness, `tools` the wire names that branch could call. `forkDepth`
+// The public, bounded description of one branch. `rank` is the source agent's
+// RANK in the harness (a branch inherits its source's rank — see
+// ../harness.ts `rankOf`), `tools` the wire names that branch could call. `forkDepth`
 // counts ordinary forks (1 = a fork of a root); autoanswer branches inherit their
 // source depth because they do not consume a general nesting level.
 export type HarnessBranchSummary = {
     branchId: string;
     kind: 'fork' | 'autoanswer';
     agent: string;
-    role: 'primary' | 'subagent';
+    rank: AgentRank;
     sourceBranchId?: string;
     // The INVOCATION identity of the requester (`HarnessThread.id`), i.e. the run
     // that asked for the fork/answer. Display/audit only.
@@ -2368,6 +2485,435 @@ export type TaskResult = Omit<RecordsResult, 'entries' | 'counts' | 'removed'> &
 
 // The shared CRUD action set is declared above with the engine types.
 
+// ---------------------------------------------------------------------------
+// knowledge — the CROSS-SESSION article store (T4)
+// ---------------------------------------------------------------------------
+//
+// A knowledge article is the record shape the session outlives: a title, tags, and an
+// ORDERED array of paragraphs, each separately addressable and separately versioned.
+// `records` (above) owns one session and dies with it; the knowledge engine owns the
+// same class of data and is persisted as JSON files by ../server/knowledge-file-store.ts,
+// so a future `knowledge` wrapper is to this engine what `tasks` is to `records`: a thin
+// domain shell over one engine, and nothing else needs to learn the storage rules again.
+//
+// THE RULES THIS SHAPE CARRIES (implemented in ../core/knowledge.ts, which owns the
+// prose; these declarations only state what the engine is allowed to say):
+//   - ids are uuid v4, minted by the engine (`node:crypto` `randomUUID()`). There is no
+//     monotonic counter and nothing to persist beside the articles, because a uuid is
+//     unique without coordination — which is the whole reason a knowledge article can
+//     live in its own file. `KNOWLEDGE_UUID_PATTERN` is the one validator.
+//   - TWO revisions per article, and both are CAS tokens. `KnowledgeArticle.rev` moves
+//     when ANYTHING in the article moves (title, tags, order, a paragraph added or
+//     removed, a paragraph body); `KnowledgeParagraph.rev` moves ONLY when that
+//     paragraph's text, tags or refs really change — the records rule (records.ts:1910),
+//     restated at paragraph grain so a caller can guard one paragraph instead of the
+//     article.
+//   - `expects` is the only conflict control (records' Decision P, carried over
+//     verbatim): no locks, no leases, no claims. A stale token refuses the WHOLE
+//     operation and the refusal carries the current article (records' R9), because one
+//     round trip to discover a conflict is a round trip a wrapper has to pay for.
+//   - `refs` point at a whole article (`paragraphId` absent) or at one paragraph in one
+//     article, self-article or across. They are validated when WRITTEN and never
+//     cascaded: removing a target leaves the reference in place and makes it DANGLING,
+//     which the engine reports as a read-side projection (`danglingRefs`) rather than
+//     rewriting history — a dangling ref is a fact about the reader's store, not a
+//     corruption of the writer's.
+//   - optional keys stay ABSENT, never `undefined`-valued (the records convention,
+//     records.ts:304-308): the persisted JSON and the byte budget both measure the real
+//     serialized shape, and a key present with `undefined` breaks a deep-equal that
+//     should have matched.
+//
+// Cross-references:
+//   - ../core/knowledge.ts               — the engine: bounds, codes, verbs, budget, feed
+//   - ../server/knowledge-file-store.ts  — the JSON file layer that subscribes to `onStoreChange`
+//   - ../core/records.ts                 — the in-memory pattern this mirrors
+//   - ../core/result-budget.ts           — MODEL_TOOL_RESULT_BUDGET_BYTES, the outer cap
+
+// One paragraph→paragraph (or paragraph→article) link. `articleId` is required because
+// a reference must be resolvable without knowing where the READER is; `paragraphId`
+// absent means the link targets the article as a whole (a "see also", not a quote).
+export interface KnowledgeReference {
+    articleId: string;
+    /** Absent ⇒ the reference points at the whole article. */
+    paragraphId?: string;
+    /** Free-text reason for the link. */
+    note?: string;
+}
+
+// One paragraph: the addressable unit of knowledge. `rev` is a CAS token in its own
+// right (see the header), and `refs` is the paragraph's own link list — article tags
+// are the article's, paragraph tags are per-paragraph.
+export interface KnowledgeParagraph {
+    id: string;                                        // uuid v4, engine-assigned
+    text: string;
+    /** Bumped only when `text` or `refs` actually changes; mirrors RecordEntry.rev. */
+    rev: number;
+    createdAt: string;                                 // ISO-8601
+    updatedAt: string;                                 // ISO-8601
+    /** Optional paragraph-level tags; article tags are the article's own. */
+    tags?: string[];
+    refs?: KnowledgeReference[];
+}
+
+// One article: the unit of persistence (one article = one JSON file, owned by the file
+// layer) and the unit the CAS token is minted for.
+export interface KnowledgeArticle {
+    id: string;                                        // uuid v4
+    title: string;
+    createdAt: string;
+    updatedAt: string;
+    tags: string[];
+    /** Ordered content array: index 0 first. Entries are KnowledgeParagraph. */
+    content: KnowledgeParagraph[];
+    rev: number;
+}
+
+// One compare-and-swap precondition, ARTICLE grain (a paragraph-level guard is expressed
+// through the article token: a paragraph edit always moves the article rev too).
+export interface KnowledgeExpect { id: string; rev: number }   // article id → article rev
+
+// One paragraph as a CALLER describes it. A bare string is the common case (text only);
+// the object form carries the paragraph's own tags and links. `id` may be pinned when
+// the caller needs a stable handle (a recipe step that quotes it back); the engine
+// refuses a pin that is not a uuid or is already taken.
+export type KnowledgeContentInput = string | {
+    text?: string;
+    tags?: string[];
+    refs?: KnowledgeReference[];
+    /** Caller may pin an id (must be a uuid and must be unused); otherwise assigned. */
+    id?: string;
+};
+
+// The whole engine surface in one discriminated union — the shape the `knowledge` tool
+// forwards verbatim. NOTE the deliberate name collision a caller must not trip on: a
+// `list` operation's free-text filter is keyed `search`, while `search` is also a VERB.
+// `list` with no `search` term is an unfiltered listing; `search` requires the term.
+export type KnowledgeOperation =
+    | { verb: 'list';   search?: string; tag?: string[]; limit?: number; offset?: number }
+    | { verb: 'search'; query: string; tag?: string[]; limit?: number; offset?: number }
+    | { verb: 'read';   id: string; paragraphs?: string[]; from?: number; limit?: number; outline?: boolean }
+    | { verb: 'create'; title: string; tags?: string[]; content?: KnowledgeContentInput[] }
+    | { verb: 'modify'; id: string; title?: string; addTags?: string[]; removeTags?: string[];
+        addContent?: KnowledgeContentInput[];
+        setParagraphs?: { id: string; text?: string; tags?: string[]; refs?: KnowledgeReference[] }[];
+        moveParagraphs?: { id: string; before?: string }[];
+        removeParagraphs?: string[];
+        expects?: KnowledgeExpect[] }
+    | { verb: 'remove'; id: string; expects?: KnowledgeExpect[] };
+
+// The verb list, derived from the union so a refusal and a test enumerate the SAME set
+// the type carries (`KnowledgeOperation['verb']` cannot drift from the values array).
+export const KNOWLEDGE_OPERATION_VERBS = [
+    'list',
+    'search',
+    'read',
+    'create',
+    'modify',
+    'remove'
+] as const;
+
+// ---------------------------------------------------------------------------
+// The engine's read projections
+// ---------------------------------------------------------------------------
+//
+// `list`/`search` deliberately ship NO paragraph bodies: the drill-in loop the tool
+// describes (list → read outline → read paragraphs → modify) only works if the cheap
+// step stays cheap, and 100 article bodies in one page is the flood the byte budget
+// exists to prevent.
+
+// The article metadata every read and every page echoes, including the CAS token.
+export type KnowledgeArticleMeta = {
+    id: string;
+    title: string;
+    tags: string[];
+    createdAt: string;
+    updatedAt: string;
+    rev: number;
+};
+
+// What a page row is: metadata + the paragraph count, so the caller can size the drill
+// in without paying for it.
+export type KnowledgeArticleSummary = KnowledgeArticleMeta & {
+    paragraphCount: number;
+};
+
+// One `read { outline: true }` row: everything about a paragraph EXCEPT its text, plus
+// `chars` so the caller can pick the paragraph worth reading. `chars` counts UTF-16 code
+// units (`String.prototype.length`), not bytes and not graphemes — it is a size hint for
+// a caller choosing a window, and the byte budget is measured separately.
+export type KnowledgeOutlineEntry = {
+    id: string;
+    rev: number;
+    updatedAt: string;
+    chars: number;
+    tags?: string[];
+    refs?: KnowledgeReference[];
+};
+
+// One page cursor, in the same shape the records pages use (offset mode only: knowledge
+// ranking is by relevance, so a keyset cursor over a score is meaningless).
+// `budgetTruncated` is records' M10 flag restated: without it a budget-cut page and a
+// limit-cut page are indistinguishable, and the two call for different fixes.
+export type KnowledgePageInfo = {
+    offset: number;
+    limit: number;
+    hasMore: boolean;
+    nextOffset?: number;
+    budgetTruncated?: boolean;
+};
+
+// `list` — a page of summaries. `counts.total` is the size of the whole MATCHED set
+// (never the page), the records F9 rule: paging must not hide how much is out there.
+export type KnowledgePageResult = {
+    articles: KnowledgeArticleSummary[];
+    counts: { total: number };
+    page: KnowledgePageInfo;
+};
+
+// `search` — the same page, plus WHICH lane answered. Title hits short-circuit the
+// paragraph-text scan (see the `search` section of ../core/knowledge.ts), so a caller
+// that asked a question and got only title matches knows the text of every article was
+// never consulted for that term; `matchedIn` is the honest statement, not a guess.
+export type KnowledgeSearchResult = KnowledgePageResult & {
+    matchedIn: 'title' | 'text';
+};
+
+// `read` — always the article metadata (and `rev`, the token the next write needs), then
+// one of: whole `paragraphs`, a windowed `paragraphs`, a selected `paragraphs`, or an
+// `outline` instead of any text.
+//
+// THE WINDOW KEYS, stated because two similar numbers invite a misread:
+//   - `paragraphCount` is ALWAYS present and is the article's TOTAL paragraph count;
+//   - `totalParagraphs` is present ONLY when the response is a subset (a `from`/`limit`
+//     window, a `paragraphs` selection, or a byte-budget cut) and repeats that total in
+//     the shape a paging loop reads;
+//   - `truncated` is present ONLY when the response IS a subset, and is the caller's
+//     signal to ask for more;
+//   - `from`/`limit` are present ONLY when the response is an ordered range, i.e. for a
+//     window or for a budget cut that left a prefix (a `paragraphs` SELECTION is a set
+//     of ids, not a range, so it reports `truncated` without inventing an offset);
+//   - `budgetTruncated` says the engine's own byte cap — not the caller's arguments —
+//     made the response a subset.
+// `danglingRefs` lists reference targets named by paragraphs in THIS response that no
+// longer resolve (a removed article or paragraph). Sorted ascending, deduped. It is a
+// projection: the stored `refs` array is left exactly as written.
+export type KnowledgeReadResult = KnowledgeArticleMeta & {
+    paragraphCount: number;
+    paragraphs?: KnowledgeParagraph[];
+    outline?: KnowledgeOutlineEntry[];
+    from?: number;
+    limit?: number;
+    totalParagraphs?: number;
+    truncated?: boolean;
+    budgetTruncated?: boolean;
+    danglingRefs?: string[];
+};
+
+// `create` — the committed article (bodies included: the caller just wrote them and the
+// next write needs the fresh `rev`) and the paragraph ids the engine minted, in the
+// order they were appended. A pinned id is in `createdIds` too: it names what the call
+// produced, not what the call invented.
+export type KnowledgeCreateResult = {
+    article: KnowledgeArticle;
+    createdIds: string[];
+};
+
+// `modify` — one key per KIND of change, present whenever that kind happened at all
+// (records' 0012 rule: a caller branches on which KEY is present, never on a count).
+//   - `changedIds`  — paragraphs whose `rev` actually bumped (text/tags/refs changed);
+//   - `noopIds`     — paragraphs `setParagraphs` named and rewrote nothing;
+//   - `movedIds`    — paragraphs whose ORDER moved (order is not content: no paragraph
+//                     `rev` bump, so this is the only place the move is visible);
+//   - `createdIds`  — paragraphs appended by `addContent`;
+//   - `removedIds`  — paragraphs removed;
+//   - `articleFields` — `title` and/or `tags` when an article-level field really moved;
+//   - `noop`        — nothing at all changed, so the store, the article `rev`,
+//                     `updatedAt` and the store feed are all untouched.
+export type KnowledgeModifyResult = {
+    article: KnowledgeArticle;
+    createdIds?: string[];
+    changedIds?: string[];
+    noopIds?: string[];
+    movedIds?: string[];
+    removedIds?: string[];
+    articleFields?: string[];
+    noop: boolean;
+    danglingRefs?: string[];
+};
+
+// `remove` — the deleted article as a summary (bodies gone; what the caller keeps as its index),
+// plus `danglingRefs`: EVERY unresolvable reference target in the WHOLE store — standing links
+// (`danglingAcrossStore`, `src/core/knowledge.ts:1543-1548` → `:2375`), so a survey, not a diff.
+export type KnowledgeRemoveResult = {
+    removed: KnowledgeArticleSummary;
+    danglingRefs: string[];
+};
+
+// Every success shape, as a union and as a verb-indexed lookup so `execute` can answer a
+// literal operation with its own result type instead of a union the caller must narrow.
+export type KnowledgeResult =
+    | KnowledgePageResult
+    | KnowledgeSearchResult
+    | KnowledgeReadResult
+    | KnowledgeCreateResult
+    | KnowledgeModifyResult
+    | KnowledgeRemoveResult;
+
+export type KnowledgeResultFor<TOperation extends KnowledgeOperation> = TOperation extends {
+    verb: 'list';
+}
+    ? KnowledgePageResult
+    : TOperation extends { verb: 'search' }
+      ? KnowledgeSearchResult
+      : TOperation extends { verb: 'read' }
+        ? KnowledgeReadResult
+        : TOperation extends { verb: 'create' }
+          ? KnowledgeCreateResult
+          : TOperation extends { verb: 'modify' }
+            ? KnowledgeModifyResult
+            : KnowledgeRemoveResult;
+
+// The two verbs the engine also exposes as direct calls (`search(op)` / `read(op)`) —
+// the operation union minus its discriminant, so a host never writes `verb` twice.
+export type KnowledgeSearchParams = Omit<Extract<KnowledgeOperation, { verb: 'search' }>, 'verb'>;
+export type KnowledgeReadParams = Omit<Extract<KnowledgeOperation, { verb: 'read' }>, 'verb'>;
+
+// ---------------------------------------------------------------------------
+// The store feed and the persistence seam
+// ---------------------------------------------------------------------------
+//
+// WHY A CALLBACK AND NOT AN EMITTER — the records R2a reasoning, unchanged: one Set, no
+// event names, the unsubscribe is the returned closure, and an engine with no subscriber
+// builds nothing. The file layer is the only consumer that exists today, and what it
+// needs is exactly one signal per COMMITTED operation: which article ids moved, which
+// ones are gone (its files must be deleted, not rewritten empty), and the watermark to
+// stamp its commit with.
+
+// What kind of store change a notification describes. `reset`/`restore` replace the
+// whole store at once, which is why the file layer treats them as "rewrite everything"
+// rather than as a delta.
+export type KnowledgeStoreChangeReason = 'create' | 'modify' | 'remove' | 'reset' | 'restore';
+
+export type KnowledgeStoreNotification = {
+    // The store watermark after this call: +1 per COMMITTED operation, and the number
+    // the file layer compares against its last commit to decide whether a flush is due.
+    // It is part of `KnowledgeStoreState`, so it survives a restart and never reads as
+    // "behind" the files it just stamped.
+    storeRev: number;
+    reason: KnowledgeStoreChangeReason;
+    // Article ids this call created or changed, in apply order. For `restore` that is
+    // every article in the restored store; for `reset` it is none.
+    affectedArticles: string[];
+    // Article ids that no longer exist — the ids whose FILES must be deleted. For
+    // `restore` these are the ids the live store held that the restored state lacks,
+    // and for `reset` every id the live store held.
+    removedArticles: string[];
+};
+
+// The whole store as one restorable value (the records `RecordsStoreState` role): a JSON
+// value, because the file layer serializes it, and the exact input
+// `readKnowledgeStoreState` accepts. `articles` is in CREATION order — the order a
+// resumed session pages in before any ranking is applied — and every paragraph id in it
+// is unique across the WHOLE state, which is what makes a `refs` target resolvable by id.
+export type KnowledgeStoreState = {
+    storeRev: number;
+    articles: KnowledgeArticle[];
+};
+
+// The engine's options. `now` makes every date deterministic in a test (and is the only
+// way to pin an `updatedAt` ordering exactly); `ids` makes uuids deterministic, which is
+// the other half of a byte-budget assertion — an id is 36 characters either way, but a
+// fixed one lets a test name the JSON it expects instead of sorting random keys. Both are
+// engine-wide seams, validated on use: a clock that returns a non-finite number, or a
+// source that returns a non-uuid, is a caller error (EKNOWLEDGE_INPUT / EKNOWLEDGE_ID),
+// never a silently forged timestamp or a stored id the reader cannot re-parse.
+export type KnowledgeEngineOptions = {
+    now?: () => number;
+    ids?: () => string;
+};
+
+// What `createKnowledgeEngine()` returns: the routed verb surface plus the persistence
+// and observation hooks. `execute` is SYNCHRONOUS — the engine never awaits anything, and
+// the file layer is a subscriber rather than a dependency — so `await`-ing it in an async
+// tool is harmless but never required. Every success answers with a DETACHED copy: a
+// caller that mutates a result cannot reach into the live store, which is the records
+// copy-on-the-way-out rule (records.ts:299) restated.
+export type KnowledgeEngine = {
+    /** Route one operation; unknown keys and unknown verbs are refusals, not coercion. */
+    execute: <TOperation extends KnowledgeOperation>(
+        operation: TOperation,
+        context?: ToolContext
+    ) => KnowledgeResultFor<TOperation>;
+    /** Every article as a summary, in the same order `list` answers with (newest change first). */
+    articles: () => KnowledgeArticleSummary[];
+    /** `search` without the `verb` key. */
+    search: (operation: KnowledgeSearchParams) => KnowledgeSearchResult;
+    /** `read` without the `verb` key. */
+    read: (operation: KnowledgeReadParams) => KnowledgeReadResult;
+    /**
+     * Subscribe to committed store mutations. The listener runs SYNCHRONOUSLY inside the
+     * mutating call, after the store is consistent; a listener that throws is IGNORED,
+     * because the write already happened and a dead persistence layer must not fail a
+     * model's tool call. One notification per COMMITTED operation: a rejected call and a
+     * call that changed nothing announce nothing. Returns the unsubscribe function.
+     */
+    onStoreChange: (listener: (notification: KnowledgeStoreNotification) => void) => () => void;
+    /** The whole store, detached, as the JSON value the file layer writes. */
+    snapshot: () => KnowledgeStoreState;
+    /** Validate-then-swap: a rejected restore leaves the live store exactly as it was. */
+    restore: (state: unknown) => void;
+    /** Clean start: no articles, watermark 0, and one `reset` notification. */
+    reset: () => void;
+};
+
+// ---------------------------------------------------------------------------
+// T7 — THE KNOWLEDGE SEAM (configuration input and the `Harness.knowledge` handle)
+// ---------------------------------------------------------------------------
+//
+// WHAT THIS UNION IS FOR. `../core/knowledge.ts` is the engine (in-memory, sync, never
+// learns where its bytes live) and `../server/knowledge-file-store.ts` is the durable
+// SUBSCRIBER that keeps those bytes at `<databaseRoot>/harness/knowledge/`. A host hands
+// `harness()` one of the two through `HarnessConfiguration.knowledge`, and the SAME object
+// is what `Harness.knowledge` hands back to tools and hosts. This type declares NO new
+// behaviour — it is the structural contract both halves already satisfy, in the layer that
+// owns the `Harness` types, so `src/types` stays the leaf it always is (it never imports
+// `../server`, exactly like `HarnessConfiguration.toolSettings` above reaches for
+// `HarnessToolSettingsProvider` rather than for the server's settings store).
+//
+// WHY A STORE AND A BARE ENGINE ARE BOTH ACCEPTED — and how a caller tells them apart.
+// A store-shaped member is DURABLE: `commit`/`flush`/`dispose` exist, and `directory` names
+// the tree the bytes land in. A bare engine (what `harness({})` builds for itself, and what
+// a server hands a build BEFORE its store has loaded) is EPHEMERAL: those members are
+// absent, and nothing the model writes survives a restart. Presence is the only durability
+// signal, and it is exact: `harness()` never invents a no-op `flush`, so a tool can say
+// "this deployment has no knowledge store" instead of silently claiming durability.
+//
+// WHY THE VERB RETURNS ARE `unknown`. `KnowledgeCommitReport`/`KnowledgeDirectoryIndex` are
+// declared in the SERVER layer (../server/knowledge-file-store.ts:367 and :329). Naming them
+// here would make `src/types` import `src/server`, which every other type in this file
+// avoids on purpose; a caller that wants the report shape imports it from
+// `@underload/harness/server` (the Node barrel) and reads it off the store it loaded itself.
+export type HarnessKnowledgeStore = {
+    /** Absolute resolved DATABASE root (the value `knowledgeDirectoryOf` takes). */
+    readonly root: string;
+    /** `<root>/harness/knowledge` — the directory THIS store owns, outside every session. */
+    readonly directory: string;
+    /** The shared in-memory engine this store keeps durable. */
+    readonly engine: KnowledgeEngine;
+    /** The last index this store wrote (the concrete shape is `KnowledgeDirectoryIndex`). */
+    readIndex?: () => unknown;
+    /** Commit what is due. The concrete report is `KnowledgeCommitReport`. */
+    commit?: (options?: { force?: boolean }) => Promise<unknown>;
+    /** The awaitable durability barrier — the member that says "this knowledge is durable". */
+    flush?: () => Promise<unknown>;
+    /** Flush, stop the trailing timer, and unsubscribe from the engine. */
+    dispose?: () => Promise<unknown>;
+};
+
+// What `HarnessConfiguration.knowledge` accepts and `Harness.knowledge` reports: the
+// DURABLE store a server owns, or a bare (ephemeral) engine.
+export type HarnessKnowledge = KnowledgeEngine | HarnessKnowledgeStore;
+
 // What a tool implementation is handed when the model calls it.
 //
 // The harness fields are optional because a tool can also be executed on its
@@ -2519,14 +3065,15 @@ export type ToolContext<TParameters = any> = {
     // not control.
     signal?: AbortSignal;
     // How deep the calling run is: 1 = a top-level run, 2 = a delegated/ctx.run
-    // child. Present for every harness invocation. The model-facing delegate
-    // tool uses it to keep delegation one level deep even when the primary agent
-    // is itself being driven as somebody else's subagent.
+    // child, 3 = a grandchild, and so on. Present for every harness invocation. The
+    // kernel caps it at the number of DISTINCT configured ranks (A→B→C needs three,
+    // because delegation is strictly downward), and the delegate RULE is a rank
+    // comparison, not a depth test: depth is the ledger the cap is enforced against.
     runDepth?: number;
     // The PERSISTENT thread this call belongs to (R2/R4). Set by the runtime from
     // RunState — never from tool arguments — so the sender identity of a
     // cross-thread message cannot be spoofed by the model. Absent for a manual
-    // `executeTool` call, which runs as the primary agent outside any thread.
+    // `executeTool` call, which runs outside any thread and names no caller agent.
     threadId?: string;
     // The LIVE harness instance this call belongs to. On an INLINE harness this is the ORIGINAL
     // reference created at startup, never a clone, spread, serialized copy, or replacement
@@ -2541,7 +3088,7 @@ export type ToolContext<TParameters = any> = {
     // `tools`, `commands`, `agent`, `executeTool`, `callTool`, `registerTool`, `threads()` /
     // `threadMessages()` reads and `nestedRuns()` — and the members that would START a conversation
     // on that replica (the callable itself, `sendThreadInput`, and the brains under `agents` /
-    // `subagents` with their `turn()` / `stream()`) throw the named `nested-run-unsupported`
+    // `agents` brains with their `turn()` / `stream()`) throw the named `nested-run-unsupported`
     // limitation WHENEVER they are reached, including from a callback the body kept after its own
     // call settled. The view is not a stub and not a snapshot: it is the live handle with those
     // doors closed, because a child conversation started on a lane is never published.
@@ -3687,8 +4234,8 @@ export type HarnessRunOptions = {
 // ---------------------------------------------------------------------------
 //
 // `harness.snapshot()` returns this shape and `harness.restore(snapshot)` applies
-// it to a fresh harness built from the SAME definition (same agents, tools,
-// primary, subagents, and policy). It is deliberately DATA ONLY:
+// it to a fresh harness built from the SAME definition (same agents, tools, entry
+// agent, ranks, and policy). It is deliberately DATA ONLY:
 //   - no provider configuration, API key, header, or other credential;
 //   - no functions (transports, tool implementations, plugins, progress hooks);
 //   - no live execution state (run stack, abort signal, in-flight turns).
@@ -3708,7 +4255,17 @@ export type HarnessRunOptions = {
 // collection map with a single store-level counter and a persisted definition per
 // collection (F3, Decision M). R5 says nothing is in production, so no v1 reader is
 // kept: a v1 file is refused by the version gate instead of half-migrated.
-export type HarnessSnapshotVersion = 2;
+//
+// V3 (the rank model, 2026-11-18) is a VOCABULARY change, and the same posture applies.
+// The invocation ledger rows this document persists renamed `role: 'primary' | 'subagent'`
+// to `rank: AgentRank`, and the roster it restores is configured by `entry`/`ranks` rather
+// than `primary`/`subagents`. A v2 document is therefore REFUSED by the version gate rather
+// than translated: reading `role: 'primary'` as `rank: 'A'` would be a guess about how that
+// deployment ranked its agents (v2 could hold several 'primary'-shaped rows only because the
+// old kernel forbade them, and a v3 harness can hold many Rank A rows), and the repo precedent
+// for a vocabulary break is "refuse, don't half-migrate" — the same call the v1 gate above
+// records, and the reason ./core/snapshot.ts keeps ONE accepted version.
+export type HarnessSnapshotVersion = 3;
 
 // One agent's resolvable state. `messages` is the ENTIRE transcript (seeded
 // instructions plus turns and tool results), and `model` is the model accessor's
@@ -3737,7 +4294,7 @@ export type HarnessAgentResultSnapshot = {
     // correct.
     completedOrder: number;
     agent: string;
-    role: 'primary' | 'subagent';
+    rank: AgentRank;
     kind: 'root' | 'delegation' | 'fork' | 'autoanswer';
     status: 'completed' | 'failed' | 'cancelled';
     // Completed answer text; empty for failed/cancelled. An unfinished run's text is
@@ -3853,7 +4410,7 @@ export type HarnessInvocationArchiveInput = {
     invocationId: string;
     sequence: number;
     agent: string;
-    role: 'primary' | 'subagent';
+    rank: AgentRank;
     kind: 'root' | 'delegation' | 'fork' | 'autoanswer';
     status: 'completed' | 'failed' | 'cancelled';
     // Completed answer text. Ignored (forced empty) for a failed/cancelled record.
@@ -4148,19 +4705,40 @@ export type HarnessCommand = {
 export type HarnessCommandConfiguration = Omit<HarnessCommand, 'name'> & { name?: string };
 
 export type HarnessConfiguration = {
-    // Every brain the harness can run, keyed by name. The FIRST entry is the
-    // entry point unless `primary` names another one: `writer(...)` runs that
-    // agent, and the rest are reachable from tools through `ctx.run(name, input)`
-    // or the `delegate` tool the primary agent gets.
+    // Every brain the harness can run, keyed by name. The FIRST entry is the entry
+    // point unless `entry` names another one: `writer(...)` runs that agent, and any
+    // other agent is reachable through `ctx.run(name, input)`, a thread, or the
+    // `delegate` tool an agent with a lower-ranked peer gets.
     agents: Record<string, Agent>;
-    // Which agent the callable runs. Defaults to the first entry of `agents`, so
-    // a single-agent config needs nothing. Must name a registered agent.
-    primary?: string;
-    // Agents the primary agent may delegate to. Defaults to every agent except
-    // the primary. When the list is empty there is no delegation at all and the
-    // `delegate` tool is not registered. Subagents never receive it, so
-    // delegation is one level deep by construction.
-    subagents?: readonly string[];
+    // Which agent the callable runs; `harness.name`/`harness.agent` are THIS agent while it stays
+    // registered. Defaults to the first entry of `agents`, and must name a registered agent. Once
+    // `removeAgent` detaches it, those two readers follow the EFFECTIVE entry — the first
+    // currently-registered agent, the same default just stated — and only a roster `removeAgent`
+    // emptied keeps this name. (Renamed `primary`: routing, not rank — an entry can be Rank A or C.)
+    entry?: string;
+    // THE ROSTER RANKS, keyed by agent name (see ./AgentRank for the model). A rank
+    // here wins over the defaults below; an agent that is NOT listed takes one rank
+    // BELOW the lowest rank explicitly configured anywhere in this map, clamped at
+    // 'Z'. Resolution, in order:
+    //
+    //   1. `ranks` absent ENTIRELY — the entry agent is Rank A and every other agent
+    //      is Rank B. That is exactly the default the old `primary` + implicit
+    //      `subagents` pair produced, so an existing single-team harness keeps its
+    //      behaviour with no config change;
+    //   2. `ranks` present — every listed name must be a registered agent (an unknown
+    //      key is refused at construction, never silently ignored), and every agent
+    //      the map omits gets `one below the lowest listed rank`;
+    //   3. an agent added at runtime (`harness.addAgent`, a plugin's `createAgent`)
+    //      with no explicit rank gets the same "one below the lowest explicitly
+    //      configured rank" value, and an explicit `rank` option is validated the same
+    //      way a configured one is.
+    //
+    // ANY NUMBER OF AGENTS MAY SHARE A RANK — two Rank A agents are ordinary, and
+    // neither can delegate to the other. What the distinct-rank COUNT decides is the
+    // nesting bound: a chain of runs may be at most as deep as the number of distinct
+    // ranks in the roster (hard-capped at 26), because delegation is strictly
+    // downward, so A→B→C needs three distinct ranks.
+    ranks?: Partial<Record<string, AgentRank>>;
 
     // Maximum number of MODEL REQUESTS (turns) one agent run may make before the
     // harness treats it as a runaway loop: history is truncated back to the start
@@ -4170,7 +4748,7 @@ export type HarnessConfiguration = {
     // both are validated at construction so a typo fails before a long run.
     //
     // The bound is harness-wide and per run: it applies to every run in this
-    // harness (entry, ctx.run, and delegated subagents), and each run gets its own
+    // harness (entry, ctx.run, and every delegated child), and each run gets its own
     // count.
     //
     // With background tool calls this counts EVERY request, not just tool rounds:
@@ -4193,16 +4771,17 @@ export type HarnessConfiguration = {
     // release its concurrency slot by itself instead of waiting for `toolCancel`.
     threadForkTimeoutMs?: number;
 
-    // Who may create tools at runtime (R12). Defaults to 'all', the historical
-    // behaviour:
-    //   - 'all'     — every agent (primary and subagents) gets toolCreate;
-    //   - 'primary' — only the primary agent gets it. The tool is not declared to
-    //                 subagents and a guessed call is rejected, so a subagent can
-    //                 neither see nor use creation;
-    //   - false     — no model-facing toolCreate at all (a session without it
-    //                 answers an honest "not registered" error). The HOST path
-    //                 `harness.toolCreate()` still works: an operator action is
-    //                 not a model privilege.
+    // Who may create tools at runtime (R12). Defaults to 'all':
+    //   - 'all'  — every agent gets toolCreate, whatever its rank;
+    //   - a rank LETTER ('A'..'Z') — that rank and every rank TOWARD A may create, so
+    //     `toolCreation: 'A'` is the faithful replacement for the removed 'primary'
+    //     policy: the tool is neither DECLARED to a lower-ranked agent nor callable by
+    //     one that guesses the name;
+    //   - false  — no model-facing toolCreate at all (a session without it answers an
+    //     honest "not registered" error). The HOST path `harness.toolCreate()` still
+    //     works: an operator action is not a model privilege.
+    // This is the ONLY rank-based capability gate left: tools themselves are never
+    // rank-gated, and every agent has access to every registered tool.
     // The lifetime creation budget (`maxCreatedTools`) still applies either way.
     toolCreation?: ToolCreationPolicy;
 
@@ -4389,25 +4968,57 @@ export type HarnessConfiguration = {
     // exception), so hiding `toolRequest` from a conversation is an operator decision the
     // host writes exactly like any other.
     toolSettings?: HarnessToolSettingsProvider;
+    // THE cross-session knowledge base (T7). Absent (every library consumer, `harness({})`)
+    // means the harness builds its OWN in-memory engine, so `harness({}).knowledge` always
+    // answers and the knowledge tool never has to specialise an unconfigured host — and never
+    // claims durability it does not have, because an ephemeral member carries no
+    // `commit`/`flush`/`dispose` (see `HarnessKnowledge`).
+    //
+    // A HOST hands in the durable half it owns: `loadKnowledgeFileStore({ root })`
+    // (../server/knowledge-file-store.ts) returns a store over
+    // `<databaseRoot>/harness/knowledge/`, and the SAME instance goes to EVERY harness THIS
+    // process builds — in-process sessions and threads alike — because knowledge is
+    // deployment-scoped, not session-scoped. (A lane WORKER replica is the one exception: a live
+    // object cannot cross `worker_threads`, so it runs on its own engine until a per-worker store
+    // is plumbed — the same limit `pluginSettings`/`toolSettings` document.) That sharing is also
+    // what makes two sessions of one server read and write one article set.
+    //
+    // KNOWLEDGE IS NEVER SESSION STATE, and this is the field that says so:
+    //   - `snapshot()`/`restore()` never carry it (a per-session snapshot of a global base
+    //     would make one session's restart overwrite another's articles);
+    //   - `reset()` never clears it (a reset starts a new CONVERSATION; the base outlives it,
+    //     exactly as it outlives the session's `sessions/<id>/` directory);
+    //   - disposing one harness never disposes a host-provided store — the process owner
+    //     that loaded it disposes it exactly once (../server/start.ts `close()`).
+    // A bare `KnowledgeEngine` is the other accepted form: a host that has the engine but not
+    // yet the store (../server/runtime.ts builds the engine synchronously and awaits the load
+    // after it) hands the engine over, and the store adopts it when it lands, so no article
+    // written in that window is lost.
+    knowledge?: HarnessKnowledge;
 };
 
 // The callable harness. `await writer('...')` runs the entry agent to
 // completion, executing tools until the model answers with text.
 export type Harness = {
     (input: string, options?: HarnessRunOptions): Promise<HarnessAssistantMessage>;
-    // The entry agent's name (`primary`, or the first key of `agents`).
+    // The entry agent's name: `entry` while registered, else the first registered one (`effectiveEntryName`).
     readonly name: string;
-    // The entry agent.
+    // The entry agent: `entry`'s brain while registered, else the first registered one (`effectiveEntryAgent`).
     readonly agent: Agent;
     // Every agent, keyed by the names given in configuration.
     readonly agents: Readonly<Record<string, Agent>>;
-    // Agents the primary may delegate to, keyed by name. Empty when delegation is
-    // not configured.
-    readonly subagents: Readonly<Record<string, Agent>>;
+    // THE RESOLVED ROSTER RANKS, keyed by agent name, complete: every registered
+    // agent has an entry, whether its rank came from `HarnessConfiguration.ranks`, a
+    // runtime `addAgent({ rank })`, or the documented default. Frozen defensive copy,
+    // so a caller cannot rewrite the roster's ranking through the handle (a plugin
+    // that wants to change a rank calls `addAgent`/`removeAgent`, or the harness's own
+    // reconfiguration door). Replaces the old `subagents` allowlist, which is now
+    // DERIVED: who may delegate to whom follows from these ranks and nothing else.
+    readonly ranks: Readonly<Record<string, AgentRank>>;
     // The registered tools, keyed by the names the model calls. Includes the
     // built-in toolRequest, toolCreate, task, profileManage,
-    // chapterManage, and locationManage entries, plus delegate when there
-    // is at least one subagent.
+    // chapterManage, and locationManage entries, plus delegate when at least one
+    // agent of this harness has a strictly-lower-ranked peer.
     readonly tools: Readonly<Record<string, Tool>>;
     // Register a tool from source at runtime. This is the host-side path the
     // model-facing toolCreate tool uses: same validation, same registry, same
@@ -4457,6 +5068,26 @@ export type Harness = {
     // Live operations behind the standalone core-tool source entries. This is an
     // addition to (never a replacement for) the unrestricted harness reference.
     readonly runtime: HarnessToolRuntime;
+    // THE knowledge base this harness writes through (T7) — always present, never `undefined`.
+    //
+    // WHAT IT IS. The object the host handed `HarnessConfiguration.knowledge`, passed through
+    // by reference (no wrapper, so identity is the proof of sharing: two sessions of one
+    // server hold the SAME store, and one session's article is the other's to read). With no
+    // configuration it is the engine `harness()` built for itself — see
+    // `HarnessConfiguration.knowledge` for the two accepted forms and for why presence of
+    // `flush` is the durability signal.
+    //
+    // WHO USES IT. The `knowledge` tool through `context.harness.knowledge` (a lane WORKER
+    // replica gets its own until a per-worker store is plumbed — a live object cannot cross
+    // `worker_threads`, the same rule `pluginSettings`/`toolSettings` document), and any host
+    // or wrapper tool that wants the base behind it: a future `recipes` tool composes over
+    // this engine exactly as `tasks` composes over the record engine
+    // (`Harness.runtime.executeRecords`), rather than inventing its own store.
+    //
+    // IT IS READ-ONLY AND IT IS NOT SESSION STATE. The member is a getter, so nothing can be
+    // assigned through the handle; `reset()`, `snapshot()` and `restore()` deliberately leave
+    // it alone, and a session deletion never touches the store's directory.
+    readonly knowledge: HarnessKnowledge;
     // Execute one registered tool by name, outside the model's discovery gate
     // (R8). This is the server/host path for an EXPLICIT user action — the CLI or
     // the UI's Tools tab — and it runs the SAME session-bound implementation the
@@ -4478,7 +5109,7 @@ export type Harness = {
     // unable to call it. Reserved policy is NOT bypassed: `toolCreate` here goes
     // through the same validated registration path (budget, name rules,
     // collisions, compilation), and `delegate` still requires a harness that
-    // actually registered it (no subagents means no delegate tool).
+    // actually registered it (no lower-ranked peer means no delegate tool).
     //
     // Throws HarnessError when the name is not registered in this harness, or
     // whatever the implementation throws; unlike the model path there is no
@@ -4902,27 +5533,31 @@ export type Harness = {
     // refuse and the host owns the commit.
     //
     //   - `addAgent(name, configuration, options?)` — build and register a NEW brain
-    //     under `name`, give it its default `agent:<name>` conversation, and (unless
-    //     `options.delegate === false`) put it in the primary's delegation allowlist,
-    //     which also installs the `delegate` tool the first time the roster gains a
-    //     subagent and re-projects its allowlist schema. Throws for a blank/unknown name
-    //     shape, a name that is already registered, or a configuration with no model.
+    //     under `name`, give it its default `agent:<name>` conversation, and give it a
+    //     RANK: `options.rank` when supplied (validated exactly like a configured rank),
+    //     otherwise the documented default of one rank below the lowest explicitly
+    //     configured rank. A rank strictly below at least one existing agent makes it a
+    //     delegate target, which also installs the `delegate` tool the first time the
+    //     roster gains a delegable pair; `options.delegate === false` keeps the agent
+    //     reachable (threads, `ctx.run`) without making it a delegation target. Throws
+    //     for a blank/unknown name shape, a name that is already registered, a
+    //     configuration with no model, or an `options.rank` that is not a rank letter.
     addAgent: (
         name: string,
         configuration: AgentConfiguration,
-        options?: { delegate?: boolean }
+        options?: { delegate?: boolean; rank?: AgentRank }
     ) => Agent;
-    //   - `removeAgent(name)` — detach one registry agent: it leaves `agents`,
-    //     `subagents`, and the delegation allowlist, and its DEFAULT conversation is
+    //   - `removeAgent(name)` — detach one registry agent: it leaves `agents` and
+    //     `ranks`, and its DEFAULT conversation is
     //     dropped with it (a host thread owned by that agent is not). Throws for an
-    //     unknown agent, for the primary (the entry point is not removable — that is a
+    //     unknown agent, for the entry agent (the entry point is not removable — that is a
     //     redefinition, not a binding change), while its default conversation has
     //     live or queued work, and while it still OWNS a host thread — the host deletes
     //     those conversations first, which is exactly the guard the server's session route
     //     states as a 409 before calling this (./server/sessions.ts `removeSessionAgent`,
     //     R6: a saved session's history is never removed behind the caller's back).
     //     Committed history in OTHER agents is never rewritten: a
-    //     delegated answer already copied into the primary's transcript stays.
+    //     delegated answer already copied into the caller's transcript stays.
     removeAgent: (name: string) => void;
     //   - `setAgentInstruction(name, instruction)` — replace the agent's leading system
     //     block IN PLACE with one system message, and reseed its `instructions` baseline

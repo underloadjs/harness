@@ -77,8 +77,11 @@ const answerFixture = (): Fixture => {
             title: 'probe',
             description: 'probe scripted preset',
             requiresEndpoint: false,
-            primary: 'probe',
-            subagents: [],
+            // A ONE-member card: the rank map covers the single member, which is also the entry
+            // (routing). One distinct rank means no strictly-lower target, so no `delegate` row —
+            // exactly what the retired `subagents: []` stated (R15).
+            entry: 'probe',
+            ranks: { probe: 'A' },
             agents: ['probe'],
             tools: [],
             builtin: true,
@@ -104,7 +107,7 @@ const answerFixture = (): Fixture => {
                             }
                         })
                     },
-                    primary: 'probe',
+                    entry: 'probe',
                     presets: false,
                     report: { progress }
                 })

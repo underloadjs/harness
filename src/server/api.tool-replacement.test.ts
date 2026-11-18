@@ -69,8 +69,11 @@ const createReplaceablePreset = (captured: Harness[]): HarnessPreset => ({
     title: 'Replaceable test harness',
     description: 'Test-only preset that exposes its live harness for registry checks.',
     requiresEndpoint: true,
-    primary: 'instruct',
-    subagents: [],
+    // A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: 'instruct',
+    ranks: { instruct: 'A' },
     agents: ['instruct'],
     tools: ['timeNow'],
     builtin: false,
@@ -78,9 +81,11 @@ const createReplaceablePreset = (captured: Harness[]): HarnessPreset => ({
     create: (settings, progress, report) => {
         const live = createToolboxHarness(
             {
+                // R1/R6 — the toolbox config takes the rank PAIR now. One member at one rank states
+                // outright that this harness delegates nothing, so no `delegate` row is registered.
                 agents: agentsFromProfiles(['instruct'], settings),
-                primary: 'instruct',
-                subagents: []
+                entry: 'instruct',
+                ranks: { instruct: 'A' }
             },
             settings,
             progress,

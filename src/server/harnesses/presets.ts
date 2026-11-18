@@ -10,12 +10,13 @@
 //   are built from TRUSTED agent profiles in src/agents through `createProfiledHarness`
 //   (./toolbox.ts), and the first SEVEN register the SAME toolbox: package coding tools, the app
 //   tools, environment-backed search, and the harness core tools. Only the agents differ: names,
-//   instructions, guidelines, primary, and subagents. The eighth, `chat`, is the ONE declared
-//   exception on the toolbox axis (./toolbox.ts `sharedToolbox: false`): it
-//   registers no catalogue tool at all, which is exactly why it exists — a client that wants a
-//   session that never touches the server host had no card to pick. These eight are `presets`, the
-//   default catalogue every registry and every `GET /harnesses` listing starts from — and they are
-//   the WHOLE catalogue. There is no second tier.
+//   instructions, guidelines, the ENTRY agent (routing) and the RANK MAP (authority). The
+//   eighth, `chat`, is the ONE declared exception on the toolbox axis (./toolbox.ts
+//   `sharedToolbox: false`): it registers no catalogue tool at all, which is exactly why it
+//   exists — a client that wants a session that never touches the server host had no card to
+//   pick. These eight are `presets`, the default catalogue every registry and every
+//   `GET /harnesses` listing starts from — and they are the WHOLE catalogue. There is no
+//   second tier.
 //
 //   THE FIXTURES ARE GONE. `demo` (a scripted offline run with timeNow only) and
 //   `flaky` (the recoverable-failure example with `testFlaky`) used to ship as
@@ -37,8 +38,10 @@
 //
 // THE SEVEN REAL ROLES, PLUS THE TOOL-LESS CARD
 // ---------------------------------------------
-//   general   — DEFAULT. Does the whole task alone; `subagents: []`, so `delegate` is
-//               never even registered for it (src/harness.ts `activation: 'subagents'`).
+//   general   — DEFAULT. Does the whole task alone; its rank map holds ONE rank, so
+//               `delegate` is never even registered for it (./toolbox.ts
+//               `ranksDeclareDelegation` needs two distinct ranks to have someone to
+//               hand work to).
 //   instruct  — a worker that delegates ONLY the steps that would burn its context
 //               (research, a long read, a review) and keeps every step it must build.
 //   research  — read-only investigator (visible title "Explore").
@@ -46,24 +49,34 @@
 //   reviewer  — strict independent judge of plans, code, documents, and claims.
 //   planner   — the orchestrator (visible title "Manager"): delegates every step and
 //               independently reviews each result before accepting it.
-//   debugger  — stress-tests the whole system; widest allowlist, nothing off-limits.
+//   debugger  — stress-tests the whole system; widest roster, nothing off-limits.
 //   chat      — NOT a role: the same trusted `general` profile with NO toolbox and ONE model
 //               call (issue 0005-D). It is last in the catalogue because it is not a team and
 //               never joins one; see the note above the card.
 //
-// HOW A TEAM IS DERIVED, AND THE ONE EXCEPTION. `teamOf()` builds every live preset's
-// allowlist from ONE list, so the presets cannot drift. Two ids are excluded: the primary
-// (a harness has exactly one primary and the registry rejects a subagent that names it) and
+// HOW A TEAM IS STATED, AND THE ONE EXCEPTION
+// -------------------------------------------
+// Every delegating card states its ROSTER and its RANK MAP explicitly, side by side, in
+// the order the runtime reads them. `teamOf(primary)` is deleted: it derived an allowlist
+// from a single "primary" concept that no longer exists, and it hid two decisions the rank
+// model makes visible — who runs at all, and who may hand work to whom. Two names are
+// still left out of every shipped team but their own: the card's own entry agent (a
+// member is listed once, and its rank is what says whether it can delegate), and
 // `planner`/Manager, because a Manager refuses to run as a delegate (src/agents/planner.ts
-// states the refusal) — offering a member that answers "I do not run as a subagent" is a
+// states the refusal) — offering a member that answers "I do not run as a delegate" is a
 // wasted run. A USER-created team may still select the Manager; the refusal is what makes
-// that honest. `summarizer` stays everywhere so the `textSummarize` delegated path keeps
-// working (it condenses locally when absent). `chat` is not in that derivation at all: it
-// declares no team, so `teamOf` is never called for it and it is never a member of one.
+// that honest. `summarizer` stays in every team so the `textSummarize` delegated path keeps
+// working (it condenses locally when absent). `chat` declares no team at all and is never a
+// member of one.
 //
-// The one-level delegation rule is a harness property (a subagent never receives delegate,
-// src/harness.ts `primaryOnlyDefinitions`), so none of these prompts may ask a subagent to
-// delegate again.
+// DELEGATION IS RANK-GATED AND STRICTLY DOWNWARD (../types/index.ts `isLowerRank`), and
+// THAT is the whole depth rule: these cards ship TWO distinct ranks — the entry agent at
+// Rank A, its team at Rank B — so a Rank B member has no strictly-lower target and cannot
+// delegate onward. The one-level behaviour of the shipped cards therefore FALLS OUT of the
+// rank map instead of being a property the runtime enforces by role, and a host that ranks
+// a roster A/B/C gets a chain two levels deep with no other change. Threading is NOT
+// delegation and is never rank-gated: a Rank B agent can fork, spawn threads and keep
+// every tool a Rank A agent has.
 //
 // EDITABLE TEMPLATES (R20.1)
 // --------------------------
@@ -83,8 +96,8 @@
 // -----------------------------------------
 // The words a model is seeded with are trusted catalogue data (AgentProfile), so a
 // harness definition and a user-created harness build an agent from the same
-// profile. This file only maps a harness onto agent ids: `agents` order is
-// [primary, ...subagents].
+// profile. This file only maps a harness onto agent ids and ranks: `agents` order is
+// [entry, ...the rest of the roster], and `ranks` states what each of them may do.
 //
 // The preset name is the harness's name and, by convention, its entry agent's
 // name. The server's registry keys by preset name; the agent registry key inside
@@ -98,7 +111,7 @@
 // "Analyst"/"Explore"/"Manager" are TITLES, not names): the harness and agent ids stay
 // `workspace`, `research` and `planner`, and a new reserved name could collide with an
 // existing user-created harness on restore. The harness ids themselves are unchanged by
-// the roster change — only titles, descriptions and subagent allowlists moved, so a
+// the roster change — only titles, descriptions and rosters moved, so a
 // saved session keeps restoring. Renaming an AGENT id is a different matter entirely: an
 // id is persisted in every record and there is no agent-level alias, so it is not done
 // here (see the matching note in ../../agents/index.ts).
@@ -108,11 +121,13 @@
 //
 // Cross-references:
 //   - ../src/agents     — AgentProfile registry (instruction + guidelines)
-//   - ./toolbox.ts      — createProfiledHarness / createToolboxHarness
-//   - ./types.ts        — HarnessPreset metadata (primary/subagents/tools/builtin)
+//   - ./toolbox.ts      — createProfiledHarness / createToolboxHarness / ranksDeclareDelegation
+//   - ./types.ts        — HarnessPreset metadata (entry/ranks/agents/tools/builtin)
+//   - ../types/index.ts — AgentRank / AGENT_RANKS / isLowerRank (the rank vocabulary itself)
 //   - ./registry.ts     — restore policy, aliases, validation
-//   - ../api.ts  — descriptors resolved from this metadata
+//   - ../api.ts         — descriptors resolved from this metadata
 
+import type { AgentRank } from '../../types';
 import type { HarnessPreset } from './types';
 import { PRESET_MAX_ITERATIONS, SHARED_TOOL_NAMES, createProfiledHarness } from './toolbox';
 
@@ -120,9 +135,10 @@ import { PRESET_MAX_ITERATIONS, SHARED_TOOL_NAMES, createProfiledHarness } from 
 // (the CLI and server tests did); the value now lives with the shared factory.
 export { PRESET_MAX_ITERATIONS };
 
-// The real roles, in catalogue/descriptor order, DEFAULT FIRST. This is the ONE list
-// the teams and the delegate enums are derived from: adding a role here adds it to every
-// built-in team (except where `teamOf` excludes it) with no other edit here.
+// The real roles, in catalogue/descriptor order, DEFAULT FIRST. This is the list a
+// roster is drawn FROM; each card then states its own roster and rank map explicitly,
+// so adding a role here does not silently join every built-in team — the cards decide
+// that, and a new role has to be added where the team is stated.
 export const SPECIALIST_AGENT_NAMES = [
     'general',
     'instruct',
@@ -133,196 +149,254 @@ export const SPECIALIST_AGENT_NAMES = [
     'debugger'
 ] as const;
 
-// `summarizer` stays a subagent everywhere so the `textSummarize` delegated path
+// `summarizer` stays in every built-in team so the `textSummarize` delegated path
 // keeps working in the real presets (it condenses locally when absent).
 const SUMMARIZER_AGENT_NAME = 'summarizer';
 
-// The Manager id, named here because it is excluded from every built-in team.
-// A Manager refuses to run as a delegate (../../agents/planner.ts states the rule), so
-// offering it as a target would only burn a child run. The refusal still applies to a
-// user-created team that selects it — this exclusion just keeps the shipped teams honest.
+// The Manager id. It is an ORDINARY agent name — the rank model has no special
+// manager role, the Manager simply holds Rank A on its own card — and it is named
+// here for the one rule it still carries: it refuses to run as a delegate
+// (../../agents/planner.ts states the rule), so it is left out of every OTHER
+// card's roster. The refusal still applies to a user-created team that selects it —
+// this exclusion just keeps the shipped teams honest.
 const MANAGER_AGENT_NAME = 'planner';
 
-// The subagent allowlist for one primary: every OTHER real role except the Manager, then
-// the summarizer. The primary is excluded because a harness has exactly one primary and the
-// registry rejects a subagent that names it.
-//
-// The `general` role is a legal target for the other primaries (it takes a whole
-// self-contained job), but its OWN preset passes `subagents: []` rather than this list, so
-// it never receives `delegate` at all — that is the contract of the default card, and the
-// runtime enforces it by not registering the tool (src/harness.ts `activation: 'subagents'`).
-export const teamOf = (primary: string): string[] => [
-    ...SPECIALIST_AGENT_NAMES.filter((name) => name !== primary && name !== MANAGER_AGENT_NAME),
-    SUMMARIZER_AGENT_NAME
-];
+// The Rank letters these cards use, named once so a rank map reads as a decision
+// rather than a letter: `ENTRY_RANK` is the card's own agent, `TEAM_RANK` everyone it
+// may hand work to. A card with a single member states only ENTRY_RANK, and that is
+// what keeps `delegate` off its tool list (./toolbox.ts `ranksDeclareDelegation`).
+const ENTRY_RANK: AgentRank = 'A';
+const TEAM_RANK: AgentRank = 'B';
 
 // ---------------------------------------------------------------------------
 // Live harnesses: same toolbox, different selected agents
 // ---------------------------------------------------------------------------
 
-// General: THE DEFAULT CARD, and the only live preset with no team. `subagents: []` is a
-// deliberate, load-bearing choice rather than an omission: `delegate` registers only when
-// the allowlist is non-empty (src/harness.ts `activation: 'subagents'`), so this harness
-// never declares the tool and `toolRequest` cannot surface it. The agent therefore cannot
-// split work out even by accident, which is exactly the contract of the default role.
-// Its `environmentTools` line is the same reasoning as every other live preset below: the
-// shared factory opts into `websearch` AND `webfetch`, `search` appears only when a key
-// resolves, and `fetch` registers either way because its native provider needs no key.
+// General: THE DEFAULT CARD, and the only live preset with no team. A one-member
+// roster and a one-rank map are a deliberate, load-bearing choice rather than an
+// omission: `delegate` registers only when the rank map holds two or more DISTINCT
+// ranks (./toolbox.ts `ranksDeclareDelegation`), so this harness never declares the
+// tool and `toolRequest` cannot surface it. The agent therefore cannot split work
+// out even by accident, which is exactly the contract of the default role — and,
+// unlike the old allowlist rule, the reason is stated in the data rather than
+// inferred from an empty array. Its `environmentTools` line is the same reasoning as
+// every other live preset below: the shared factory opts into `websearch` AND
+// `webfetch`, `search` appears only when a key resolves, and `fetch` registers either
+// way because its native provider needs no key.
 const general: HarnessPreset = {
     name: 'general',
     title: 'General',
     description:
-        'The default general-purpose agent, with the full shared toolbox and NO subagents: it does every step itself, so `delegate` is not registered and cannot be enabled. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes.',
+        'The default general-purpose agent, with the full shared toolbox and NO delegates: it does every step itself, so `delegate` is not registered and cannot be enabled. File read/write/edit/glob and a configured search are always available; call toolRequest for files, commands, diffs, syntax checks, time, text, or notes.',
     requiresEndpoint: true,
-    primary: 'general',
-    // Empty on purpose — see the note above. `teamOf('general')` is what a delegating
-    // variant would use; this card must not.
-    subagents: [],
+    // The routing agent, stated explicitly (never inferred here, even though it is
+    // also roster[0]).
+    entry: 'general',
+    // ONE rank, therefore no delegation surface at all — see the note above.
+    ranks: { general: ENTRY_RANK },
     agents: ['general'],
     tools: SHARED_TOOL_NAMES,
     environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
-    create: createProfiledHarness('general', [])
+    create: createProfiledHarness('general', ['general'], { general: ENTRY_RANK })
 };
 
 // Instruct: the worker posture between General and the Manager. Same toolbox; the profile
 // decides WHO does each step — it keeps anything it would have to write or run afterwards
 // and delegates only context-burning reading (an investigation, a long document, a review).
-const instructTeam = teamOf('instruct');
+// Its roster is every other real role except the Manager (which refuses to be a delegate),
+// with Instruct ranked above all of them.
+const instructRoster = ['instruct', 'general', 'research', 'workspace', 'reviewer', 'debugger', SUMMARIZER_AGENT_NAME];
+const instructRanks: Record<string, AgentRank> = {
+    instruct: ENTRY_RANK,
+    general: TEAM_RANK,
+    research: TEAM_RANK,
+    workspace: TEAM_RANK,
+    reviewer: TEAM_RANK,
+    debugger: TEAM_RANK,
+    summarizer: TEAM_RANK
+};
 
 const instruct: HarnessPreset = {
     name: 'instruct',
     title: 'Instruct',
     description:
-        'General worker with the full shared toolbox and the other roles as direct subagents. It does its own building and editing, and delegates only the steps that would burn its context: research, exploration, a long read, a review. Unlike the Manager, it never hands out work it must still finish itself.',
+        'General worker with the full shared toolbox and the other roles as its Rank B delegates. It does its own building and editing, and delegates only the steps that would burn its context: research, exploration, a long read, a review. Unlike the Manager, it never hands out work it must still finish itself.',
     requiresEndpoint: true,
-    primary: 'instruct',
-    subagents: instructTeam,
-    agents: ['instruct', ...instructTeam],
+    entry: 'instruct',
+    ranks: instructRanks,
+    agents: instructRoster,
     tools: SHARED_TOOL_NAMES,
     environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
-    create: createProfiledHarness('instruct', instructTeam)
+    create: createProfiledHarness('instruct', instructRoster, instructRanks)
 };
 
 // Research (visible title "Explore"): the read-only investigator. Same toolbox as every
 // live harness — nothing can deny it `write`/`edit`, so the read-only contract lives in the
-// profile. Its team is the ordinary one so a standalone Explore card can still ask the
+// profile. Its roster is the ordinary one so a standalone Explore card can still ask the
 // Analyst to run something or the Reviewer to challenge a conclusion.
-const researchTeam = teamOf('research');
+const researchRoster = ['research', 'general', 'instruct', 'workspace', 'reviewer', 'debugger', SUMMARIZER_AGENT_NAME];
+const researchRanks: Record<string, AgentRank> = {
+    research: ENTRY_RANK,
+    general: TEAM_RANK,
+    instruct: TEAM_RANK,
+    workspace: TEAM_RANK,
+    reviewer: TEAM_RANK,
+    debugger: TEAM_RANK,
+    summarizer: TEAM_RANK
+};
 
 const research: HarnessPreset = {
     name: 'research',
     title: 'Explore',
     description:
-        'Read-only investigator with the same full toolbox as every live harness and the other roles as direct subagents. Maps files, symbols, configuration and the web, cross-checks what decides the answer, and cites file, line, tool, or URL. Changes nothing on disk unless the brief authorises a change.',
+        'Read-only investigator with the same full toolbox as every live harness and the other roles as its Rank B delegates. Maps files, symbols, configuration and the web, cross-checks what decides the answer, and cites file, line, tool, or URL. Changes nothing on disk unless the brief authorises a change.',
     requiresEndpoint: true,
-    primary: 'research',
-    subagents: researchTeam,
-    agents: ['research', ...researchTeam],
+    entry: 'research',
+    ranks: researchRanks,
+    agents: researchRoster,
     tools: SHARED_TOOL_NAMES,
     environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
-    create: createProfiledHarness('research', researchTeam)
+    create: createProfiledHarness('research', researchRoster, researchRanks)
 };
 
 // Workspace (visible title "Analyst"): the implementor. The id stays `workspace` for every
 // saved session, bookmark and script; only the title moved. Same toolbox as every live
 // harness — the profile is what makes it an engineering role, which is exactly the product
 // rule ("the only difference is the agents configuration").
-const workspaceTeam = teamOf('workspace');
+const workspaceRoster = ['workspace', 'general', 'instruct', 'research', 'reviewer', 'debugger', SUMMARIZER_AGENT_NAME];
+const workspaceRanks: Record<string, AgentRank> = {
+    workspace: ENTRY_RANK,
+    general: TEAM_RANK,
+    instruct: TEAM_RANK,
+    research: TEAM_RANK,
+    reviewer: TEAM_RANK,
+    debugger: TEAM_RANK,
+    summarizer: TEAM_RANK
+};
 
 const workspace: HarnessPreset = {
     name: 'workspace',
     title: 'Analyst',
     description:
-        'The implementor, with the full shared toolbox and the other roles as direct subagents: file read/write/edit/glob are always available, and files, syntax checks, diffs, and commands are discovered by tag. Writes the change in the existing style of the codebase, keeps it minimal and efficient, and verifies it with a real check.',
+        'The implementor, with the full shared toolbox and the other roles as its Rank B delegates: file read/write/edit/glob are always available, and files, syntax checks, diffs, and commands are discovered by tag. Writes the change in the existing style of the codebase, keeps it minimal and efficient, and verifies it with a real check.',
     requiresEndpoint: true,
-    primary: 'workspace',
-    subagents: workspaceTeam,
-    agents: ['workspace', ...workspaceTeam],
+    entry: 'workspace',
+    ranks: workspaceRanks,
+    agents: workspaceRoster,
     tools: SHARED_TOOL_NAMES,
     environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
-    create: createProfiledHarness('workspace', workspaceTeam)
+    create: createProfiledHarness('workspace', workspaceRoster, workspaceRanks)
 };
 
-// Reviewer: a strict pass over a change, a plan, a document, or a claim. Its team is the
+// Reviewer: a strict pass over a change, a plan, a document, or a claim. Its roster is the
 // ordinary one, so it can ask the Analyst to verify a code path or Explore to confirm a
 // fact, but its own default is read-only — the Manager depends on that when it sends work
 // here for an independent check.
-const reviewerTeam = teamOf('reviewer');
+const reviewerRoster = ['reviewer', 'general', 'instruct', 'research', 'workspace', 'debugger', SUMMARIZER_AGENT_NAME];
+const reviewerRanks: Record<string, AgentRank> = {
+    reviewer: ENTRY_RANK,
+    general: TEAM_RANK,
+    instruct: TEAM_RANK,
+    research: TEAM_RANK,
+    workspace: TEAM_RANK,
+    debugger: TEAM_RANK,
+    summarizer: TEAM_RANK
+};
 
 const reviewer: HarnessPreset = {
     name: 'reviewer',
     title: 'Reviewer',
     description:
-        'Strict, independent reviewer with the full shared toolbox and the other roles as direct subagents. Judges plans, code, documents, and claims against their own acceptance criteria, reports each finding with file/line or quote evidence plus the smallest fix, and says plainly when there is nothing to find. Reads and verifies by default; edits only when asked.',
+        'Strict, independent reviewer with the full shared toolbox and the other roles as its Rank B delegates. Judges plans, code, documents, and claims against their own acceptance criteria, reports each finding with file/line or quote evidence plus the smallest fix, and says plainly when there is nothing to find. Reads and verifies by default; edits only when asked.',
     requiresEndpoint: true,
-    primary: 'reviewer',
-    subagents: reviewerTeam,
-    agents: ['reviewer', ...reviewerTeam],
+    entry: 'reviewer',
+    ranks: reviewerRanks,
+    agents: reviewerRoster,
     tools: SHARED_TOOL_NAMES,
     environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
-    create: createProfiledHarness('reviewer', reviewerTeam)
+    create: createProfiledHarness('reviewer', reviewerRoster, reviewerRanks)
 };
 
 // Planner (visible title "Manager"): the orchestrator, the preset that exists FOR
-// delegation. Its team deliberately contains every other role by id (the Manager itself is
-// excluded from every OTHER team, because it refuses to be a delegate), so `delegate`
+// delegation. Its roster deliberately contains every other role by id (the Manager itself
+// is excluded from every OTHER card, because it refuses to be a delegate), so `delegate`
 // targets really exist — and it accepts no step on its author's word without a reviewer's
-// independent check.
-const plannerTeam = teamOf('planner');
+// independent check. Rank A here is what gives it the whole card; nothing about being the
+// entry agent is what makes it delegate.
+const plannerRoster = ['planner', 'general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', SUMMARIZER_AGENT_NAME];
+const plannerRanks: Record<string, AgentRank> = {
+    planner: ENTRY_RANK,
+    general: TEAM_RANK,
+    instruct: TEAM_RANK,
+    research: TEAM_RANK,
+    workspace: TEAM_RANK,
+    reviewer: TEAM_RANK,
+    debugger: TEAM_RANK,
+    summarizer: TEAM_RANK
+};
 
 const planner: HarnessPreset = {
     name: 'planner',
     title: 'Manager',
     description:
-        'Planning and orchestration lead with the full shared toolbox and every other role as a direct subagent. Holds the whole goal, writes an explicit plan, delegates every step (research, workspace, reviewer, debugger, general, instruct), and accepts each result only after an independent review. It never executes a step itself, and refuses to run as a delegate.',
+        'Planning and orchestration lead with the full shared toolbox, Rank A itself and every other role as its Rank B delegates. Holds the whole goal, writes an explicit plan, delegates every step (research, workspace, reviewer, debugger, general, instruct), and accepts each result only after an independent review. It never executes a step itself, and refuses to run as a delegate.',
     requiresEndpoint: true,
-    primary: 'planner',
-    subagents: plannerTeam,
-    agents: ['planner', ...plannerTeam],
+    entry: MANAGER_AGENT_NAME,
+    ranks: plannerRanks,
+    agents: plannerRoster,
     tools: SHARED_TOOL_NAMES,
     environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
-    create: createProfiledHarness('planner', plannerTeam)
+    create: createProfiledHarness(MANAGER_AGENT_NAME, plannerRoster, plannerRanks)
 };
 
 // Debugger: the stress-test harness. Same toolbox as every live preset (no profile can add
-// a tool), so "access to everything" is expressed as the widest TEAM plus a profile that
+// a tool), so "access to everything" is expressed as the widest ROSTER plus a profile that
 // tells it nothing is off-limits — it is expected to unlock the searchable half itself and
 // to drive the system into a failure rather than route around one.
-const debuggerTeam = teamOf('debugger');
+const debuggerRoster = ['debugger', 'general', 'instruct', 'research', 'workspace', 'reviewer', SUMMARIZER_AGENT_NAME];
+const debuggerRanks: Record<string, AgentRank> = {
+    debugger: ENTRY_RANK,
+    general: TEAM_RANK,
+    instruct: TEAM_RANK,
+    research: TEAM_RANK,
+    workspace: TEAM_RANK,
+    reviewer: TEAM_RANK,
+    summarizer: TEAM_RANK
+};
 
 const debuggerPreset: HarnessPreset = {
     name: 'debugger',
     title: 'Debugger',
     description:
-        'Stress-test harness with the full shared toolbox and every other role as a direct subagent. Nothing is off-limits: it enables any searchable tool, runs any command, exercises each capability at its edges, reproduces what breaks, and reports the exact input and error.',
+        'Stress-test harness with the full shared toolbox, Rank A itself and every other role as its Rank B delegates. Nothing is off-limits: it enables any searchable tool, runs any command, exercises each capability at its edges, reproduces what breaks, and reports the exact input and error.',
     requiresEndpoint: true,
-    primary: 'debugger',
-    subagents: debuggerTeam,
-    agents: ['debugger', ...debuggerTeam],
+    entry: 'debugger',
+    ranks: debuggerRanks,
+    agents: debuggerRoster,
     tools: SHARED_TOOL_NAMES,
     environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
-    create: createProfiledHarness('debugger', debuggerTeam)
+    create: createProfiledHarness('debugger', debuggerRoster, debuggerRanks)
 };
 
 // Chat: THE TOOL-LESS CARD (issue 0005-D). Every other card here answers "what can an agent do with
@@ -337,14 +411,14 @@ const debuggerPreset: HarnessPreset = {
 //     spend a tool round reading or writing the SERVER HOST's filesystem. That is the gap this card
 //     exists to close — before it, a client had no way to select an empty toolbox, because every
 //     shipped card declared `SHARED_TOOL_NAMES`.
-//   - `subagents: []`: `delegate` is not even registered (src/harness.ts `activation: 'subagents'`),
+//   - a ONE-RANK roster: `delegate` is not even registered (./toolbox.ts `ranksDeclareDelegation`),
 //     so there is no delegation and no child conversation.
 //   - `maxIterations` is NOT set here: the tool-loop budget is an optional safeguard and no
 //     shipped card carries one, so this card answers when the model answers, however many
 //     rounds that takes. A tool round it does take can only ever hit a harness-owned core row
 //     — `sharedToolbox: false` registered nothing else.
 //
-// WHY `general` IS THE PRIMARY. "The preset name is also the entry agent's name" is a convention, not
+// WHY `general` IS THE ENTRY AGENT. "The preset name is also the entry agent's name" is a convention, not
 // a rule (the deleted `demo`/`flaky` fixtures ran `general` the same way), and `general` is the one
 // TRUSTED profile whose own guidelines already state this card's contract — it works alone, and it is
 // told not to spawn a branch with `threadFork` or hand a step over with `threadSend`
@@ -359,10 +433,10 @@ const debuggerPreset: HarnessPreset = {
 // for `toolRequest` to surface here.
 //
 // WHAT AN EXECUTABLE PATCH DOES. The registry rebuilds a 'live' template through
-// `createProfiledHarness(primary, subagents, …)` (./registry.ts), which passes no toolbox argument, so
-// PATCHing this card's TEAM gives the shared toolbox back. That is deliberate: the tool-less posture is
-// a property of the shipped TEMPLATE, not a durable field — `HarnessPresetRecord` carries no tool
-// column, and widening the durable schema is out of scope for this issue. A metadata-only patch
+// `createProfiledHarness(entry, roster, ranks, …)` (./registry.ts), which passes no toolbox argument, so
+// PATCHing this card's TEAM or RANKS gives the shared toolbox back. That is deliberate: the tool-less
+// posture is a property of the shipped TEMPLATE, not a durable field — `HarnessPresetRecord` carries no
+// tool column, and widening the durable schema is out of scope for this issue. A metadata-only patch
 // (title/description) keeps this factory exactly like every other template.
 const chat: HarnessPreset = {
     name: 'chat',
@@ -371,9 +445,9 @@ const chat: HarnessPreset = {
         'A single answer with no toolbox: the General profile on an empty catalogue (no file, search, delegation, or record tool is registered), so it cannot read or write the server host — the only tools it can ever call are the harness-owned core rows. It carries no iteration budget, so it keeps going until the model answers.',
     requiresEndpoint: true,
     // The trusted profile it runs — see the note above for why this is `general` and not a new id.
-    primary: 'general',
-    // Empty on purpose, exactly like the default card: no team, therefore no `delegate` row.
-    subagents: [],
+    entry: 'general',
+    // One rank, exactly like the default card: no team, therefore no `delegate` row.
+    ranks: { general: ENTRY_RANK },
     agents: ['general'],
     // THE load-bearing line. The descriptor projects this list (plus any environment row the host can
     // run), and `sharedToolbox: false` below is what makes the empty promise true in the runtime rather
@@ -384,7 +458,9 @@ const chat: HarnessPreset = {
     builtin: true,
     editable: true,
     template: 'live',
-    create: createProfiledHarness('general', [], {}, {}, {}, {}, { sharedToolbox: false })
+    create: createProfiledHarness('general', ['general'], { general: ENTRY_RANK }, {}, {}, {}, {}, {
+        sharedToolbox: false
+    })
 };
 
 // ---------------------------------------------------------------------------
@@ -445,12 +521,24 @@ export const presets: readonly HarnessPreset[] = [
 // fail. Recording the T3 shape instead would have traded one refresh path for the other
 // rather than keeping both; a future migration that wants both should widen this type to a
 // list of accepted historical shapes rather than replacing an entry.
+//
+// THE RANK PASS RESTATES THIS TABLE IN THE CURRENT VOCABULARY (`entry` + `ranks`), it
+// does not translate it at read time. That is deliberate and it is a CLEAN BREAK:
+// ./persistence.ts refuses a stored row that still carries the old `primary`/
+// `subagents` keys with an error naming the new shape, so a pre-rank document never
+// reaches this comparison at all. What the table can still match is a row written in
+// the rank vocabulary whose roster and rank assignment were never customised — which is
+// exactly the case the refresh policy is about.
 export type LegacyPresetDefinition = {
     title: string;
     description: string;
     requiresEndpoint: boolean;
-    primary: string;
-    subagents: readonly string[];
+    // The routing agent of that shipped shape (what `primary` used to name).
+    entry: string;
+    // The authority map of that shipped shape: the entry agent ranked above whoever
+    // the card could hand work to. An empty roster had one rank; that is the same
+    // statement the old `subagents: []` made, made directly.
+    ranks: Readonly<Record<string, AgentRank>>;
     agents: readonly string[];
     tools: readonly string[];
     environmentTools?: readonly string[];
@@ -463,8 +551,8 @@ export const LEGACY_PRESET_DEFINITIONS: Readonly<Record<string, LegacyPresetDefi
         description:
             'A general instruction-following agent with the full shared toolbox. File read/write/edit/glob and a configured search are always available; call toolRequest with capability tags for files, commands, diffs, syntax checks, time, text, or notes. The live presets differ only in their agents, not their tools.',
         requiresEndpoint: true,
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         agents: ['instruct'],
         tools: SHARED_TOOL_NAMES,
         environmentTools: ['search'],
@@ -473,10 +561,10 @@ export const LEGACY_PRESET_DEFINITIONS: Readonly<Record<string, LegacyPresetDefi
     research: {
         title: 'Research',
         description:
-            'A research agent with the same full toolbox as every live harness, plus a summarizer subagent. read and glob are always available; `primary` and `subagents` are explicit: the research agent is the entry point and the only agent that may delegate, and delegation is one level deep. Web search is core and joins the toolbox when the host configured a search key.',
+            'A research agent with the same full toolbox as every live harness, plus a summarizer delegate. read and glob are always available; `entry` and `ranks` are explicit: the research agent is the entry point and holds Rank A, the summarizer holds Rank B, and delegation runs strictly downward, so only a higher-ranked agent may hand work to a lower-ranked one. Web search is core and joins the toolbox when the host configured a search key.',
         requiresEndpoint: true,
-        primary: 'research',
-        subagents: ['summarizer'],
+        entry: 'research',
+        ranks: { research: 'A', summarizer: 'B' },
         agents: ['research', 'summarizer'],
         tools: SHARED_TOOL_NAMES,
         environmentTools: ['search'],
@@ -487,8 +575,8 @@ export const LEGACY_PRESET_DEFINITIONS: Readonly<Record<string, LegacyPresetDefi
         description:
             'A coding agent with the full shared toolbox: file read/write/edit/glob are always available, and files, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. It has the same registered tools as every live harness and differs only in its agent profile and routing. Everything runs on the server host.',
         requiresEndpoint: true,
-        primary: 'workspace',
-        subagents: [],
+        entry: 'workspace',
+        ranks: { workspace: 'A' },
         agents: ['workspace'],
         tools: SHARED_TOOL_NAMES,
         environmentTools: ['search'],

@@ -610,8 +610,8 @@ describe('invocation thread entries', () => {
                 outcome: 'outcome · same outcome'
             }
         ]);
-        expect(live.summary()).toEqual({ agents: 2, tools: 1, primary: 'writer' });
-        expect(replay.summary()).toEqual({ agents: 2, tools: 1, primary: 'writer' });
+        expect(live.summary()).toEqual({ agents: 2, tools: 1, rootAgent: 'writer' });
+        expect(replay.summary()).toEqual({ agents: 2, tools: 1, rootAgent: 'writer' });
     });
 
     it('merges an authoritative record without duplicating or orphaning entries', () => {
@@ -870,7 +870,7 @@ describe('invocation thread entries', () => {
                         branchId: 'b1',
                         agent: 'writer',
                         kind: 'fork',
-                        role: 'subagent',
+                        rank: 'B',
                         forkDepth: 1,
                         model: 'm1',
                         tools: [],
@@ -929,7 +929,7 @@ describe('invocation thread entries', () => {
         expect(threadRows(turn)).toHaveLength(0);
         const agents = [...turn.element.querySelectorAll<HTMLElement>('.agent')];
         expect(agents.map((agent) => agent.dataset.agent)).toEqual(['writer', 'helper']);
-        expect(agents.map((agent) => agent.dataset.role)).toEqual(['primary', 'subagent']);
+        expect(agents.map((agent) => agent.dataset.root)).toEqual(['true', undefined]);
         // R3: no visible role badge on a flat section either.
         expect(turn.element.querySelectorAll('.agent-role, .thread-role')).toHaveLength(0);
         expect(agents[1].querySelector('.agent-text')?.textContent).toBe('legacy answer\n');
@@ -1013,7 +1013,7 @@ describe('invocation thread entries', () => {
 
     // R3: a FLAT legacy section (a second agent the stream cannot attribute to an
     // invocation) is still an agent-owned block: it must be a direct child of
-    // `.tile-flow` with `data-role="subagent"`, the only shape styles.css outlines.
+    // `.tile-flow` without `data-root`, the one section shape styles.css outlines.
     // The primary section is the tile's own content and is deliberately excluded.
     it('marks a flat legacy subagent section so it can carry its own outline', () => {
         const board = mount();
@@ -1025,9 +1025,9 @@ describe('invocation thread entries', () => {
         const flow = turn.element.querySelector('.tile-flow');
         const flat = [...(flow?.children ?? [])].filter((child) => child.classList.contains('agent'));
 
-        expect(flat.map((node) => node.getAttribute('data-role'))).toEqual(['primary', 'subagent']);
-        expect(flat[0].matches(".tile-flow > .agent[data-role='subagent']")).toBe(false);
-        expect(flat[1].matches(".tile-flow > .agent[data-role='subagent']")).toBe(true);
+        expect(flat.map((node) => node.getAttribute('data-root'))).toEqual(['true', null]);
+        expect(flat[0].matches(".tile-flow > .agent:not([data-root='true'])")).toBe(false);
+        expect(flat[1].matches(".tile-flow > .agent:not([data-root='true'])")).toBe(true);
         // R4: it keeps its own agent's colour (name + outline together), which the outline
         // rule reads — the tone itself is drawn per page, see `toneOf` above.
         expect(paintedTone(flat[1] as HTMLElement)).toEqual(toneOf('helper'));

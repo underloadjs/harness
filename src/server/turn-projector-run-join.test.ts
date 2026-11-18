@@ -82,7 +82,7 @@ const LEGACY_LABELS = (): Map<string, string> => new Map([['15', 'WE6']]);
 const contextOf = (
     options: { threadIds?: ReadonlyMap<string, string>; labels?: ReadonlyMap<string, string> } = {}
 ): DisplayProjectContext => ({
-    primary: 'instruct',
+    entry: 'instruct',
     ...(options.labels === undefined ? {} : { threadLabels: options.labels }),
     ...(options.threadIds === undefined ? {} : { invocationThreadIds: options.threadIds })
 });

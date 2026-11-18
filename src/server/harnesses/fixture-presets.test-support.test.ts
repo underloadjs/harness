@@ -152,15 +152,19 @@ describe('the fixture presets carry the templates the registry rules need', () =
         expect({
             name: SCRIPTED_FIXTURE.name,
             requiresEndpoint: SCRIPTED_FIXTURE.requiresEndpoint,
-            primary: SCRIPTED_FIXTURE.primary,
+            entry: SCRIPTED_FIXTURE.entry,
+            ranks: SCRIPTED_FIXTURE.ranks,
             template: SCRIPTED_FIXTURE.template,
             tools: SCRIPTED_FIXTURE.tools
         }).toEqual({
             name: 'demo',
             requiresEndpoint: false,
             // A REAL profile: there is no `demo` agent profile in the trusted registry any
-            // more, and the scripted transport ignores the instruction text anyway.
-            primary: 'general',
+            // more, and the scripted transport ignores the instruction text anyway. The card
+            // states routing AND authority, and a one-agent roster holds one rank — the shape
+            // that used to be spelled `subagents: []`.
+            entry: 'general',
+            ranks: { general: 'A' },
             template: 'scripted',
             tools: ['timeNow']
         });
@@ -175,6 +179,7 @@ describe('the fixture presets carry the templates the registry rules need', () =
         // the trusted registry any more, so a live harness naming one would fail
         // validation against src/agents.
         expect(FLAKY_FIXTURE.agents).toEqual(['general']);
-        expect(FLAKY_FIXTURE.primary).toBe('general');
+        expect(FLAKY_FIXTURE.entry).toBe('general');
+        expect(FLAKY_FIXTURE.ranks).toEqual({ general: 'A' });
     });
 });

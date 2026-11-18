@@ -116,8 +116,8 @@ beforeEach(() => {
                             agents: ['instruct'],
                             tools: ['files'],
                             coreTools: ['toolRequest', 'toolCreate', 'tasks'],
-                            primary: 'instruct',
-                            subagents: [],
+                            entry: 'instruct',
+                            ranks: { instruct: 'A' },
                             builtin: true,
                             editable: true
                         }

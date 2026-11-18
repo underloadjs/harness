@@ -11,8 +11,10 @@
 // `server/api.test.ts` asserts that projection end to end.
 //
 // T14: the wire names are toolRequest / toolList / toolManage / toolCreate /
-// task / profileManage / chapterManage / locationManage / agentManage /
-// agentResult / delegate.
+// task / profileManage / chapterManage / locationManage / knowledge /
+// agentManage / agentResult / delegate. `knowledge` joined later (T11) and is
+// listed in the same catalogue order the visibility matrix below uses, so this
+// inventory cannot go stale when a runtime entry is added.
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness } from '@underload/harness';
@@ -61,7 +63,7 @@ describe('core tool metadata', () => {
         // host-configured enabled bound, and newest-request precedence have to be
         // stated there too.
         expect(writer.tools.toolRequest.description).toBe(
-            'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. A tool the user of THIS conversation has switched off is not listed here at all - not in `enabled`, `tools`, `alreadyAvailable`, or `forbidden` - so no query can find or re-enable it. In a scoped run (a delegation with `scope.tools`), tools outside your run scope are reported under `forbidden` with the allowed list instead of `enabled`: they cannot be enabled or called here, the answer is stable, and requesting one again will not change it - adapt to the allowed tools or report the limitation. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.'
+            'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when you have a strictly lower-ranked agent to hand work to; a capability that appears in neither list is genuinely unavailable. A tool the user of THIS conversation has switched off is not listed here at all - not in `enabled`, `tools`, `alreadyAvailable`, or `forbidden` - so no query can find or re-enable it. In a scoped run (a delegation with `scope.tools`), tools outside your run scope are reported under `forbidden` with the allowed list instead of `enabled`: they cannot be enabled or called here, the answer is stable, and requesting one again will not change it - adapt to the allowed tools or report the limitation. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.'
         );
         expect(writer.tools.toolRequest.tags).toEqual(['discovery', 'tools', 'catalogue']);
         expect(writer.tools.toolRequest.visibility).toBe('core');
@@ -100,6 +102,10 @@ describe('core tool metadata', () => {
                 'profiles',
                 'chapters',
                 'locations',
+                // knowledge sits where its registration order puts it (95, after locations 90
+                // and before agentManage 100 — src/tools/runtime/knowledge.tool.ts:503-510), so
+                // this list stays the catalogue reading order rather than an arbitrary one.
+                'knowledge',
                 'agentManage',
                 'agentResult'
             ].map((name) => writer.tools[name].visibility)
@@ -116,6 +122,15 @@ describe('core tool metadata', () => {
             'searchable', // profiles
             'searchable', // chapters
             'searchable', // locations
+            // T11: the cross-session knowledge base. `searchable`, exactly like the per-session
+            // stores above it, because its own literals say so — `visibility: 'searchable'`
+            // (src/tools/runtime/knowledge.tool.ts:195) and `alwaysDeclared: false`
+            // (src/tools/runtime/knowledge.tool.ts:508). A model reaches it by name/tag through
+            // `toolRequest` instead of every provider paying for its description and schema on
+            // every request, which is the records/tasks posture. This row is what keeps a NEW
+            // runtime entry from escaping the public-surface pin silently: the value is read from
+            // `harness().tools`, the surface a model actually sees, not from a named export.
+            'searchable', // knowledge
             'searchable', // agentManage
             'searchable' // agentResult
         ]);
@@ -654,8 +669,8 @@ describe('core tool metadata', () => {
         );
     });
 
-    it('registers delegate from the allowlist, and never without subagents', () => {
-        // No subagents: no delegate tool at all, which is why the server's
+    it('registers delegate when the roster spans two ranks, and never for one rank', () => {
+        // One rank in the roster: no delegate tool at all, which is why the server's
         // delegate descriptor is session-dependent.
         expect(solo().tools.delegate).toBeUndefined();
 
@@ -664,13 +679,16 @@ describe('core tool metadata', () => {
                 lead: agent({ model: 'test/model', provider }),
                 helper: agent({ model: 'test/model', provider })
             },
-            subagents: ['helper']
+            entry: 'lead'
         });
 
-        // The runtime declaration names the exact allowlist in its enum, and the
-        // description states the one-level rule. T28: the argument surface is derived
-        // from the entry's own literal, so this pins the DERIVATION (only `agent` is
-        // replaced) rather than restating a schema that would drift.
+        // The INSTALLED definition is the capability envelope: its enum is the WHOLE
+        // registered roster, because rank is a per-CALLER question resolved on every request
+        // (src/harness.ts `widenDelegateEnum`), and a wrong guess has to reach `delegateFor`
+        // (which names the caller's rank) instead of a schema rejection. The per-caller
+        // narrowing lives in the DECLARATION the agent is sent, not here. T28: the argument
+        // surface is still derived from the entry's own literal, so this pins the DERIVATION
+        // (only `agent` is replaced) rather than restating a schema that would drift.
         const parameters = team.tools.delegate.parameters as {
             properties: Record<string, any>;
             required: string[];
@@ -679,12 +697,12 @@ describe('core tool metadata', () => {
 
         expect(parameters.properties.agent).toEqual({
             type: 'string',
-            enum: ['helper'],
-            description: 'Subagent name, one of the configured allowlist.'
+            enum: ['lead', 'helper'],
+            description: 'Agent name, one of the lower-ranked targets listed above.'
         });
         expect(parameters.properties.input).toEqual({
             type: 'string',
-            description: 'The full brief the subagent should act on.'
+            description: 'The full brief the child agent should act on.'
         });
         // The T28 arguments are declared on the live tool, not only in the
         // catalogue row.
@@ -702,13 +720,18 @@ describe('core tool metadata', () => {
         expect(parameters.required).toEqual(['agent', 'input']);
         expect(parameters.additionalProperties).toBe(false);
         expect(team.tools.delegate.description).toContain(
-            'Delegate a self-contained task to a configured subagent and return its answer. Subagents: helper.'
+            'Delegate a self-contained task to a lower-ranked agent and return its answer. Agents you may delegate to: lead, helper.'
         );
-        expect(team.tools.delegate.description).toContain('cannot delegate further');
+        // The rank sentence replaces the old "cannot delegate further" one-level rule: it
+        // states the comparison, the refusal wording, and that a rank change is not a call.
+        expect(team.tools.delegate.description).toContain(
+            'You may delegate only to a strictly lower-ranked agent'
+        );
+        expect(team.tools.delegate.description).toContain('Delegation never widens upward');
         // The result contract is stated where the model reads it.
         expect(team.tools.delegate.description).toContain('invocationId');
         expect(team.tools.delegate.description).toContain('partialContent');
         expect(team.tools.delegate.visibility).toBe('core');
-        expect(team.tools.delegate.tags).toEqual(['agents', 'delegate', 'delegation', 'subagent', 'team']);
+        expect(team.tools.delegate.tags).toEqual(['agents', 'delegate', 'delegation', 'rank', 'team']);
     });
 });

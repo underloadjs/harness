@@ -21,8 +21,8 @@
 //     same door (src/harness.ts ~2690 / ~2804 / ~3370 call `runtime.*`, not
 //     `handle.runtime.*`), so an operator action performed on a lane still has one writer;
 //   - `delegate`, `search` and `fetch` stay local (./capability.ts LOCAL_RUNTIME_METHODS):
-//     their loop and IO are the work isolation protects, and their shared effects (a
-//     subagent transcript, an archived result) are committed as operations, never merged.
+//     their loop and IO are the work isolation protects, and their shared effects (a delegated
+//     transcript, an archived result) are committed as operations, never merged.
 //
 // WHY THE COMMIT IS AN OPERATION LIST AND NOT A DIFF
 // --------------------------------------------------
@@ -518,7 +518,8 @@ export const installAuthorityRuntime = (replica: Harness): void => {
 
 // T12 (S7) + T14: close EVERY nested-run path on this replica before any turn can start a child
 // conversation inside it, and report the names actually removed so the hello frame carries the
-// limitation (a replica whose preset registered no subagents has no `delegate` to remove).
+// limitation (a replica whose preset registered no delegation targets has no `delegate` to
+// remove — delegation targets are RANK-derived, so that is a harness with no lower rank to call).
 //
 // Three levers, because three kinds of door can start a child (./capability.ts
 // NESTED_RUN_TOOL_NAMES + LANE_NESTED_RUN_DOORS explain why a refusal, not a private copy, is the
@@ -1093,7 +1094,10 @@ export const deriveOperations = (lane: LaneWorkerState, replica: ReplicaReadView
             sequence: record.sequence,
             completedOrder: record.completedOrder,
             agent: record.agent,
-            role: record.role,
+            // The RANK of the agent that ran (replaces the retired `role` field); it is part of
+            // the archived row and `archiveDigestOf` digests it, so both sides must name it the
+            // same way or the writer re-archives on every boundary.
+            rank: record.rank,
             // The run's origin (root / delegation / fork / autoanswer).
             runKind: record.kind,
             status: record.status,
@@ -1441,7 +1445,8 @@ const capabilityReport = (replica: Harness, preset: HarnessPreset, refusedNested
 //     registered them), named as tools;
 //   - the doors `refuseNestedRuns` ARMED on the replica (./capability.ts NESTED_RUN_ARMED_DOORS),
 //     named as the call a tool body would write — so the limitation is still stated for a harness
-//     that has no subagents, where the only way to reach a child was always through the context.
+//     that has no lower rank to delegate to, where the only way to reach a child was always
+//     through the context.
 export const nestedRunHandshakeLimitations = (refusedTools: readonly string[]): { code: string; message: string }[] => [
     ...refusedTools
         .slice()

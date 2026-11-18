@@ -88,8 +88,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct', 'summarizer'],
         tools: [],
         coreTools: ['toolRequest', 'toolCreate', 'tasks', 'delegate'],
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         builtin: true,
         editable: true,
         ...overrides
@@ -1245,8 +1245,11 @@ describe('the harness agent write', () => {
         // ...and its body carries the contract's names, with the team restated and every
         // stored override kept (the server replaces the map, it does not merge it).
         expect(writes[0]?.body).toEqual({
-            primary: 'instruct',
-            subagents: ['summarizer'],
+            // The roster travels first: `agents` REPLACES the roster on this route
+            // (../shared/harness-api.ts:804-805), so the save restates the team it means.
+            agents: ['instruct', 'summarizer'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', 'summarizer': 'B' },
             agent_models: { instruct: 'm3' },
             agent_instructions: { summarizer: 'Compress into one paragraph.' }
         });
@@ -1257,15 +1260,17 @@ describe('the harness agent write', () => {
 
 // A definition CARD, in the contract's snake_case spelling: identity, membership and the
 // resolved tool set, and deliberately NOT `agent_models` / instruction text
-// (../shared/harness-api.ts:418-433).
+// (../shared/harness-api.ts:418-433). Membership is THREE independent facts on the wire — the roster,
+// the entry and the rank map — and the fixture states all three, so the card passes them through
+// rather than deriving one from another.
 function harnessCard(definition: Record<string, unknown>): Record<string, unknown> {
     return {
         name: definition.name,
         title: definition.title,
         description: definition.description,
         requires_endpoint: definition.requiresEndpoint,
-        primary: definition.primary,
-        subagents: definition.subagents,
+        entry: definition.entry,
+        ranks: definition.ranks,
         agents: definition.agents,
         tools: definition.tools,
         builtin: definition.builtin,
@@ -1279,10 +1284,12 @@ function harnessCard(definition: Record<string, unknown>): Record<string, unknow
 function harnessDefinition(definition: Record<string, unknown>, patch?: Record<string, unknown>): Record<string, unknown> {
     const models = (patch?.agent_models ?? definition.agentModels) as Record<string, string> | undefined;
     const instructions = (patch?.agent_instructions ?? definition.agentInstructions) as Record<string, string> | undefined;
-    const members = (patch?.subagents ? [String(patch.primary), ...(patch.subagents as string[])] : (definition.agents as string[]));
+    // A PATCH REPLACES the roster, the entry and the rank map it states, so the read after a write
+    // reflects exactly what the body said (../shared/harness-api.ts:804-816).
+    const members = (patch?.agents ?? definition.agents) as string[];
 
     return {
-        ...harnessCard({ ...definition, ...(patch === undefined ? {} : { agents: members }) }),
+        ...harnessCard({ ...definition, ...(patch === undefined ? {} : { agents: members, entry: patch?.entry ?? definition.entry, ranks: patch?.ranks ?? definition.ranks }) }),
         core_tools: (definition.coreTools as string[]) ?? [],
         ...(models === undefined || Object.keys(models).length === 0 ? {} : { agent_models: models }),
         instruction_summary: members.map((agent: string) => {

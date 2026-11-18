@@ -39,8 +39,8 @@ const descriptor = () =>
         description: 'A general instruction-following agent.',
         agents: ['instruct'],
         tools: [],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true
     }) as never;

@@ -8,9 +8,9 @@
 //     adds) and nothing else: an agent the team does not select has no badge, and the
 //     removed dropdown/team-section/note paragraph never come back;
 //   - selecting a badge is a VIEW change: it moves the instruction and model area and
-//     never writes and never promotes;
+//     never writes and never moves the entry agent;
 //   - `[+]` offers the nonmembers ONLY, drafting an add that becomes a badge;
-//   - `Make primary` / `Remove from team` are the only things that move the team, and
+//   - `Set as entry` / `Remove from team` are the only things that move the team, and
 //     they are LOCAL drafts until the action;
 //   - the bottom-right action is the only writer, it is disabled while nothing is
 //     pending, and it reports the exact delta (including an armed promotion);
@@ -37,7 +37,7 @@
 //     dialog never offers that form;
 //   - R6: an agent a conversation already runs keeps its badge but cannot be removed,
 //     and the reason is visible rather than tooltip-only; a saved conversation's fixed
-//     entry agent (`canPromote: false`) cannot be made primary.
+//     entry agent (`canSetEntry: false`) cannot be made the entry agent.
 //
 // Every assertion names the exact expected value — see the deterministic rule.
 
@@ -89,7 +89,8 @@ const base = (overrides: Partial<AgentDialogOptions> = {}): AgentDialogOptions =
 
     return {
         members: ['instruct', 'research'],
-        primary: 'instruct',
+        entry: 'instruct',
+        ranks: { instruct: 'A', research: 'B' },
         agents,
         editable: true,
         models: {
@@ -151,7 +152,7 @@ const instructionBox = (): HTMLTextAreaElement => byClass('.agent-dialog-instruc
 const modelSelect = (): HTMLSelectElement => byClass('.agent-model-select', 'select');
 const applyButton = (): HTMLButtonElement => byClass('.agent-dialog-apply', 'button');
 const addButton = (): HTMLButtonElement => byClass('.agent-dialog-add', 'button');
-const promoteButton = (): HTMLButtonElement => byClass('.agent-dialog-promote', 'button');
+const entryButton = (): HTMLButtonElement => byClass('.agent-dialog-entry', 'button');
 const removeButton = (): HTMLButtonElement => byClass('.agent-dialog-remove', 'button');
 
 // The roster strip as the reader sees it: who has a badge, in which order, with the
@@ -159,7 +160,7 @@ const removeButton = (): HTMLButtonElement => byClass('.agent-dialog-remove', 'b
 const tabsOf = (): [string, string, boolean, string, string][] =>
     [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => [
         tab.dataset.agent ?? '',
-        tab.dataset.role ?? '',
+        tab.dataset.entry ?? '',
         tab.getAttribute('aria-selected') === 'true',
         tab.querySelector('.agent-dialog-agent-name')?.textContent ?? '',
         tab.querySelector('.agent-dialog-agent-model')?.textContent ?? ''
@@ -244,7 +245,7 @@ const flush = async (): Promise<void> => {
 };
 
 describe('the roster strip', () => {
-    it('lists only the team as badges, primary first, and shows its model', () => {
+    it('lists only the team as badges, entry agent first, and shows its model', () => {
         dialog = openAgentDialog(
             base({
                 // A saved conversation can name an agent the catalogue no longer
@@ -256,11 +257,11 @@ describe('the roster strip', () => {
 
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Instruct');
         expect(tabsOf()).toEqual([
-            ['instruct', 'primary', true, 'Instruct', 'm1'],
+            ['instruct', 'true', true, 'Instruct', 'm1'],
             // T7b: a rostered member the catalogue does not describe is named by its id — it IS a
             // member of this team (`legacy` may be a profile the server dropped or an agent a
             // session invented), and 'Agent' would make two of them indistinguishable.
-            ['legacy', 'secondary', false, 'legacy', 'm1']
+            ['legacy', '', false, 'legacy', 'm1']
         ]);
 
         // R3: no dropdown, no duplicate Team section, no explanation paragraph, and no
@@ -275,7 +276,7 @@ describe('the roster strip', () => {
         expect(byClass('.agent-dialog-tabs', 'div').getAttribute('role')).toBe('tablist');
         expect(byClass('.agent-dialog-tabs', 'div').getAttribute('aria-label')).toBe('Agent team');
 
-        // The primary is the default view: its instruction and model are on screen, and
+        // The entry agent is the default view: its instruction and model are on screen, and
         // the panel is the tab's declared controls.
         const config = byClass('.agent-dialog-config', 'section');
         expect(config.dataset.agent).toBe('instruct');
@@ -284,11 +285,11 @@ describe('the roster strip', () => {
         expect(instructionBox().getAttribute('aria-label')).toBe('Instruction for Instruct');
         expect(instructionBox().value).toBe('Answer directly.');
         expect(modelSelect().getAttribute('aria-label')).toBe('Model for Instruct');
-        expect(promoteButton().getAttribute('aria-pressed')).toBe('false');
-        expect(promoteButton().disabled).toBe(true);
-        expect(promoteButton().title).toBe('The primary agent is already the primary.');
+        expect(entryButton().getAttribute('aria-pressed')).toBe('false');
+        expect(entryButton().disabled).toBe(true);
+        expect(entryButton().title).toBe('Instruct is already the entry agent.');
         expect(removeButton().disabled).toBe(true);
-        expect(removeButton().title).toBe('The primary agent is always part of the team.');
+        expect(removeButton().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
     });
 
     it('never lists an agent the team does not select', () => {
@@ -297,8 +298,8 @@ describe('the roster strip', () => {
         // `reviewer` is in the trusted catalogue but not on the team, so it has no
         // badge at all; it reaches the strip through `[+]`.
         expect(tabsOf()).toEqual([
-            ['instruct', 'primary', true, 'Instruct', 'm1'],
-            ['research', 'secondary', false, 'Researcher', 'm1']
+            ['instruct', 'true', true, 'Instruct', 'm1'],
+            ['research', '', false, 'Researcher', 'm1']
         ]);
         expect(document.querySelector('.agent-dialog-tab[data-agent="reviewer"]')).toBeNull();
     });
@@ -444,7 +445,10 @@ describe('the add picker', () => {
         ]);
         expect(
             [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
-        ).toEqual(['Reviewer joins the team when you save · nothing is sent yet.']);
+        ).toEqual([
+            'Reviewer joins the team when you save · nothing is sent yet.',
+            'Reviewer has no rank stated. Use the steps above to assign one; an agent with no rank has nothing to delegate from.'
+        ]);
         expect(instructionBox().value).toBe('Hunt for bugs.');
 
         // Instruct's unsaved instruction survived the add, and nothing was written.
@@ -478,8 +482,8 @@ describe('the add picker', () => {
         // Cancelling an add is not a removal: the saved team never listed that agent, so
         // the roster is back to the server state and there is nothing to send.
         expect(tabsOf()).toEqual([
-            ['instruct', 'primary', true, 'Instruct', 'm1'],
-            ['research', 'secondary', false, 'Researcher', 'm1']
+            ['instruct', 'true', true, 'Instruct', 'm1'],
+            ['research', '', false, 'Researcher', 'm1']
         ]);
         expect(applyButton().disabled).toBe(true);
 
@@ -521,7 +525,7 @@ describe('the preset read (onRequestPreset)', () => {
 
         dialog = openAgentDialog(base({ onApply, onRequestPreset: preset.onRequestPreset }));
 
-        // Opening the dialog selects the primary WITHOUT asking: the page it was built
+        // Opening the dialog selects the entry agent WITHOUT asking: the page it was built
         // from already carries that roster, so a read paid per render is the bug.
         expect(preset.calls).toEqual([]);
         expect(preset.onRequestPreset).toHaveBeenCalledTimes(0);
@@ -654,7 +658,10 @@ describe('the preset read (onRequestPreset)', () => {
         expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('reviewer');
         expect(
             [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
-        ).toEqual(['Reviewer joins the team when you save · nothing is sent yet.']);
+        ).toEqual([
+            'Reviewer joins the team when you save · nothing is sent yet.',
+            'Reviewer has no rank stated. Use the steps above to assign one; an agent with no rank has nothing to delegate from.'
+        ]);
 
         // A read request is not a write and it does not arm the action by itself.
         expect(onApply).toHaveBeenCalledTimes(0);
@@ -863,7 +870,7 @@ describe('the one instruction editor (R4/R5)', () => {
 });
 
 describe('drafts', () => {
-    it('writes nothing for an instruction edit, a model edit or an armed promotion', () => {
+    it('writes nothing for an instruction edit, a model edit or an armed entry change', () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
@@ -871,20 +878,20 @@ describe('drafts', () => {
         chooseModel('m2');
 
         selectAgent('research');
-        promoteButton().click();
+        entryButton().click();
 
         expect(apply.calls).toEqual([]);
         // The controls still show the reader own choices (draft state, not the server's).
         expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
-        expect(promoteButton().getAttribute('aria-pressed')).toBe('true');
-        expect(applyButton().textContent).toBe('Save & set primary');
+        expect(entryButton().getAttribute('aria-pressed')).toBe('true');
+        expect(applyButton().textContent).toBe('Save & set entry');
     });
 
     it('keeps every agent draft across badge switches and sends both deltas without promoting', async () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
-        // The action starts disabled: nothing has changed and the primary is selected.
+        // The action starts disabled: nothing has changed and the entry agent is selected.
         expect(applyButton().disabled).toBe(true);
         expect(applyButton().textContent).toBe('Save configuration');
 
@@ -904,7 +911,7 @@ describe('drafts', () => {
         expect(modelSelect().value).toBe('m2');
 
         // One save carries BOTH agents deltas, and the viewed agent stays a member
-        // without becoming the primary (R3: selection never promotes).
+        // without becoming the entry agent (R3: selection never moves the entry role).
         applyButton().click();
         await flush();
 
@@ -919,37 +926,37 @@ describe('drafts', () => {
         ]);
     });
 
-    it('promotes only when the panel control is pressed', async () => {
+    it('moves the entry agent only when the panel control is pressed', async () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
         selectAgent('research');
         expect(applyButton().disabled).toBe(true);
 
-        promoteButton().click();
+        entryButton().click();
         expect(applyButton().disabled).toBe(false);
-        expect(applyButton().textContent).toBe('Save & set primary');
+        expect(applyButton().textContent).toBe('Save & set entry');
         expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
-            'Saves this harness and makes Researcher the primary.'
+            'Saves this harness and makes Researcher the entry agent.'
         );
 
         applyButton().click();
         await flush();
 
         expect(apply.calls).toEqual([
-            { agent: 'research', primary: 'research', models: {}, instructions: {}, add: [], remove: [] }
+            { agent: 'research', entry: 'research', models: {}, instructions: {}, add: [], remove: [] }
         ]);
     });
 
-    it('cancels an armed promotion on a second press', () => {
+    it('cancels an armed entry change on a second press', () => {
         dialog = openAgentDialog(base());
 
         selectAgent('research');
-        promoteButton().click();
+        entryButton().click();
         expect(applyButton().disabled).toBe(false);
 
-        promoteButton().click();
-        expect(promoteButton().getAttribute('aria-pressed')).toBe('false');
+        entryButton().click();
+        expect(entryButton().getAttribute('aria-pressed')).toBe('false');
         expect(applyButton().disabled).toBe(true);
         expect(applyButton().textContent).toBe('Save configuration');
     });
@@ -963,7 +970,7 @@ describe('drafts', () => {
         selectAgent('research');
         removeButton().click();
 
-        expect(tabsOf()).toEqual([['instruct', 'primary', true, 'Instruct', 'm1']]);
+        expect(tabsOf()).toEqual([['instruct', 'true', true, 'Instruct', 'm1']]);
         expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('instruct');
 
         applyButton().click();
@@ -1129,8 +1136,8 @@ describe('the transactional action', () => {
         // invented badge, no dropped instruction, no dropped model choice.
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
         expect(tabsOf()).toEqual([
-            ['instruct', 'primary', true, 'Instruct', 'm1'],
-            ['research', 'secondary', false, 'Researcher', 'm1']
+            ['instruct', 'true', true, 'Instruct', 'm1'],
+            ['research', '', false, 'Researcher', 'm1']
         ]);
         expect(instructionBox().value).toBe('Answer directly.');
         expect(modelSelect().value).toBe('');
@@ -1149,7 +1156,7 @@ describe('live refresh while open', () => {
 
         dialog.update(
             base({
-                primary: 'research',
+                entry: 'research',
                 members: ['research', 'instruct', 'reviewer'],
                 models: {
                     models: { research: 'm2', instruct: 'm1' },
@@ -1164,11 +1171,11 @@ describe('live refresh while open', () => {
 
         // Touched: the draft wins over the refreshed baseline.
         expect(instructionBox().value).toBe('Investigate with sources.');
-        // The strip follows the server: new primary, new member, in the server order.
+        // The strip follows the server: new entry agent, new member, in the server order.
         expect(tabsOf()).toEqual([
-            ['research', 'primary', true, 'Researcher', 'm2'],
-            ['instruct', 'secondary', false, 'Instruct', 'm1'],
-            ['reviewer', 'secondary', false, 'Reviewer', 'm1']
+            ['research', 'true', true, 'Researcher', 'm2'],
+            ['instruct', '', false, 'Instruct', 'm1'],
+            ['reviewer', '', false, 'Reviewer', 'm1']
         ]);
         // An untouched agent shows the server value.
         selectAgent('instruct');
@@ -1218,20 +1225,20 @@ describe('live refresh while open', () => {
         selectAgent('research');
         const tab = byClass('.agent-dialog-tab[data-agent="research"]', 'button');
         tab.focus();
-        dialog.update(base({ primary: 'research', members: ['research', 'instruct'] }));
+        dialog.update(base({ entry: 'research', members: ['research', 'instruct'] }));
         const rebuiltTab = byClass('.agent-dialog-tab[data-agent="research"]', 'button');
         expect(rebuiltTab).not.toBe(tab);
         expect(document.activeElement).toBe(rebuiltTab);
 
         const model = modelSelect();
         model.focus();
-        dialog.update(base({ primary: 'research', members: ['research', 'instruct'] }));
+        dialog.update(base({ entry: 'research', members: ['research', 'instruct'] }));
         const rebuilt = modelSelect();
         expect(rebuilt).not.toBe(model);
         expect(document.activeElement).toBe(rebuilt);
     });
 
-    it('falls back to the primary when the viewed agent leaves the roster and the catalogue', () => {
+    it('falls back to the entry agent when the viewed agent leaves the roster and the catalogue', () => {
         dialog = openAgentDialog(base());
 
         // The viewed agent is a drafted addition, so it only exists while the trusted
@@ -1240,10 +1247,10 @@ describe('live refresh while open', () => {
         byClass('.agent-dialog-add-option[data-agent="reviewer"]', 'button').click();
         expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('reviewer');
 
-        dialog.update(base({ members: ['research', 'instruct'], primary: 'instruct', agents: [agents[0], agents[1]] }));
+        dialog.update(base({ members: ['research', 'instruct'], entry: 'instruct', agents: [agents[0], agents[1]] }));
 
         // Configuring an agent the server can no longer reach is meaningless, so the
-        // view returns to the primary instead of stranding the reader on a dead badge.
+        // view returns to the entry agent instead of stranding the reader on a dead badge.
         expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('instruct');
         expect(tabsOf().map((tab) => tab[0])).toEqual(['research', 'instruct']);
         expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
@@ -1282,15 +1289,15 @@ describe('honest restrictions and lifecycle', () => {
         );
         expect(addButton().disabled).toBe(true);
         expect(addButton().title).toBe(hint);
-        expect(promoteButton().disabled).toBe(true);
-        expect(promoteButton().title).toBe(hint);
+        expect(entryButton().disabled).toBe(true);
+        expect(entryButton().title).toBe(hint);
         expect(removeButton().disabled).toBe(true);
         expect(removeButton().title).toBe(hint);
         // R2: models stay live in a saved session, so the select is still enabled.
         expect(modelSelect().disabled).toBe(false);
 
         // The action can only save a model here: it is disabled until one is drafted,
-        // so a disabled button can never falsely promote.
+        // so a disabled button can never falsely move the entry agent.
         expect(applyButton().textContent).toBe('Save configuration');
         expect(applyButton().disabled).toBe(true);
         expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
@@ -1386,7 +1393,7 @@ describe('honest restrictions and lifecycle', () => {
 
         // Idempotent + late async updates are no-ops (no resurrected overlay).
         dialog.close();
-        dialog.update(base({ primary: 'research' }));
+        dialog.update(base({ entry: 'research' }));
         expect(document.querySelector('.dialog')).toBeNull();
     });
 });
@@ -1394,10 +1401,10 @@ describe('honest restrictions and lifecycle', () => {
 // R5: a saved conversation is a first-class configuration surface. The dialog's model
 // (drafts, apply, roster) is identical for both scopes; what differs is the copy that
 // states WHERE a save lands, plus the two capability flags the shell passes
-// (`allowCustom`, `canPromote`). Every string below is asserted exactly.
+// (`allowCustom`, `canSetEntry`). Every string below is asserted exactly.
 describe('the session scope (R5)', () => {
     it('names this conversation as the place a save lands, and keeps the box editable', () => {
-        dialog = openAgentDialog(base({ scope: 'session', allowCustom: true, canPromote: false }));
+        dialog = openAgentDialog(base({ scope: 'session', allowCustom: true, canSetEntry: false }));
 
         // The team is editable in a session, so the instruction is editable too: this is
         // the whole point of R5 (the harness definition is only a template).
@@ -1431,7 +1438,7 @@ describe('the session scope (R5)', () => {
             base({
                 scope: 'session',
                 allowCustom: true,
-                canPromote: false,
+                canSetEntry: false,
                 editable: false,
                 hint: 'Wait for the current run to finish before switching agents.'
             })
@@ -1453,7 +1460,7 @@ describe('the session scope (R5)', () => {
 // and no wasted read for a profile the server has never heard of.
 describe('a custom agent in a session (R7)', () => {
     const session = (overrides: Partial<AgentDialogOptions> = {}): AgentDialogOptions =>
-        base({ scope: 'session', allowCustom: true, canPromote: false, ...overrides });
+        base({ scope: 'session', allowCustom: true, canSetEntry: false, ...overrides });
 
     it('creates a badge from a typed name with an empty editable instruction', async () => {
         const apply = applyOf();
@@ -1492,7 +1499,7 @@ describe('a custom agent in a session (R7)', () => {
             document.querySelector<HTMLElement>('.agent-dialog-tab[data-agent="note-taker"]')?.getAttribute(
                 'aria-label'
             )
-        ).toBe('Configure note-taker · subagent');
+        ).toBe('Configure note-taker · rank not stated');
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · note-taker');
         expect(instructionBox().value).toBe('');
         expect(instructionBox().disabled).toBe(false);
@@ -1542,7 +1549,7 @@ describe('a custom agent in a session (R7)', () => {
     // act, so it is displayed (the rule the test above pins); a name that is not on any roster has
     // no team entry to justify showing an id, and keeps the neutral word ui/agents.ts defines.
     it('labels a name that is not on the team with the neutral fallback, not its id', () => {
-        dialog = openAgentDialog(session({ members: [], primary: 'ghost' }));
+        dialog = openAgentDialog(session({ members: [], entry: 'ghost' }));
 
         // Nothing is rostered, so the tab strip is empty and the panel describes an agent this
         // dialog only knows by an id it never saw on a library row.
@@ -1565,7 +1572,7 @@ describe('a custom agent in a session (R7)', () => {
             ['notes!', 'Use a lowercase name that starts with a letter and continues with letters, digits, "-" or "_".'],
             // `unknown` matches the pattern but is the reserved id for an unreadable agent.
             ['unknown', '"unknown" is the reserved name for an agent the server cannot identify.'],
-            // A member and the primary are both collisions, and case does not save you.
+            // A member and the entry agent are both collisions, and case does not save you.
             ['research', 'An agent named research is already on this team.'],
             ['instruct', 'An agent named instruct is already on this team.']
         ];
@@ -1647,7 +1654,7 @@ describe('an agent a conversation already runs (R6)', () => {
     it('disables the removal with the reason and shows it under the actions', () => {
         const apply = applyOf();
         dialog = openAgentDialog(
-            base({ scope: 'session', allowCustom: true, canPromote: false, threadAgents: ['research'], onApply: apply.onApply })
+            base({ scope: 'session', allowCustom: true, canSetEntry: false, threadAgents: ['research'], onApply: apply.onApply })
         );
 
         selectAgent('research');
@@ -1657,7 +1664,8 @@ describe('an agent a conversation already runs (R6)', () => {
             'This agent is used by a conversation in this session; deleting that conversation does not release it, so removing the agent needs the session deleted.'
         );
         expect(fieldNotes()).toEqual([
-            'This agent is in use by a conversation and cannot be removed.'
+            'This agent is in use by a conversation and cannot be removed.',
+            'Researcher holds Rank B. Assigning a rank to another member does not change this one.'
         ]);
 
         // A press on the disabled control cannot draft a removal, so there is nothing to
@@ -1670,7 +1678,7 @@ describe('an agent a conversation already runs (R6)', () => {
 
     it('leaves an agent no conversation runs removable', () => {
         dialog = openAgentDialog(
-            base({ scope: 'session', allowCustom: true, canPromote: false, threadAgents: ['research'] })
+            base({ scope: 'session', allowCustom: true, canSetEntry: false, threadAgents: ['research'] })
         );
 
         // `reviewer` is not in `threadAgents`, so it keeps the ordinary add flow: the tab
@@ -1681,45 +1689,51 @@ describe('an agent a conversation already runs (R6)', () => {
         expect(removeButton().disabled).toBe(false);
         expect(removeButton().title).toBe('Cancel the add, so Reviewer never joins this team.');
         expect(fieldNotes()).toEqual([
-            'Reviewer joins the team when you save · nothing is sent yet.'
+            'Reviewer joins the team when you save · nothing is sent yet.',
+            'Reviewer has no rank stated. Use the steps above to assign one; an agent with no rank has nothing to delegate from.'
         ]);
     });
 
-    it('states the primary reason for the primary, not the thread reason', () => {
+    it('states the entry-agent reason for the entry agent, not the thread reason', () => {
         // The entry agent is always running SOME conversation, so both rules apply to it.
-        // The stronger one (the primary always stays) wins, and the note stays hidden so
+        // The stronger one (the entry agent always stays) wins, and the note stays hidden so
         // the panel never states two reasons for one disabled control.
         dialog = openAgentDialog(
-            base({ scope: 'session', allowCustom: true, canPromote: false, threadAgents: ['instruct', 'research'] })
+            base({ scope: 'session', allowCustom: true, canSetEntry: false, threadAgents: ['instruct', 'research'] })
         );
 
         expect(removeButton().disabled).toBe(true);
-        expect(removeButton().title).toBe('The primary agent is always part of the team.');
-        expect(fieldNotes()).toEqual([]);
+        expect(removeButton().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
+        // The panel states NO removal reason here (the rule lives on the disabled control), and
+        // the only note in the config area is the rank readout for the selected member — a
+        // different fact, never a second reason for the same disabled control.
+        expect(fieldNotes()).toEqual([
+            'Instruct holds Rank A. Assigning a rank to another member does not change this one.'
+        ]);
     });
 });
 
-// R5/R6: a saved conversation's entry agent is fixed, so `Make primary` has nothing to
+// R5/R6: a saved conversation's entry agent is fixed, so `Set as entry` has nothing to
 // do there and must not arm a promotion the shell cannot write.
-describe('a fixed entry agent (R5 canPromote)', () => {
-    it('disables Make primary with the reason and never arms a promotion', () => {
+describe('a fixed entry agent (R5 canSetEntry)', () => {
+    it('disables Set as entry with the reason and never arms an entry change', () => {
         const apply = applyOf();
         dialog = openAgentDialog(
-            base({ scope: 'session', allowCustom: true, canPromote: false, onApply: apply.onApply })
+            base({ scope: 'session', allowCustom: true, canSetEntry: false, onApply: apply.onApply })
         );
 
         selectAgent('research');
 
-        expect(promoteButton().disabled).toBe(true);
-        expect(promoteButton().title).toBe(
-            'The primary agent is fixed for a saved conversation.'
+        expect(entryButton().disabled).toBe(true);
+        expect(entryButton().title).toBe(
+            'The entry agent is fixed for a saved conversation.'
         );
-        expect(promoteButton().getAttribute('aria-pressed')).toBe('false');
+        expect(entryButton().getAttribute('aria-pressed')).toBe('false');
 
         // Even a forced press cannot arm it, so the action keeps its plain label and
         // stays disabled: a disabled button can never falsely promise a promotion.
-        promoteButton().click();
-        expect(promoteButton().getAttribute('aria-pressed')).toBe('false');
+        entryButton().click();
+        expect(entryButton().getAttribute('aria-pressed')).toBe('false');
         expect(applyButton().textContent).toBe('Save configuration');
         expect(applyButton().disabled).toBe(true);
         expect(apply.calls).toEqual([]);
@@ -1728,23 +1742,23 @@ describe('a fixed entry agent (R5 canPromote)', () => {
         );
     });
 
-    it('keeps the promotion available for a harness template (default canPromote)', async () => {
+    it('keeps the entry move available for a harness template (default canSetEntry)', async () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
         selectAgent('research');
 
-        expect(promoteButton().disabled).toBe(false);
-        expect(promoteButton().title).toBe('Make Researcher the primary agent when you save.');
+        expect(entryButton().disabled).toBe(false);
+        expect(entryButton().title).toBe('Make Researcher the entry agent when you save, so a new conversation starts with it. No rank changes, and this does not make it the highest-ranked agent.');
 
-        promoteButton().click();
-        expect(applyButton().textContent).toBe('Save & set primary');
+        entryButton().click();
+        expect(applyButton().textContent).toBe('Save & set entry');
 
         applyButton().click();
         await flush();
 
         expect(apply.calls).toEqual([
-            { agent: 'research', primary: 'research', models: {}, instructions: {}, add: [], remove: [] }
+            { agent: 'research', entry: 'research', models: {}, instructions: {}, add: [], remove: [] }
         ]);
     });
 });

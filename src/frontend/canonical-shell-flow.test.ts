@@ -61,8 +61,8 @@ const HARNESS_CARD = {
     title: 'Instruct',
     description: 'A general instruction-following agent.',
     requires_endpoint: true,
-    primary: 'instruct',
-    subagents: [],
+    entry: 'instruct',
+    ranks: { instruct: 'A' },
     agents: ['instruct'],
     tools: ['read'],
     core_tools: ['tasks'],
@@ -255,7 +255,7 @@ const stub = (sessions: Record<string, unknown>[]): void => {
                         sections: [
                             {
                                 id: 't1:0',
-                                role: 'primary',
+                                rank: 'A',
                                 agent: 'instruct',
                                 agentLabel: 'IN1',
                                 threadId: 'thread-1',

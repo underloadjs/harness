@@ -54,7 +54,7 @@ const rig = (overrides: Partial<AgentControlOptions> = {}): Rig => {
     const cycles: number[] = [];
     const activations: string[] = [];
     const control = createAgentControl({
-        primary: 'instruct',
+        agent: 'instruct',
         agents,
         device: 'fine',
         onCycle: (direction) => cycles.push(direction),
@@ -152,10 +152,10 @@ describe('the desktop control', () => {
         expect(element.getAttribute('aria-busy')).toBe('true');
     });
 
-    it('paints the agent the shell resolved, not the team primary it happens to be', () => {
+    it('paints the agent the shell resolved, not the entry agent it happens to be', () => {
         // The chip is the composer's promise about the NEXT message, so the shell passes
-        // the pending selection as `primary` and the label follows it (D10).
-        const { element, button } = rig({ primary: 'research' });
+        // the pending selection as `agent` and the label follows it (D10).
+        const { element, button } = rig({ agent: 'research' });
 
         expect(button.querySelector('.agent-control-name')?.textContent).toBe('Researcher');
         expect(button.querySelector('.agent-control-code')?.textContent).toBe('RR');
@@ -376,7 +376,7 @@ describe('a team with nothing to cycle', () => {
 
 describe('the fallbacks', () => {
     it('names an agent the catalogue never carried without leaking its raw id', () => {
-        const { button } = rig({ primary: 'ghost' });
+        const { button } = rig({ agent: 'ghost' });
 
         // Same rule as ui/agents.ts `displayTitleOf`: the neutral word, never the id.
         expect(button.getAttribute('aria-label')).toBe('Agent: Agent. Open agent settings.');

@@ -3,7 +3,7 @@
 // Pinned contract:
 //   - HarnessRunOptions.attachments ride on the ROOT user message only;
 //   - the root request transcript carries them and history retains them;
-//   - delegated subagents never inherit the root's bytes;
+//   - delegated children never inherit the root's bytes;
 //   - malformed attachments reject before any mutation or progress event;
 //   - a run without attachments keeps the historical request shape.
 
@@ -106,7 +106,7 @@ describe('harness root attachments', () => {
         expect(seen[0].messages).toStrictEqual([{ role: 'user', content: 'plain' }]);
     });
 
-    it('does not attach root bytes to a delegated subagent prompt', async () => {
+    it('does not attach root bytes to a delegated child prompt', async () => {
         const primarySeen: HarnessStreamRequest[] = [];
         const childSeen: HarnessStreamRequest[] = [];
 
@@ -120,9 +120,11 @@ describe('harness root attachments', () => {
         const helper = agent({ model: 'child', stream: scripted([answer('child answer')], childSeen) });
 
         const app = harness({
+            // Rank roster: `writer` is the entry point at Rank A and `helper` is Rank B, so
+            // the delegation under test (`writer -> helper`) is a strictly-downward call.
             agents: { writer, helper },
-            primary: 'writer',
-            subagents: ['helper'],
+            entry: 'writer',
+            ranks: { writer: 'A', helper: 'B' },
             presets: false,
             tools: {}
         });

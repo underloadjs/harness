@@ -46,7 +46,7 @@ const block = (overrides: Partial<ContextBlock> = {}): ContextBlock => ({
 
 const section = (overrides: Partial<TurnSection> = {}): TurnSection => ({
     id: 't1:0',
-    role: 'primary',
+    rank: 'A',
     agent: 'instruct',
     agentLabel: 'RR1',
     state: 'streaming',

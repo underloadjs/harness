@@ -17,6 +17,17 @@
 //   - `SessionStore` — authoritative turns + FIFO task queue.
 //   - `HarnessPersistence` — the versioned atomic database under `<root>/harness/`
 //     (R3b), plus registry/session record helpers used to rebuild a restart.
+//   - `loadKnowledgeFileStore` — the durable half of the cross-session knowledge base
+//     (T5), the store `startHarnessServer` loads before the first request. Listed
+//     name-by-name (the same single-declaration rule that keeps `./api` and
+//     `./harnesses` explicit above), together with the shapes a host needs to hold one:
+//     `KnowledgeStore`, `KnowledgeStoreOptions`, `KnowledgeCommitReport`,
+//     `KnowledgeStoreReportEvent`, `KnowledgeFlush` and the on-disk types.
+//     `prepareHarnessKnowledge`/`harnessKnowledgeOf` from `./runtime` (already
+//     star-exported) are the per-root accessors; THIS is the door for a host that owns
+//     its own store, which is what `HarnessConfiguration.knowledge` takes. `src/harness.ts`
+//     names this factory in its validation refusal, so the advice has to be reachable
+//     from the published surface — `yarn test:package` gates that map.
 //   - `protocol` types — the wire contract the browser client consumes.
 //   - `harnesses` — presets, registry, catalogue, descriptors, scripted demo.
 //
@@ -133,6 +144,31 @@ export type {
 // `HarnessStreamMount.upgrade` (./stream/mount.ts:108), also already exported. Nothing
 // referenced `StreamUpgradeHandler`, so dropping the phantom name removes no capability.
 
+// T15 / F1: the durable knowledge store, exported name-by-name. `./runtime` (star-exported above)
+// already publishes the PER-ROOT accessors, so what was missing was the store ITSELF: the factory
+// `HarnessConfiguration.knowledge` takes, the shapes that describe one, and the two path helpers an
+// operator-facing tool needs to name the files. Without these the refusal in ../harness.ts:1315-1321
+// names a factory a consumer cannot import, and the fix advice could not be followed.
+export {
+    HARNESS_KNOWLEDGE_DIRECTORY,
+    HARNESS_KNOWLEDGE_INDEX_FILE,
+    HARNESS_KNOWLEDGE_VERSION,
+    knowledgeArticleFileOf,
+    knowledgeDirectoryOf,
+    knowledgeIndexFileOf,
+    loadKnowledgeFileStore
+} from './knowledge-file-store';
+export type {
+    KnowledgeArticleFile,
+    KnowledgeCommitReport,
+    KnowledgeDirectoryIndex,
+    KnowledgeDirectoryIndexEntry,
+    KnowledgeFlush,
+    KnowledgeStore,
+    KnowledgeStoreOptions,
+    KnowledgeStoreReportEvent
+} from './knowledge-file-store';
+
 // The catalogue the CLI and the server share (see ./harnesses/index.ts).
 export {
     AGENT_PROFILES,
@@ -180,8 +216,10 @@ export {
     presetToRecord,
     providerOf,
     restoreHarnessRegistry,
-    SPECIALIST_AGENT_NAMES,
-    teamOf
+    // `teamOf` is gone with the rank model (./harnesses/presets.ts states each card's
+    // roster and rank map explicitly), so this barrel no longer re-exports a
+    // delegation derivation that no longer exists.
+    SPECIALIST_AGENT_NAMES
 } from './harnesses';
 export type {
     AgentProfile,

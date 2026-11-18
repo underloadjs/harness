@@ -62,8 +62,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct', 'helper'],
         tools: [],
         coreTools: ['toolRequest', 'toolCreate', 'tasks', 'delegate'],
-        primary: 'instruct',
-        subagents: ['helper'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', helper: 'B' },
         builtin: true,
         editable: true,
         ...overrides

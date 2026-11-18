@@ -76,9 +76,11 @@ import {
 } from './guidelines';
 import { BUILTIN_TOOL_DESCRIPTORS } from '../core/tool-manifest';
 // The one place that decides whether a role actually HAS a team: `delegate` registers only
-// when the harness's allowlist is non-empty (src/harness.ts `activation: 'subagents'`), so a
-// prompt line about delegating is only true while the matching preset agrees.
+// while the roster spans two distinct ranks (src/harness.ts `activation: 'delegation'` +
+// `rosterHasDelegation`), so a prompt line about delegating is only true while the matching
+// preset's RANK MAP says the same thing. The team is no longer a list — it is the ranking.
 import { presets } from '../server/harnesses/presets';
+import { rankIndexOf } from '../types';
 
 // The exact error text a client sees for a bad id: the message lists the known set
 // in picker order, so this is also a roster pin.
@@ -119,7 +121,7 @@ const CONTRACT = {
     // once the host has a second conversation — a server session always does). The bullet bans
     // each by name, so the prompt matches the rule the profile exists to state.
     generalWorksAlone:
-        'You work alone: no subagent exists here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.',
+        'You work alone: no agent is ranked below you here, so a step you cannot do is a step to unlock with toolRequest, never a step to pass on. Do not spawn a branch with threadFork, and do not hand the step to another conversation with threadSend.',
     // Instruct: the worker stance — only context-burning, non-mutating steps leave it.
     instructDelegatesOnlyReads:
         'Delegate only context-burning steps that change nothing: research, exploration, a long read, a review. Anything you would then have to write, edit, or run, you do yourself.',
@@ -151,6 +153,21 @@ const CONTRACT = {
         'Write scratch files when a probe needs them, but never change the code under test unless the brief asks for a fix.'
 };
 
+// The team a card actually offers: every agent it ranks STRICTLY BELOW its own entry agent.
+// This is the rank statement of the removed `teamOf(primary)` helper, and it is derived from
+// `ranks` with the same comparison the runtime uses (`rankIndexOf`, ./types).
+const teamBelowEntry = (preset: (typeof presets)[number]): string[] => {
+    const entryRank = preset.ranks[preset.entry];
+
+    if (entryRank === undefined) {
+        throw new Error(`The "${preset.name}" preset does not rank its entry agent "${preset.entry}".`);
+    }
+
+    return preset.agents.filter(
+        (name) => name !== preset.entry && rankIndexOf(preset.ranks[name] ?? entryRank) > rankIndexOf(entryRank)
+    );
+};
+
 // Measured length of the ONE composed system prompt, per profile, in registry order
 // (`yarn vite-node Temp/opencode/prompt-size.ts` prints this table). Exact equality (not a range):
 // growth has to be intentional, so adding a bullet to a shared guideline line is a visible
@@ -166,23 +183,23 @@ const PROMPT_LENGTHS = [
     // 1245: 1227 + the conditional `toolRequest` clause (see the block above); before that
     // it grew from 1168 because the "works alone" bullet now names BOTH ways a lone agent
     // could still offload a step (`threadFork` and `threadSend`) instead of only the fork.
-    { name: 'general', length: 1245 },
+    { name: 'general', length: 1255 },
     // +55 each (0028, 2026-11-14): `DELEGATION_GUIDELINE` no longer promises that "a later
     // delegation continues that subagent's conversation" — a delegation from a conversation
     // mints its OWN child transcript, so the line now says each delegation starts a NEW one
     // and names the handle that makes continuation real (`threadSend` on the returned
     // `threadId`). Every role that composes the delegation line grows by exactly that delta;
     // `general` and `summarizer` do not compose it and are unmoved.
-    { name: 'instruct', length: 1589 },
-    { name: 'research', length: 1660 },
-    { name: 'workspace', length: 1576 },
-    { name: 'reviewer', length: 1548 },
-    { name: 'planner', length: 1689 },
+    { name: 'instruct', length: 1604 },
+    { name: 'research', length: 1675 },
+    { name: 'workspace', length: 1591 },
+    { name: 'reviewer', length: 1563 },
+    { name: 'planner', length: 1704 },
     // 1783: the widest prompt on the roster, because the debugger composes every shared line
     // (web + delegation + discovery + toolCreate + permissions) on top of its own five bullets.
     // Still under the 1800 budget below, by 17 characters — the delegation line was reworded
     // to fit under that ceiling rather than raising the ceiling.
-    { name: 'debugger', length: 1783 },
+    { name: 'debugger', length: 1798 },
     { name: 'summarizer', length: 141 }
 ];
 
@@ -206,7 +223,8 @@ const sharedLinesOf = (profile: AgentProfile): string[] =>
 
 // THE DELEGATION-STANCE MATRIX. One row per roster entry, exactly which shared policy lines
 // it composes. This is the roster's design made executable:
-//   general   — no DELEGATION at all: its preset passes `subagents: []`, so `delegate` is
+//   general   — no DELEGATION at all: its preset ranks a single agent (one distinct rank),
+//   so `delegate` is
 //               never registered and a delegation line would describe a tool it cannot call.
 //   instruct  — a worker: DELEGATION plus the full discovery/web/permissions block.
 //   research  — read-only investigator (READ_ONLY), delegating because a sub-agent may still
@@ -231,7 +249,7 @@ const SHARED_COMPOSITION = [
     // DELEGATION for the debugger (it reads the web before it reads the team).
     { name: 'debugger', shared: ['WEB_SEARCH', 'DELEGATION', 'DISCOVERY', 'TOOL_CREATE', 'PERMISSIONS'] },
     // The summarizer composes none of them: it is a two-sentence condenser with its own
-    // two bullets, and it runs on a brief, not on the tool policy of a primary.
+    // two bullets, and it runs on a brief, not on the tool policy of a Rank A agent.
     { name: 'summarizer', shared: [] }
 ];
 
@@ -337,15 +355,16 @@ describe('agent profiles', () => {
 
 // The delegation stance is the axis the roster is organised around, and each end of it is
 // enforced by the RUNTIME in a way the prompt alone cannot fake: `delegate` is registered
-// only when the harness has subagents (src/harness.ts `activation: 'subagents'` + the empty
-// allowlist refusal) and it is primary-only (src/tools/runtime/delegate.tool.ts
-// `registration.primaryOnly`). The profile text has to match that reality for each role.
+// only when the roster spans two distinct ranks (src/harness.ts `rosterHasDelegation`), and
+// it is DECLARED only to an agent that has someone ranked below it
+// (`delegableNamesFor`). The profile text has to match that reality for each role.
 describe('delegation stance per role', () => {
     it('gives the default role no delegation line and no team at all', () => {
         const prompt = agentInstruction(general);
 
-        // `subagents: []` means `delegate` is never registered here, so the prompt must not
-        // describe a tool that does not exist — and `toolRequest` cannot surface it either.
+        // A single-rank roster means `delegate` is never registered here, so the prompt must
+        // not describe a tool that does not exist — and `toolRequest` cannot surface it
+        // either (discovery only answers searchable rows).
         expect(general.guidelines).not.toContain(DELEGATION_GUIDELINE);
         expect(prompt).not.toContain(DELEGATION_GUIDELINE);
         expect(prompt.toLowerCase()).not.toContain('delegate');
@@ -359,8 +378,9 @@ describe('delegation stance per role', () => {
         // The preset side of the same contract (src/server/harnesses/presets.ts): a lone
         // card, so the runtime never registers `delegate` for it.
         const generalPreset = presets.find((preset) => preset.name === 'general');
-        expect(generalPreset?.primary).toBe('general');
-        expect(generalPreset?.subagents).toEqual([]);
+        expect(generalPreset?.entry).toBe('general');
+        // ONE agent, ONE rank: `rosterHasDelegation()` is false, so there is no door.
+        expect(generalPreset?.ranks).toEqual({ general: 'A' });
         expect(generalPreset?.agents).toEqual(['general']);
     });
 
@@ -403,14 +423,17 @@ describe('delegation stance per role', () => {
         expect(prompt).not.toContain(WEB_SEARCH_GUIDELINE);
     });
 
-    // No built-in team can name the Manager: a Manager running as a subagent has no
-    // `delegate` (it is primary-only), so its own rule would fire and burn a child run. The
-    // string form keeps this one exact assertion over all eight presets. The trailing
+    // No built-in team can name the Manager. Under the rank model the reason is structural
+    // and worth stating: every shipped card ranks its entry agent at A and its WHOLE team at
+    // B, so a Manager inside someone else's card sits at Rank B with no juniors — `delegate`
+    // is never even declared for it, so its own rule 1 fires and burns a child run. The team
+    // below is therefore DERIVED from the rank map (`teamBelowEntry`), which is the point: the
+    // old `teamOf(primary)` helper is gone, and a card's team IS its ranking. The trailing
     // `chat:general:` entry is the tool-less card (issue 0005-D): it selects the trusted
-    // `general` profile and declares NO team, so it is neither a delegator nor a target.
+    // `general` profile and ranks nobody below it, so it is neither a delegator nor a target.
     it('keeps the Manager out of every built-in team', () => {
         expect(
-            presets.map((preset) => `${preset.name}:${preset.primary}:${preset.subagents.join('+')}`)
+            presets.map((preset) => `${preset.name}:${preset.entry}:${teamBelowEntry(preset).join('+')}`)
         ).toEqual([
             'general:general:',
             'instruct:instruct:general+research+workspace+reviewer+debugger+summarizer',

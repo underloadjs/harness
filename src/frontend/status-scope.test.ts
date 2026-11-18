@@ -62,8 +62,8 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
         agents: ['instruct'],
         tools: ['read'],
         coreTools: ['read', 'write', 'edit', 'glob', 'toolRequest', 'toolCreate', 'tasks'],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true,
         ...overrides

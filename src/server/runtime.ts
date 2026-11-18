@@ -58,6 +58,14 @@ import {
     normalizeHarnessDatabaseRoot,
     readHarnessAgentRecords
 } from './persistence';
+// T7: the DURABLE knowledge base. The file layer is the only thing imported here for it — the
+// engine comes from the library core, and the store is a SUBSCRIBER of that engine
+// (./knowledge-file-store.ts header), so this module owns one engine + at most one store per
+// resolved root and nothing else in the process may build a second pair.
+import { createKnowledgeEngine } from '../core';
+import { loadKnowledgeFileStore } from './knowledge-file-store';
+import type { KnowledgeStore } from './knowledge-file-store';
+import type { HarnessKnowledge, KnowledgeEngine } from '../types';
 
 // Error text helper kept local so this module has no dependency on the store.
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -81,6 +89,33 @@ export type HarnessRuntime = {
     // getHarnessRuntime), so a supplied root can never be silently ignored.
     root?: string;
     persistence?: HarnessPersistence;
+    // -------------------------------------------------------------------
+    // T7 — THE DEPLOYMENT'S KNOWLEDGE BASE (cross-session, outlives every session)
+    // -------------------------------------------------------------------
+    //
+    // `knowledge` is the DURABLE half, and it is a live getter rather than a captured value:
+    // `createHarnessRuntime` is synchronous (the SessionStore restores sessions in its own
+    // constructor, so a harness can be built the instant this function returns) while
+    // `loadKnowledgeFileStore` is a Promise. A captured `undefined` would tell an embedder
+    // "this deployment has no knowledge" for the rest of the process on the strength of one
+    // microtask. The getter answers the store as soon as it exists and `undefined` until then
+    // — and until then EVERY harness still sees the same engine through `harness.knowledge`
+    // (see ./runtime's knowledge block for why that is loss-free), so a reader never has to
+    // guess which of two bases a session is writing.
+    //
+    // `undefined` FOREVER is the no-root deployment: knowledge is in memory, the process
+    // performs no filesystem write for it, and nothing here pretends otherwise — the same
+    // posture as `root`/`persistence` above, and the one the `knowledge` tool reports to the
+    // model (a bare engine carries no `flush`).
+    knowledge?: KnowledgeStore;
+    // The load itself: resolves with the store, or `undefined` for a no-root runtime. A LOAD
+    // FAILURE rejects here (a corrupt article file names itself in the message) and is NOT
+    // replaced by an empty base — same rule as a corrupt `harness/index.json`
+    // (./persistence.ts:135-137). `startHarnessServer` awaits this before it serves; a runtime
+    // that was created without an awaiter keeps serving knowledge from the shared engine and
+    // prints the failure once, because a broken knowledge file must not take the session store
+    // down with it.
+    knowledgeReady: Promise<KnowledgeStore | undefined>;
     // T15: the live update stream for THIS runtime (one broker, one epoch, one subscription set).
     // The standalone listener attaches it to its own `http.Server`; the service gateway reaches it
     // through the endpoint module's `upgrade` export, so both mounts share the same epoch. Always
@@ -160,6 +195,35 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
     // own frozen preset record, which is independent of later registry patches.
     const root = normalizeHarnessDatabaseRoot(options.root);
 
+    // T7: the knowledge base is resolved at the SAME moment as the agent overlay below —
+    // the same "durable thing at the root, exactly one per resolved root" discipline as
+    // `readHarnessAgentRecords(root)` — and it is kicked off here rather than at the first
+    // tool call, because the whole point of the base is that it is ready before any session
+    // exists. `prepareHarnessKnowledge` is memoized per root, so this line is also what
+    // `startHarnessServer` and the service handler await without ever loading twice.
+    //
+    // WHY THE PROMISE IS NOT AWAITED HERE: `createHarnessRuntime` is sync (the SessionStore
+    // restores every saved session inside its constructor, so the first harness exists the
+    // instant this function returns), while the file load is async. The ENGINE is therefore
+    // created synchronously and the store ADOPTS it (`loadKnowledgeFileStore({ engine })`,
+    // ./knowledge-file-store.ts:411-425 — the files win per article, an article the engine
+    // holds with no file is KEPT and committed, and the watermark never moves backwards), so
+    // a write that lands in the load window is durable a moment later instead of being lost
+    // or stranded on a second engine. A host that wants the durable half BEFORE its first
+    // build awaits `prepareHarnessKnowledge` itself — which is exactly what ./start.ts and
+    // ./service.ts do.
+    const knowledgeReady = prepareHarnessKnowledge(root);
+
+    // A knowledge load failure is printed once, and the base stays in memory on the shared
+    // engine. Deliberately not fatal to a runtime: a corrupt `harness/index.json` aborts
+    // startup because the SESSION document is what the store cannot serve without
+    // (./persistence.ts:135-137), while a corrupt article file costs one base the sessions
+    // still do not need to answer a prompt. The rejection still reaches an awaiter through
+    // `knowledgeReady` below (./start.ts fails startup with the real message).
+    void knowledgeReady.catch((error: unknown) => {
+        console.error(`[harness] the knowledge base could not be loaded and stays in memory: ${messageOf(error)}`);
+    });
+
     // T19: the global agent overlay is durable registry state (`<root>/harness/agents.json`),
     // so it is read at the same moment as the checkpoint header `index.json` and replayed onto
     // the registry BEFORE
@@ -227,7 +291,17 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
                 ...(database === undefined ? {} : { database }),
                 // R1/R3: the store gets the RESOLVED runtime, so the execution model it
                 // enforces is the one this process reported - never a second guess.
-                runtime
+                runtime,
+                // T7: THE KNOWLEDGE ACCESSOR, on the same one-per-root rule as `pluginSettings`
+                // and the tool switch above. It is a FUNCTION, not the value, for one reason:
+                // the store builds harnesses inside its own constructor (a restored session,
+                // ./sessions.ts) as well as on a later request, and the durable store may land
+                // between those two moments. Each build reads the live value, so the first
+                // restored session and the last one created share one object, and the window
+                // where the answer is the shared engine costs nothing (that engine is what the
+                // store adopts on load). An injected store keeps its own knowledge, exactly like
+                // its own settings and registry — there is nothing to wire here.
+                knowledge: () => harnessKnowledgeOf(root)
             }
         );
 
@@ -290,6 +364,13 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
         streamBridge: createStreamBridge(stream.broker),
         events,
         detachStreamBridge,
+        // T7: live reads of the knowledge seam (see the `HarnessRuntime` members above). The
+        // getter is what keeps `runtime.knowledge` true from the moment the load settles,
+        // instead of freezing the answer this synchronous function happened to have.
+        get knowledge(): KnowledgeStore | undefined {
+            return peekHarnessKnowledge(root);
+        },
+        knowledgeReady,
         ...(root === undefined ? {} : { root }),
         ...(persistence === undefined ? {} : { persistence })
     };
@@ -329,4 +410,153 @@ export const setHarnessRuntime = (next: HarnessRuntime | undefined, root?: strin
     }
 
     runtimes.set(key, next);
+};
+
+// ---------------------------------------------------------------------------
+// T7 — THE KNOWLEDGE BASE, ONE PER RESOLVED DATABASE ROOT
+// ---------------------------------------------------------------------------
+//
+// WHY IT LIVES HERE AND NOT ON THE SESSION STORE. Knowledge is deployment state: the file
+// layer keeps it at `<databaseRoot>/harness/knowledge/` (./knowledge-file-store.ts), which is
+// a SIBLING of `harness/sessions/` and therefore outside every session folder — killing or
+// deleting a session changes nothing about it, which is the guarantee the user asked for and
+// which ./knowledge-session.test.ts pins. `SessionStore` is the wrong owner for it for the
+// same reason `HarnessPersistence` is not: the store's life is the database's life, and its
+// sessions come and go inside it. This module already owns the one thing the knowledge base is
+// keyed by (the resolved root, `runtimes` above), so it owns the base too.
+//
+// ONE ENTRY PER ROOT, WITH ONE ENGINE AND AT MOST ONE STORE.
+//   - `engine` is created SYNCHRONOUSLY on first touch, so a harness built before the store
+//     load settles still holds THE engine (see the note in `createHarnessRuntime`);
+//   - `store` is the durable half once `loadKnowledgeFileStore` settles;
+//   - `loading` is the memoized promise, so ten concurrent hosts cause exactly one load.
+// The '' key is the no-root deployment, matching `runtimes`: knowledge works in memory and
+// the process performs NO filesystem write for it.
+type KnowledgeEntry = {
+    engine?: KnowledgeEngine;
+    store?: KnowledgeStore;
+    loading?: Promise<KnowledgeStore | undefined>;
+};
+
+const knowledgeEntries = new Map<string, KnowledgeEntry>();
+
+const knowledgeEntryOf = (root: string | null | undefined): KnowledgeEntry => {
+    const key = runtimeKey(root);
+    const existing = knowledgeEntries.get(key);
+
+    if (existing !== undefined) return existing;
+
+    // The engine exists the moment anything asks about knowledge for this root, whether or not
+    // a durable store can ever follow. `ids`/`now` are left alone: the engine's own defaults
+    // are what every other consumer of the base (the tool, a wrapper tool) sees too.
+    const created: KnowledgeEntry = { engine: createKnowledgeEngine() };
+
+    knowledgeEntries.set(key, created);
+
+    return created;
+};
+
+// The engine every harness of this root shares — durable or not. Exported because an embedder
+// that wants the base without a runtime (a CLI subcommand, a test) still must not build a
+// second engine over one directory: two engines mean two article sets that both believe
+// themselves authoritative.
+export const getHarnessKnowledgeEngine = (root?: string | null): KnowledgeEngine => {
+    const entry = knowledgeEntryOf(root);
+
+    if (entry.engine === undefined) entry.engine = createKnowledgeEngine();
+
+    return entry.engine;
+};
+
+// Load (or join the load of) the durable half. Idempotent per root, and the SAME promise
+// object for concurrent callers, so `startHarnessServer`, the service handler, and
+// `createHarnessRuntime` cannot race each other into two stores over one directory.
+//
+// A FAILURE is memoized exactly like a corrupt session document is
+// (./runtimes above: "a corrupt database throws on creation and is NOT replaced by an empty
+// one: every later request for that root fails clearly until the file is fixed"): the rejected
+// promise is the answer for the rest of the process, so a broken knowledge file is a fact an
+// operator fixes, not a condition this function re-probes on every request (a sync directory
+// scan per request would be a second problem it created).
+//
+// A no-root deployment resolves `undefined` and never touches `node:fs`.
+export const prepareHarnessKnowledge = (root?: string | null): Promise<KnowledgeStore | undefined> => {
+    const entry = knowledgeEntryOf(root);
+
+    if (entry.store !== undefined) return Promise.resolve(entry.store);
+
+    const key = runtimeKey(root);
+
+    // No database root means no durable knowledge, and that is a statement about THIS
+    // deployment rather than a fallback: `loadKnowledgeFileStore` refuses a blank root on
+    // purpose (./knowledge-file-store.ts:1010-1013), so the in-memory case is decided HERE,
+    // once, in code — the same "absent means absent" posture as `agents.json` with no root
+    // (./persistence.ts:3285).
+    if (key === '') return Promise.resolve(undefined);
+
+    if (entry.loading !== undefined) return entry.loading;
+
+    const loading = loadKnowledgeFileStore({ root: key, engine: getHarnessKnowledgeEngine(root) }).then(
+        (store) => {
+            entry.store = store;
+
+            return store;
+        }
+    );
+
+    entry.loading = loading;
+
+    return loading;
+};
+
+// The settled durable half, or `undefined` (no root, or a load that has not landed / failed).
+// Synchronous by design: this is what a HARNESS BUILD reads (./sessions.ts `buildHarness`), and
+// harness construction cannot await.
+export const peekHarnessKnowledge = (root?: string | null): KnowledgeStore | undefined =>
+    knowledgeEntryOf(root).store;
+
+// WHAT A HARNESS IS BUILT WITH (`HarnessConfiguration.knowledge`, ../types:4772): the store as
+// soon as it exists, and until then THE shared engine — the same object, for every build of
+// this root, because `loadKnowledgeFileStore` adopts it (./knowledge-file-store.ts:1042-1072).
+// Handing over an engine is never a lie about durability: an engine-shaped member carries no
+// `flush`, so the `knowledge` tool says "in memory" rather than promising bytes
+// (../types `HarnessKnowledge`).
+export const harnessKnowledgeOf = (root?: string | null): HarnessKnowledge =>
+    peekHarnessKnowledge(root) ?? getHarnessKnowledgeEngine(root);
+
+// The durability barrier for a root: awaits the load if one is still running, then the store's
+// own `flush()`. A no-root runtime costs nothing. Used by a host that must answer "this
+// article survived" before it responds.
+export const flushHarnessKnowledge = async (root?: string | null): Promise<void> => {
+    const store = await prepareHarnessKnowledge(root);
+
+    if (store === undefined) return;
+
+    await store.flush();
+};
+
+// THE ONE DISPOSAL PATH. `KnowledgeStore.dispose()` flushes, clears the trailing timer, and
+// unsubscribes from the engine, and it must happen exactly ONCE per store — which is why it is
+// a server call (./start.ts `close()`) and never a `harness.dispose` hook: one session's
+// teardown would otherwise unsubscribe the base every other session in the process is still
+// writing (../harness.ts keeps the matching note). The entry is evicted afterwards so a
+// listener restarted in the same process (a test, an embedder) loads a FRESH store instead of
+// disposing one twice, and the engine it held goes with it.
+export const disposeHarnessKnowledge = async (root?: string | null): Promise<void> => {
+    const key = runtimeKey(root);
+
+    if (key === '') return;
+
+    const entry = knowledgeEntries.get(key);
+    const store = entry?.store;
+
+    // Nothing durable for this root: an in-memory engine has no timer and no subscription to
+    // release, and the entry is deliberately KEPT (its articles stay readable for the rest of
+    // the process, which is what an in-memory deployment promises).
+    if (entry === undefined || store === undefined) return;
+
+    knowledgeEntries.delete(key);
+
+    await store.flush();
+    await store.dispose();
 };

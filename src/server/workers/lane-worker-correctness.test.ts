@@ -171,7 +171,10 @@ type ArchivedRow = {
     sequence: number;
     completedOrder: number;
     agent: string;
-    role: string;
+    // The agent's rank letter on the authority scale ('A' highest – 'Z' lowest). This replaces the
+    // retired primary/subagent pair: `HarnessAgentResultSnapshot` (../../types/index.ts:4287) names
+    // `rank`, and it is part of the archived row's content — `archiveDigestOf` digests it (./lane-commit.ts).
+    rank: string;
     kind: string;
     status: string;
     content: string;
@@ -553,7 +556,7 @@ describe('worker mode: a deleted conversation keeps its lane-archived results (s
                 sequence: 513,
                 completedOrder: 1,
                 agent: 'general',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: ANSWER,
@@ -568,7 +571,7 @@ describe('worker mode: a deleted conversation keeps its lane-archived results (s
                 sequence: 514,
                 completedOrder: 2,
                 agent: 'general',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: ANSWER,
@@ -629,7 +632,7 @@ describe('worker mode: a stopped lane run archives its forensic pair (review #5,
             'epoch',
             'invocationId',
             'kind',
-            'role',
+            'rank',
             'sequence',
             'status',
             'threadId'

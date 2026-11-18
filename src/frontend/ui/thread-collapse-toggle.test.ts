@@ -252,7 +252,7 @@ describe('block footer collapse chevron (R5/T7)', () => {
         turn.flush();
 
         const agents = [...turn.element.querySelectorAll<HTMLElement>('.agent')];
-        expect(agents.map((agent) => agent.dataset.role)).toEqual(['primary', 'subagent']);
+        expect(agents.map((agent) => agent.dataset.root)).toEqual(['true', undefined]);
 
         const flat = agents[1].querySelector<HTMLElement>('.agent-answer-actions');
         expect(flat?.querySelector('.answer-collapse')).toBeNull();

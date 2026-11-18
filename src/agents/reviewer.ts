@@ -20,8 +20,9 @@
 // line" finding is read from. Tool availability, the discovery selector's contract, and the
 // delegation gate are left to the declarations plus ./guidelines.ts. The delegation line is
 // conditional because this profile is also selectable as a lone agent in a user-created
-// harness, and a subagent never receives delegate (delegation is one level deep —
-// src/harness.ts), so the wording must never imply nested delegation.
+// harness, and whether this role can delegate at all depends on its rank: it receives the
+// tool only while an agent is ranked below it, and it can never reach upward or sideways,
+// so the wording must never imply that a delegated reviewer re-delegates.
 import type { AgentProfile } from './types';
 import {
     DELEGATION_GUIDELINE,

@@ -2,8 +2,8 @@
 //
 // Contract pinned here:
 //   - `toolCreation` defaults to 'all' (every agent sees toolCreate);
-//   - 'primary' declares the tool only to the primary and rejects a guessed call
-//     from a subagent;
+//   - a RANK LETTER (e.g. 'A') declares the tool only to that rank and every rank
+//     toward A, and rejects a guessed call from an agent below the gate;
 //   - `false` registers no model-facing tool at all, while the HOST path
 //     `harness.createTool()` keeps working;
 //   - the creation budget is a LIFETIME budget: reset() does not restore it;
@@ -12,7 +12,7 @@
 //   - `maxCreatedTools` is validated at construction;
 //   - runs nest at most one level deep, enforced centrally, so a tool holding the
 //     whole `context` (including a model-CREATED tool) cannot widen the
-//     hierarchy — while the primary's own ctx.run still works.
+//     hierarchy — while a Rank A agent's own ctx.run still works.
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
@@ -81,7 +81,7 @@ const creation = {
 };
 
 describe('toolCreation policy', () => {
-    it('defaults to all: a subagent sees toolCreate too', async () => {
+    it('defaults to all: a lower-ranked agent sees toolCreate too', async () => {
         const seenResearcher: HarnessStreamRequest[] = [];
         const researcher = brain(scripted([answer('facts')], seenResearcher));
         const writerAgent = brain(
@@ -93,13 +93,13 @@ describe('toolCreation policy', () => {
 
         expect(writer.tools.toolCreate).toBeDefined();
         // R9-R11: 'all' still REGISTERS the row for every agent, but it is
-        // searchable now, so a subagent reaches it through toolRequest instead of
+        // searchable now, so a lower-ranked agent reaches it through toolRequest instead of
         // seeing it declared on the first request.
         expect(writer.tools.toolCreate.visibility).toBe('searchable');
         expect(declaredNames(seenResearcher[0])).toEqual(['toolRequest', 'tasks']);
     });
 
-    it('primary: hides the tool from subagents and rejects a guessed call', async () => {
+    it('a rank gate hides the tool from agents below it and rejects a guessed call', async () => {
         const seenResearcher: HarnessStreamRequest[] = [];
         const researcher = brain(
             scripted([callTool('r1', 'toolCreate', JSON.stringify(creation)), answer('blocked')], seenResearcher)
@@ -110,29 +110,67 @@ describe('toolCreation policy', () => {
         const writer = harness({
             agents: { writer: writerAgent, researcher },
             presets: false,
-            toolCreation: 'primary'
+            // Rank A is the faithful replacement for the removed `'primary'` policy:
+            // the entry agent (Rank A in an unranked roster) keeps the capability, the
+            // Rank B researcher does not.
+            toolCreation: 'A'
         });
 
         await writer('go');
 
-        // R9-R11: toolCreate is not declared to anybody; `primary` additionally
-        // keeps it out of the subagent registry, so the guessed call below is
-        // refused by the policy rather than by the declaration list.
+        // R9-R11: toolCreate is not declared to anybody, and the rank gate additionally
+        // keeps it out of the LOWER-RANKED agent's declaration list — so even once the
+        // name is enabled harness-wide, the Rank B researcher never sees it.
         expect(declaredNames(seenResearcher[0])).toEqual([
             'toolRequest',
             'tasks',
         ]);
 
-        // ... and a guessed call is answered, not executed.
+        // A guessed call is answered, not executed. GATE ORDER is what this pins: the
+        // searchable name is registered but not enabled for this run, so the enablement
+        // door answers first. The rank refusal is the NEXT door, and the test below pins
+        // it by enabling the name and calling again.
         expect(content(researcher.messages[2])).toBe(
-            'Tool "toolCreate" is only available to the primary agent "writer".'
+            'Tool "toolCreate" is registered but not enabled yet. Call toolRequest with tags like "tools", "create", "extension" to enable it.'
         );
         expect(writer.tools.repeat).toBeUndefined();
 
-        // The primary still sees it.
+        // The Rank A entry agent still sees it.
         const seenWriter = brain(scripted([answer('x')]));
-        expect(harness({ agents: { writer: seenWriter }, presets: false, toolCreation: 'primary' }).tools.toolCreate)
+        expect(harness({ agents: { writer: seenWriter }, presets: false, toolCreation: 'A' }).tools.toolCreate)
             .toBeDefined();
+    });
+
+    it('a rank gate refuses an enabled toolCreate by rank, naming both ranks', async () => {
+        const researcher = brain(
+            scripted([callTool('r1', 'toolCreate', JSON.stringify(creation)), answer('blocked')])
+        );
+        const writerAgent = brain(
+            scripted([callTool('c1', 'delegate', '{"agent":"researcher","input":"go"}'), answer('final')])
+        );
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            presets: false,
+            toolCreation: 'A'
+        });
+
+        // Discovery on the HOST door enables the searchable `toolCreate` for the whole
+        // harness (the same move the nesting fixture below uses for a created tool), so
+        // the enablement door is open and the refusal below CAN only come from the rank
+        // gate: `createToolForAgent` checks the caller's rank against the ceiling.
+        await writer.executeTool('toolRequest', { names: ['toolCreate'] });
+
+        await writer('go');
+
+        // Exact message: it names the gate rank and the caller's own rank, so a model that
+        // guessed the name learns which standing it lacks. The `Tool "toolCreate" failed:`
+        // prefix is how a tool that RAN and threw reports, as opposed to the enablement
+        // door above, which answers without executing anything.
+        expect(content(researcher.messages[2])).toBe(
+            'Tool "toolCreate" failed: Tool creation is limited to Rank A and above in this harness; "researcher" holds Rank B.'
+        );
+        // Nothing was created.
+        expect(writer.tools.repeat).toBeUndefined();
     });
 
     it('false: registers no model-facing tool, but the host path still creates', () => {
@@ -156,7 +194,7 @@ describe('toolCreation policy', () => {
                 agents: { writer: brain(scripted([answer('hi')])) },
                 toolCreation: 'sometimes' as never
             })
-        ).toThrow('toolCreation must be one of: "all", "primary", false. Received sometimes.');
+        ).toThrow('toolCreation must be "all", false, or a rank letter (A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z). Received sometimes.');
     });
 });
 
@@ -237,7 +275,7 @@ describe('creation budget', () => {
 });
 
 describe('run depth authority', () => {
-    it('lets the primary run a tool that starts one agent through ctx.run', async () => {
+    it('lets the entry agent run a tool that starts one agent through ctx.run', async () => {
         const summarizer = brain(scripted([answer('summary')]));
         const delegate = tool({
             description: 'Summarise through a sibling agent.',
@@ -254,7 +292,8 @@ describe('run depth authority', () => {
 
         await writer('go');
 
-        // The trusted primary ctx.run still works (depth 2).
+        // The trusted entry-agent ctx.run still works (depth 2, and the roster's
+        // ceiling is 2 because it spans exactly two distinct ranks).
         expect(content(entry.messages[2])).toBe('summary');
         expect(withoutIds(summarizer.messages)).toEqual([
             { role: 'user', content: 'text' },
@@ -262,7 +301,7 @@ describe('run depth authority', () => {
         ]);
     });
 
-    it('refuses a third level from inside a delegated subagent, even from a created tool', async () => {
+    it('refuses a third level from inside a delegated agent, even from a created tool', async () => {
         const editor = brain(scripted([answer('edited')]));
         const seenResearcher: HarnessStreamRequest[] = [];
         const researcher = brain(
@@ -295,14 +334,18 @@ describe('run depth authority', () => {
             tags: ['agents'],
             source: "return context.run('editor', 'edit');"
         });
-        // The subagent never discovered it: make it callable for this fixture by
+        // The Rank B researcher never discovered it: make it callable for this
+        // fixture by
         // running discovery through the same harness (its result enables it).
         await writer.executeTool('toolRequest', { tags: ['agents'] });
 
         await writer('go');
 
         expect(content(researcher.messages[2])).toBe(
-            'Tool "nest" failed: Agent "editor" cannot run: runs nest at most 2 deep, and "researcher" is already running.'
+            // The ceiling is the DISTINCT-RANK COUNT (writer is Rank A, researcher and
+            // editor are both Rank B), so a third level is impossible: `ctx.run` never
+            // consults rank, so this is the nesting bound doing the work.
+            'Tool "nest" failed: Agent "editor" cannot run: this harness configures 2 distinct ranks, so runs nest at most 2 levels deep, and "researcher" is already running at that depth.'
         );
         // The editor never ran, so it has no transcript.
         expect(editor.messages).toEqual([]);

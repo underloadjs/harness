@@ -67,8 +67,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct', 'research', 'workspace'],
         tools: [],
         coreTools: [],
-        primary: 'instruct',
-        subagents: ['research', 'workspace'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', research: 'B', workspace: 'B' },
         builtin: true,
         editable: true,
         ...overrides
@@ -215,7 +215,7 @@ const stubServer = (
                 rootPath: '/api',
                 // `single` is the locked-roster case (D6): a team with one member has
                 // nothing to cycle between.
-                presets: [options.single === true ? descriptor({ agents: ['instruct'], subagents: [] }) : descriptor()],
+                presets: [options.single === true ? descriptor({ agents: ['instruct'], ranks: { }}) : descriptor()],
                 tools: [],
                 defaults,
                 sessions: session === undefined ? [] : [session],

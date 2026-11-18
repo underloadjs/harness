@@ -6,7 +6,7 @@
 //
 //   - `start`                              → that agent is active;
 //   - `text` / `reasoning` / `tool_call` / `tool_result` → reactivate it, because a
-//     delegated subagent can speak again after an intermediate `done`-less gap and
+//     delegated member can speak again after an intermediate `done`-less gap and
 //     a parent waiting on a delegated tool is still working;
 //   - `done` / `error`                     → only that agent leaves the set —
 //     EXCEPT a `done` whose `pending` list is non-empty (R6): the response is

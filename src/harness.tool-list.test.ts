@@ -72,6 +72,7 @@ describe('toolList', () => {
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',

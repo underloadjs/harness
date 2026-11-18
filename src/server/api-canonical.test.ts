@@ -60,8 +60,8 @@ const workerPreset = (): HarnessPreset => ({
     title: 'Worker',
     description: 'Scripted canonical-contract preset',
     requiresEndpoint: false,
-    primary: 'worker',
-    subagents: [],
+    entry: 'worker',
+    ranks: { worker: 'A' },
     agents: ['worker'],
     tools: [],
     builtin: true,
@@ -78,7 +78,7 @@ const workerPreset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'worker',
+            entry: 'worker',
             presets: false,
             // The store hands its recorder in as `progress`: WITHOUT this the run records no
             // events, and a turn row/event_count would prove nothing about the read model.
@@ -460,7 +460,8 @@ describe('canonical REST contract', () => {
 
         // T27: a session agent binding is a REAL operation now (it used to answer 403 naming the
         // missing create/remove). The roster key must be the trusted profile's own name, so a
-        // made-up alias is a 400 that says why, and the primary is still not detachable.
+        // made-up alias is a 400 that says why, and the ENTRY AGENT is still not detachable
+        // (./sessions.ts `removeSessionAgent` guards membership, not a rank letter).
         const createBinding = jsonOf(
             await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'extra', profile: 'instruct' })
         );
@@ -476,7 +477,7 @@ describe('canonical REST contract', () => {
         expect(roster.status).toBe(200);
         expect(Object.keys(roster.body).sort()).toEqual(['agents', 'revision', 'session_id', 'total']);
         expect(roster.body.total).toBe(1);
-        expect(roster.body.agents[0]).toMatchObject({ agent_id: 'worker', role: 'primary', origin: 'definition' });
+        expect(roster.body.agents[0]).toMatchObject({ agent_id: 'worker', rank: 'A', origin: 'definition' });
 
         const patched = jsonOf(
             await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/worker`, { model: 'scripted/next' })
@@ -559,10 +560,12 @@ describe('canonical REST contract', () => {
             'builtin',
             'definition_revision',
             'description',
+            'entry',
             'name',
-            'primary',
+            // `ranks` is the resolved authority map the card carries next to its roster; the
+            // list is compared against `Object.keys(...).sort()`, so the pin states it sorted.
+            'ranks',
             'requires_endpoint',
-            'subagents',
             'title',
             'tools'
         ]);
@@ -576,9 +579,9 @@ describe('canonical REST contract', () => {
 
         expect(definition.status).toBe(200);
         // The core-tool set is what THIS host would declare: the harness-owned control tools
-        // (`toolRequest`, `task`), and no `delegate` because this definition has no subagent
-        // allowlist. Same rule the frozen session copies use, so a card and a session cannot
-        // disagree.
+        // (`toolRequest`, `task`), and no `delegate` because no member of this one-member roster is
+        // ranked strictly below another, so there is nowhere to hand work (../types `isLowerRank`).
+        // Same rule the frozen session copies use, so a card and a session cannot disagree.
         expect(definition.body.harness.core_tools).toEqual(['toolRequest', 'tasks']);
         expect(definition.body.harness.instruction_summary).toEqual([
             { agent: 'worker', source: 'catalogue', overridden: false, chars: 0 }
@@ -587,7 +590,10 @@ describe('canonical REST contract', () => {
         const created = jsonOf(
             await call(api, 'POST', `${MOUNT}/harnesses`, {
                 name: 'canon',
-                primary: 'instruct',
+                // B2 requires the roster on create: `agents` is the member list, `entry` names one
+                // of them, and the rank map defaults from that pair (entry 'A', no one else).
+                agents: ['instruct'],
+                entry: 'instruct',
                 agent_models: { instruct: 'scripted/model' }
             })
         );

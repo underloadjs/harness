@@ -5,7 +5,7 @@
 // those records into the values the UI renders, with a documented fallback for a
 // server that predates a field:
 //
-//   - descriptor extensions (primary/subagents/builtin/editable/coreTools);
+//   - descriptor extensions (entry/ranks/builtin/editable/coreTools);
 //   - session freezing (`harnessDefinition`);
 //   - per-turn timings (`eventTimes`) and per-frame `at`;
 //   - `tool_result.callId`;
@@ -43,10 +43,21 @@ import type {
 // N3 interaction/branch wire shapes live in the shared type barrel. They are read
 // structurally below so a server that predates them (or a malformed frame) cannot
 // make the transcript throw; the canonical types only anchor the return values.
+// `AgentRank` is the canonical rank letter (R20) from the same barrel.
 import type {
+    AgentRank,
     HarnessActionAnswer,
     HarnessActionChoice,
     HarnessActionRequest
+} from '../types';
+// The rank vocabulary as VALUES (the type-only import above cannot supply them). They are
+// aliased to `*Value` inside this module because the PUBLIC names are re-exported below for
+// the browser surfaces, and a local binding with the same name would shadow them.
+import {
+    AGENT_RANKS as CANONICAL_AGENT_RANKS_VALUE,
+    isAgentRank as isAgentRankValue,
+    isLowerRank as isLowerRankValue,
+    rankIndexOf as rankIndexOfValue
 } from '../types';
 
 // Legacy fallback: the harness-owned core tools an OLD server (no `coreTools`)
@@ -115,32 +126,195 @@ export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = 
 const descriptorsOf = (descriptor: HarnessDescriptor): readonly string[] =>
     Array.isArray(descriptor.agents) ? descriptor.agents : [];
 
-// The entry agent. The contract makes `primary` explicit; an older descriptor is
-// interpreted the documented way — first declared agent, else the harness name.
-export const primaryOf = (descriptor: HarnessDescriptor): string => {
-    const primary = descriptor.primary;
-    if (typeof primary === 'string' && primary.trim().length > 0) return primary;
+// --- The RANK vocabulary (R20) ------------------------------------------------
+//
+// The harness taxonomy is now a RANK ladder, not a primary/subagent pair:
+//   - `AgentRank` is a single letter, 'A'..'Z'; its INDEX in the alphabet is the
+//     authority, so 'A' is the highest rank and 'Z' the lowest.
+//   - ANY number of agents may share a rank — several members can be Rank A — so
+//     nothing in the UI may imply a unique top agent.
+//   - DELEGATION is rank-gated: an agent may delegate only to a STRICTLY LOWER
+//     rank, and a Rank A agent cannot delegate to another Rank A agent. Threading
+//     is not delegation and is not rank-gated, so only `delegateTargetsOf` (below)
+//     applies the gate — never the member roster or the composer's agent cycle.
+//   - ENTRY is a SEPARATE concept: `descriptor.entry` names the agent that routes a
+//     new/seeded conversation. It is NOT an authority claim; the entry agent can be
+//     any rank.
+//
+// The letters, the ordering, the guard and the delegation predicate are all CANONICAL
+// in ../types/index.ts — the kernel's own vocabulary, already value-imported by
+// ./ui/turns.ts — so this module re-exports them instead of keeping a second copy the
+// browser could drift away from. What lives HERE is only what the browser owns: the
+// label wording and the stepper arithmetic on top of the canonical ordering.
+export { AGENT_RANKS, isAgentRank, isLowerRank, rankIndexOf } from '../types';
+
+// The two ends of the ladder as NAMES. A surface that has to say "Rank A is the highest"
+// or clamp a stepper reads these instead of hard-coding a letter, and ./view-test-support
+// uses `LOWEST_RANK` for the server's own rule that an unranked member reports the lowest
+// letter it was never granted.
+// The `??` arms only satisfy the index signature (the table is non-empty by construction).
+export const HIGHEST_RANK: AgentRank = CANONICAL_AGENT_RANKS_VALUE[0] ?? 'A';
+export const LOWEST_RANK: AgentRank =
+    CANONICAL_AGENT_RANKS_VALUE[CANONICAL_AGENT_RANKS_VALUE.length - 1] ?? 'Z';
+
+// The one wording the UI shows for a rank. Every label (tile, tab, dialog, tooltip)
+// goes through this so a rank never reads as a bare letter in one surface and a
+// worded rank in another.
+export const rankLabelOf = (rank: AgentRank): string => `Rank ${rank}`;
+
+// Move a rank by `delta` steps of authority (`-1` = one rank HIGHER, `+1` = one
+// rank LOWER) and clamp to the ladder. A non-rank input starts at the top, because
+// the steppers only ever appear on a member whose letter the reader is choosing.
+// The clamp reads the canonical table, so the ladder cannot have two different
+// lengths on the client and the server.
+export const stepRank = (rank: unknown, delta: number): AgentRank => {
+    const from = isAgentRankValue(rank) ? rankIndexOfValue(rank) : 0;
+    const next = Math.min(CANONICAL_AGENT_RANKS_VALUE.length - 1, Math.max(0, from + delta));
+
+    return CANONICAL_AGENT_RANKS_VALUE[next] ?? HIGHEST_RANK;
+};
+
+// Is `to` a legal delegation target for an agent ranked `from`? The kernel's own
+// predicate (`isLowerRank`, strict by construction — a same-rank peer is not a
+// subordinate). A rank this browser cannot read is never a target: the rule must not
+// be applied from a guess.
+export const canDelegateTo = (from: unknown, to: unknown): boolean => {
+    if (!isAgentRankValue(from) || !isAgentRankValue(to)) return false;
+
+    return isLowerRankValue(to, from);
+};
+
+// The routing/seed agent for a new conversation. The wire states it; a payload
+// without it is read the documented way — first declared agent, else the harness
+// name (the same fallback the old primary accessor used).
+export const entryOf = (descriptor: HarnessDescriptor): string => {
+    const entry = descriptor.entry;
+    if (typeof entry === 'string' && entry.trim().length > 0) return entry;
 
     return descriptorsOf(descriptor)[0] ?? descriptor.name;
 };
 
-// Agents the primary may delegate to. The server's list wins; the fallback is
-// "every agent except the primary", which is what the harness does when
-// `subagents` is omitted.
-export const subagentsOf = (descriptor: HarnessDescriptor): string[] => {
-    const primary = primaryOf(descriptor);
+// The RANK each member is configured with, as a defensive copy. Only valid letters
+// survive: an entry the wire states as `rank: 'captain'` is no rank at all, and a
+// rank this browser cannot read must never reach a label or a delegation filter.
+// Members the map omits simply have no rank (see `rankOf`).
+export const ranksOf = (descriptor: HarnessDescriptor): Record<string, AgentRank> => {
+    const declared = descriptor.ranks;
 
-    const listed = Array.isArray(descriptor.subagents)
-        ? descriptor.subagents.filter((name): name is string => typeof name === 'string')
-        : descriptorsOf(descriptor);
+    if (declared === null || typeof declared !== 'object') return {};
 
-    return uniqueNames(listed.filter((name) => name !== primary));
+    const ranks: Record<string, AgentRank> = {};
+
+    for (const [name, rank] of Object.entries(declared)) {
+        if (name.length === 0 || !isAgentRankValue(rank)) continue;
+        ranks[name] = rank;
+    }
+
+    return ranks;
 };
 
-// The complete team in display order: primary first, then secondaries.
+// One member's rank, or `undefined` when the definition states none. Callers render
+// "rank not stated" honestly rather than inventing 'A' for an unknown member.
+export const rankOf = (descriptor: HarnessDescriptor, name: string): AgentRank | undefined =>
+    ranksOf(descriptor)[name];
+
+// THE RANK MAP A TEAM RUNS WITH WHEN ITS CARD STATES NONE — the browser's mirror of the
+// server's documented default: the ENTRY agent holds the highest rank and every other
+// member sits ONE rank below it (../server/harnesses/toolbox.ts:258-259). ./api.ts applies
+// it to a card that omits `ranks`, so the deck, the rank steppers, and the next save all
+// describe what the runtime actually does instead of claiming a team has no ranks.
+//
+// WHY NOT AN EMPTY MAP: `ranks: {}` is not "unknown" to the server. An explicit empty map
+// ranks EVERY member one below the floor — a flat team that cannot delegate at all — so a
+// client that echoed `{}` for a card that never stated ranks would erase ranks it was
+// never told about. Stating the default is the only echo that cannot lose state.
+//
+// `entry` is matched by exact name. When the name is unknown or missing, this helper is the
+// LENIENT layer and the leniency is its OWN: every member simply lands on the floor rank,
+// because a deck tile only needs a display rank to draw. Do not read that as the server's
+// behaviour — the layers that route refuse the same definition outright: the registry answers
+// a 400 naming the roster (../server/harnesses/registry.ts `normalizeEntry`) and the kernel
+// throws at construction, `Entry agent "<name>" is not registered` (../harness.ts, the
+// `entryName` check). So an entry outside the roster never runs as a floor-ranked team; the
+// client draws it, the server refuses it, and the difference is a UI convenience only.
+export const defaultRanksOf = (entry: unknown, agents: readonly string[]): Record<string, AgentRank> => {
+    // One step below the top, computed from the canonical ladder rather than hard-coded, so
+    // the client's mirror cannot drift if the ladder ever changes.
+    const below = stepRank(HIGHEST_RANK, 1);
+    const named = typeof entry === 'string' ? entry : '';
+
+    return Object.fromEntries(
+        uniqueNames(agents).map((agent) => [agent, agent === named ? HIGHEST_RANK : below])
+    );
+};
+
+// The authority map a CARD gives a roster, reduced to what this browser may safely re-send.
+// Three cases, in the order ./api.ts meets them:
+//   - the card states NO map → the default above (a card that omits ranks is read by the
+//     server exactly that way, so the client is not inventing anything);
+//   - the card states a map → keep only the members' own keys and only valid letters. The
+//     read shape guarantees both (../server/protocol.ts:384-388: the stored map covers every
+//     member), so dropping a stale key cannot lose information here — but it DOES protect the
+//     next PATCH, which the server refuses outright for a `ranks` key outside the roster
+//     (../server/harnesses/registry.ts:559);
+//   - a stated map with nothing left after that filter → the default again. A map whose keys
+//     all point at agents the roster dropped is as good as unstated, and echoing `{}` would
+//     quietly turn a delegating team into a flat one.
+//
+// A member the stated map omits keeps NO rank rather than a guessed one: `ranksOf`/`rankOf`
+// then read it as "rank not stated", and the server fills it one rank below the lowest
+// stated letter when the map is saved (../server/harnesses/toolbox.ts:269-275).
+export const rosterRanksOf = (entry: unknown, agents: readonly string[], stated?: unknown): Record<string, AgentRank> => {
+    const roster = uniqueNames(agents);
+
+    if (stated === null || typeof stated !== 'object') return defaultRanksOf(entry, roster);
+
+    const ranks: Record<string, AgentRank> = {};
+
+    for (const agent of roster) {
+        const rank = (stated as Record<string, unknown>)[agent];
+
+        if (isAgentRankValue(rank)) ranks[agent] = rank;
+    }
+
+    if (Object.keys(ranks).length === 0) return defaultRanksOf(entry, roster);
+
+    return ranks;
+};
+
+// The complete team in display order: the ENTRY agent first, then every other
+// declared agent in the order the definition lists it. Order is presentation and
+// routing only — it says nothing about authority, so two Rank A members are
+// perfectly normal here and no caller may read "first" as "top".
 export const membersOf = (descriptor: HarnessDescriptor): string[] => {
-    const primary = primaryOf(descriptor);
-    return [primary, ...subagentsOf(descriptor).filter((name) => name !== primary)];
+    const entry = entryOf(descriptor);
+    return uniqueNames([entry, ...descriptorsOf(descriptor)]);
+};
+
+// Who an agent may DELEGATE to: every other member of its team that sits at a
+// STRICTLY LOWER rank. This is the rank rule, spelled once:
+//   - a Rank A agent delegating to a Rank A sibling is refused (equal is not lower);
+//   - an agent with no stated rank has no targets, because the rule cannot be
+//     evaluated from a missing rank;
+//   - A→B→C chains are legal, so the filter never excludes anything but equals and
+//     superiors — it is the runtime, not this list, that decides how deep a chain runs.
+export const delegateTargetsOf = (
+    descriptor: HarnessDescriptor,
+    agent: string,
+    ranks?: Readonly<Record<string, AgentRank>>
+): string[] => {
+    const map = ranks ?? ranksOf(descriptor);
+    const from = map[agent];
+
+    if (from === undefined) return [];
+
+    return membersOf(descriptor)
+        .filter((name) => name !== agent && canDelegateTo(from, map[name]))
+        .slice()
+        .sort(
+            (left, right) =>
+                rankIndexOfValue(map[left] ?? LOWEST_RANK) - rankIndexOfValue(map[right] ?? LOWEST_RANK)
+        );
 };
 
 // Deduplicate while preserving order. Used for every request body so a repeated
@@ -661,7 +835,11 @@ export const branchStartEventOf = (
     if (typeof branch.branchId !== 'string' || branch.branchId.length === 0) return undefined;
     if (branch.kind !== 'fork' && branch.kind !== 'autoanswer') return undefined;
     if (typeof branch.agent !== 'string' || branch.agent.length === 0) return undefined;
-    if (branch.role !== 'primary' && branch.role !== 'subagent') return undefined;
+    // R20: the branch's structural field is its RANK letter. Any letter A–Z is a
+    // valid stamp (several agents share a rank, and a branch is threading, not
+    // delegation, so no rank ordering is implied here) — anything else means the
+    // frame is malformed and must not render.
+    if (!isAgentRankValue(branch.rank)) return undefined;
     if (!Number.isFinite(branch.forkDepth) || branch.forkDepth < 0) return undefined;
     if (typeof branch.model !== 'string') return undefined;
     if (!Array.isArray(branch.tools)) return undefined;

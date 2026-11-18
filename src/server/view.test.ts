@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, afterAll, describe, expect, it, vi } from 'vitest';
 import { agent, harness } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
-import type { HarnessEvent, HarnessStream, HarnessStreamEvent } from '../harness';
+import type { AgentRank, HarnessEvent, HarnessStream, HarnessStreamEvent } from '../harness';
 import { createHarnessRegistry } from './harnesses';
 import { SessionError, SessionStore } from './sessions';
 import { HarnessPersistence } from './persistence';
@@ -97,8 +97,15 @@ const presetOf = (
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: agents[0] ?? name,
-    subagents: agents.slice(1),
+    // R15 — `entry` is ROUTING (which member an unfocused submit opens) and `ranks` is AUTHORITY.
+    // The retired `primary` + `subagents` pair said "the first agent leads, the rest are its
+    // delegation targets"; the map says it outright — the entry holds Rank A and every other member
+    // sits strictly below it, which is what derives the `delegate` allowlist (`isLowerRank`). A
+    // stored card covers EVERY member (./harnesses/registry.ts `sortedRanks`).
+    entry: agents[0] ?? name,
+    ranks: Object.fromEntries(
+        agents.map((member) => [member, member === (agents[0] ?? name) ? 'A' : 'B'])
+    ) as Record<string, AgentRank>,
     agents,
     tools: [],
     builtin: true,
@@ -164,7 +171,7 @@ const toolRoundPreset = (name = 'worker', instruction = WORKER_INSTRUCTION): Har
                     tools: ['task']
                 })
             },
-            primary: name,
+            entry: name,
             presets: false,
             report: { progress }
         })
@@ -180,7 +187,7 @@ const singlePreset = (name = 'one'): HarnessPreset =>
                     stream: answerStream('plain answer')
                 })
             },
-            primary: name,
+            entry: name,
             presets: false,
             report: { progress }
         })
@@ -217,7 +224,7 @@ const twoRunPreset = (name = 'splitter', firstText = 'part one', secondText = 'p
                     tools: ['task']
                 })
             },
-            primary: name,
+            entry: name,
             presets: false,
             report: { progress }
         })
@@ -1530,7 +1537,7 @@ describe('the canonical session surface (R3)', () => {
                         }
                     })
                 },
-                primary: name,
+                entry: name,
                 presets: false,
                 report: { progress }
             })
@@ -1730,7 +1737,7 @@ describe('the canonical session surface (R3)', () => {
                             tools: ['task']
                         })
                     },
-                    primary: 'twice',
+                    entry: 'twice',
                     presets: false,
                     report: { progress }
                 })
@@ -2111,7 +2118,7 @@ describe('the context bar survives a restart with the counts it recorded', () =>
                             }
                         })
                     },
-                    primary: 'thinker',
+                    entry: 'thinker',
                     presets: false,
                     report: { progress }
                 })

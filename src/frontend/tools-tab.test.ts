@@ -136,8 +136,10 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct'],
         tools: ['read'],
         coreTools: ['toolRequest', 'toolCreate', 'tasks'],
-        primary: 'instruct',
-        subagents: [],
+        // One-member team: its sole agent is the entry point and holds Rank A, so this harness
+        // has nothing BELOW it and registers no delegation.
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true,
         ...overrides
@@ -882,7 +884,11 @@ it('fills the delegation presets from the playground harness, not a hard-coded a
                         presets: [
                             descriptor({
                                 agents: ['instruct', 'research', 'workspace'],
-                                subagents: ['research', 'workspace']
+                                // Instruct plays the playground at Rank A, and the two teammates
+                                // sit strictly below it — which is exactly the set `delegate` may
+                                // name. An equal-rank peer would not appear.
+                                entry: 'instruct',
+                                ranks: { instruct: 'A', 'research': 'B', 'workspace': 'B' }
                             })
                         ],
                         tools: [agentDelegateTool, fileReadTool]
@@ -900,8 +906,8 @@ it('fills the delegation presets from the playground harness, not a hard-coded a
     await flush();
     document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="delegate"]')?.click();
 
-    // The first configured subagent is the example target, and the brief says what a
-    // self-contained brief must contain.
+    // The first legal target is the example, and the brief says what a self-contained brief
+    // must contain.
     expect(JSON.parse(byClass('.tool-args', 'textarea').value)).toEqual({
         agent: 'research',
         input:
@@ -911,7 +917,7 @@ it('fills the delegation presets from the playground harness, not a hard-coded a
     // R7: the runner states the playground harness's real targets and the one-level
     // limit, and never claims the selected conversation is the one it writes into.
     expect(document.querySelector('.tool-note')?.textContent).toBe(
-        'Core tool — it runs in the playground’s temporary session and hands ONE subagent a self-contained brief. Targets for the playground harness: research, workspace. Subagents cannot delegate further.'
+        'Core tool — it runs in the playground’s temporary session and hands ONE lower-ranked agent a self-contained brief. Targets for the playground harness: research, workspace. An agent may delegate only to a strictly lower rank.'
     );
     // R8: each target is its own named preset button, with the schema fallback after it.
     expect(
@@ -920,7 +926,55 @@ it('fills the delegation presets from the playground harness, not a hard-coded a
     expect(document.querySelector('.tool-card button.primary')?.disabled).toBe(false);
 });
 
-it('reports delegation as unavailable when the playground harness has no subagents', async () => {
+it('excludes an equal-rank teammate from the delegation targets', async () => {
+    // THE rank rule at the picker (R20): a team may hold any number of agents on one rank, and
+    // an agent may delegate only STRICTLY below its own. Here `research` shares Rank A with the
+    // agent the playground plays, so it is a peer — never a target — while the Rank B member
+    // below it is. A picker that listed peers would offer a call the server refuses.
+    stubFetch(
+        (url) =>
+            url === '/api'
+                ? json(
+                    bootstrap({
+                        presets: [
+                            descriptor({
+                                agents: ['instruct', 'research', 'workspace'],
+                                entry: 'instruct',
+                                ranks: { instruct: 'A', 'research': 'A', 'workspace': 'B' }
+                            })
+                        ],
+                        tools: [agentDelegateTool, fileReadTool]
+                    })
+                )
+                : undefined,
+        undefined,
+        [agentDelegateTool, fileReadTool]
+    );
+
+    await boot();
+    await flush();
+
+    openTools();
+    await flush();
+    document.querySelector<HTMLButtonElement>('.tool-tab-info[data-tool="delegate"]')?.click();
+
+    // The one legal target is both the example in the drafted call and the only preset button.
+    expect(JSON.parse(byClass('.tool-args', 'textarea').value)).toEqual({
+        agent: 'workspace',
+        input:
+            'Give workspace everything it needs: the goal, the files or areas, the constraints, and the evidence you want back.'
+    });
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.tool-preset')].map((node) => node.textContent)
+    ).toEqual(['Delegate to workspace']);
+    expect(document.querySelector('.tool-note')?.textContent).toBe(
+        'Core tool — it runs in the playground’s temporary session and hands ONE lower-ranked agent a self-contained brief. Targets for the playground harness: workspace. An agent may delegate only to a strictly lower rank.'
+    );
+    // The team is still THREE agents — the peer is a member, it is simply not a target.
+    expect(document.querySelector('.tool-card button.primary')?.disabled).toBe(false);
+});
+
+it('reports delegation as unavailable when no team member sits at a lower rank', async () => {
     // T4: the same shift as the test above — the toolbox page and the runner's schema read are
     // both served from the `[agentDelegateTool]` list this fixture states.
     const calls = stubFetch(
@@ -936,7 +990,7 @@ it('reports delegation as unavailable when the playground harness has no subagen
     await flush();
 
     // R1 (Tools Catalogue): the pane's long "Every tool the server lists…" paragraph — the one
-    // that used to name `delegate when the playground harness has subagents` — is GONE, from
+    // that used to name `delegate when the playground harness has second-tier agents` — is GONE, from
     // the source and from the document. What still states that a subagent-less harness
     // registers no delegation is the runner this test opens below (`.tool-note`), and the
     // row's own meta line; nothing is claimed above the list any more.
@@ -951,7 +1005,7 @@ it('reports delegation as unavailable when the playground harness has no subagen
     expect(document.querySelectorAll('.tool-preset')).toHaveLength(0);
     expect(document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.disabled).toBe(true);
     expect(document.querySelector('.tool-note')?.textContent).toBe(
-        'Core tool — the playground harness declares no subagents, so delegation is not available in its session. Add an agent to that team to enable one-level delegation.'
+        'Core tool — no agent in the playground harness sits at a rank below the one you are playing, so delegation is not available in its session. Give a team member a lower rank to enable delegation.'
     );
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-runner-slot .tool-note.is-warning')].map(
@@ -959,7 +1013,7 @@ it('reports delegation as unavailable when the playground harness has no subagen
         )
     ).toEqual([
         'This runs on the harness server with the server process permissions. The file and command presets are not sandboxed.',
-        'Not available for the playground harness: it declares no subagents, so delegate is not registered in its session.'
+        'Not available for the playground harness: no agent sits at a rank below the one you are playing, so delegate is not registered in its session.'
     ]);
     expect(byClass('.tool-output .card-label', 'span').textContent).toBe('unavailable');
 

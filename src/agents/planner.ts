@@ -6,13 +6,17 @@
 // A Manager is only a Manager while it can delegate. Two situations break that contract,
 // and the runtime detects them in ONE observable way — whether `delegate` is declared:
 //
-//   1. NO TEAM AT ALL. `delegate`'s registration gate is `activation: 'subagents'` and the
-//      harness drops the row when the allowlist is empty (src/harness.ts:1093-1103), so a
-//      single-agent harness simply has no such tool and `toolRequest` cannot add it.
-//   2. IT IS THE DELEGATE. `delegate` is marked primary-only (src/tools/runtime/
-//      delegate.tool.ts `registration.primaryOnly`, enforced by `primaryOnlyDefinitions` in
-//      src/harness.ts:1765-1782 plus the launch gate at :6949-6954), so a Manager running as
-//      someone's subagent has no delegate either.
+//   1. NO TEAM AT ALL. `delegate`'s registration gate is `activation: 'delegation'` plus
+//      `rosterHasDelegation()` — the roster must span at least two distinct ranks — so a
+//      single-agent harness, or a Manager nobody is ranked below, simply has no such tool
+//      and `toolRequest` cannot add it (src/harness.ts, `rosterHasDelegation`).
+//   2. IT WAS DELEGATED TO. A rank is INTRINSIC, not the seat: a Manager that a Rank A
+//      caller delegated to keeps its OWN door to whatever is below it (delegation is
+//      strictly downward, so that is allowed). What the runtime does NOT do is give it the
+//      brief's authority — it is being asked to plan, and its own rule 2 below is a POLICY
+//      the profile states, not a capability the harness withholds. A Manager that is also
+//      the roster's lowest rank has no door either, which is the same observable absence as
+//      case 1 (`delegate` not declared).
 //
 // Neither case can be expressed as a capability denial (`AgentConfiguration` has no tools
 // field, src/types/index.ts), so the profile states both consequences explicitly and forbids
@@ -33,17 +37,19 @@
 // additionally make that read-only BY CONSTRUCTION with the delegate `scope.tools` allowlist
 // (src/tools/runtime/delegate.tool.ts) — a schema option, so it needs no prose here.
 //
-// ROUTING NAMES NO UNREACHABLE ID. The delegate `agent` enum is this session's allowlist
-// (src/harness.ts:2962-2976), and a built-in team is every role EXCEPT its primary and
+// ROUTING NAMES NO UNREACHABLE ID. The delegate `agent` enum is the CALLER's own legal set
+// — every agent ranked strictly below it, projected per agent by `delegateDeclarationFor`
+// (src/harness.ts) — and a built-in team is every role EXCEPT the entry agent and
 // except the Manager itself — so the ids listed below are the ones a shipped Manager team
 // actually contains, and `planner` is deliberately not among them. When no specialist fits,
 // the target is `general` (./general.ts), the one role designed to take a whole
 // self-contained job; the Manager still never takes the step itself.
 //
-// WHY `instruct` IS NOT IN THE ROUTING TABLE (it IS often in the team). A delegate never
-// receives `delegate` (primary-only, src/harness.ts `primaryOnlyDefinitions`), so an
-// Instruct running as someone's subagent cannot use its own context-burning delegation
-// licence — in that seat it behaves exactly like `general`. Naming it as a separate route
+// WHY `instruct` IS NOT IN THE ROUTING TABLE (it IS often in the team). An Instruct that is
+// ranked at or below every other member has no door of its own (`delegate` is registered
+// only while somebody is ranked below it, and its enum only ever names those), so an
+// Instruct running as someone's delegate may well have no delegation licence at all — in
+// that seat it behaves exactly like `general`. Naming it as a separate route
 // would promise a capability the seat does not have, so the table names the role that OWNS
 // each kind of step instead of enumerating every reachable id; a call to `instruct` is
 // still legal, it is simply not a distinct capability.
@@ -63,11 +69,12 @@ export const planner: AgentProfile = {
     instruction:
         'You are the Manager agent. Hold the whole goal, plan it, and steer specialists through every step; you delegate the work and never do it yourself.',
     guidelines: [
-        // Rule 1: no team, no Manager. `delegate` absent means "no one to delegate to"
-        // (src/harness.ts drops the row when the allowlist is empty).
+        // Rule 1: no team, no Manager. `delegate` absent means "nobody ranked below me"
+        // (`rosterHasDelegation()` is false, so the row is never registered).
         'If `delegate` is not declared to you, stop and say why: with no one to delegate to a Manager cannot manage, and it must not quietly become a worker.',
         // Rule 2: a Manager that was delegated to returns the reason instead of the work.
-        // A subagent never receives `delegate`, so the same absence tells it this happened.
+        // This is profile POLICY, not the runtime: a delegated Manager may still hold a rank
+        // with juniors below it, so the prompt is what stops it from starting the job.
         'If this brief reached you because another agent delegated to you, reply that a Manager does not run as a delegate, and stop without starting the task.',
         // The plan comes before any delegation, and it is written where the team can read it.
         'Restate the objective, constraints, and acceptance criteria, then write a numbered plan naming the target id and the evidence each step must produce; keep it in the task list (add with { tasks: [{ text }] }, patch by id, no arguments reads it).',

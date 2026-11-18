@@ -81,7 +81,9 @@ import type {
     DisplayPanelSummary,
     DisplayProjectContext,
     DisplayReasoningNode,
-    DisplayRole,
+    // The section authority axis (was `DisplayRole`). A rank is resolved from the harness rank
+    // map, never from "is this the primary".
+    DisplayRank,
     DisplayStep,
     DisplayTail,
     DisplayTailKind,
@@ -104,6 +106,10 @@ import type { SessionTurn } from './protocol';
 // with the same helper (../sessions.ts `noteInvocationThread`), so a section can only ever be
 // resolved by the key the recorder used, and the format is defined in exactly one place.
 import { invocationRunKeyOf } from './protocol';
+// The rank vocabulary (../types/index.ts `AGENT_RANKS`, ordered highest authority first). A
+// VALUE import on purpose: the fallback rank below is derived from the same ordered list every
+// other rank rule reads, never from a hard-coded letter that could drift from the vocabulary.
+import { AGENT_RANKS } from '../types';
 
 // The turn's own root flow. INTERNAL key only: a section's wire identity is always
 // its minted `${turnId}:${ordinal}` id, which is why a delegation placeholder can
@@ -1046,12 +1052,13 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
     // denominator (`applyShares`), never a displayed figure: a denominator is a scale,
     // so "the biggest context this turn ever worked in" is the honest choice there.
     let turnLatestInput: number | undefined;
-    // T3 (user-reported display bug): the turn-level PRIMARY figure — `TurnSummary.latestInput`
+    // T3 (user-reported display bug): the turn-level figure of the TURN ITSELF — `TurnSummary.latestInput`
     // and the `sectionId:'turn'` usage op — must describe the TURN'S OWN (root section) latest
     // model request. Before this, `turnLatestInput` was republished from the last usage event of
     // ANY section, so on a turn whose delegated child reported last the parent task part's row
     // printed the CHILD's context (e.g. parent row `100,666 (27,668,349)` while the figure shown
-    // was subagent RR4's 100,666) — the emission-order rule that `turn-projector.test.ts` used to
+    // belonged to the delegated child `RR4`, then badged with the retired `subagent` word) — the
+    // emission-order rule that `turn-projector.test.ts` used to
     // pin as intended. The user declared that display wrong, so the rule is REVERSED here: root
     // frames only, and `undefined` (not a stand-in) when the root section made no request.
     // The bracket (`turn.usage`, folded turn-wide by ../sessions.ts `addUsage` ~1064) is
@@ -1101,6 +1108,24 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         summaryCache = undefined;
     };
 
+    // The LOWEST rank in the vocabulary — the authority an agent holds when the harness rank map
+    // does not name it. Derived from `AGENT_RANKS` (ordered highest first) rather than written as
+    // a letter, so a vocabulary change needs no edit here.
+    const LOWEST_RANK = AGENT_RANKS[AGENT_RANKS.length - 1];
+
+    // RANK of one agent's flow, resolved from the harness RANK MAP the store hands in
+    // (`context.ranks`, the frozen definition's `ranks` map — ../server/sessions.ts).
+    //
+    // This replaces `agent === context.primary ? 'primary' : 'subagent'`, which was a SINGLETON
+    // test: it could describe exactly one privileged agent. Ranks are not singletons — any number
+    // of agents may hold Rank A — and the ENTRY agent (`context.entry`) may itself be any rank,
+    // because entry is a ROUTING choice (which conversation an unfocused submit opens), not an
+    // authority. So a section's rank is looked up, never compared against the entry name.
+    //
+    // An agent the map omits gets `LOWEST_RANK`: authority exists only where the definition grants
+    // it, and guessing 'A' for an unknown name would show an agent as more powerful than it runs.
+    const rankOfAgent = (agent: string): DisplayRank => context.ranks?.[agent] ?? LOWEST_RANK;
+
     // -----------------------------------------------------------------------
     // Sections
     // -----------------------------------------------------------------------
@@ -1127,8 +1152,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         const parent =
             parentKey === undefined ? undefined : byKey.get(parentKey) ?? byInvocation.get(parentKey);
         const ordinal = sectionOrdinal++;
-        const role: DisplayRole =
-            parent === undefined && key === ROOT_KEY ? (agent === context.primary ? 'primary' : 'subagent') : 'subagent';
+        // Every section — root, adopted child, placeholder, inline flow — carries the RANK its own
+        // agent holds. The old rule stamped a non-root row 'subagent' unconditionally, which folded
+        // "who spawned me" into "who is authoritative"; a Rank A agent delegating another agent is
+        // Rank A in its own flow, and that is what the renderer must see.
+        const rank: DisplayRank = rankOfAgent(agent);
 
         const record: SectionRecord = {
             key,
@@ -1149,7 +1177,7 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             section: {
                 id: `${turn.id}:${ordinal}`,
                 ...(parent === undefined ? {} : { parentSectionId: parent.section.id }),
-                role,
+                rank,
                 agent,
                 // Labels arrive with the store's block projection / thread join; an
                 // adopted child patches its own conversation label (R8/T14).
@@ -1368,7 +1396,7 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         meta: NonNullable<HarnessEvent['thread']>,
         agent: string,
         ops: TurnDisplayOp[],
-        options: { state?: SectionDisplayState; branchId?: string; model?: string; role?: DisplayRole; threadId?: string } = {}
+        options: { state?: SectionDisplayState; branchId?: string; model?: string; rank?: DisplayRank; threadId?: string } = {}
     ): SectionRecord => {
         const record = newSection(meta.id, agent, meta.parentId, false);
 
@@ -1391,7 +1419,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
         const label = conversationLabelOf(meta.id, meta.epoch);
 
-        record.section.role = options.role ?? 'subagent';
+        // A branch frame states its own rank; anything else (a delegated or metadata-minted
+        // child) keeps the rank its OWN agent holds in the harness map. `newSection` already
+        // resolved the map value — this line only lets a frame override it, and it no longer
+        // forces a second-class label on every nested row.
+        record.section.rank = options.rank ?? rankOfAgent(agent);
         record.section.invocationId = meta.id;
         record.section.branchId = options.branchId ?? meta.branchId;
         record.section.model = options.model;
@@ -1417,7 +1449,10 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         if (existing !== undefined) return existing;
 
         const record = newSection(key, agent, undefined, false);
-        record.section.role = agent === context.primary ? 'primary' : 'subagent';
+        // RANK: no override here. `newSection` already resolved this agent's rank from the harness
+        // map; the old line re-derived it as `agent === context.primary ? 'primary' : 'subagent'`,
+        // which would have made a threadless Rank B flow read as a subagent even when the entry
+        // agent held Rank C.
 
         openSection(record, ops);
 
@@ -1606,7 +1641,7 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // `inlineEntry` falls back to `ROOT_KEY`). Without this, a legacy run would
         // render into an `inline:<agent>` section and lose the conversation label the
         // root row owns.
-        if (root === undefined && event.agent === context.primary) {
+        if (root === undefined && event.agent === context.entry) {
             const created = rootSection(event.agent);
 
             openSection(created, ops);
@@ -2658,7 +2693,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     {
                         ...(startedAt === undefined ? {} : { startedAt }),
                         model: typeof event.model === 'string' ? event.model : undefined,
-                        role: record.key === ROOT_KEY ? (event.agent === context.primary ? 'primary' : 'subagent') : record.section.role,
+                        // Re-stamped from the RANK MAP for the agent this frame routed to — for the
+                        // root row and a nested row alike. The old rule special-cased the root and
+                        // echoed the stored value elsewhere, because `role` could only mean "is this
+                        // the primary"; a rank is a property of the agent, so the map answers both.
+                        rank: rankOfAgent(event.agent),
                         agentLabel: record.section.agentLabel,
                         ...(record.section.threadLabel === undefined ? {} : { threadLabel: record.section.threadLabel }),
                         ...(record.terminal ? {} : { state: 'streaming' }),
@@ -2885,7 +2924,9 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
                             byCall.set(callId, placeholder);
                             placeholder.spawnCallId = callId;
-                            placeholder.section.role = 'subagent';
+                            // The placeholder already carries the delegate's OWN rank (`newSection`
+                            // resolves it from the harness map), so a Rank A agent spawning a child
+                            // is not demoted to a second-class row before its first frame lands.
                             openSection(placeholder, ops);
                             window.sectionKeys.push(key);
                         }
@@ -3079,8 +3120,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 // move it, because it is a scale, not the figure the row prints.
                 turnLatestInput = record.latestInput;
 
-                // T3: the turn's OWN section is the only source of the turn-level primary
-                // figure. A child/subagent/inline frame reports its OWN context and that
+                // T3: the turn's OWN section is the only source of the turn-level root
+                // figure. A child/inline frame of ANY rank reports its OWN context and that
                 // figure rides its own `sectionId` op (below) and its `TurnSection.latestInput`;
                 // it must never become the parent task part's headline context.
                 const isRootSection = record.key === ROOT_KEY;
@@ -3458,7 +3499,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 } as NonNullable<HarnessEvent['thread']>;
 
                 createChild(meta, branch.agent, ops, {
-                    role: branch.sourceThreadId === undefined && branch.role === 'primary' ? 'primary' : 'subagent',
+                    // The branch summary states the RANK of the agent that ran it, so a fork or
+                    // autoanswer row needs no "was the source the primary" special case: the old
+                    // rule (`branch.role === 'primary'` AND no source thread) existed only because
+                    // `role` was a singleton, and it mislabelled a Rank A agent's branch as soon as
+                    // the entry agent held some other rank.
+                    rank: branch.rank,
                     branchId: branch.branchId,
                     model: typeof branch.model === 'string' ? branch.model : undefined,
                     threadId: typeof branch.threadId === 'string' ? branch.threadId : undefined,

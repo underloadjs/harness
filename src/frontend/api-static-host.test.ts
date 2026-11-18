@@ -41,8 +41,11 @@ const card = {
     title: 'Demo',
     description: 'demo preset',
     requires_endpoint: false,
-    primary: 'demo',
-    subagents: [],
+    // The entry agent names a MEMBER (../shared/harness-api.ts:806-807: it "must name a member
+    // of the resulting roster"), and its rank is its own letter. The harness NAME is not an
+    // agent, so an entry of `demo` here would be a request the route refuses.
+    entry: 'writer',
+    ranks: { writer: 'A' },
     agents: ['writer'],
     tools: [],
     builtin: true,
@@ -56,8 +59,8 @@ const cardView = {
     title: 'Demo',
     description: 'demo preset',
     requiresEndpoint: false,
-    primary: 'demo',
-    subagents: [],
+    entry: 'writer',
+    ranks: { writer: 'A' },
     agents: ['writer'],
     tools: [],
     builtin: true,

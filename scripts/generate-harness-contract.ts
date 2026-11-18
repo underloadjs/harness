@@ -60,6 +60,14 @@ const ALIASES = {
     HarnessActionOption: { from: '../types', as: 'HarnessActionOption' },
     HarnessErrorInfo: { from: '../types', as: 'HarnessErrorInfo' },
     ToolMediaDescriptor: { from: '../types', as: 'ToolMediaDescriptor' },
+    // THE RANK LETTER (rank pass, 2026-11-18). `AgentRank` is the kernel's 26-member A–Z
+    // union (src/types/index.ts:1469), and the spec declares the same 26 letters as an enum
+    // so a client sees the scale in the document. Aliasing rather than generating a second
+    // union is what keeps ONE vocabulary: the harness config, the frozen definition, the
+    // session roster row, and the display section all name the same type, and a rank letter
+    // added or removed on either side fails the assignability probe in
+    // src/shared/harness-api.test.ts instead of drifting quietly.
+    AgentRank: { from: '../types', as: 'AgentRank' },
     // Subagent result reference (src/shared/agent-results.ts).
     AgentResultReference: { from: './agent-results', as: 'AgentResultReference' },
 };

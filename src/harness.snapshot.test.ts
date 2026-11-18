@@ -201,8 +201,7 @@ const buildSession = (options: SessionOptions = {}): Harness => {
 
     return harness({
         agents: { writer, researcher },
-        primary: 'writer',
-        subagents: ['researcher'],
+        entry: 'writer',
         tools: bulkTools(),
         presets: false,
         maxCreatedTools: options.maxCreatedTools,
@@ -1610,7 +1609,7 @@ describe('harness restore validation', () => {
             // collapse: R5 says nothing is in production, so a v1 snapshot is REFUSED by
             // the version gate rather than half-migrated into the new reader.
             snapshot.version = 1 as unknown as HarnessSnapshot['version'];
-        }, /Snapshot version 1 is not supported; this harness reads version 2\./);
+        }, /Snapshot version 1 is not supported; this harness reads version 3\./);
     });
 
     it('rejects a non-object snapshot and unknown top-level fields', async () => {
@@ -1989,7 +1988,7 @@ describe('task store snapshot/restore (T1)', () => {
         });
 
         return {
-            session: harness({ agents: { writer: writerAgent }, primary: 'writer', presets: false }),
+            session: harness({ agents: { writer: writerAgent }, entry: 'writer', presets: false }),
             writer: writerAgent
         };
     };
@@ -2023,7 +2022,7 @@ describe('snapshot persistence of the display lane', () => {
             agents: {
                 writer: agent({ model: 'merge/ds4-flash', stream: scripted([answer('idle')]) })
             },
-            primary: 'writer',
+            entry: 'writer',
             presets: false
         });
 
@@ -2183,13 +2182,15 @@ describe('snapshot persistence of the display lane', () => {
 // ---------------------------------------------------------------------------
 
 describe('snapshot persistence of the conversation tool switches', () => {
-    it('omits the key while nothing is switched off, and pins the schema version at 2', async () => {
+    it('omits the key while nothing is switched off, and pins the schema version at 3', async () => {
         const writer = buildSession();
 
         // Absence, not an empty list: the document shape a v2 file always had.
         expect(writer.snapshot().discovery).toEqual({ enabled: [], offsets: [] });
         expect(Object.hasOwn(writer.snapshot().discovery, 'withheld')).toBe(false);
-        expect(HARNESS_SNAPSHOT_VERSION).toBe(2);
+        // V3 is the rank model: `results[].role` left the format and
+        // `results[].rank` (a rank letter) replaced it, so a v2 document cannot be read back.
+        expect(HARNESS_SNAPSHOT_VERSION).toBe(3);
     });
 
     it('round-trips a core switch and a searchable switch through JSON, and the next request obeys both', async () => {
@@ -2316,7 +2317,8 @@ describe('snapshot persistence of the conversation tool switches', () => {
 //   - `HarnessThreadMessageResult.delivered` gains `'resumed'`, the third named operation
 //     (steering 'queued' / continue 'started' / resume 'resumed').
 //
-// `HARNESS_SNAPSHOT_VERSION` stayed 2: every key above is OPTIONAL, so a document written
+// V3 moved the version for the RANK rename only (`results[].role` -> `results[].rank`);
+// every key above stayed OPTIONAL, so a document written
 // before them — and every fixture in this file — validates and restores with its exact prior
 // meaning (the mechanism ./core/snapshot.ts's header documents).
 //
@@ -2337,7 +2339,7 @@ describe('snapshot reader validation of the run-stop and soft-delete keys', () =
             agents: {
                 writer: agent({ model: 'merge/ds4-flash', stream: scripted([answer('idle')]) })
             },
-            primary: 'writer',
+            entry: 'writer',
             presets: false
         });
 
@@ -2363,13 +2365,15 @@ describe('snapshot reader validation of the run-stop and soft-delete keys', () =
     // One terminal row the reader accepts verbatim: a CANCELLED root run of the only
     // configured agent, with the `error` a non-completed row requires (./core/snapshot.ts
     // `readAgentResults`). `stopReason` is the key under test, so everything else here is the
-    // minimum that is legal without it.
+    // minimum that is legal without it. `rank: 'A'` is the v3 spelling of the actor field —
+    // the only configured agent of a rank-less harness IS Rank A (src/harness.ts rule 1), so
+    // the row states the rank the writer would have written.
     const cancelledRow = (stopReason?: unknown): Record<string, unknown> => ({
         invocationId: '7',
         sequence: 7,
         completedOrder: 7,
         agent: 'writer',
-        role: 'primary',
+        rank: 'A',
         kind: 'root',
         status: 'cancelled',
         content: '',
@@ -2408,7 +2412,7 @@ describe('snapshot reader validation of the run-stop and soft-delete keys', () =
 
         // The version did not move for an additive optional key, and the copy is detached —
         // a restored harness never aliases the caller's document.
-        expect(read.version).toBe(2);
+        expect(read.version).toBe(3);
         expect(read.threads).not.toBe(document.threads);
     });
 
@@ -2499,7 +2503,7 @@ describe('snapshot reader validation of the run-stop and soft-delete keys', () =
             sequence: 7,
             completedOrder: 7,
             agent: 'writer',
-            role: 'primary',
+            rank: 'A',
             kind: 'root',
             status: 'cancelled',
             content: '',
@@ -2529,7 +2533,7 @@ describe('snapshot reader validation of the run-stop and soft-delete keys', () =
                 sequence: 8,
                 completedOrder: 8,
                 agent: 'writer',
-                role: 'primary',
+                rank: 'A',
                 kind: 'root',
                 status: 'completed',
                 content: 'Done.',
@@ -2539,6 +2543,60 @@ describe('snapshot reader validation of the run-stop and soft-delete keys', () =
         expect(() => readHarnessSnapshot(completed)).toThrow(
             'snapshot.agentResults[0].stopReason must be absent on a completed result.'
         );
+    });
+
+    // THE V3 VOCABULARY BREAK (R7). A v2-era row that reaches this reader (the version
+    // gate was bypassed by hand, or another build wrote the file) is REFUSED rather than
+    // mapped: `role: 'primary'` does not say which rank the agent held, so translating it
+    // would invent a ranking the harness never configured. Both refusals are pinned as
+    // exact strings, because the message is the migration guide.
+    it('refuses the removed primary/subagent vocabulary instead of translating it', () => {
+        const rankLetters = 'A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z';
+
+        // (1) the v2 field, with the v2 words, and no `rank` at all.
+        const legacy = baseline();
+        const v2Row = { ...cancelledRow() } as Record<string, unknown>;
+
+        delete v2Row.rank;
+        v2Row.role = 'primary';
+        legacy.agentResults = [v2Row];
+
+        expect(() => readHarnessSnapshot(legacy)).toThrow(
+            'snapshot.agentResults[0] carries the removed `role` field (snapshot v2 vocabulary); '
+            + `v3 stores \`rank\` as a rank letter (${rankLetters}).`
+        );
+
+        // (2) the v3 field spelled with the v2 words: the guard is `isAgentRank`, so a
+        // letter is the only accepted value and the refusal names the whole set.
+        const words = baseline();
+
+        words.agentResults = [{ ...cancelledRow(), rank: 'subagent' }];
+
+        expect(() => readHarnessSnapshot(words)).toThrow(
+            `snapshot.agentResults[0].rank must be one of: ${rankLetters} `
+            + '(the removed primary/subagent vocabulary is not accepted).'
+        );
+
+        // (3) an ABSENT rank, with no legacy field to explain it, is the same mistake and
+        // gets the same exact answer.
+        const missing = baseline();
+        const noRank = { ...cancelledRow() } as Record<string, unknown>;
+
+        delete noRank.rank;
+        missing.agentResults = [noRank];
+
+        expect(() => readHarnessSnapshot(missing)).toThrow(
+            `snapshot.agentResults[0].rank must be one of: ${rankLetters} `
+            + '(the removed primary/subagent vocabulary is not accepted).'
+        );
+
+        // (4) the writer's own spelling round-trips, so the refusal above is about the
+        // vocabulary and not about the fixture.
+        const current = baseline();
+
+        current.agentResults = [cancelledRow()];
+
+        expect(readHarnessSnapshot(current).agentResults![0].rank).toBe('A');
     });
 
     // A COMPILE-TIME pin, the only honest form for a change with no runtime producer yet:

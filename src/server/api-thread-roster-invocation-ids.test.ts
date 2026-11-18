@@ -81,8 +81,10 @@ const instructPreset = (): HarnessPreset => ({
     title: 'instruct',
     description: 'instruct scripted preset',
     requiresEndpoint: false,
-    primary: 'instruct',
-    subagents: ['workspace'],
+    // R15 — `entry` routes, `ranks` grant authority: `instruct` is Rank A and `workspace`
+    // is strictly below it, which is the only reason the delegated child can be addressed at all.
+    entry: 'instruct',
+    ranks: { instruct: 'A', workspace: 'B' },
     agents: ['instruct', 'workspace'],
     tools: [],
     builtin: true,
@@ -120,8 +122,8 @@ const instructPreset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'instruct',
-            subagents: ['workspace'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', workspace: 'B' },
             presets: false,
             report: { progress }
         })

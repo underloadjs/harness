@@ -58,8 +58,11 @@ const presetOf = (name: string, create: HarnessPreset['create']): HarnessPreset 
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: [],
+    // A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: name,
+    ranks: { [name]: 'A' },
     agents: [name],
     tools: [],
     builtin: true,
@@ -83,7 +86,7 @@ const answeringPreset = (): HarnessPreset =>
                     }
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
             presets: false,
             // The store's recorder rides the harness's own progress report; without this the turn
             // never records its frames (./harnesses/types.ts `HarnessPreset.create`).

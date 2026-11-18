@@ -43,10 +43,12 @@ export { presets, harnessTools, PRESET_MAX_ITERATIONS };
 // superset to export. A host or a test that wants an offline or extra-tool harness
 // declares its own `HarnessPreset` and passes it to
 // `createHarnessRegistry([...presets, mine])`.
-// The derived roster (T3): one specialist list, one `teamOf()` helper, and the
-// previous shipped definitions the restore policy compares against. Exported so
-// tests and any caller can reason about the same data the registry uses.
-export { LEGACY_PRESET_DEFINITIONS, SPECIALIST_AGENT_NAMES, teamOf } from './presets';
+// The derived roster (T3): one specialist list, and the previous shipped definitions
+// the restore policy compares against. Exported so tests and any caller can reason
+// about the same data the registry uses. (`teamOf` is GONE with the rank model: a
+// card states its roster and rank map explicitly, so there is no derivation left to
+// export.)
+export { LEGACY_PRESET_DEFINITIONS, SPECIALIST_AGENT_NAMES } from './presets';
 export type { LegacyPresetDefinition } from './presets';
 export {
     CORE_ENVIRONMENT_TOOL_NAMES,
@@ -65,7 +67,11 @@ export {
     coreToolNames,
     createProfiledHarness,
     createToolboxHarness,
-    providerOf
+    providerOf,
+    ranksDeclareDelegation,
+    // The rank FILL (R1): exported so a test and any host can see the exact map a sparse
+    // request resolves to, rather than re-implementing the rule to assert it.
+    resolveRosterRanks
 } from './toolbox';
 export type { ToolboxHarnessConfiguration } from './toolbox';
 // The discovered app catalogue (T25). Exported so a host/test can see the exact

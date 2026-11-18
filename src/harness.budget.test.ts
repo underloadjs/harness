@@ -9,7 +9,7 @@
 //   - every tool ERROR goes through the same cap;
 //   - a small result is still fed back byte-exact;
 //   - `signal` reaches the transport, a tool's `ToolContext.signal`, a delegated
-//     subagent's request, and a ctx.run agent's tools;
+//     child's request, and a ctx.run agent's tools;
 //   - an aborted run starts no new tool call and rejects; a thread-bound run
 //     RETAINS the turns it committed (issue 0036 R1) and repairs each call left
 //     without an answer by one synthesized interrupted result;
@@ -280,7 +280,7 @@ describe('cancellation', () => {
         ]);
     });
 
-    it('reaches a delegated subagent and its tools', async () => {
+    it('reaches a delegated child and its tools', async () => {
         const controller = new AbortController();
         const seenTools: (AbortSignal | undefined)[] = [];
 
@@ -290,7 +290,7 @@ describe('cancellation', () => {
             visibility: 'core',
             execute: ({ signal }) => {
                 seenTools.push(signal);
-                // Cancel WHILE the subagent's tool is running: the derived
+                // Cancel WHILE the child's tool is running: the derived
                 // per-call controllers must already be linked at this point.
                 controller.abort();
                 return 'ok';
@@ -313,12 +313,12 @@ describe('cancellation', () => {
             'This operation was aborted'
         );
 
-        // The subagent's request carries a cancellation signal derived from the
+        // The child's request carries a cancellation signal derived from the
         // run's (not the run object itself, because the delegation call owns its
         // own controller) ...
         expect(seenResearcher[0].signal).toBeInstanceOf(AbortSignal);
         expect(seenResearcher[0].signal?.aborted).toBe(true);
-        // ... and so does the tool the subagent then calls.
+        // ... and so does the tool the child then calls.
         expect(seenTools).toHaveLength(1);
         expect(seenTools[0]).toBeInstanceOf(AbortSignal);
         expect(seenTools[0]?.aborted).toBe(true);
@@ -536,13 +536,13 @@ describe('provider-anchored context estimate (T5.4)', () => {
     it('extrapolates the next turn from the reported prompt size', async () => {
         // Hand-derived, not read off the implementation. ONE constant first: the catalogue
         // this harness declares (the `echo` definition plus the runtime controls a session
-        // always offers) serializes to 12,629 payload bytes — `toolSchemaPayloadBytes` of
+        // always offers) serializes to 12,657 payload bytes — `toolSchemaPayloadBytes` of
         // the request's own `tools`, asserted exactly by the case below — so its floor is
-        // ceil(12,629 / 4) = 3,158 tokens.
+        // ceil(12,657 / 4) = 3,165 tokens.
         //   turn 1 sends one 2-byte user message and this agent has no instructions, so the
         //   anchored prefix is 2 bytes. Nothing has been reported yet, so turn 1 is the
         //   BLIND round, and the blind round now prices the catalogue that rides with it:
-        //   ceil((2 + 12,629) / 4) = 3,158. (It was 1 before the catalogue floor, which is
+        //   ceil((2 + 12,657) / 4) = 3,165. (It was 1 before the catalogue floor, which is
         //   the number the measured provider refusal proved wrong: a first request the
         //   harness believed was 464 tokens was billed 31,693.)
         //   The provider reports 900 prompt tokens for THAT request.
@@ -556,7 +556,7 @@ describe('provider-anchored context estimate (T5.4)', () => {
         const seen: HarnessStreamRequest[] = [];
 
         expect(await estimatesWith([calls('usage', ['c1', 'echo', '{}']), answerTurn], '', seen)).toEqual([
-            3158, 904
+            3165, 904
         ]);
     });
 
@@ -580,13 +580,13 @@ describe('provider-anchored context estimate (T5.4)', () => {
         );
 
         // The catalogue the shipped request carries, asserted exactly: 3 declarations —
-        // `echo` plus the runtime controls — and 12,629 serialized payload bytes.
+        // `echo` plus the runtime controls — and 12,657 serialized payload bytes.
         expect(seen[0].tools).toHaveLength(3);
-        expect(toolSchemaPayloadBytes(seen[0].tools)).toBe(12_629);
+        expect(toolSchemaPayloadBytes(seen[0].tools)).toBe(12_657);
         // The transcript alone would say 1 token; the round the provider receives is
-        // ceil((2 + 12,629) / 4), and that is the number the compaction limit is compared
+        // ceil((2 + 12,657) / 4), and that is the number the compaction limit is compared
         // against on the round that has no anchor to hide behind.
-        expect(firstTurn).toBe(Math.ceil((2 + 12_629) / 4));
+        expect(firstTurn).toBe(Math.ceil((2 + 12_657) / 4));
         expect(firstTurn).toBeGreaterThan(1);
     });
 
@@ -594,12 +594,12 @@ describe('provider-anchored context estimate (T5.4)', () => {
         // The identical conversation with the `usage` field absent: still the plain
         // heuristic, but the heuristic now counts what the body carries — the transcript
         // AND the catalogue, since no anchor exists to absorb either.
-        //   turn 1: ceil((2 + 12,629) / 4) = 3,158;
-        //   turn 2: ceil((14 + 12,629) / 4) = ceil(12,643 / 4) = 3,161.
-        // The transcript-only half is the old 1 and 4; the delta is the same 12,629 bytes
+        //   turn 1: ceil((2 + 12,657) / 4) = 3,165;
+        //   turn 2: ceil((14 + 12,657) / 4) = ceil(12,671 / 4) = 3,168.
+        // The transcript-only half is the old 1 and 4; the delta is the same 12,657 bytes
         // of declaration both rounds really send.
         expect(await estimatesWith([calls('plain', ['c1', 'echo', '{}']), answerTurn])).toEqual([
-            3158, 3161
+            3165, 3168
         ]);
     });
 
@@ -608,12 +608,12 @@ describe('provider-anchored context estimate (T5.4)', () => {
         // provider reports 900, which is inside the sanity band (900*4 >= 1001), so it
         // is a real measurement of a denser tokenizer and the number steps DOWN.
         // Turn 1 is still blind, so it reports the catalogue floor:
-        // ceil((4,002 + 12,629) / 4) = 4,158. Turn 2 then measures 4,014 bytes, 12 more
+        // ceil((4,002 + 12,657) / 4) = 4,165. Turn 2 then measures 4,014 bytes, 12 more
         // than the anchored prefix -> 900 + ceil(12 x 1.166 / 4) = 904, and the low-side
         // clamp (ceil(ceil(4,014/4) / 4) = 251) is far below it.
         expect(
             await estimatesWith([calls('usage', ['c1', 'echo', '{}']), answerTurn], 'p'.repeat(4000))
-        ).toEqual([4158, 904]);
+        ).toEqual([4165, 904]);
     });
 
     it('refuses a count the transcript cannot support and stays on the heuristic', async () => {
@@ -622,8 +622,8 @@ describe('provider-anchored context estimate (T5.4)', () => {
         // request's prompt size (a provider counting only the uncached delta, say). The
         // estimate keeps the heuristic it has always used — the heuristic that counts the
         // catalogue, because on this leg nothing else can: turn 1
-        // ceil((4,002 + 12,629) / 4) = 4,158, then turn 2
-        // ceil((4,014 + 12,629) / 4) = 4,161.
+        // ceil((4,002 + 12,657) / 4) = 4,165, then turn 2
+        // ceil((4,014 + 12,657) / 4) = 4,168.
         const refused: HarnessStreamEvent[] = [
             {
                 type: 'done',
@@ -633,6 +633,6 @@ describe('provider-anchored context estimate (T5.4)', () => {
             }
         ];
 
-        expect(await estimatesWith([refused, answerTurn], 'p'.repeat(4000))).toEqual([4158, 4161]);
+        expect(await estimatesWith([refused, answerTurn], 'p'.repeat(4000))).toEqual([4165, 4168]);
     });
 });

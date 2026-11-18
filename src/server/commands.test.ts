@@ -91,7 +91,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 // agent a command turn's synthesized events name (`sessions.ts commandAgentOf` reads
 // `harness.name`, the entry agent). Spell it out instead of reading it back from the
 // session so an agent-attribution regression is visible.
-const primary = 'instruct';
+const entryAgent = 'instruct';
 
 // The `task` tool's page shape (src/core/task.ts) — the same one the built-in
 // command renders. Hard-coded so a harness-state assertion is exact. T1 adds
@@ -110,7 +110,9 @@ const taskPage = (
 });
 
 // One stored task as the COMMAND / tools-tab door writes it. `sessions.ts callTool`
-// runs `harness.executeTool`, which hands the tool the session's PRIMARY agent and
+// runs `harness.executeTool`, which hands the tool the session's ENTRY agent (the rank
+// pass renamed that axis: `harness.name` is the entry agent's name, and a rank is what
+// grants authority, not the entry) and
 // NO thread, so `updatedBy` names that agent and `updatedThreadId` is absent
 // entirely. `updatedAt` is the pinned instant (see `pinClock`): `new Date(2_000)`.
 const taskRecord = (
@@ -123,7 +125,7 @@ const taskRecord = (
     text,
     completed,
     rev,
-    updatedBy: primary,
+    updatedBy: entryAgent,
     updatedAt: new Date(2_000).toISOString()
 });
 
@@ -132,8 +134,13 @@ const presetOf = (name: string, create: HarnessPreset['create']): HarnessPreset 
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: [],
+    // THE RANK PAIR (clean break, R11). `entry` names the routing agent and `ranks` states
+    // its authority; the retired `primary` + `subagents: []` pair is REFUSED at load
+    // (../../server/persistence.ts `requireNoLegacyRosterKeys`), so a stored row built from
+    // this helper has to state the new shape. ONE member, ONE rank means no `delegate`
+    // tool at all — the same behaviour the empty allowlist used to produce.
+    entry: name,
+    ranks: { [name]: 'A' as const },
     agents: [name],
     tools: [],
     builtin: true,
@@ -215,7 +222,8 @@ const scriptedFixture = (): ScriptedFixture => {
             // The `task` tool is a harness-owned (runtime) entry, so `presets: false`
             // keeps it registered (src/harness.ts:783) — which is what makes
             // `/task add "testing"` really mutate this session's task store.
-            primary: 'instruct',
+            entry: 'instruct',
+            ranks: { instruct: 'A' },
             presets: false,
             report: { progress },
             tools: {
@@ -279,7 +287,8 @@ const gatedFixture = (): GatedFixture => {
                     }
                 })
             },
-            primary: 'gated',
+            entry: 'gated',
+            ranks: { gated: 'A' },
             presets: false,
             report: { progress }
         })
@@ -428,14 +437,14 @@ describe('POST /sessions/:id/tasks slash commands', () => {
 
         expect(rows.map((row) => row.index)).toEqual([0, 1, 2]);
         expect(rows.map((row) => row.at)).toEqual([2_000, 2_000, 2_000]);
-        expect(rows[0]!.event).toEqual({ type: 'start', agent: primary, model: 'scripted/test' });
+        expect(rows[0]!.event).toEqual({ type: 'start', agent: entryAgent, model: 'scripted/test' });
 
         // The synthesized call id is a real uuid and pairs the two frames exactly.
         const callId = String((rows[1]!.event as { call: { id: string } }).call.id);
 
         expect(rows[1]!.event).toEqual({
             type: 'tool_call',
-            agent: primary,
+            agent: entryAgent,
             call: {
                 id: callId,
                 name: 'command',
@@ -444,7 +453,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         });
         expect(rows[2]!.event).toEqual({
             type: 'tool_result',
-            agent: primary,
+            agent: entryAgent,
             name: 'command',
             callId,
             content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
@@ -505,7 +514,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
 
         expect(rows[2]!.event).toEqual({
             type: 'tool_result',
-            agent: primary,
+            agent: entryAgent,
             name: 'command',
             callId,
             content: '#1 [ ] testing\n1 total, 0 completed, 1 pending\npage: offset 0, limit 20, showing 1',
@@ -531,7 +540,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         // them sorted with their usage lines), so a registry regression is visible.
         expect(helpRows[2]!.event).toEqual({
             type: 'tool_result',
-            agent: primary,
+            agent: entryAgent,
             name: 'command',
             callId: String((helpRows[1]!.event as { call: { id: string } }).call.id),
             content: [
@@ -576,7 +585,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         };
 
         expect(result.type).toBe('tool_result');
-        expect(result.agent).toBe(primary);
+        expect(result.agent).toBe(entryAgent);
         expect(result.name).toBe('command');
         expect(result.isError).toBe(false);
         expect(result.outcome).toBe('completed');
@@ -591,6 +600,9 @@ describe('POST /sessions/:id/tasks slash commands', () => {
             'agentResult',
             'chapters',
             'digest',
+            // The cross-session knowledge row is seeded like every other switchable
+            // name, and /tools lists the enabled set alphabetically.
+            'knowledge',
             'locations',
             'profiles',
             'records',
@@ -631,10 +643,10 @@ describe('POST /sessions/:id/tasks slash commands', () => {
         const callId = String((rows[1]!.event as { call: { id: string } }).call.id);
 
         expect(rows.map((row) => row.event)).toEqual([
-            { type: 'start', agent: primary, model: 'scripted/test' },
+            { type: 'start', agent: entryAgent, model: 'scripted/test' },
             {
                 type: 'tool_call',
-                agent: primary,
+                agent: entryAgent,
                 call: {
                     id: callId,
                     name: 'command',
@@ -643,7 +655,7 @@ describe('POST /sessions/:id/tasks slash commands', () => {
             },
             {
                 type: 'tool_result',
-                agent: primary,
+                agent: entryAgent,
                 name: 'command',
                 callId,
                 content: 'unknown command: /nope',

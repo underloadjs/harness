@@ -5,10 +5,10 @@
 // The catalogue used to be a frozen array of presets: the only harnesses a client
 // could run were the ones shipped with the package. The registry now starts from
 // INDEPENDENT COPIES of the shipped templates (R20.1): every card is an editable
-// application entry, a client may create a harness (choose a primary, optionally
-// subagents/models), and PATCH produces a new immutable entry. Everything is
-// in-memory only: there is no persistence layer, so a restart returns to the
-// shipped templates. That limitation is documented in README.md/knowledge.md.
+// application entry, a client may create a harness (an explicit roster, optionally
+// an entry agent and a rank map), and PATCH produces a new immutable entry.
+// Everything is in-memory only: there is no persistence layer, so a restart returns
+// to the shipped templates. That limitation is documented in README.md/knowledge.md.
 //
 // There is NO read-only harness concept. `editable` survives on the wire as a
 // compatibility field and is always true; the registry never gates on it, and a
@@ -16,9 +16,17 @@
 //
 // INVARIANTS
 // ----------
-//   - exactly one primary; `agents` is derived as [primary, ...subagents];
-//   - a subagent is never the primary, never duplicated, and must be a known
-//     TRUSTED agent id (src/agents);
+//   - a NON-EMPTY explicit roster in declaration order; the first name is the entry
+//     default when `entry` is omitted, and `entry` must always name a member;
+//   - a RANK MAP keyed by agent id with A–Z letter values, RESOLVED so EVERY member
+//     is keyed: a request may name fewer, and the rest take one rank BELOW the lowest
+//     rank the request stated, entry agent included (./toolbox.ts `resolveRosterRanks`,
+//     the host mirror of the kernel's fill at ../harness.ts:1505-1545). There is
+//     NO "exactly one primary" invariant any more — the rank model allows ANY
+//     NUMBER of Rank A agents, and what each may do follows from its rank alone
+//     (../types/index.ts `isLowerRank`: delegation goes strictly downward);
+//   - a member is never listed twice, and every name must be a known TRUSTED agent
+//     id (src/agents);
 //   - names are unique (case-insensitively) and a client may not take a built-in
 //     name or a legacy alias;
 //   - create() adds a NEW preset object and update() REPLACES one. Nothing is
@@ -33,8 +41,8 @@
 //   - metadata only (title/description) — keep the captured factory and every
 //     executable field, so a scripted fixture stays scripted and a live harness
 //     keeps the exact closure a session captured;
-//   - executable (primary/subagents and the per-agent maps: agentModels,
-//     agentInstructions, agentColors) — rebuild from the template:
+//   - executable (the roster, the entry agent, the rank map and the per-agent maps:
+//     agentModels, agentInstructions, agentColors) — rebuild from the template:
 //       'live'     → createProfiledHarness (unchanged behaviour);
 //       'scripted' → upgrade to a LIVE profiled harness and correct the descriptor
 //                    (requiresEndpoint, shared toolbox, environmentTools) so the
@@ -69,20 +77,27 @@
 // SHIPPED-DEFAULT REFRESH (T3)
 // ----------------------------
 // restoreHarnessRegistry() replays a saved built-in row only when it differs from
-// what this build ships. To keep an improved default (a wider subagent allowlist,
-// a new title) from being pinned by an old copy, a row whose executable fields
-// still match LEGACY_PRESET_DEFINITIONS (./presets.ts) is treated as an unmodified
-// shipped default and refreshed; a row with any executable difference is treated
-// as a customisation and replayed. Frozen sessions are unaffected: they rebuild
-// from their own record (see ./sessions.ts restoreSession).
+// what this build ships. To keep an improved default (a wider roster, a moved
+// rank map, a new title) from being pinned by an old copy, a row whose executable
+// fields still match LEGACY_PRESET_DEFINITIONS (./presets.ts) is treated as an
+// unmodified shipped default and refreshed; a row with any executable difference is
+// treated as a customisation and replayed. Frozen sessions are unaffected: they
+// rebuild from their own record (see ./sessions.ts restoreSession).
+//
+// The rank pass makes that legacy table HISTORICAL in a new way: it is written in
+// the CURRENT `entry`/`ranks` vocabulary, and a row saved before the rank pass
+// cannot be read at all — ./persistence.ts refuses the old durable keys outright
+// (clean break, no dual read). What the table still does is prove "the operator
+// never customised this row" for a row in the rank vocabulary that matches an older
+// shipped roster.
 //
 // VALIDATION OWNERSHIP
 // --------------------
 // Field/type validation that concerns the wire (unknown properties, non-object
 // bodies) lives in src/server/api.ts. Semantic validation — known agents, duplicate
-// ids, reserved names — lives here, because both the HTTP API and any future
-// caller must agree. Registry failures carry an HTTP status so the dispatcher can
-// map them without re-deriving one.
+// ids, rank letters, reserved names — lives here, because both the HTTP API and any
+// future caller must agree. Registry failures carry an HTTP status so the dispatcher
+// can map them without re-deriving one.
 //
 // Cross-references:
 //   - ../src/agents/index.ts — the trusted profile registry
@@ -93,6 +108,14 @@
 
 import { agentProfiles, isAgentProfileName } from '../../agents';
 import type { AgentProfile } from '../../agents';
+// THE RANK MODEL. `AgentRank` is the A–Z letter union, `AGENT_RANKS` the same union
+// as DATA (highest first, so a message can name the range honestly), and
+// `isAgentRank` the untrusted-input guard every boundary validator routes through
+// (../types/index.ts). This layer validates rank VALUES and their KEYS; the
+// ordering and the delegation predicate (`rankIndexOf`/`isLowerRank`) stay with the
+// kernel, which is the only place that decides who may hand work to whom.
+import { AGENT_RANKS, isAgentRank } from '../../types';
+import type { AgentRank } from '../../types';
 import type { HarnessPreset } from './types';
 import type { HarnessAgentRecord, HarnessPresetRecord } from '../persistence';
 import { attachDefaultAgentState, createAgentState } from './agent-state';
@@ -103,7 +126,8 @@ import {
     SHARED_TOOL_NAMES,
     agentsFromProfiles,
     createProfiledHarness,
-    createToolboxHarness
+    createToolboxHarness,
+    resolveRosterRanks
 } from './toolbox';
 
 // Legacy preset identifiers. The catalogue is agent-named now, but a CLI
@@ -144,12 +168,14 @@ const NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const MAX_TITLE_LENGTH = 120;
 const MAX_DESCRIPTION_LENGTH = 2_000;
 
-// A harness with a huge allowlist is almost certainly a mistake (and every name
+// A harness with a huge roster is almost certainly a mistake (and every name
 // is a trusted id, so the useful ceiling is tiny). The agent registry has ten
 // profiles today (seven real roles, the summarizer, two fixtures), so the largest
-// team a user can even name is nine; 16 leaves room for one more role without
-// allowing an unbounded array.
-const MAX_SUBAGENTS = 16;
+// roster a user can even name is ten; 16 leaves room for a few more roles without
+// allowing an unbounded array. This is a ROSTER cap, not an allowlist cap: there is
+// no allowlist any more, and a roster of any size can hold any number of Rank A
+// agents — rank, not headcount, is what limits delegation.
+const MAX_ROSTER_AGENTS = 16;
 
 // Bounds on a client-supplied model id (R9). Generous for the workspace's
 // provider-prefixed ids ("merge/ds4-flash") and for a long hosted name, tight
@@ -186,12 +212,31 @@ const AGENT_COLOR_PATTERN = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 // or model: those are trusted/configured server-side. `agentInstructions` (T3) is
 // the one text-shaped field, and it is an OVERRIDE stored on this harness — the
 // trusted profile in src/agents is never rewritten by it.
+//
+// THE RANK MODEL replaced `primary` + `subagents`:
+//   - `agents` is now an EXPLICIT roster (it used to be derived as
+//     [primary, ...subagents]). Its ORDER is load-bearing: the first name is the
+//     entry agent when `entry` is omitted, so a client that cares about routing
+//     states the order it means, and a PATCH that restates the roster keeps the
+//     entry it already had whenever that agent is still a member;
+//   - `entry` is optional ROUTING. Omitted means "the first name of `agents`";
+//     stated means it must name a member. It says nothing about authority — two
+//     members may both hold Rank A, and the entry may hold any rank;
+//   - `ranks` is the AUTHORITY map, agent id → A–Z letter (A highest). Delegation
+//     is derived from it alone: an agent may hand work only to a STRICTLY lower
+//     rank, so there is no allowlist field left to send. Keys must name members, and
+//     the stored map covers EVERY member (a request may name fewer — the server fills
+//     them; see `resolveRosterRanks` in ./toolbox.ts).
 export type HarnessRegistration = {
     name: string;
     title?: string;
     description?: string;
-    primary: string;
-    subagents?: readonly string[];
+    // THE ROSTER, in declaration order (first = the entry default). Required: a
+    // definition with no agents is not a harness, so an empty or missing roster is
+    // a 400 rather than a silent single-agent default.
+    agents: readonly string[];
+    entry?: string;
+    ranks?: Readonly<Record<string, AgentRank>>;
     // Per-agent model overrides (R9): agent id → model id. Optional; an omitted
     // member uses the session's model. Only ids are client-supplied — never a
     // provider, base URL, or credential.
@@ -208,11 +253,22 @@ export type HarnessRegistration = {
 
 // What a client may change on an existing harness. `name` is immutable: a rename
 // would break sessions, bookmarks, and the UI's selected card.
+//
+// THE THREE ROSTER FIELDS ARE INDEPENDENT, which is what a PATCH needs:
+//   - `agents` REPLACES the roster (order included). Members are the only thing
+//     that decides whether an override key or a rank key is legal;
+//   - `entry` re-targets routing alone. An omitted `entry` keeps the current entry
+//     when the same patch leaves it a member; when the patch REMOVES it, the entry
+//     falls back to the first name of the new roster — the same default create()
+//     uses, so a patch can never leave a harness pointing at an agent it dropped;
+//   - `ranks` REPLACES the authority map (`{}` clears every rank). An omitted
+//     `ranks` keeps the current map restricted to the surviving members.
 export type HarnessPatch = {
     title?: string;
     description?: string;
-    primary?: string;
-    subagents?: readonly string[];
+    agents?: readonly string[];
+    entry?: string;
+    ranks?: Readonly<Record<string, AgentRank>>;
     // REPLACE semantics when present (not merge): the patch states the map the
     // harness should have afterwards, so `{}` clears every override, and an agent
     // the patch omits falls back to the session model. Keys must name a FINAL
@@ -261,7 +317,7 @@ export type HarnessRegistry = {
     // Resolve a name, including a legacy alias. Undefined means 404 for a session
     // request.
     find: (name: string) => HarnessPreset | undefined;
-    // The trusted agent profiles a client may select as primary/subagent. T19: these are
+    // The trusted agent profiles a client may select as a roster member. T19: these are
     // the EFFECTIVE profiles — the shipped catalogue with the global override layer merged
     // and retired profiles removed — so every existing reader of `agents()` (harness
     // validation, instruction projections, the agent catalogue) states the operator's
@@ -394,38 +450,126 @@ const requireAgent = (
     return name;
 };
 
-// Validate the allowlist against the (already resolved) primary. Duplicates are
-// an error rather than silently collapsed: a request that names an agent twice is
-// ambiguous, and the registry should not guess which occurrence was meant.
-const normalizeSubagents = (
+// THE ROSTER: an explicit, NON-EMPTY list of trusted agent ids in declaration
+// order. It replaces the old `[primary, ...subagents]` derivation, so the rules it
+// carries are the ones the allowlist used to enforce plus one more:
+//   - it must be a non-empty array — a harness with no agent cannot run a turn, and
+//     silently defaulting to someone would make the entry default (the first name)
+//     depend on a value the client never sent;
+//   - at most MAX_ROSTER_AGENTS entries;
+//   - every name must be a known TRUSTED agent id, and a name being SELECTED NEW
+//     must not be retired (same `selectable` gate as before);
+//   - duplicates are an error rather than silently collapsed: a roster that names
+//     an agent twice is ambiguous, and the registry should not guess which
+//     occurrence — and which rank entry — was meant.
+//
+// There is deliberately NO rule about which name comes first, and no rule that the
+// first name outranks the others: rank says authority, order says only which agent
+// is the routing default.
+const normalizeRoster = (
     value: unknown,
-    primary: string,
     selectable?: (name: string) => boolean
 ): string[] => {
     if (!Array.isArray(value)) {
-        throw new HarnessRegistryError(400, '`subagents` must be an array of agent names.');
+        throw new HarnessRegistryError(400, '`agents` must be a non-empty array of agent names.');
     }
 
-    if (value.length > MAX_SUBAGENTS) {
-        throw new HarnessRegistryError(400, `\`subagents\` cannot exceed ${MAX_SUBAGENTS} entries.`);
+    if (value.length === 0) {
+        throw new HarnessRegistryError(
+            400,
+            '`agents` must name at least one agent; a harness with no agent cannot run a turn.'
+        );
+    }
+
+    if (value.length > MAX_ROSTER_AGENTS) {
+        throw new HarnessRegistryError(
+            400,
+            `\`agents\` cannot exceed ${MAX_ROSTER_AGENTS} entries.`
+        );
     }
 
     const resolved: string[] = [];
 
     for (const entry of value) {
-        const name = requireAgent(entry, 'subagents', selectable);
-        if (name === primary) {
-            throw new HarnessRegistryError(
-                400,
-                `Subagent "${name}" is the primary agent; a harness has exactly one primary.`
-            );
-        }
+        const name = requireAgent(entry, 'agents', selectable);
 
         if (resolved.includes(name)) {
-            throw new HarnessRegistryError(400, `Subagent "${name}" is listed more than once.`);
+            throw new HarnessRegistryError(400, `Agent "${name}" is listed in \`agents\` more than once.`);
         }
 
         resolved.push(name);
+    }
+
+    return resolved;
+};
+
+// THE ENTRY AGENT: routing, so the only rule is membership. It is resolved
+// separately from the roster (never derived from it inside this helper) because the
+// caller has to say which default applies when the client omitted it, and because a
+// PATCH needs to distinguish "the client restated routing" from "the roster moved
+// under it".
+//
+// A non-member is a 400 that names the roster: the common mistake is a client that
+// renamed an agent, or one that sent `entry` for a member it forgot to add.
+const normalizeEntry = (value: unknown, roster: readonly string[]): string => {
+    const name = requireString(value, 'entry');
+
+    if (!roster.includes(name)) {
+        throw new HarnessRegistryError(
+            400,
+            `\`entry\` names "${name}", which is not a member of this harness. Members: ${roster.join(', ')}.`
+        );
+    }
+
+    return name;
+};
+
+// THE RANK MAP: agent id → A–Z letter. Two rules, both a 400, both named exactly:
+//   - every KEY must name a member of the final roster. A rank for an agent this
+//     harness does not select can never apply, so accepting it would leave the
+//     client believing it configured something (the identical reasoning
+//     `normalizeAgentModels` gives the model map);
+//   - every VALUE must be a rank letter, checked with the shared `isAgentRank`
+//     guard rather than a re-spelled letter set, so this edge and the kernel can
+//     never disagree about what a rank is. Case matters: `'a'` is not a rank, and
+//     the message says so instead of quietly upper-casing the client's intent.
+//
+// A member the map OMITS is not an error, and it does NOT mean "no rank": the CALLER
+// fills it with `resolveRosterRanks` (./toolbox.ts), which is the kernel's own rule — one
+// rank below the lowest rank this map states, entry agent included. Nothing here requires a
+// Rank A agent either: several members may hold A, and a roster with none is a team whose
+// entry agent was simply ranked like its peers.
+const normalizeRanks = (
+    value: unknown,
+    roster: readonly string[]
+): Record<string, AgentRank> => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        throw new HarnessRegistryError(
+            400,
+            '`ranks` must be an object mapping agent ids to rank letters.'
+        );
+    }
+
+    const resolved: Record<string, AgentRank> = {};
+
+    for (const [agent, rank] of Object.entries(value as Record<string, unknown>)) {
+        if (!roster.includes(agent)) {
+            throw new HarnessRegistryError(
+                400,
+                `\`ranks\` names "${agent}", which is not a member of this harness. Members: ${roster.join(', ')}.`
+            );
+        }
+
+        if (!isAgentRank(rank)) {
+            throw new HarnessRegistryError(
+                400,
+                `\`ranks.${agent}\` must be a single rank letter from ${AGENT_RANKS[0]} (highest) to ${
+                    AGENT_RANKS[AGENT_RANKS.length - 1]
+                } (lowest), upper-case. Received ${JSON.stringify(rank)}.`
+            );
+        }
+
+        resolved[agent] = rank;
     }
 
     return resolved;
@@ -657,7 +801,10 @@ export const normalizeAgentColors = (
 // kept only so an existing client still sees its familiar wire shape.
 const copyTemplate = (preset: HarnessPreset): HarnessPreset => ({
     ...preset,
-    subagents: [...preset.subagents],
+    // The rank map is copied like the arrays and the three override maps: a registry
+    // entry (or a caller holding list()[i]) must never reach the shipped module
+    // constant. `entry` and `agents` need no special copy beyond the array below.
+    ranks: { ...preset.ranks },
     agents: [...preset.agents],
     tools: [...preset.tools],
     ...(preset.environmentTools === undefined
@@ -687,8 +834,9 @@ const copyTemplate = (preset: HarnessPreset): HarnessPreset => ({
 // the caller that hands it back.
 const liveFactory = (
     template: 'live' | 'flaky',
-    primary: string,
-    subagents: readonly string[],
+    entry: string,
+    roster: readonly string[],
+    ranks: Readonly<Record<string, AgentRank>>,
     agentModels: Readonly<Record<string, string>>,
     agentInstructions: Readonly<Record<string, string>> = {},
     agentColors: Readonly<Record<string, string>> = {},
@@ -696,8 +844,9 @@ const liveFactory = (
 ): HarnessPreset['create'] => {
     if (template === 'live') {
         return createProfiledHarness(
-            primary,
-            subagents,
+            entry,
+            roster,
+            ranks,
             agentModels,
             agentInstructions,
             agentColors,
@@ -709,15 +858,19 @@ const liveFactory = (
         createToolboxHarness(
             {
                 agents: agentsFromProfiles(
-                    [primary, ...subagents],
+                    // Entry FIRST, then the rest of the roster in order — the same
+                    // ordering rule `createProfiledHarness` applies, so a 'flaky'
+                    // rebuild and a 'live' rebuild cannot disagree about which key the
+                    // kernel's entry default would read.
+                    [entry, ...roster.filter((name) => name !== entry)],
                     settings,
                     agentModels,
                     agentInstructions,
                     agentColors,
                     customAgents
                 ),
-                primary,
-                subagents: [...subagents],
+                entry,
+                ranks: { ...ranks },
                 // The 'flaky' template used to mean "the live toolbox PLUS the example
                 // tool, compiled from its editable source entry". The example preset and
                 // its folder are deleted, so there is no shipped extra left to attach and
@@ -747,13 +900,27 @@ const liveFactory = (
 
 // Project a preset onto durable metadata. Arrays/maps are copied so a caller
 // (or a saved document) can never alias the live registry entry.
+
+// The rank map in SORTED KEY ORDER. `presetRecordEquals` compares JSON strings, so
+// two maps holding the SAME ranks written in a different insertion order — a client
+// that sent `{ reviewer: 'B', planner: 'A' }` against a template that declares them
+// the other way round, or a document a human edited — would otherwise read as an
+// executable difference and pin a shipped default that was never customised. Sorting
+// is the same trick `presetToRecordShape` already applies to FIELD order, extended
+// to the one map whose key order carries no meaning: `agents` keeps its order
+// untouched, because there the order IS the entry default.
+const sortedRanks = (ranks: Readonly<Record<string, AgentRank>>): Record<string, AgentRank> =>
+    Object.fromEntries(
+        Object.entries(ranks).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    );
+
 export const presetToRecord = (preset: HarnessPreset): HarnessPresetRecord => ({
     name: preset.name,
     title: preset.title,
     description: preset.description,
     requiresEndpoint: preset.requiresEndpoint,
-    primary: preset.primary,
-    subagents: [...preset.subagents],
+    entry: preset.entry,
+    ranks: sortedRanks(preset.ranks),
     agents: [...preset.agents],
     tools: [...preset.tools],
     ...(preset.environmentTools === undefined
@@ -796,8 +963,8 @@ const presetToRecordShape = (record: HarnessPresetRecord): HarnessPresetRecord =
     title: record.title,
     description: record.description,
     requiresEndpoint: record.requiresEndpoint,
-    primary: record.primary,
-    subagents: [...record.subagents],
+    entry: record.entry,
+    ranks: sortedRanks(record.ranks),
     agents: [...record.agents],
     tools: [...record.tools],
     ...(record.environmentTools === undefined
@@ -873,20 +1040,22 @@ export const presetFromRecord = (
     } else if (record.template === 'flaky') {
         create = liveFactory(
             'flaky',
-            record.primary,
-            record.subagents,
+            record.entry,
+            record.agents,
+            record.ranks,
             record.agentModels ?? {},
-            record.agentInstructions ?? {},
-            record.agentColors ?? {},
             // R7: the session's invented agents go back into the same closure the roster is
             // built from, so a rebuilt member runs the same prompt and model it was bound with.
+            record.agentInstructions ?? {},
+            record.agentColors ?? {},
             record.customAgents ?? {}
         );
     } else if (record.template === 'live') {
         create = liveFactory(
             'live',
-            record.primary,
-            record.subagents,
+            record.entry,
+            record.agents,
+            record.ranks,
             record.agentModels ?? {},
             record.agentInstructions ?? {},
             record.agentColors ?? {},
@@ -902,8 +1071,13 @@ export const presetFromRecord = (
         const current = presetToRecord(fallback);
 
         if (
-            current.primary !== record.primary ||
-            JSON.stringify(current.subagents) !== JSON.stringify(record.subagents) ||
+            current.entry !== record.entry ||
+            // The ROSTER is compared in order (it is the entry default), and the RANK MAP
+            // in sorted key order (the same canonical form `presetToRecord` writes), so an
+            // injected factory that really still describes this team is not rejected over
+            // JSON key order — and one that moved a member's rank IS rejected, because
+            // rank is executable authority, not decoration.
+            JSON.stringify(sortedRanks(current.ranks)) !== JSON.stringify(sortedRanks(record.ranks)) ||
             JSON.stringify(current.agents) !== JSON.stringify(record.agents) ||
             JSON.stringify(current.agentModels ?? {}) !== JSON.stringify(record.agentModels ?? {}) ||
             // T3: a saved instruction override is part of the executable
@@ -936,8 +1110,8 @@ export const presetFromRecord = (
         title: record.title,
         description: record.description,
         requiresEndpoint: record.requiresEndpoint,
-        primary: record.primary,
-        subagents: [...record.subagents],
+        entry: record.entry,
+        ranks: { ...record.ranks },
         agents: [...record.agents],
         tools: [...record.tools],
         ...(record.environmentTools === undefined
@@ -968,8 +1142,9 @@ export const presetFromRecord = (
 // A SHIPPED DEFAULT vs A USER EDIT (T3 restore policy)
 // ----------------------------------------------------
 // A saved built-in record is a copy of what shipped at the time it was saved. Some
-// builds change a shipped default — T3 widened the real presets' subagent
-// allowlists and retitled research/workspace — and replaying such a row verbatim
+// builds change a shipped default — T3 widened the real presets' rosters and
+// retitled research/workspace, and the rank pass restates every shipped team as an
+// `entry` + `ranks` pair — and replaying such a row verbatim
 // would pin the old build's defaults forever.
 //
 // The rule is CONSERVATIVE and provable: refresh a built-in row only when its
@@ -992,10 +1167,21 @@ export const isLegacyShippedDefinition = (
     const sameList = (left: readonly string[] | undefined, right: readonly string[] | undefined): boolean =>
         JSON.stringify(left ?? []) === JSON.stringify(right ?? []);
 
+    // RANK comparison, canonicalised the way `presetToRecord` writes it: the legacy
+    // table states an older shipped ROSTER plus its ranks, and a saved row matches it
+    // only when both the roster order and the rank assignment are untouched. Rank is
+    // executable authority — a row whose planner sits at Rank B instead of Rank A is a
+    // real customisation and must be replayed, not refreshed away.
+    const sameRanks = (
+        left: Readonly<Record<string, AgentRank>> | undefined,
+        right: Readonly<Record<string, AgentRank>> | undefined
+    ): boolean =>
+        JSON.stringify(sortedRanks(left ?? {})) === JSON.stringify(sortedRanks(right ?? {}));
+
     return (
         record.requiresEndpoint === definition.requiresEndpoint &&
-        record.primary === definition.primary &&
-        sameList(record.subagents, definition.subagents) &&
+        record.entry === definition.entry &&
+        sameRanks(record.ranks, definition.ranks) &&
         sameList(record.agents, definition.agents) &&
         sameList(record.tools, definition.tools) &&
         sameList(record.environmentTools, definition.environmentTools) &&
@@ -1059,8 +1245,15 @@ export const restoreHarnessRegistry = (
                 name: record.name,
                 title: record.title,
                 description: record.description,
-                primary: record.primary,
-                subagents: [...record.subagents],
+                // The saved ROSTER goes back in its saved ORDER, and the saved ENTRY is
+                // restated explicitly rather than left to the order default: a row
+                // written by a build whose entry was not roster[0] must still come back
+                // with the same routing. `ranks` is the row's authority map, replayed in
+                // full. A stored map is already RESOLVED — every member keyed — so the
+                // restart reproduces the SAME ranks instead of re-deriving them.
+                agents: [...record.agents],
+                entry: record.entry,
+                ranks: { ...record.ranks },
                 ...(record.agentModels === undefined ? {} : { agentModels: { ...record.agentModels } }),
                 ...(record.agentInstructions === undefined
                     ? {}
@@ -1114,8 +1307,13 @@ export const restoreHarnessRegistry = (
             description: record.description,
             ...(executable
                 ? {
-                      primary: record.primary,
-                      subagents: [...record.subagents],
+                      // Roster, routing and authority replay together: the saved row is
+                      // the definition, so the factory this patch rebuilds must see the
+                      // same agents, the same entry agent and the same rank map the row
+                      // carried. `agents` order is preserved for the same reason.
+                      agents: [...record.agents],
+                      entry: record.entry,
+                      ranks: { ...record.ranks },
                       agentModels: { ...record.agentModels },
                       // T3: instruction overrides are executable state, so a saved
                       // row replays them through the same patch that rebuilds the
@@ -1246,16 +1444,43 @@ export const createHarnessRegistry = (
             throw new HarnessRegistryError(409, `Harness "${name}" already exists.`);
         }
 
-        const primary = requireAgent(registration?.primary, 'primary', selectableAgent);
-        const subagents =
-            registration.subagents === undefined
-                ? []
-                : normalizeSubagents(registration.subagents, primary, selectableAgent);
+        // THE ROSTER IS RESOLVED FIRST, because both other roster fields are
+        // validated against it: `entry` must be a member, and every `ranks` key must
+        // be a member. `agents` was DERIVED here before ([primary, ...subagents]); it
+        // is now the client's own explicit list, and its order is load-bearing (see
+        // ./types.ts).
+        const roster = normalizeRoster(registration?.agents, selectableAgent);
 
-        // The final member set: one primary then its allowlist. The per-agent
-        // model map is validated against exactly this, so a key can never name an
-        // agent the harness does not contain.
-        const agents = [primary, ...subagents];
+        // THE ENTRY AGENT: optional, and the default is the first name of the roster.
+        // It is a ROUTING default only — the rank map says authority, and nothing here
+        // requires the entry to hold Rank A, or to be the only Rank A member. A
+        // two-Rank-A harness is a normal shape in this model, not an invariant to
+        // police, so there is no "exactly one" check left to fail.
+        const entry =
+            registration?.entry === undefined
+                ? roster[0]
+                : normalizeEntry(registration.entry, roster);
+
+        // THE RANK MAP, RESOLVED INTO THE MAP THE HARNESS RUNS WITH. An omitted map is the
+        // kernel's rule-1 default (../harness.ts:1540): the ENTRY agent at 'A' and every other
+        // member one below at 'B' — the ordinary two-level team, and the direct successor of
+        // the old `primary` + `subagents` shape. A stated map is validated, then filled by the
+        // rule the kernel itself applies (one rank below the lowest rank named, entry agent
+        // included), which gives `ranks: {}` the flat team it reads as: every member at 'B', no
+        // delegation anywhere. Storing the RESOLVED map is what keeps the durable record, the
+        // card, and the construction argument stating the same ranks — the operator's map is
+        // resolved ONCE, here, instead of re-derived at every start (./toolbox.ts
+        // `resolveRosterRanks`).
+        const ranks = resolveRosterRanks(
+            roster,
+            entry,
+            registration?.ranks === undefined ? undefined : normalizeRanks(registration.ranks, roster)
+        );
+
+        // The final member set. The per-agent model / instruction / color maps are
+        // validated against exactly this, so a key can never name an agent the harness
+        // does not contain.
+        const agents = roster;
         const agentModels =
             registration.agentModels === undefined
                 ? {}
@@ -1290,8 +1515,10 @@ export const createHarnessRegistry = (
             // A user-created harness selects trusted live agents, so it needs a
             // provider exactly like the live built-ins do.
             requiresEndpoint: true,
-            primary,
-            subagents,
+            // Routing and authority, stored as the two separate fields they are: the
+            // entry agent (a member, defaulted from roster order) and the rank map.
+            entry,
+            ranks,
             agents,
             // One toolbox for every live harness, user-created included. The four
             // core file tools are declared up front (R18); the searchable remainder
@@ -1316,9 +1543,10 @@ export const createHarnessRegistry = (
             // A created harness is a live profiled harness; later PATCHes treat
             // it like the live built-ins.
             template: 'live',
-            // The factory closure captures the map, so a later PATCH builds a NEW
-            // closure: an existing session keeps the models it was created with.
-            create: createProfiledHarness(primary, subagents, agentModels, agentInstructions, agentColors)
+            // The factory closure captures the rank map and the model/instruction/color
+            // maps, so a later PATCH builds a NEW closure: an existing session keeps the
+            // team, ranks and models it was created with.
+            create: createProfiledHarness(entry, agents, ranks, agentModels, agentInstructions, agentColors)
         };
 
         entries.set(name, preset);
@@ -1355,20 +1583,64 @@ export const createHarnessRegistry = (
         const selectableHere = (name: string): boolean =>
             selectableAgent(name) || previouslySelected.has(name);
 
-        const primary =
-            patch.primary === undefined
-                ? current.primary
-                : requireAgent(patch.primary, 'primary', selectableHere);
+        // THE ROSTER. A stated roster REPLACES the member list (order included, since
+        // order is the entry default); an omitted one keeps the current members in their
+        // current order.
+        const roster =
+            patch.agents === undefined
+                ? [...current.agents]
+                : normalizeRoster(patch.agents, selectableHere);
 
-        // Changing the primary without restating the allowlist must not leave the
-        // new primary inside `subagents` (a harness has exactly one primary). When
-        // the client does restate it, it is validated against the new primary.
-        const subagents =
-            patch.subagents === undefined
-                ? current.subagents.filter((entry) => entry !== primary)
-                : normalizeSubagents(patch.subagents, primary, selectableHere);
+        // THE ENTRY AGENT. Stated: it must name a member of the FINAL roster (a 400
+        // otherwise). Omitted: the current entry survives whenever the same patch left
+        // it a member — re-targeting routing is a separate decision from changing the
+        // team — and when the patch dropped it, the entry falls back to the first name
+        // of the new roster, the same default create() applies. A patch can therefore
+        // never leave a harness routed at an agent it no longer contains, which is the
+        // guarantee the old "changing the primary removes it from subagents" rule was
+        // reaching for from the other direction.
+        const entry =
+            patch.entry === undefined
+                ? roster.includes(current.entry)
+                    ? current.entry
+                    : roster[0]
+                : normalizeEntry(patch.entry, roster);
 
-        const agents = [primary, ...subagents];
+        // THE RANK MAP, RESOLVED THE SAME WAY. A stated map REPLACES the stored one and is
+        // filled for every member it does not name; an omitted one keeps the current ranks
+        // RESTRICTED TO THE SURVIVING MEMBERS, and a member this patch ADDED takes the filled
+        // value the kernel would give it — one rank below the lowest rank that survives, so a
+        // newcomer never lands at 'A' by accident and a flat harness stays flat. A rank for an
+        // agent this patch removed can no longer apply — it is not a target and not a delegator
+        // — so it is dropped rather than rejected, exactly like a model, instruction or color
+        // override for the same member below.
+        //
+        // THE EMPTY-MAP DISTINCTION IS THE CLIENT'S, NOT THE HOST'S. `ranks: {}` in the PATCH
+        // BODY is an explicit statement ("make this team flat") and reaches the fill as an empty
+        // map, which is what puts every member on 'B'. An OMITTED map is "no opinion", and when a
+        // roster swap drops every member the retained map is legitimately empty — that must NOT
+        // read as "flat", because the client never said so: passing `undefined` here applies the
+        // SAME rule-1 default create() uses (entry 'A', every other member 'B'), so replacing a
+        // roster wholesale gives the team the shape an equivalent POST would, and a two-member
+        // new roster keeps a delegation surface instead of silently losing one.
+        const retainedRanks = Object.fromEntries(
+            Object.entries(current.ranks).filter(([agent]) => roster.includes(agent))
+        );
+
+        const ranks = resolveRosterRanks(
+            roster,
+            entry,
+            patch.ranks === undefined
+                ? Object.keys(retainedRanks).length === 0
+                    ? undefined
+                    : retainedRanks
+                : normalizeRanks(patch.ranks, roster)
+        );
+
+        // The FINAL member set. The three override maps and the rank map are all
+        // validated against this, so no key can name an agent the harness does not
+        // contain.
+        const agents = roster;
 
         // Per-agent models (R9) follow the FINAL membership:
         //   - existing overrides for a member this patch removed are dropped: the
@@ -1432,8 +1704,9 @@ export const createHarnessRegistry = (
         // factory exactly like a model or team change (and, on the scripted demo,
         // upgrade it to a live harness rather than storing text the script ignores).
         const executable =
-            patch.primary !== undefined ||
-            patch.subagents !== undefined ||
+            patch.entry !== undefined ||
+            patch.ranks !== undefined ||
+            patch.agents !== undefined ||
             patch.agentModels !== undefined ||
             patch.agentInstructions !== undefined ||
             // R2: a color is display-only, but it is still EXECUTABLE in this sense: the
@@ -1462,8 +1735,9 @@ export const createHarnessRegistry = (
         const create = executable
             ? liveFactory(
                   template === 'scripted' || template === 'live' ? 'live' : 'flaky',
-                  primary,
-                  subagents,
+                  entry,
+                  agents,
+                  ranks,
                   agentModels,
                   agentInstructions,
                   agentColors
@@ -1489,8 +1763,8 @@ export const createHarnessRegistry = (
                 patch.description === undefined
                     ? upgradedDescription
                     : normalizeDescription(patch.description),
-            primary,
-            subagents,
+            entry,
+            ranks,
             agents,
             agentModels,
             // T3: stated explicitly (not inherited from `...current`) so a patch that

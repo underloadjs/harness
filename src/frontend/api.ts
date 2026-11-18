@@ -60,6 +60,9 @@ import { HARNESS_API_ROOT, HARNESS_EPOCH_HEADER, HARNESS_PAGE_LIMIT, HARNESS_REV
 import { isTrustedRuntimeOrigin } from '../shared/origin';
 import { providerTimeoutsOf } from './provider-diagnostics';
 import type { ProviderTimeouts } from './provider-diagnostics';
+// The browser's own rank vocabulary. Only the roster/authority-map rule is needed at this
+// boundary; every other rank read goes through ./contract.ts accessors downstream.
+import { rosterRanksOf } from './contract';
 import { STATIC_API_CANDIDATES, isStaticPagesHost } from './deployment';
 import type {
     ActionChoiceInput,
@@ -151,7 +154,7 @@ import type {
     PatchTurnBlockRequest,
     TurnBlockWriteReceipt
 } from '../shared/harness-api';
-import type { HarnessEvent, HarnessUsage } from '../types';
+import type { AgentRank, HarnessEvent, HarnessUsage } from '../types';
 // The display subtree uses the GENERATED aliases in ../shared/harness-api (they ARE
 // ../shared/turn-display.ts's models). Naming them here is what makes this module's
 // returns "the wire contract", and ./display-project.ts is the single place that
@@ -1653,8 +1656,16 @@ export type HarnessCardView = {
     title: string;
     description: string;
     requiresEndpoint: boolean;
-    primary: string;
-    subagents: string[];
+    // R20: the ENTRY agent — the member an unfocused submit opens a conversation for. A
+    // ROUTING fact only: it holds no authority, may carry any rank, and the card has no
+    // `primary` field any more (../shared/harness-api.ts `HarnessCard`).
+    entry: string;
+    // R20: the RANK of each member (agent name -> 'A'-'Z', A highest). Any number of members
+    // may share one letter (../types/index.ts `AgentRank`). `descriptorOf` ALWAYS states a
+    // map, reduced to the roster and its valid letters (`contract.ts#rosterRanksOf`); the
+    // field stays optional so a hand-built row (a frozen view, a test fixture) can honestly
+    // carry none, and ./contract.ts `ranksOf` reads an absent map as "no rank stated".
+    ranks?: Partial<Record<string, AgentRank>>;
     agents: string[];
     tools: string[];
     builtin: boolean;
@@ -1674,8 +1685,24 @@ export const descriptorOf = (card: HarnessCard | HarnessDefinition): HarnessCard
     title: card.title,
     description: card.description,
     requiresEndpoint: card.requires_endpoint,
-    primary: card.primary,
-    subagents: [...card.subagents],
+    // R20: `entry` and `ranks` replace the old `primary`/`subagents` pair. The authority map
+    // is reduced to what this browser may safely re-send — members' own keys, valid letters,
+    // and the server's documented default when the row states nothing — see
+    // `contract.ts#rosterRanksOf`. An empty echo would mean "a flat team that cannot
+    // delegate" to the server and delete ranks this browser was never told about.
+    //
+    // `entry` is resolved here rather than passed through: the read shape states it, and the
+    // documented client rule for a row that omits it is "the first member of `agents`, else the
+    // card name" (../server/protocol.ts:384-388, ../shared/harness-api.ts:751). Resolving at this
+    // boundary means the view NEVER carries an `entry: undefined` key for the shell to re-guard,
+    // and `contract.ts#entryOf` keeps the same fallback for hand-built descriptors. Position
+    // states routing only — it is not an authority claim, so this cannot promote a member.
+    ...(() => {
+        const entry = card.entry ?? card.agents[0] ?? card.name;
+        const stated = 'ranks' in card ? card.ranks : undefined;
+
+        return { entry, ranks: rosterRanksOf(entry, card.agents, stated) };
+    })(),
     agents: [...card.agents],
     tools: [...card.tools],
     builtin: card.builtin,

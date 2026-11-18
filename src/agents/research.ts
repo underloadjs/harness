@@ -7,7 +7,7 @@
 // tools field, src/types/index.ts) and every live harness registers the same toolbox
 // (src/server/harnesses/toolbox.ts), so `write`/`edit` ARE callable here. `READ_ONLY_GUIDELINE`
 // (./guidelines.ts) is therefore the whole enforcement for the standalone card, and the
-// caller's `delegate` `scope.tools` allowlist is the enforcement when it runs as a subagent
+// caller's `delegate` `scope.tools` allowlist is the enforcement when it is delegated to
 // (src/tools/runtime/delegate.tool.ts — "a planning or review delegation can be read-only by
 // construction instead of by instruction"). Both are stated so the agent neither assumes a
 // hard wall exists nor assumes it is free to write.

@@ -245,6 +245,7 @@ export const HARNESS_SERVICE_CAPABILITIES = {
 
 // In-repo models the contract reuses verbatim instead of duplicating.
 import type {
+    AgentRank as AgentRankModel,
     ToolMediaDescriptor as ToolMediaDescriptorModel,
     HarnessErrorInfo as HarnessErrorInfoModel,
     HarnessUsage as HarnessUsageModel,
@@ -612,10 +613,18 @@ export interface GlobalConfigUpdateRequest {
 }
 
 /**
- * One named harness definition as a picker needs it: identity, the entry agent, the delegation allowlist, the
- * declared tool set, and whether a provider endpoint is required. `agents` is derived as `[primary,
- * ...subagents]`. A card omits per-agent instruction TEXT, the per-agent model map, and the resolved core-tool
- * set; the identified read adds those.
+ * Verbatim alias of the in-repo model `AgentRank` from ../types; shape equivalence is probed in
+ * src/shared/harness-api.test.ts.
+ * Not a duplicate: the model stays the single definition of this shape.
+ */
+export type AgentRank = AgentRankModel;
+
+/**
+ * One named harness definition as a picker needs it: identity, the ENTRY agent, the RANK MAP, the roster, the
+ * declared tool set, and whether a provider endpoint is required. `agents` is the roster in DECLARATION ORDER -
+ * it is not derived from anything, and neither `entry` nor `ranks` is derived from it: three independent facts,
+ * because position in the roster states no authority. A card omits per-agent instruction TEXT, the per-agent
+ * model map, and the resolved core-tool set; the identified read adds those.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface HarnessCard {
@@ -624,10 +633,29 @@ export interface HarnessCard {
     description: string;
     /** False only for a scripted definition, which needs no provider base URL; no shipped card is endpoint-free. */
     requires_endpoint: boolean;
-    /** The entry agent, and the agent an unfocused submit opens a conversation for. */
-    primary: string;
-    /** The exact delegation allowlist. Empty means `delegate` is not registered at all. */
-    subagents: string[];
+    /**
+     * THE ENTRY AGENT - the member an unfocused submit opens a conversation for, and the member a session
+     * refuses to delete. ROUTING ONLY, and not a leader: it carries whatever letter `ranks` gives it, and a
+     * definition with several top-ranked members still has exactly one entry for routing. The one place
+     * position matters is the DEFAULT - an omitted `entry` is the first name of `agents`, and an omitted
+     * `ranks` map ranks the entry at `A` and everyone else at `B`.
+     */
+    entry: string;
+    /**
+     * THE RANK MAP - authority per member (agent name to a single rank letter, `A` highest), and it covers
+     * EVERY name in `agents`. The server resolves a sparser request into this map with the runtime's own fill
+     * rule (one rank below the lowest rank stated, the entry agent included), so a card states what the harness
+     * RUNS, never a subset an operator happened to write, and nothing is derived from roster position.
+     * Delegation exists exactly when this map holds two or more DISTINCT letters: a roster all at one rank has
+     * no strictly-lower target, so `delegate` is not registered at all.
+     */
+    ranks: {
+      [key: string]: AgentRank;
+      };
+    /**
+     * THE ROSTER, in DECLARATION ORDER. Order is meaningful twice - it is the default `entry` (the first entry)
+     * and the order every per-member read returns - and meaningless for authority, which `ranks` states.
+     */
     agents: string[];
     /** The declared tool set of this definition. */
     tools: string[];
@@ -675,8 +703,9 @@ export type HarnessDefinition = HarnessCard
     & {
     /**
      * The core tools this definition's runs will actually declare - the file tools when registered, the
-     * harness-owned control tools, `delegate` when a subagent allowlist exists, and `search` only when a
-     * provider key exists. Runtime visibility, not a hard-coded list.
+     * harness-owned control tools, `delegate` when the rank map states two or more DISTINCT ranks (one rank for
+     * everybody is a flat team, which has nobody to delegate to), and `search` only when a provider key exists.
+     * Runtime visibility, not a hard-coded list.
      */
     core_tools?: string[];
     /**
@@ -696,24 +725,44 @@ export type HarnessDefinition = HarnessCard
     agent_colors?: {
       [key: string]: string;
       };
-    /** One row per member, in `[primary, ...subagents]` order. No text. */
+    /** One row per member, in the roster's DECLARATION ORDER. No text. */
     instruction_summary?: HarnessInstructionSummaryEntry[];
 };
 
 /**
  * Selection-only body. A client picks trusted agent names and may record per-agent model ids, instruction
  * overrides, and display colors; it cannot supply a provider, a credential, a transport, or a tool list. Every
- * override key must name a member of the resulting definition. The roster itself is validated as a SET: an
- * agent listed in `subagents` more than once is a 400, and listing `primary` in `subagents` is a 400, because a
- * harness has exactly one primary.
+ * override key must name a member of the resulting definition. THE ROSTER IS `agents`, in declaration order,
+ * and it is the ONLY roster field: an agent listed in it more than once is a 400, because `delegate` targets an
+ * agent, not a position in a list. `ranks` states AUTHORITY and may cover fewer agents than the roster; `entry`
+ * states ROUTING, must be a member, and defaults to the roster's first agent.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface CreateHarnessRequest {
     name: string;
     title?: string;
     description?: string;
-    primary: string;
-    subagents?: string[];
+    /**
+     * THE ROSTER, in declaration order: at least one agent, at most 16. A harness with no agent has no entry
+     * and no rank, so it could never run a turn - an empty list is 400, not a valid team with a missing entry.
+     */
+    agents: string[];
+    /**
+     * THE ENTRY AGENT (routing). Must name a member of `agents`; omitted means the FIRST entry of `agents`,
+     * which is the only default the rank model allows, because position states no authority.
+     */
+    entry?: string;
+    /**
+     * THE RANK MAP - authority per member (agent name to a single rank letter, `A` highest). A key must name a
+     * member, and the map MAY name fewer: every member it leaves out is filled one rank BELOW the lowest rank
+     * it does state (the entry agent included), and the read returns the RESOLVED map. Omitted ENTIRELY is the
+     * ordinary team - the entry agent at `A`, every other member at `B`, which spans two ranks and registers
+     * `delegate`. An explicit `{}` is the flat team: every member at `B`, one distinct rank, no delegation at
+     * all. Several members may hold the same letter, including `A`.
+     */
+    ranks?: {
+      [key: string]: AgentRank;
+      };
     /**
      * Agent name to model id. An id only - never a provider or a credential - trimmed, non-empty, and free of
      * control characters.
@@ -743,15 +792,28 @@ export interface CreateHarnessRequest {
 /**
  * An omitted field keeps its current value; the name is immutable. `agent_models`, `agent_instructions` and
  * `agent_colors` REPLACE the map they name (`{}` clears it), and an override for a member this patch removes is
- * dropped rather than rejected. Changing `primary` without `subagents` removes the new primary from the old
- * allowlist.
+ * dropped rather than rejected. `agents` REPLACES the roster; an omitted `entry` keeps the current entry agent
+ * when the new roster still contains it and otherwise falls back to the new roster's FIRST agent (a harness
+ * whose entry agent left has to route to someone); `ranks` REPLACES the authority map, and a key naming an
+ * agent outside the resulting roster is 400 rather than a silent drop.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UpdateHarnessRequest {
     title?: string;
     description?: string;
-    primary?: string;
-    subagents?: string[];
+    /** Replaces the roster, in declaration order. The entry-agent and rank rules are on the route. */
+    agents?: string[];
+    /** Replaces the recorded entry agent as-is. Must name a member of the resulting roster. */
+    entry?: string;
+    /**
+     * Replaces the authority map. Keys must name members of the resulting roster; a member this patch removes
+     * loses its rank with it, and a member the new map does not name is filled one rank below the lowest rank
+     * it does state. Omitted keeps the ranks of the members that survive and fills only the members this patch
+     * added.
+     */
+    ranks?: {
+      [key: string]: AgentRank;
+      };
     agent_models?: {
       [key: string]: string;
       };
@@ -853,9 +915,9 @@ export interface AgentSummary {
 }
 
 /**
- * The full trusted profile as a client needs it to choose a primary or subagent. Every text field is trusted
- * catalogue content, never client input and never secret: `instruction` is the identity system message and
- * `guidelines` are the rules appended to it at runtime.
+ * The full trusted profile as a client needs it to pick roster members. Every text field is trusted catalogue
+ * content, never client input and never secret: `instruction` is the identity system message and `guidelines`
+ * are the rules appended to it at runtime.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface AgentProfile {
@@ -1629,8 +1691,13 @@ export interface SessionAgentBinding {
      * that is not in the trusted catalogue was created by THIS session and has no profile behind it.
      */
     profile: string;
-    /** `subagent` means the primary may delegate to it; `primary` is the entry agent. */
-    role: "primary" | "subagent";
+    /**
+     * THE RANK this session RUNS this member at, resolved server-side from the live harness's rank map and
+     * falling back to the frozen definition's map. It is a letter, not a prose role: several members may report
+     * the same one, and the entry agent is not necessarily the top letter. A member no map names reports the
+     * LOWEST letter, because an agent has no authority the definition did not grant it.
+     */
+    rank: AgentRank;
     /**
      * How this member entered the conversation, NOT whether it can leave: `definition` means it came with the
      * frozen harness definition and `session` means `POST …/agents` bound it here, and BOTH are removable with
@@ -1780,12 +1847,15 @@ export interface CreateSessionAgentRequest {
      */
     instruction?: string;
     /**
-     * `subagent` adds this binding to the primary's delegation allowlist for THIS session only, and is what an
-     * omitted value means. `primary` is ALWAYS 409, running or idle: the entry agent is structural metadata of
-     * the harness definition, so no session write can re-target what an unfocused submit opens; the refusal
-     * says so rather than binding a subagent and ignoring the request. A value outside these two is 400.
+     * THE RANK this session gives the agent - delegation authority, for THIS session only. ANY letter binds,
+     * several members may share one, and no rank is refused: the structural protection is the ENTRY agent, and
+     * it is protected by MEMBERSHIP (a binding cannot detach it), not by a letter. An omitted or null value
+     * asks for NO authority, and the binding is given the LOWEST letter of the scale - never "inherit", never a
+     * guess. A value that is not one upper-case letter A-Z is 400 naming the letters the scale accepts; the
+     * retired `role` field is not accepted at all and lands in the unknown-field refusal. The rank is not
+     * patchable on the binding PATCH, which takes `model` and `instruction` only.
      */
-    role?: "primary" | "subagent";
+    rank?: AgentRank;
 }
 
 /**
@@ -2298,7 +2368,7 @@ export interface SubmitTaskRequest {
      */
     references?: AgentResultReference[];
     /**
-     * The persistent conversation this input belongs to. Absent opens a NEW host thread for the primary agent,
+     * The persistent conversation this input belongs to. Absent opens a NEW host thread for the ENTRY agent,
      * connected by a reference edge to any referenced threads. Present and RUNNING steers the text into that
      * conversation at its next safe model boundary, unless an attachment is present or a reference has not
      * completed - both become a QUEUED CONTINUATION instead. Present and IDLE or STOPPED starts a continuation
@@ -3629,7 +3699,13 @@ export interface TurnSection {
     /** Server-minted and stable, `${turnId}:${ordinal}` in allocation order. */
     id: string;
     parentSectionId?: string;
-    role: "primary" | "subagent";
+    /**
+     * The RANK of `agent` in this harness, resolved SERVER-side from the definition's rank map - never from a
+     * prose role, and never from "is this the primary". Several sections may carry the same letter. A member
+     * the map omits is emitted at the LOWEST rank, because an agent has no authority the definition did not
+     * grant it.
+     */
+    rank: AgentRank;
     agent: string;
     /** The block label (`RR2`), from one sequence shared with the conversation label. */
     agentLabel: string;

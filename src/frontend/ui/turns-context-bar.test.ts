@@ -74,7 +74,7 @@ const block = (overrides: Partial<ContextBlock> = {}): ContextBlock => ({
 
 const rootSection = (overrides: Partial<TurnSection> = {}): TurnSection => ({
     id: 't1:0',
-    role: 'primary',
+    rank: 'A',
     agent: 'instruct',
     agentLabel: 'RR1',
     state: 'streaming',
@@ -85,7 +85,7 @@ const rootSection = (overrides: Partial<TurnSection> = {}): TurnSection => ({
 const childSection = (overrides: Partial<TurnSection> = {}): TurnSection => ({
     id: 't1:1',
     parentSectionId: 't1:0',
-    role: 'subagent',
+    rank: 'B',
     agent: 'helper',
     agentLabel: 'RH1',
     state: 'streaming',

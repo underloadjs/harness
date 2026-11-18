@@ -43,9 +43,10 @@
  *     failure mode the persistence pass documents at :1670-1672);
  *   - ANSWER POSITION — "already answered" is decided across the WHOLE array, not the block that
  *     follows the call, because a real result can legitimately sit anywhere (the owed-account path
- *     can answer a call later, a thread split moves tail rows into a child, a merged subagent
- *     transcript appends what it adopted). Adjacency-only scanning fabricates a second result for
- *     one call id, which is exactly what a provider request schema rejects.
+ *     can answer a call later, a thread split moves tail rows into a child, and a transcript merged
+ *     in from a lower-ranked (delegated) run appends what it adopted — the rank model's wording for
+ *     what this file used to call "a merged subagent transcript"). Adjacency-only scanning fabricates
+ *     a second result for one call id, which is exactly what a provider request schema rejects.
  */
 
 import type { HarnessMessage } from '../types';

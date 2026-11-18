@@ -69,7 +69,7 @@ const snapshotOf = (status: 'running' | 'idle', turns: SessionTurn[]): SessionSn
         updatedAt: T + 1_000,
         turns,
         threads: [],
-        harnessDefinition: { name: 'instruct', primary: 'instruct', members: ['instruct'] }
+        harnessDefinition: { name: 'instruct', entry: 'instruct', members: ['instruct'] }
     }) as unknown as SessionSnapshot;
 
 // The canonical row a `turn.upsert` carries for one turn (`TurnSummary`, camelCase per

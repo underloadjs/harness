@@ -414,10 +414,12 @@ export const isNestedRunTool = (name: string): boolean =>
 //   2. THE RUNTIME CLOSES THE HANDLE DOORS AT THE EXPOSURE (T15). A REFUSING replica does not hand
 //      a tool the raw live handle at all: it hands it `toolHandleView()` (src/harness.ts), a stable
 //      view whose conversation-starting members — the callable, `sendThreadInput`, and the brains
-//      under `agents` / `subagents` — refuse WHENEVER they are called, so a body cannot dodge the
-//      guard by storing the reference and firing it after its own call settled. An INLINE harness
-//      keeps receiving the strict-identical live handle, exactly as it always did. These bodies are
-//      still REFUSED before they run, naming the tool — a revision whose captured source starts a
+//      under `agents` — refuse WHENEVER they are called, so a body cannot dodge the guard by
+//      storing the reference and firing it after its own call settled. (`ranks` is on the same
+//      view but is not a door: it answers as a fresh frozen copy, and it replaced the removed
+//      `subagents` allowlist when the rank model landed.) An INLINE harness keeps receiving the
+//      strict-identical live handle, exactly as it always did. These bodies are still REFUSED
+//      before they run, naming the tool — a revision whose captured source starts a
 //      nested conversation has no worker-safe purpose left, and installing it would promise the
 //      model a call that can only fail. The runtime refusal is the guarantee; the up-front refusal
 //      is the honest placement.
@@ -455,7 +457,7 @@ export const LANE_NESTED_RUN_DOORS: readonly NestedRunDoor[] = [
     NESTED_RUN_CONTEXT_DOOR,
     {
         // Door (2a): the live handle called AS A RUNNER from inside a body. The core's own root
-        // callable, so it writes the primary's conversation inside this replica.
+        // callable, so it writes the ENTRY agent's conversation inside this replica.
         label: 'context.harness(...)',
         blocking: true,
         patterns: [/\b(?:context|ctx|toolContext)\s*(?:\?\.|\.)\s*harness\s*\(/]
@@ -687,7 +689,7 @@ export const assessWorkerToolSurface = (tool: {
         //   - a RUNTIME-REFUSED door (`context.run`, and a `callTool` naming a removed entry) is
         //     a WARNING: armed cores refuse it before the child exists, so the tool still runs
         //     lane-local and the body can take a local path. Refusing it outright would ban a
-        //     whole toolbox because one shipped tool summarises through a subagent;
+        //     whole toolbox because one shipped tool summarises through a delegated run;
         //   - a door NO runtime guard can see (the live handle used as a runner, a sibling brain
         //     run directly) is a REASON: the tool is refused before it can create a child nobody
         //     publishes.

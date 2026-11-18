@@ -66,7 +66,7 @@ const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     ...overrides
 });
 
-const CONTEXT: DisplayProjectContext = { primary: 'one' };
+const CONTEXT: DisplayProjectContext = { entry: 'one' };
 
 // One recorded event per 10 ms, exactly as ./turn-projector.test.ts does it, so every
 // duration and every boundary stamp in these assertions is an event index the reader can

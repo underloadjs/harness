@@ -16,7 +16,8 @@
 //       when results arrive out of order).
 //   R4  One model stream per agent at a time; `delegate` stays pending while
 //       the child runs, the parent stays free, same-agent followups are queued with
-//       the child's transcript preserved, and only the primary sees delegation.
+//       the child's transcript preserved, and only an agent with a strictly
+//       lower-ranked peer sees delegation.
 //       `toolCancel({callId})` releases one call, siblings continue, and a late
 //       settlement of an uncooperative tool changes nothing.
 //   R5  The recurring wake is 600000 ms by default, reports elapsed pending time,
@@ -40,6 +41,12 @@
 // Clock policy: fake timers own the clock in every test. Tool promises are settled
 // explicitly, so each `durationMs`/`elapsedMs` below is an exact number rather than
 // a wall-clock approximation, and `getTimerCount()` can prove timer cleanup.
+//
+// Roster policy: every two-agent fixture here states its ranks explicitly
+// (`entry: <parent>, ranks: { <parent>: 'A', <child>: 'B' }`). `ranks` REPLACES the
+// whole map and an omitted agent silently drops out of the delegation surface, so
+// relying on the no-`ranks` default would let a later edit change which agent can
+// delegate without any test noticing.
 //
 // ALIGNMENT NOTE (runtime was mid-implementation when this file was authored):
 //   1. A paused (no tool calls, work pending) assistant message is expected to be
@@ -1470,8 +1477,8 @@ describe('delegation under background tools', () => {
             // result, the child finishes on its first turn, and the parent is never
             // exercised while delegation is in flight.
             tools: { slow: gatedTool('slow', slowGate) },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             presets: false
         });
 
@@ -1492,7 +1499,7 @@ describe('delegation under background tools', () => {
             },
             { role: 'tool', content: expect.any(String), toolCallId: 'd1', name: 'delegate' }
         ]);
-        // Allowlist/depth: a subagent never sees the delegation control.
+        // Rank roster: an agent with no strictly lower-ranked peer never sees the delegation control.
         expect(childSeen[0].toolNames.filter((name) => name === 'delegate')).toEqual([]);
         expect(state.status).toBe('pending');
 
@@ -1591,8 +1598,8 @@ describe('delegated answer extraction', () => {
         const writer = harness({
             agents: { writer: parent(), researcher },
             tools: { slow: gatedTool('slow', slowGate) },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             presets: false,
             report: {
                 progress: (event) => {
@@ -1654,8 +1661,8 @@ describe('delegated answer extraction', () => {
         const writer = harness({
             agents: { writer: parent(), researcher },
             tools: { slow: gatedTool('slow', slowGate) },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             presets: false
         });
 
@@ -1680,8 +1687,8 @@ describe('delegated answer extraction', () => {
                 lead: agent({ model: 'test/lead', stream: streamFrom(() => answer('lead'), []) }),
                 researcher
             },
-            primary: 'lead',
-            subagents: ['researcher'],
+            entry: 'lead',
+            ranks: { lead: 'A', researcher: 'B' },
             tools: { slow: gatedTool('slow', slowGate) },
             presets: false
         });
@@ -1719,8 +1726,8 @@ describe('delegated answer extraction', () => {
                 lead: agent({ model: 'test/lead', stream: streamFrom(() => answer('lead'), []) }),
                 researcher
             },
-            primary: 'lead',
-            subagents: ['researcher'],
+            entry: 'lead',
+            ranks: { lead: 'A', researcher: 'B' },
             tools: { slow: gatedTool('slow', slowGate) },
             presets: false
         });
@@ -1766,8 +1773,8 @@ describe('delegated answer extraction', () => {
                 researcher
             },
             tools: { slow: gatedTool('slow', slowGate), ask },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             presets: false
         });
 
@@ -1804,8 +1811,8 @@ describe('delegated answer extraction', () => {
                 lead: agent({ model: 'test/lead', stream: streamFrom(() => answer('lead'), []) }),
                 researcher
             },
-            primary: 'lead',
-            subagents: ['researcher'],
+            entry: 'lead',
+            ranks: { lead: 'A', researcher: 'B' },
             tools: { slow: gatedTool('slow', slowGate) },
             presets: false
         });
@@ -2196,8 +2203,8 @@ describe('toolCancel', () => {
                 }),
                 helper
             },
-            primary: 'writer',
-            subagents: ['helper'],
+            entry: 'writer',
+            ranks: { writer: 'A', helper: 'B' },
             tools: { slow: gatedTool('slow', helperGate) },
             presets: false,
             report: { progress: (event) => void events.push(event) }
@@ -2465,8 +2472,8 @@ describe('whole-run cancel', () => {
                 }),
                 researcher
             },
-            primary: 'writer',
-            subagents: ['researcher'],
+            entry: 'writer',
+            ranks: { writer: 'A', researcher: 'B' },
             tools: { work: parentWork.definition, dig: childWork.definition },
             presets: false
         });

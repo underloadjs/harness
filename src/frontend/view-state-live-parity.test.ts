@@ -45,7 +45,7 @@ const timeOf = (index: number): number => T + index * 10;
 const INSTRUCTION = 'You are the entry agent.';
 
 const CONTEXT: DisplayProjectContext = {
-    primary: 'instruct',
+    entry: 'instruct',
     // The store owns the instruction evidence; the fold may not invent it
     // (../shared/turn-display.ts `DisplayProjectContext.instructionSourcesOf`).
     instructionSourcesOf: () => [{ agent: 'instruct', instructions: [INSTRUCTION], at: T }]

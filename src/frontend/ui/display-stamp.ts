@@ -244,7 +244,7 @@ export const displayStampOf = (display: TurnDisplay): string => {
         // Identity and measurement figures of one invocation block: every one of these is
         // painted into a header, a label or the token line, and every one can move in place
         // (`section:set`, ../view-state.ts:411-423).
-        mixField(section.role);
+        mixField(section.rank);
         mixField(section.agent);
         mixField(section.agentLabel);
         mixField(section.state);

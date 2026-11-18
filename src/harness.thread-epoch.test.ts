@@ -92,8 +92,8 @@ describe('run identity carries the process epoch (T-W8)', () => {
                 ),
                 helper: brain(scripted([answer('child answer')]))
             },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false,
             report
         });
@@ -125,8 +125,11 @@ describe('run identity carries the process epoch (T-W8)', () => {
         ]);
         const configuration = {
             agents: { lead: brain(scriptedLead), helper: brain(scripted([answer('child answer')])) },
-            primary: 'lead',
-            subagents: ['helper'],
+            // `as const` keeps the rank letters as literal types: this object is declared
+            // separately and passed to `harness(configuration)`, so it gets no contextual
+            // type from the call and a bare `'A'` would widen to `string`.
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' } as const,
             presets: false,
             report
         };
@@ -165,8 +168,8 @@ describe('run identity carries the process epoch (T-W8)', () => {
                 ),
                 helper: brain(scripted([answer('child answer')]))
             },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false,
             report: source.report
         });
@@ -209,8 +212,8 @@ describe('run identity carries the process epoch (T-W8)', () => {
                 ),
                 helper: brain(scripted([answer('child answer')]))
             },
-            primary: 'lead',
-            subagents: ['helper'],
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
             presets: false,
             report: restored.report
         });
@@ -232,7 +235,7 @@ describe('run identity carries the process epoch (T-W8)', () => {
         const { events, report } = recorder();
         const writer = harness({
             agents: { writer: brain(scripted([answer('host answer')])) },
-            primary: 'writer',
+            entry: 'writer',
             presets: false,
             report
         });
@@ -263,7 +266,7 @@ describe('run identity carries the process epoch (T-W8)', () => {
             agents: {
                 lead: brain(scripted([callTool('f1', 'threadFork', '{"input":"branch task"}'), answer('lead done')]))
             },
-            primary: 'lead',
+            entry: 'lead',
             presets: false,
             report
         });

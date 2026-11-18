@@ -13,8 +13,9 @@
 //   - when a query matches nothing, the honest answer pairs `unmatchedTags` (for a
 //     tag no registered tool carries) or `availableTags` (the searchable
 //     vocabulary) with an empty `enabled`;
-//   - a one-agent harness (no delegate at all) and a SUBAGENT (delegate is
-//     primary-only) get no already-available entry - their absence stays honest.
+//   - a one-agent harness (its roster has a single rank, so there is nowhere to
+//     delegate) and an agent at the lowest rank of the roster (nobody below it to
+//     reach) get no already-available entry - their absence stays honest.
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
@@ -56,7 +57,7 @@ const declaredNames = (request: HarnessStreamRequest | undefined): string[] =>
     (request?.tools ?? []).map((declaration) => declaration.name);
 
 // The exact runtime metadata delegate carries in a harness whose only
-// subagent is "researcher" (core/metadata.ts agentDelegateMetadata). Derived from
+// lower-ranked peer is "researcher" (core/metadata.ts agentDelegateMetadata). Derived from
 // the projection itself so a wording change is a one-place edit, not a second copy
 // that silently drifts (T28).
 const DELEGATE_MATCH = (() => {
@@ -90,6 +91,8 @@ const AGENT_QUERY_TOOLS = [...AGENT_MATCHES, TOOL_CREATE_MATCH];
 const SEARCHABLE_TAGS = [
     'agents',
     'answer',
+    'article',
+    'articles',
     'branch',
     'catalogue',
     'chapter',
@@ -107,6 +110,7 @@ const SEARCHABLE_TAGS = [
     'history',
     'inspect',
     'inventory',
+    'knowledge',
     'list',
     'location',
     'locations',
@@ -120,21 +124,26 @@ const SEARCHABLE_TAGS = [
     'preview',
     'profile',
     'profiles',
+    // The rank-model tag (2026-11-18): agentManage and agentResult replaced their retired
+    // `subagent` tag with `rank`, so `rank` joins this vocabulary and `subagent` leaves it.
+    'rank',
+    'read',
     'record',
     'records',
+    'reference',
     'registry',
     'reload',
     'research',
     'result',
     'results',
     'scene',
+    'search',
     'self-modifying',
     'setting',
     'settings',
     'source',
     'store',
     'story',
-    'subagent',
     'summarize',
     'team',
     'thread',
@@ -155,7 +164,7 @@ describe('toolRequest already-available core tools', () => {
 
         await writer('delegate?');
 
-        // The primary HAS delegate declared, so the answer names it. Nothing is
+        // The entry agent HAS delegate declared, so the answer names it. Nothing is
         // enabled, nothing is left over, and the tag is not called unmatched. The
         // demoted rows now offer their vocabulary instead of an empty list.
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
@@ -250,7 +259,8 @@ describe('toolRequest already-available core tools', () => {
 
         await writer('delegate?');
 
-        // No subagents means no delegate was ever registered, so the honest answer
+        // A one-agent roster spans a single rank, so no delegate was ever registered
+        // and the honest answer
         // has no alreadyAvailable key at all and reports the tag as unmatched. Tags
         // come back normalized (trimmed + lower-cased).
         expect(writer.tools.delegate).toBeUndefined();
@@ -263,10 +273,10 @@ describe('toolRequest already-available core tools', () => {
         });
     });
 
-    it('does not advertise delegate to a subagent that never receives it', async () => {
-        // The primary delegates once; INSIDE that run the subagent queries the exact
-        // name and the synonyms. delegate is core but primary-only, so the
-        // subagent's own toolRequest must not list it.
+    it('does not advertise delegate to an agent that has nobody ranked below it', async () => {
+        // The Rank A entry delegates once; INSIDE that run the Rank B child queries the exact
+        // name and the synonyms. `delegate` is declared only to an actor that has a strictly
+        // lower-ranked peer, so the child's own toolRequest must not list it.
         const researcher = brain(
             scripted([
                 callTool('r1', 'toolRequest', '{"tags":["delegate","agents","delegate"]}'),
@@ -283,7 +293,7 @@ describe('toolRequest already-available core tools', () => {
 
         await writer('delegate?');
 
-        // Subagent history: [0] user, [1] assistant tool call, [2] tool result.
+        // Child (Rank B) history: [0] user, [1] assistant tool call, [2] tool result.
         expect(JSON.parse(content(researcher.messages[2]))).toEqual({
             enabled: AGENT_QUERY_ENABLED,
             tools: AGENT_QUERY_TOOLS,

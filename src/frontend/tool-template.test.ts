@@ -200,8 +200,8 @@ const descriptor = {
     agents: ['instruct'],
     tools: ['glob'],
     coreTools: ['toolRequest', 'tasks'],
-    primary: 'instruct',
-    subagents: [],
+    entry: 'instruct',
+    ranks: { instruct: 'A' },
     builtin: true,
     editable: true
 };

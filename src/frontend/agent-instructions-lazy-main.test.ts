@@ -40,6 +40,7 @@
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts agent-instructions-lazy-main.test.ts
 
+import type { AgentRank } from '../types';
 import type { HarnessDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { viewAwareFetch } from './view-test-support';
@@ -55,20 +56,26 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct', 'summarizer'],
         tools: [],
         coreTools: ['toolRequest', 'toolCreate', 'tasks', 'delegate'],
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', 'summarizer': 'B' },
         builtin: true,
         editable: true,
         ...overrides
     }) as HarnessDescriptor;
 
-// The same definition with extra members on the team (primary first, then every subagent).
+// The same definition with extra members on the team, in declaration order. Rank A is the entry and
+// every added member sits one rank below it, so the extra members are delegation targets — which is
+// what makes this fixture exercise the per-member instruction reads at all.
 // One helper so the boot row and the identified read can never disagree about the team.
 const definitionWith = (extra: readonly string[], overrides: Partial<HarnessDescriptor> = {}): HarnessDescriptor =>
     descriptor({
         ...(extra.length === 0
             ? {}
-            : { agents: ['instruct', 'summarizer', ...extra], subagents: ['summarizer', ...extra] }),
+            : {
+                  agents: ['instruct', 'summarizer', ...extra],
+                  entry: 'instruct',
+                  ranks: { instruct: 'A', summarizer: 'B', ...Object.fromEntries(extra.map((member) => [member, 'B'])) }
+              }),
         ...overrides
     });
 
@@ -250,8 +257,8 @@ const stub = (
 
                 return json({
                     harness: descriptor({
-                        primary: body.primary as string,
-                        subagents: body.subagents as string[],
+                        entry: body.entry as string,
+                        ranks: body.ranks as Record<string, AgentRank>,
                         ...(body.agentModels === undefined ? {} : { agentModels: body.agentModels as Record<string, string> }),
                         ...(body.agentInstructions === undefined ? {} : { agentInstructions: body.agentInstructions as Record<string, string> })
                     })
@@ -500,7 +507,7 @@ describe('the configuration dialog reads the default text it seeds', () => {
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Instruct');
         expect(
             byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').getAttribute('aria-label')
-        ).toBe('Configure Instruct · primary agent');
+        ).toBe('Configure Instruct · Rank A · entry agent');
         expect(
             byClass('.agent-dialog-tab[data-agent="instruct"] .agent-dialog-agent-name', 'span').textContent
         ).toBe('Instruct');
@@ -538,8 +545,9 @@ describe('the configuration dialog reads the default text it seeds', () => {
         // The complete map is restated with this key cleared — the server replaces it wholesale.
         expect(server.patches).toHaveLength(1);
         expect(server.patches[0]).toEqual({
-            primary: 'instruct',
-            subagents: ['summarizer'],
+            agents: ['instruct', 'summarizer'],
+            entry: 'instruct',
+            ranks: { instruct: 'A', 'summarizer': 'B' },
             agentInstructions: {}
         });
 

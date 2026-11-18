@@ -90,7 +90,7 @@
        `.agent-control` (the composer button, ui/agent-control.ts) and
        `.agent-dialog-agent` / `.agent-dialog-add-option` (ui/agent-dialog.ts). The values
        here are the UNKNOWN-AGENT fallback — identical to `UNKNOWN_AGENT_COLOR` — so a
-       block that exists before any event names a primary agent reads neutral instead of
+       block that exists before any event names an agent reads neutral instead of
        borrowing one of the (now randomly handed out) palette slots.
        R4 changed only HOW a slot is chosen: a shuffled palette permutation per page,
        stable for that page's lifetime. What the two properties MEAN is unchanged. */
@@ -858,6 +858,71 @@ body.is-resizing-rail {
 
 .chip-remove:hover {
     color: var(--danger);
+}
+
+/* R20: the per-chip rank stepper in the create form (ui/create-harness.ts
+   `rankStepperFor`). The entry agent starts at Rank A and every added member at Rank
+   B, and the reader can move each one independently — a team of three Rank A agents is
+   expressible here, which the old primary/subagent pair could not state. */
+.create-chip-rank {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 2px;
+    padding-left: 4px;
+    border-left: 1px solid var(--border);
+}
+
+.chip-rank-step {
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.chip-rank-step:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.chip-rank-step:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.chip-rank-step:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.create-chip-rank-value {
+    min-width: 4ch;
+    color: var(--muted);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-align: center;
+    text-transform: uppercase;
+}
+
+/* The chip that names the entry agent: the accent outline plus the small flag. This is
+   a ROUTING marker — the rank stepper next to it is the authority control, and the two
+   are independent by contract. */
+.create-chip[data-entry='true'] {
+    border-color: var(--accent);
+}
+
+.create-chip-flag {
+    color: var(--accent);
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
 }
 
 .create-error {
@@ -2621,7 +2686,7 @@ body.is-resizing-rail {
 
 /* R1: phone-only summary that owns the agent-strip disclosure. Hidden outside the
    860px block, so desktop/tablet show the cards exactly as before. Its label is the
-   primary's title and its state is `aria-expanded` (ui/agents.ts). */
+   front agent's title and its state is `aria-expanded` (ui/agents.ts). */
 .agent-summary {
     display: none;
     align-items: center;
@@ -2673,7 +2738,7 @@ body.is-resizing-rail {
 
 /* Agent deck (R2) ---------------------------------------------------------- */
 /* The team is an overlapping card deck: ONE fully visible front card at the left
-   and every other card showing only its right-hand strip, i.e. `[primary] ] ] ]`.
+   and every other card showing only its right-hand strip, i.e. `[entry] ] ] ]`.
 
    The geometry is purely CSS:
      - `--agent-deck-width` fixes each card so the exposed strip is predictable;
@@ -2735,9 +2800,15 @@ body.is-resizing-rail {
     box-shadow: none;
 }
 
-/* Primary reads green end to end; secondary stays neutral. The name colour
-   below is the primary/secondary signal, so no role badge is needed. */
-.agent-tile[data-role='primary'] {
+/* R20: the ENTRY agent reads green end to end; every other member stays neutral. The
+   name colour below is the entry signal, so no role badge is needed.
+   WHY ENTRY AND NOT RANK: any number of members may hold Rank A, so a single
+   green highlight on "the top agent" cannot survive — while the entry agent (the
+   member a new conversation opens with) is unique by contract, which is what makes a
+   one-card emphasis honest again. Rank is stated in text on the card's own rank row
+   (`ui/agents.ts` rankRowFor), never by colour, so two Rank A tiles can never be read
+   as one ranking the other. */
+.agent-tile[data-entry='true'] {
     border-color: rgba(74, 222, 128, 0.5);
     /* Deck: the card surface must stay OPAQUE or the cards it covers would show
        through the front card. Layering the same 10% green gradient over the solid
@@ -2790,8 +2861,118 @@ body.is-resizing-rail {
     white-space: nowrap;
 }
 
-.agent-tile[data-role='primary'] .agent-tile-name {
+.agent-tile[data-entry='true'] .agent-tile-name {
     color: var(--ok);
+}
+
+/* The per-member rank row (R20, ui/agents.ts `rankRowFor`). It sits between the name
+   row and the model row, and it is the ONLY place a rank letter is written in the deck:
+   `−` raises one step of authority, `+` lowers one, and the readout between them states
+   the letter the definition actually grants — or "rank not stated", which is a real
+   state (an unranked member cannot delegate and cannot be delegated to). Two tiles may
+   read Rank A at the same time and neither one outranks the other. */
+.agent-rank {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px 3px;
+    border-top: 1px solid var(--border);
+}
+
+/* The rank row is the tile's first divider, so the model row below it must not draw a
+   second one. A tile with no rank row (the create target) keeps its own border-top. */
+.agent-rank + .agent-model {
+    border-top: 0;
+}
+
+.agent-rank-step {
+    flex: none;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.agent-rank-step:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.agent-rank-step:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* A clamped step is a stated fact, not a hidden one: the tooltip names the ladder end,
+   and the disabled state keeps the button in place so the row never shifts. */
+.agent-rank-step:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.agent-rank-value {
+    flex: 1;
+    min-width: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-align: center;
+    text-transform: uppercase;
+    overflow-wrap: anywhere;
+}
+
+/* A stated rank reads as data, an unstated one stays muted. The hook is the row's own
+   `data-rank`, which ui/agents.ts writes ONLY when the definition states a letter. */
+.agent-rank[data-rank] .agent-rank-value {
+    color: var(--text);
+}
+
+/* The separate ENTRY control (R20). Deliberately not merged into the rank stepper:
+   naming the entry agent changes routing and no authority, and one control per fact is
+   what keeps that difference visible. `aria-pressed` is the state hook, so the current
+   entry agent's chip reads set rather than depending on the tile's outline alone. */
+.agent-entry {
+    flex: none;
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    line-height: 1.5;
+    cursor: pointer;
+}
+
+.agent-entry:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.agent-entry:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.agent-entry[aria-pressed='true'] {
+    border-color: var(--ok);
+    background: var(--ok-wash);
+    color: var(--ok);
+}
+
+.agent-entry:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
 }
 
 .agent-remove {
@@ -2876,9 +3057,9 @@ body.is-resizing-rail {
     transform: rotate(180deg);
 }
 
-/* Keep the primary identifiable even while its card is hidden: the same green used
-   by the primary name/role colour, applied to the strip label. */
-.agent-tile[data-role='primary'] .agent-handle-name {
+/* Keep the entry agent identifiable even while its card is hidden: the same green the
+   entry name uses, applied to the strip label. */
+.agent-tile[data-entry='true'] .agent-handle-name {
     color: var(--ok);
 }
 
@@ -3440,6 +3621,34 @@ body.is-resizing-rail {
    Issue D: same reserved-slot treatment — the nested rows keep the column their own
    card header occupies, so they align with each other instead of shifting left. */
 .thread-flow > .turn-row :is(.tile-thread, .tile-agent) {
+    visibility: hidden;
+}
+
+/* R6: ONE conversation code per SESSION — the same figure, applied ACROSS cards.
+   `ui/turns.ts syncCompiledThreadRepeats` (:3307) marks every compiled card whose
+   conversation code an EARLIER card already shows, and never marks the earliest one.
+   "Earlier" = the owner turn's index in the board's turn ARRAY, then the in-tile order inside
+   that turn: the recorded order on a snapshot frame, arrival order after an ops `{op:'turn'}`
+   append (`ui/turns.ts:10660`) until the next snapshot heals it. Never document order overall —
+   a continued child's rows are nested INSIDE another tile's card (`placeTurn`/`childExchangeHost`)
+   and would win a rank they do not hold. One rank per row per paint: never twice, never zero.
+   (`data-thread-repeat`, elected from the `data-thread-card` stamp each tile publishes).
+   The case this closes is a `threadSend` reply-run recorded in a LATER turn: each tile
+   printed its own `WE7`, which is the confusion the user reported, reached through a door
+   no tile-scoped fix can see (a tile never knows what another tile painted).
+   The row keeps everything else — its persistent join (`data-persistent-thread`), its own
+   context strip, its prose, its body and its dialog/transcript routes — and it keeps the
+   code's SLOT, for the ONE reason given twice above: `[hidden] { display: none !important }`
+   (`styles.css:124`) would collapse the row's identity half and start `.thread-preview`
+   (the only flexible item of `.thread-select`, :4016) one badge width left of its
+   neighbours. The node keeps its text, so a card promoted back into place — the owner's row
+   deleted, a session switched, a tree re-hydrated — reads its code again with no re-render.
+   `data-thread-exchange` (the IN-TILE exchange a tile builds for a later run of a
+   conversation it already shows) repeats its own card's code, so it is withdrawn the same
+   way: it used to use the `hidden` attribute, whose `display:none` collapsed the slot and
+   shifted the preview out of column under the card header. */
+.thread-row[data-thread-repeat] > .thread-tile > .thread-select > .thread-name,
+.thread-row[data-thread-exchange] > .thread-tile > .thread-select > .thread-name {
     visibility: hidden;
 }
 
@@ -4871,24 +5080,29 @@ body.is-resizing-rail {
     text-transform: uppercase;
 }
 
-/* R3: there is no `.agent-role` / `.thread-role` badge any more — the visible role
-   chip was removed from the DOM (ui/turns.ts). `data-role` remains as a structural
-   attribute only, so hierarchy is expressed by nesting + agent colour. */
+/* R3/R20: there is no `.agent-role` / `.thread-role` badge any more — the visible role
+   chip was removed from the DOM (ui/turns.ts) — and the old `data-role='primary'|
+   'subagent'` pair is gone with it. Two structural hooks remain, and NEITHER is a
+   rank: `data-root='true'` marks the ONE section that is the tile's own flow, and
+   `data-rank` states the agent's rank letter for inspection. Hierarchy stays entirely
+   a function of nesting + agent colour, because a rank orders authority, not the tree:
+   several sections legitimately share one letter. */
 
-/* F3/R1: the compact header already names the root agent, so the PRIMARY section
-   head is redundant in the expanded body. Flat legacy SUBAGENT sections keep their
-   head: they are different agents whose codes must stay distinguishable. */
-.tile-flow > .agent[data-role='primary'] .agent-head {
+/* F3/R1: the compact header already names the root agent, so the ROOT section's head
+   is redundant in the expanded body. Every other block — a delegated flow, or a flat
+   legacy section — keeps its head: they are different agents whose codes must stay
+   distinguishable. */
+.tile-flow > .agent[data-root='true'] .agent-head {
     display: none;
 }
 
-/* A FLAT legacy section (an agent the stream could not attribute to an invocation)
-   is still an agent-owned block, so it gets its own colour outline. The PRIMARY
-   section is the tile's own content — the main block already outlines it — so it is
-   deliberately excluded (no double outline). Scoped to `.tile-flow >` because a
-   thread entry's section lives in `.thread-flow` inside an already-outlined
-   `.thread-tile`. */
-.tile-flow > .agent[data-role='subagent'] {
+/* Every NON-root section (a delegated flow, or a flat legacy section an agent the
+   stream could not attribute to an invocation) is still an agent-owned block, so it
+   gets its own colour outline. The ROOT section is the tile's own content — the main
+   block already outlines it — so it is deliberately excluded (no double outline).
+   Scoped to `.tile-flow >` because a thread entry's section lives in `.thread-flow`
+   inside an already-outlined `.thread-tile`. */
+.tile-flow > .agent:not([data-root='true']) {
     padding: 8px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius);

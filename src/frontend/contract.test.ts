@@ -18,11 +18,19 @@ import {
     agentsFromDescriptors,
     attemptCommitOf,
     builtinOf,
+    canDelegateTo,
     callIdOf,
     canonicalHarnessName,
     colorsForMembers,
     coreToolsOf,
+    // R20: the rank ladder and the separate routing fact. `entryOf` is the old primary accessor's
+    // successor, `ranksOf`/`rankOf` read the authority map, `delegateTargetsOf` applies the
+    // strictly-lower rule, and the two `*RanksOf` helpers state what a card that says nothing
+    // still runs with.
+    defaultRanksOf,
+    delegateTargetsOf,
     editableOf,
+    entryOf,
     eventTimesOf,
     frameAtOf,
     frameUsageOf,
@@ -30,13 +38,18 @@ import {
     // The exported core-name/hint constants the coreToolsOf fallback is built from.
     HARNESS_CORE_TOOL_DESCRIPTIONS,
     HARNESS_CORE_TOOL_NAMES,
+    HIGHEST_RANK,
     instructionsForMembers,
+    LOWEST_RANK,
     membersOf,
     modelsForMembers,
     pendingOf,
-    primaryOf,
+    rankLabelOf,
+    rankOf,
+    ranksOf,
     retryOf,
-    subagentsOf,
+    rosterRanksOf,
+    stepRank,
     toolDurationOf,
     uniqueNames,
     usageOf,
@@ -55,33 +68,141 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
     }) as HarnessDescriptor;
 
 describe('descriptor extensions', () => {
-    it('prefers an explicit primary and falls back to the first agent, then the name', () => {
-        expect(primaryOf(descriptor({ primary: 'summarizer', agents: ['instruct', 'summarizer'] }))).toBe(
+    it('prefers an explicit entry agent and falls back to the first agent, then the name', () => {
+        expect(entryOf(descriptor({ entry: 'summarizer', agents: ['instruct', 'summarizer'] }))).toBe(
             'summarizer'
         );
-        expect(primaryOf(descriptor({ agents: ['writer', 'helper'] }))).toBe('writer');
-        expect(primaryOf(descriptor({ agents: [] }))).toBe('instruct');
+        expect(entryOf(descriptor({ agents: ['writer', 'helper'] }))).toBe('writer');
+        expect(entryOf(descriptor({ agents: [] }))).toBe('instruct');
+        // A blank is not a name: the fallback is what the shell renders, and it never leaves an
+        // `entry: undefined` key for a surface to re-guard.
+        expect(entryOf(descriptor({ entry: '  ', agents: ['writer'] }))).toBe('writer');
     });
 
-    it('uses the explicit subagent list, excluding the primary', () => {
+    it('reads the rank map, dropping anything that is not a letter', () => {
+        // A rank the browser cannot read is no rank at all: 'captain' would paint a label the
+        // ladder does not contain, and a non-string is the same mistake.
         expect(
-            subagentsOf(descriptor({ primary: 'instruct', subagents: ['helper', 'instruct', 'critic'] }))
-        ).toEqual(['helper', 'critic']);
-        // No explicit list: every other declared agent is a subagent.
-        expect(subagentsOf(descriptor({ agents: ['instruct', 'helper'] }))).toEqual(['helper']);
+            ranksOf(
+                descriptor({
+                    ranks: { instruct: 'A', helper: 'B', critic: 'captain', ghost: null }
+                })
+            )
+        ).toEqual({ instruct: 'A', helper: 'B' });
+        // A definition that states nothing has no ranks; that is a real answer, not 'A' by
+        // default for everyone.
+        expect(ranksOf(descriptor({}))).toEqual({});
+        expect(rankOf(descriptor({ ranks: { instruct: 'A' } }), 'instruct')).toBe('A');
+        expect(rankOf(descriptor({ ranks: { instruct: 'A' } }), 'ghost')).toBeUndefined();
     });
 
-    it('returns the team primary-first without duplicates', () => {
+    // The rank rule, spelled once (R20): delegation needs a STRICTLY lower rank, so an equal-rank
+    // peer is never a target and a rank the reader cannot see is never a target either.
+    it('gates delegation on a strictly lower rank', () => {
+        expect(canDelegateTo('A', 'B')).toBe(true);
+        expect(canDelegateTo('A', 'C')).toBe(true);
+        expect(canDelegateTo('B', 'A')).toBe(false);
+        expect(canDelegateTo('A', 'A')).toBe(false);
+        expect(canDelegateTo('Z', 'Z')).toBe(false);
+        expect(canDelegateTo(undefined, 'B')).toBe(false);
+        expect(canDelegateTo('A', undefined)).toBe(false);
+    });
+
+    it('lists delegation targets as the strictly lower-ranked members, highest rank first', () => {
+        // Two members share Rank A — the rank model allows any number — and `delta` was never
+        // given a letter, so it is neither a target nor a source.
+        const team = descriptor({
+            agents: ['alpha', 'beta', 'gamma', 'delta', 'epsilon'],
+            entry: 'alpha',
+            ranks: { alpha: 'A', beta: 'A', gamma: 'B', epsilon: 'C' }
+        });
+
+        expect(delegateTargetsOf(team, 'alpha')).toEqual(['gamma', 'epsilon']);
+        // An equal-rank sibling is excluded; the ladder below it is not.
+        expect(delegateTargetsOf(team, 'beta')).toEqual(['gamma', 'epsilon']);
+        // Nothing sits below B except C, and an agent with no rank has nothing to delegate FROM.
+        expect(delegateTargetsOf(team, 'gamma')).toEqual(['epsilon']);
+        expect(delegateTargetsOf(team, 'delta')).toEqual([]);
+        expect(delegateTargetsOf(team, 'epsilon')).toEqual([]);
+        // An agent outside the team has no targets either.
+        expect(delegateTargetsOf(team, 'ghost')).toEqual([]);
+    });
+
+    it('steps a rank along the ladder and clamps at both ends', () => {
+        // `-1` raises authority, `+1` lowers it, and the ends are the ladder's own letters.
+        expect(stepRank('C', -1)).toBe('B');
+        expect(stepRank('C', 1)).toBe('D');
+        expect(stepRank(HIGHEST_RANK, -1)).toBe(HIGHEST_RANK);
+        expect(stepRank(HIGHEST_RANK, -9)).toBe(HIGHEST_RANK);
+        expect(stepRank(LOWEST_RANK, 1)).toBe(LOWEST_RANK);
+        expect(stepRank(LOWEST_RANK, 9)).toBe(LOWEST_RANK);
+        // A rank the reader cannot see starts at the top, which is what a stepper shows before
+        // the first press.
+        expect(stepRank(undefined, 1)).toBe('B');
+        expect(rankLabelOf('A')).toBe('Rank A');
+        expect(rankLabelOf(LOWEST_RANK)).toBe(`Rank ${LOWEST_RANK}`);
+    });
+
+    // What a card that states NO rank map still runs with: the server's documented default, so
+    // the deck never claims a team has no ranks when the runtime ranks it anyway
+    // (../server/harnesses/toolbox.ts:258-259).
+    it('states the server default for a card that names no ranks', () => {
+        expect(defaultRanksOf('alpha', ['alpha', 'beta', 'gamma'])).toEqual({
+            alpha: 'A',
+            beta: 'B',
+            gamma: 'B'
+        });
+        // An entry outside the roster promotes nobody: every member lands on the floor rank.
+        expect(defaultRanksOf('ghost', ['beta', 'gamma'])).toEqual({ beta: 'B', gamma: 'B' });
+        // The roster is deduplicated and emptied of blank names, exactly like the request bodies.
+        expect(defaultRanksOf('alpha', ['alpha', 'alpha', ''])).toEqual({ alpha: 'A' });
+    });
+
+    it('reduces a stated rank map to the members this browser may re-send', () => {
+        // A stale key naming an agent the roster dropped would make the NEXT save a 400
+        // (../server/harnesses/registry.ts:559), so it is dropped here.
+        expect(
+            rosterRanksOf('alpha', ['alpha', 'beta'], { alpha: 'A', beta: 'B', gone: 'C' })
+        ).toEqual({ alpha: 'A', beta: 'B' });
+        // A member the map omits keeps NO rank rather than a guessed one: the route fills it one
+        // rank below the lowest stated letter when the map is saved.
+        expect(rosterRanksOf('alpha', ['alpha', 'beta'], { alpha: 'A' })).toEqual({ alpha: 'A' });
+        // A map whose every key is stale (or unreadable) is as good as unstated — echoing `{}`
+        // would tell the server "a flat team that cannot delegate", which is a different team.
+        expect(rosterRanksOf('alpha', ['alpha', 'beta'], { gone: 'C' })).toEqual({
+            alpha: 'A',
+            beta: 'B'
+        });
+        expect(rosterRanksOf('alpha', ['alpha', 'beta'], { alpha: 'captain' })).toEqual({
+            alpha: 'A',
+            beta: 'B'
+        });
+        // No map at all is the same question as a useless one.
+        expect(rosterRanksOf('alpha', ['alpha'], undefined)).toEqual({ alpha: 'A' });
+        expect(rosterRanksOf('alpha', ['alpha', 'beta'], null)).toEqual({ alpha: 'A', beta: 'B' });
+    });
+
+    it('returns the team entry-first without duplicates', () => {
         expect(
             membersOf(
                 descriptor({
-                    primary: 'helper',
-                    agents: ['helper', 'instruct'],
-                    subagents: ['instruct', 'helper']
+                    entry: 'helper',
+                    agents: ['helper', 'instruct']
                 })
             )
         ).toEqual(['helper', 'instruct']);
         expect(membersOf(descriptor({ agents: ['only'] }))).toEqual(['only']);
+        // Order is presentation and ROUTING only: a team whose entry agent is not the highest
+        // ranked still lists it first, and that says nothing about authority.
+        expect(
+            membersOf(
+                descriptor({
+                    entry: 'instruct',
+                    agents: ['helper', 'instruct'],
+                    ranks: { helper: 'A', instruct: 'C' }
+                })
+            )
+        ).toEqual(['instruct', 'helper']);
     });
 
     it('deduplicates while preserving order', () => {

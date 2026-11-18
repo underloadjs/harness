@@ -996,13 +996,33 @@ describe('import safety', () => {
             'Debugger',
             'Chat'
         ]);
-        // TWO cards have no team: the default (a load-bearing contract, src/harness.ts
-        // `activation: 'subagents'` means `delegate` is never registered for it) and the tool-less
-        // `chat` card (issue 0005-D — no team, so no delegation row either, on a harness that has
-        // no catalogue tool to hand off). The exact empty-allowlist set is those two names.
+        // THE RANK SURFACE REPLACES THE TEAM FIELD (R6/R15). `HarnessPreset.subagents` is gone, so
+        // "has no team" is now a statement about `ranks`: `delegate` registers exactly when the map
+        // spans TWO OR MORE distinct letters (src/harness.ts `activation: 'delegation'`, and
+        // ./server/harnesses/toolbox.ts `coreToolNames` projects the same rule). TWO cards have no
+        // delegation target: the default — a load-bearing contract, one member at one rank — and the
+        // tool-less `chat` card (issue 0005-D: one member, so no target either, on a harness that has
+        // no catalogue tool to hand off). The exact single-rank set is those two names.
         expect(
-            root.presets.filter((preset) => preset.subagents.length === 0).map((preset) => preset.name)
+            root.presets
+                .filter((preset) => new Set(Object.values(preset.ranks)).size < 2)
+                .map((preset) => preset.name)
         ).toEqual(['general', 'chat']);
+        // RESOLVED, NOT SPARSE. A published card states every member's rank (./server/harnesses/
+        // registry.ts `sortedRanks`, filled by ./server/harnesses/toolbox.ts `resolveRosterRanks`),
+        // its entry is a member of its own roster, and the shipped shape is the kernel's own default
+        // for a single team: the entry at Rank A, every other member at Rank B. Pinned per card
+        // because `delegate`'s per-caller target list is derived from exactly this map.
+        for (const preset of root.presets) {
+            expect([...preset.agents].sort()).toEqual(Object.keys(preset.ranks).sort());
+            expect(preset.entry).toBe(preset.agents[0]);
+            expect(preset.ranks[preset.entry]).toBe('A');
+            expect(
+                Object.fromEntries(
+                    preset.agents.map((agent) => [agent, agent === preset.entry ? 'A' : 'B'])
+                )
+            ).toEqual(preset.ranks);
+        }
         // The deleted fixtures are gone from the published surface, not hidden behind it:
         // a root that still exported `FIXTURE_PRESETS` or `ALL_PRESET_TEMPLATES` would be
         // offering a scripted card and a throwing tool to any host that imports the

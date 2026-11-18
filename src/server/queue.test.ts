@@ -86,8 +86,11 @@ const presetOf = (
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: [],
+    // A ONE-member card: `ranks` covers the single member, which is also the entry (routing).
+    // One distinct rank means nobody sits strictly below it, so the runtime registers no
+    // `delegate` row — exactly what the retired `subagents: []` stated (R15).
+    entry: name,
+    ranks: { [name]: 'A' },
     agents: [name],
     tools: [],
     builtin: true,
@@ -201,7 +204,7 @@ const gatedFixture = (): GatedFixture => {
                     }
                 })
             },
-            primary: 'gated',
+            entry: 'gated',
             presets: false,
             report: { progress }
         })
@@ -235,7 +238,7 @@ const failingFixture = (): HarnessPreset =>
                     retry: false
                 })
             },
-            primary: 'flaky',
+            entry: 'flaky',
             presets: false,
             report: { progress }
         })
@@ -263,7 +266,7 @@ const toolFixture = (): HarnessPreset =>
                     execute: () => 'digested'
                 })
             },
-            primary: 'toolbox',
+            entry: 'toolbox',
             presets: false,
             report: { progress }
         })

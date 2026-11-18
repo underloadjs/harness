@@ -108,7 +108,7 @@ describe('R3 — the global tool switch: declarations', () => {
 
         const writer = harness({
             agents: { writer: brain(scripted([callTool('r1', 'toolRequest', '{"names":["write","read"]}'), answer('one')], seen)) },
-            primary: 'writer',
+            entry: 'writer',
             tools: { ...capabilities },
             presets: false,
             toolSettings: provider
@@ -150,14 +150,14 @@ describe('R3 — the global tool switch: declarations', () => {
 
         const plain = harness({
             agents: { writer: brain(scripted(script(), withoutSwitch)) },
-            primary: 'writer',
+            entry: 'writer',
             tools: { ...capabilities },
             presets: false
         });
 
         const switched = harness({
             agents: { writer: brain(scripted(script(), withSwitch)) },
-            primary: 'writer',
+            entry: 'writer',
             tools: { ...capabilities },
             presets: false,
             toolSettings: switchOf(new Set<string>()).provider
@@ -177,7 +177,7 @@ describe('R3 — the global tool switch: the launch gate', () => {
         const disabled = new Set<string>(['write']);
         const seen: HarnessStreamRequest[] = [];
 
-        const primary = brain(
+        const entryBrain = brain(
             scripted(
                 [
                     // The model guesses `write` by name — the defence-in-depth case the
@@ -190,8 +190,8 @@ describe('R3 — the global tool switch: the launch gate', () => {
         );
 
         const writer = harness({
-            agents: { writer: primary },
-            primary: 'writer',
+            agents: { writer: entryBrain },
+            entry: 'writer',
             tools: { ...capabilities },
             presets: false,
             toolSettings: switchOf(disabled).provider
@@ -205,10 +205,10 @@ describe('R3 — the global tool switch: the launch gate', () => {
 
         // The exact sentence, in one place in ../harness.ts, so discovery and this gate can
         // never state two different reasons for one name.
-        expect(toolResult(primary.messages, 'c1')).toBe('Tool "write" is disabled on this server by the operator.');
+        expect(toolResult(entryBrain.messages, 'c1')).toBe('Tool "write" is disabled on this server by the operator.');
 
         // `write` never executed: the transcript carries the refusal, not the tool's value.
-        expect(primary.messages.some((message) => message.role === 'tool' && message.content === 'written')).toBe(false);
+        expect(entryBrain.messages.some((message) => message.role === 'tool' && message.content === 'written')).toBe(false);
     });
 
     // The two gates must not disagree, and their ORDER is pinned: an out-of-scope call
@@ -239,8 +239,8 @@ describe('R3 — the global tool switch: the launch gate', () => {
                 ),
                 child
             },
-            primary: 'writer',
-            subagents: ['child'],
+            entry: 'writer',
+            ranks: { writer: 'A', child: 'B' },
             tools: { ...capabilities },
             presets: false,
             ...(disabled.size === 0 ? {} : { toolSettings: switchOf(disabled).provider })
@@ -292,13 +292,13 @@ describe('R3 — the global tool switch: discovery answers honestly', () => {
         const disabled = new Set<string>(['write']);
         const seen: HarnessStreamRequest[] = [];
 
-        const primary = brain(
+        const entryBrain = brain(
             scripted([callTool('r1', 'toolRequest', '{"names":["write"]}'), answer('done')], seen)
         );
 
         const writer = harness({
-            agents: { writer: primary },
-            primary: 'writer',
+            agents: { writer: entryBrain },
+            entry: 'writer',
             tools: { ...capabilities },
             presets: false,
             toolSettings: switchOf(disabled).provider
@@ -309,7 +309,7 @@ describe('R3 — the global tool switch: discovery answers honestly', () => {
         // The exact discovery envelope: NOT `enabled: ["write"]` (the lie that made a scoped
         // child loop, T11) — an explicit denial with the switch's own reason, and the
         // session-wide enabled set untouched, which is what the NEXT request proves.
-        expect(JSON.parse(toolResult(primary.messages, 'r1'))).toEqual({
+        expect(JSON.parse(toolResult(entryBrain.messages, 'r1'))).toEqual({
             enabled: [],
             tools: [],
             matched: 1,
@@ -332,13 +332,13 @@ describe('R3 — the global tool switch: discovery answers honestly', () => {
     it('keeps the in-scope path byte-identical for a name the switch does not list', async () => {
         const seen: HarnessStreamRequest[] = [];
 
-        const primary = brain(
+        const entryBrain = brain(
             scripted([callTool('r1', 'toolRequest', '{"names":["read"]}'), answer('done')], seen)
         );
 
         const writer = harness({
-            agents: { writer: primary },
-            primary: 'writer',
+            agents: { writer: entryBrain },
+            entry: 'writer',
             tools: { ...capabilities },
             presets: false,
             toolSettings: switchOf(new Set<string>(['write'])).provider
@@ -347,7 +347,7 @@ describe('R3 — the global tool switch: discovery answers honestly', () => {
         await writer('go');
 
         // The historical shape: enabled + tools + matched, and NO `forbidden` key at all.
-        const discovery = JSON.parse(toolResult(primary.messages, 'r1')) as Record<string, unknown>;
+        const discovery = JSON.parse(toolResult(entryBrain.messages, 'r1')) as Record<string, unknown>;
 
         expect(discovery.enabled).toEqual(['read']);
         expect(discovery.matched).toBe(1);

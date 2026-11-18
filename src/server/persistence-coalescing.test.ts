@@ -95,8 +95,8 @@ const toolTurnPreset = (observed: { stateChanges: number; kinds: string[] }): Ha
     title: 'Worker',
     description: 'Scripted three-tool-round preset',
     requiresEndpoint: false,
-    primary: 'worker',
-    subagents: [],
+    entry: 'worker',
+    ranks: { worker: 'A' },
     agents: ['worker'],
     tools: [],
     builtin: true,
@@ -140,7 +140,7 @@ const toolTurnPreset = (observed: { stateChanges: number; kinds: string[] }): Ha
                     tools: ['task']
                 })
             },
-            primary: 'worker',
+            entry: 'worker',
             presets: false,
             report: {
                 progress,

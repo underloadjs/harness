@@ -175,7 +175,10 @@ describe('event guards', () => {
                 branchId: 'branch-1',
                 kind: 'fork' as const,
                 agent: 'helper',
-                role: 'subagent' as const,
+                // R20: the structural field a branch summary carries is the agent's RANK letter
+                // (../server/protocol.ts `HarnessBranchSummary`). Any letter is legal — a branch
+                // is threading, not delegation — but a non-letter is a malformed frame.
+                rank: 'B',
                 forkDepth: 1,
                 model: 'm1',
                 tools: ['read']
@@ -191,6 +194,14 @@ describe('event guards', () => {
         ).toBeUndefined();
         expect(
             branchStartEventOf({ ...start, branch: { ...start.branch, tools: 'read' } } as unknown as HarnessEvent)
+        ).toBeUndefined();
+        // The retired spelling is refused too, so a frame from a host that still says
+        // `role: 'subagent'` cannot render as a branch row next to a rank-stamped one.
+        expect(
+            branchStartEventOf({
+                ...start,
+                branch: { ...start.branch, rank: undefined, role: 'subagent' }
+            } as unknown as HarnessEvent)
         ).toBeUndefined();
 
         const end = {

@@ -33,7 +33,7 @@ import { HARNESS_JOURNAL_VERSION, HarnessJournal } from './journal';
 import type { SessionTurn } from './protocol';
 import { createTurnProjector, projectTurn } from './turn-projector';
 
-const CONTEXT: DisplayProjectContext = { primary: 'one' };
+const CONTEXT: DisplayProjectContext = { entry: 'one' };
 
 // The repo-root Temp/ (root AGENTS.md): journal files are throwaway artifacts.
 const REPO_ROOT = path.resolve(__dirname, '../../..');

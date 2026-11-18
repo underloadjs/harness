@@ -273,7 +273,10 @@ describe('DELETE /agents/{agent_id}', () => {
         // pretending the id is unknown.
         const harness = await call(runtime, 'POST', `${MOUNT}/harnesses`, {
             name: 'condense',
-            primary: 'summarizer'
+            // R5 — the roster field is `agents`; `primary` was not aliased, so a body still
+            // naming it is an unknown-field 400 and never reaches the retirement check. Selecting
+            // the retired id as a MEMBER is what answers the 409 below.
+            agents: ['summarizer']
         });
 
         expect(harness.status).toBe(409);

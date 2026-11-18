@@ -19,7 +19,7 @@
 //   IME Enter (isComposing / keyCode 229) -> ignored everywhere (unchanged)
 //   Tab / Shift+Tab                    -> T1's agent cycle, and ONLY when the team has
 //                                        another member to move to. Every fixture in this
-//                                        file is `subagents: []`, so Tab must still be the
+//                                        file is `ranks: { }`, so Tab must still be the
 //                                        browser's focus move here — the cycle itself lives
 //                                        in composer-agent-cycle.test.ts
 //   Ctrl/Cmd/Alt+Tab                   -> left alone (browser / OS chords)
@@ -50,8 +50,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         agents: ['instruct'],
         tools: [],
         coreTools: ['toolRequest', 'toolCreate', 'tasks', 'delegate'],
-        primary: 'instruct',
-        subagents: [],
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
         builtin: true,
         editable: true,
         ...overrides

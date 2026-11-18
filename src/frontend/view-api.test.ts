@@ -393,7 +393,7 @@ describe('the lazy identified reads', () => {
                 sections: [
                     {
                         id: 't1:0',
-                        role: 'primary',
+                        rank: 'A',
                         agent: 'instruct',
                         state: 'done',
                         nodes: [{ kind: 'text', id: 'n1', text: 'hi', committed: true, chars: 2 }]

@@ -85,7 +85,7 @@ const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     ...overrides
 });
 
-const CONTEXT: DisplayProjectContext = { primary: 'one' };
+const CONTEXT: DisplayProjectContext = { entry: 'one' };
 
 // One recorded event per 10 ms, exactly as ./turn-projector-abandoned-card.test.ts does it, so every
 // span below is an event index the reader can count.

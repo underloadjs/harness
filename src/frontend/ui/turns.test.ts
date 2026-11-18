@@ -1,5 +1,5 @@
 // Turn-tile tests: the one-expanded-tile rule, streaming Markdown, tool pairing
-// and subagent labelling. These pin the layout contract the UI depends on:
+// and delegated-section labelling. These pin the layout contract the UI depends on:
 // newest tile open, older tiles compact, expansion never destroyed by stream
 // deltas, and every event routed to the agent that emitted it.
 //
@@ -128,7 +128,7 @@ describe('createTurnBoard', () => {
 
         const tool = turn.element.querySelector('details.tool');
         expect(tool?.getAttribute('data-state')).toBe('running');
-        expect(turn.summary()).toEqual({ agents: 1, tools: 1, primary: 'writer' });
+        expect(turn.summary()).toEqual({ agents: 1, tools: 1, rootAgent: 'writer' });
 
         turn.apply({
             type: 'tool_result',
@@ -156,7 +156,7 @@ describe('createTurnBoard', () => {
         // other, told apart by nesting and its own colour (see the assertion below).
         const agents = [...turn.element.querySelectorAll('.agent')];
         expect(agents.map((agent) => agent.getAttribute('data-agent'))).toEqual(['writer', 'helper']);
-        expect(agents.map((agent) => agent.getAttribute('data-role'))).toEqual(['primary', 'subagent']);
+        expect(agents.map((agent) => agent.getAttribute('data-root'))).toEqual(['true', null]);
         // R3: no visible role badge — the nesting plus the agent colour say who
         // owns the block. `data-role` above is the structural attribute only.
         expect(agents[1]?.querySelector('.agent-role')).toBeNull();
@@ -168,7 +168,7 @@ describe('createTurnBoard', () => {
         // framed by one agent while its label shows another).
         expect(agents.map(paintedTone)).toEqual([toneOf('writer'), toneOf('helper')]);
 
-        // `done` closes the agent turn, not the user turn: the primary still has
+        // `done` closes the agent turn, not the user turn: the root agent still has
         // to return from its tool call.
         turn.apply({ type: 'done', agent: 'helper', message: doneMessage('helper') });
         expect(turn.state()).toBe('streaming');
@@ -206,7 +206,7 @@ describe('createTurnBoard', () => {
         expect(turn.element.dataset.agent).toBe('writer');
         expect(paintedTone(turn.element)).toEqual(toneOf('writer'));
 
-        // A different primary agent is painted from ITS OWN identity, not by copying the
+        // A different agent is painted from ITS OWN identity, not by copying the
         // tile that happened to be painted first. (After R4 the values are per-page; what
         // is fixed is the routing from the event's agent to the block's tone.)
         const other = board.begin('second');
@@ -227,7 +227,7 @@ describe('createTurnBoard', () => {
 
         const agent = turn.element.querySelector<HTMLElement>('.agent');
         expect(agent?.dataset.agent).toBeUndefined();
-        expect(agent?.dataset.role).toBe('primary');
+        expect(agent?.dataset.root).toBe('true');
         expect(agent?.style.getPropertyValue('--agent-color')).toBe('#8b94a7');
         expect(agent?.style.getPropertyValue('--agent-line')).toBe('rgba(139, 148, 167, 0.55)');
 
@@ -445,7 +445,7 @@ describe('server turns', () => {
         expect(handles[1].element.classList.contains('is-expanded')).toBe(false);
     });
 
-    it('renders subagents from the recorded event order', () => {
+    it('renders a delegated section from the recorded event order', () => {
         const { board } = mount();
 
         const [turn] = board.hydrate([
@@ -463,9 +463,39 @@ describe('server turns', () => {
 
         const agents = [...turn.element.querySelectorAll<HTMLElement>('.agent')];
         expect(agents.map((agent) => agent.dataset.agent)).toEqual(['writer', 'helper']);
-        expect(agents.map((agent) => agent.dataset.role)).toEqual(['primary', 'subagent']);
+        expect(agents.map((agent) => agent.dataset.root)).toEqual(['true', undefined]);
         expect(agents[0].querySelector('.agent-text')).toBeNull();
         expect(agents[1].querySelector('.agent-text')?.textContent).toBe('delegated\n');
+    });
+
+    it('stamps two sections that share one rank with the same letter', () => {
+        // THE SHARED-RANK TRANSCRIPT. Any number of members may hold the same rank, so two
+        // sections can legitimately read Rank A at once. What tells a reader which flow is the
+        // tile's own is `data-root` (a structural fact: the first section with no parent), never
+        // the letter — so `data-rank` must repeat here instead of being demoted to a second
+        // letter, and the hierarchy must not move.
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        const board = createTurnBoard({ empty, ranks: { writer: 'A', helper: 'A' } });
+        document.body.replaceChildren(board.element);
+
+        const [turn] = board.hydrate([
+            serverTurn({
+                events: [
+                    { type: 'start', agent: 'writer', model: 'm1' },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'd1', name: 'delegate', arguments: '{}' } },
+                    { type: 'start', agent: 'helper', model: 'm2' },
+                    { type: 'text', agent: 'helper', delta: 'delegated' },
+                    { type: 'done', agent: 'helper', message: doneMessage('helper') },
+                    { type: 'tool_result', agent: 'writer', name: 'delegate', content: 'done', isError: false }
+                ]
+            })
+        ]);
+
+        const agents = [...turn.element.querySelectorAll<HTMLElement>('.agent')];
+        expect(agents.map((agent) => agent.dataset.agent)).toEqual(['writer', 'helper']);
+        expect(agents.map((agent) => agent.dataset.rank ?? '')).toEqual(['A', 'A']);
+        expect(agents.map((agent) => agent.dataset.root ?? '')).toEqual(['true', '']);
     });
 
     it('restores the empty state when a snapshot has no turns', () => {
@@ -2292,8 +2322,8 @@ describe('final answer copy action (R5)', () => {
 
         const buttons = [...turn.element.querySelectorAll('.agent-answer-actions .answer-copy')];
         expect(buttons).toHaveLength(2);
-        // DOM order is block order: the primary section first, then the flat
-        // subagent section — each copies ONLY its own answer.
+        // DOM order is block order: the root section first, then the flat legacy
+        // section — each copies ONLY its own answer.
         expect(await copyPayloads(buttons[0] as HTMLButtonElement)).toEqual(['root answer']);
         expect(await copyPayloads(buttons[1] as HTMLButtonElement)).toEqual(['child answer']);
     });

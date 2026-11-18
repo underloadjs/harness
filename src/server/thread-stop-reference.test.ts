@@ -38,7 +38,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { agent, harness } from '../harness';
-import type { HarnessMessage, HarnessStreamEvent } from '../harness';
+import type { AgentRank, HarnessMessage, HarnessStreamEvent } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { createHarnessRuntime } from './runtime';
@@ -87,8 +87,15 @@ const presetOf = (
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: agents[0] ?? name,
-    subagents: agents.slice(1),
+    // R15 — `entry` is ROUTING (which member an unfocused submit opens) and `ranks` is AUTHORITY.
+    // The retired `primary` + `subagents` pair said "the first agent leads, the rest are its
+    // delegation targets"; the map says it outright — the entry holds Rank A and every other member
+    // sits strictly below it, which is what derives the `delegate` allowlist (`isLowerRank`). A
+    // stored card covers EVERY member (./harnesses/registry.ts `sortedRanks`).
+    entry: agents[0] ?? name,
+    ranks: Object.fromEntries(
+        agents.map((member) => [member, member === (agents[0] ?? name) ? 'A' : 'B'])
+    ) as Record<string, AgentRank>,
     agents,
     tools: [],
     builtin: true,
@@ -188,7 +195,7 @@ const probeFixture = (): ProbeFixture => {
                     retry: false
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
             presets: false,
             report: { progress }
         })

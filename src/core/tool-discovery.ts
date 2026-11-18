@@ -96,7 +96,6 @@ const cloneDescriptor = (descriptor: DiscoveredTool): DiscoveredTool => ({
     order: descriptor.order,
     ...(descriptor.pendingOnly === undefined ? {} : { pendingOnly: descriptor.pendingOnly }),
     ...(descriptor.control === undefined ? {} : { control: descriptor.control }),
-    ...(descriptor.primaryOnly === undefined ? {} : { primaryOnly: descriptor.primaryOnly }),
     ...(descriptor.answerExtraction === undefined
         ? {}
         : { answerExtraction: descriptor.answerExtraction }),

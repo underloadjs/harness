@@ -7,7 +7,7 @@
 // The policy under test is conservative and provable:
 //   - an unmodified shipped row (executable fields == LEGACY_PRESET_DEFINITIONS) is
 //     refreshed to the current template;
-//   - a row with ANY executable difference (team, tools, environment tools,
+//   - a row with ANY executable difference (team, RANK MAP, tools, environment tools,
 //     template, or a non-empty agentModels map) is replayed exactly as saved;
 //   - an edited title/description survives a refresh;
 //   - the fixtures keep their scripted/flaky templates (they have no legacy entry,
@@ -18,24 +18,38 @@
 // Assertions are exact: registry rows are compared as complete records, not by
 // individual fields, so an accidental extra change is a failure.
 //
-// AGENT ROSTER / ROLE-CONTRACT PASS (what the assertions below re-pinned)
-// ----------------------------------------------------------------------
+// THE RANK PASS AND THIS FILE
+// ---------------------------
+// A row's executable team is now TWO fields — `entry` (routing) and the complete
+// `ranks` map (authority) — and both are compared by `isLegacyShippedDefinition`
+// (./registry.ts): a saved row whose rank assignment differs from what this build
+// ships is an operator decision, so it replays instead of being refreshed away.
+//
 // `LEGACY_PRESET_DEFINITIONS` was deliberately NOT extended for this pass: it still
 // holds the three pre-T3 snapshots (`instruct`, `research`, `workspace`) with their OLD
-// titles (Instruct / Research / Workspace (coding)) and `environmentTools: ['search']`.
-// Consequences pinned here:
+// titles (Instruct / Research / Workspace (coding)) and `environmentTools: ['search']`,
+// now written in the CURRENT vocabulary (`entry` + `ranks`). Consequences pinned here:
 //   - an install holding a pre-T3 row still matches its snapshot, so it refreshes to the
-//     CURRENT template — which now carries the new roster (the Manager is out of every
+//     CURRENT template — which now carries the wider roster (the Manager is out of every
 //     built-in team) and the new titles (Explore / Analyst / Manager);
 //   - an install holding the T3 row matches neither its single legacy snapshot nor the
 //     current template, so it is an operator customisation and replays verbatim — legal,
 //     because every id in that old 5-role team is still a known profile;
 //   - an edited title/description survives a refresh;
 //   - an older document has no rows for the two new cards, and they ship anyway.
+//
+// There is no `teamOf` helper and no `subagents` field any more, so every team assertion
+// below is a PROJECTION of a rank map — see `juniorsOf`.
 
 import { describe, expect, it } from 'vitest';
 import type { HarnessProgress } from '../../harness';
 import type { HarnessPresetRecord } from '../persistence';
+// THE RANK VOCABULARY. `rankIndexOf` is the ordering the kernel itself uses
+// (../../types/index.ts), so this file projects "who is below whom" with the same
+// comparison the runtime applies — it cannot disagree with `delegate` about who is a
+// legal target.
+import { rankIndexOf } from '../../types';
+import type { HarnessPreset } from './types';
 import {
     createHarnessRegistry,
     LEGACY_PRESET_DEFINITIONS,
@@ -43,8 +57,7 @@ import {
     presetRecordEquals,
     presetToRecord,
     presets,
-    restoreHarnessRegistry,
-    teamOf
+    restoreHarnessRegistry
 } from './index';
 import { SHARED_TOOL_NAMES } from './toolbox';
 import { PRODUCTION_WITH_FIXTURES, SCRIPTED_FIXTURE } from './fixture-presets.test-support';
@@ -62,8 +75,23 @@ const shipped = (name: string) => {
     return preset;
 };
 
+// One card's TEAM, read the way the rank model reads it: every member STRICTLY BELOW the
+// entry agent in that card's own rank map, in roster order. `Harness.subagents` is gone
+// (../../types/index.ts `Harness.ranks` explains why: the allowlist is now DERIVED), so this
+// projection IS the team — delegation goes strictly downward, and nothing else decides it.
+// A card whose roster holds one rank therefore has an empty team by construction, which is
+// what used to be spelled `subagents: []`.
+const juniorsOf = (card: HarnessPreset): string[] => {
+    const entryRank = rankIndexOf(card.ranks[card.entry]);
+
+    return card.agents.filter(
+        (name) => name !== card.entry && rankIndexOf(card.ranks[name]) > entryRank
+    );
+};
+
 // Build the exact record an older build would have persisted for a shipped preset:
-// the current record shape with the recorded legacy EXECUTABLE definition merged in.
+// the current record shape with the recorded legacy EXECUTABLE definition merged in —
+// including its `entry`/`ranks` pair, which is the legacy team in the rank vocabulary.
 const legacyRecord = (
     name: string,
     overrides: Partial<HarnessPresetRecord> = {}
@@ -76,8 +104,8 @@ const legacyRecord = (
         title: definition.title,
         description: definition.description,
         requiresEndpoint: definition.requiresEndpoint,
-        primary: definition.primary,
-        subagents: [...definition.subagents],
+        entry: definition.entry,
+        ranks: { ...definition.ranks },
         agents: [...definition.agents],
         tools: [...definition.tools],
         ...(definition.environmentTools === undefined
@@ -92,7 +120,7 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
     it('refreshes an unmodified shipped row to the current template', () => {
         const registry = createHarnessRegistry();
 
-        // The pre-T3 row: one agent, no subagents, the old title.
+        // The pre-T3 row: one agent, one rank, the old title.
         restoreHarnessRegistry(registry, [legacyRecord('instruct')]);
 
         const refreshed = registry.find('instruct');
@@ -100,10 +128,11 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         expect(presetToRecord(refreshed!)).toEqual(presetToRecord(shipped('instruct')));
 
         // The concrete point of the refresh: the wider team is live, so delegation
-        // works in the restored entry. This is `teamOf('instruct')` as the roster pass
-        // ships it — every OTHER live role (now including the two new profiles, `general`
-        // and `debugger`) minus the Manager, plus the summarizer.
-        expect(refreshed?.subagents).toEqual([
+        // works in the restored entry. This is the roster the rank pass ships — every
+        // OTHER live role (now including the two new profiles, `general` and `debugger`)
+        // minus the Manager, every one of them Rank B under an entry that holds Rank A.
+        expect(refreshed?.entry).toBe('instruct');
+        expect(juniorsOf(refreshed!)).toEqual([
             'general',
             'research',
             'workspace',
@@ -111,6 +140,10 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'debugger',
             'summarizer'
         ]);
+        // The refreshed MAP is the current card's map, key for key — the row's single
+        // `entry: instruct` rank did not survive the refresh, because the refresh replays
+        // the template's authority, not the stale one.
+        expect(refreshed?.ranks).toEqual(presetToRecord(shipped('instruct')).ranks);
         expect(refreshed?.agents).toEqual([
             'instruct',
             'general',
@@ -127,47 +160,57 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         ).toContain('delegate');
     });
 
-    it('derives every built-in team from the 7 live roles, excluding the Manager', () => {
-        // `teamOf` is the ONE list the shipped teams come from (presets.ts:133-164). Two
-        // ids never appear in another card's allowlist: the primary itself, and `planner`
-        // — the Manager refuses to run as a delegate, so offering it would burn a child
-        // run. `summarizer` is appended everywhere so the `textSummarize` path works.
-        expect([
-            teamOf('general'),
-            teamOf('instruct'),
-            teamOf('research'),
-            teamOf('workspace'),
-            teamOf('reviewer'),
-            teamOf('planner'),
-            teamOf('debugger')
-        ]).toEqual([
-            ['instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
-            ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']
-        ]);
-
-        // The shipped rows agree with it, and the default card is the one deliberate
-        // exception: `general` runs alone, so `delegate` is never registered for it.
+    it('states every built-in team as card data, and keeps the Manager out of every other team', () => {
+        // There is no `teamOf` helper to derive a team any more: each card STATES its roster
+        // and its rank map (./presets.ts), and the shape below is what the cards say. The two
+        // ids that never appear in another card's team are `planner` — the Manager refuses to
+        // run as a delegate — and the card's own entry agent, which has no rank below itself.
         const registry = createHarnessRegistry();
+        const card = (name: string) => registry.find(name)!;
+
         expect(
             ['general', 'instruct', 'research', 'workspace', 'reviewer', 'planner', 'debugger'].map(
-                (name) => registry.find(name)!.subagents
+                (name) => [name, card(name).entry, juniorsOf(card(name))]
             )
         ).toEqual([
-            [],
-            ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer'],
-            ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']
+            // The default card runs alone: one rank in the roster, so an empty team and no
+            // `delegate` row at all.
+            ['general', 'general', []],
+            ['instruct', 'instruct', ['general', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['research', 'research', ['general', 'instruct', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['workspace', 'workspace', ['general', 'instruct', 'research', 'reviewer', 'debugger', 'summarizer']],
+            ['reviewer', 'reviewer', ['general', 'instruct', 'research', 'workspace', 'debugger', 'summarizer']],
+            // The Manager's own card is the only roster that holds it, and it is the entry there.
+            ['planner', 'planner', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'debugger', 'summarizer']],
+            ['debugger', 'debugger', ['general', 'instruct', 'research', 'workspace', 'reviewer', 'summarizer']]
         ]);
-        expect(Object.keys(registry.find('general')!.create(SETTINGS, progress).subagents)).toEqual([]);
-        expect(registry.find('general')!.create(SETTINGS, progress).tools.delegate).toBeUndefined();
+
+        // EVERY shipped card states the two-level shape: entry 'A', every other member 'B'.
+        // Nothing about the rank model is implicit here — the map is on the card, and the
+        // runtime runs with exactly that map. A card that runs alone has NO second rank at all
+        // (empty list), which is the same fact its empty team states.
+        expect(
+            presets.map((preset) => [
+                preset.name,
+                preset.ranks[preset.entry],
+                [...new Set(Object.values(preset.ranks).filter((rank) => rank !== preset.ranks[preset.entry]))]
+            ])
+        ).toEqual([
+            ['general', 'A', []],
+            ['instruct', 'A', ['B']],
+            ['research', 'A', ['B']],
+            ['workspace', 'A', ['B']],
+            ['reviewer', 'A', ['B']],
+            ['planner', 'A', ['B']],
+            ['debugger', 'A', ['B']],
+            // The tool-less card carries the default profile and its one-rank map.
+            ['chat', 'A', []]
+        ]);
+
+        // `general` and `chat` have one member each, so the map holds ONE distinct rank and the
+        // kernel registers no `delegate` row for them.
+        expect(Object.keys(card('general').create(SETTINGS, progress).ranks)).toEqual(['general']);
+        expect(card('general').create(SETTINGS, progress).tools.delegate).toBeUndefined();
     });
 
     it('refreshes every real preset whose saved row is an unmodified shipped default', () => {
@@ -195,8 +238,8 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         expect(LEGACY_PRESET_DEFINITIONS.workspace.title).toBe('Workspace (coding)');
 
         // The refreshed rows run the current roster, and the Manager is nowhere in another
-        // card's allowlist.
-        expect(registry.find('research')!.subagents).toEqual([
+        // card's team — not because a helper excluded it, but because no card lists it.
+        expect(juniorsOf(registry.find('research')!)).toEqual([
             'general',
             'instruct',
             'workspace',
@@ -204,7 +247,7 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'debugger',
             'summarizer'
         ]);
-        expect(registry.find('workspace')!.subagents).toEqual([
+        expect(juniorsOf(registry.find('workspace')!)).toEqual([
             'general',
             'instruct',
             'research',
@@ -255,20 +298,66 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         const registry = createHarnessRegistry();
 
         // A deliberate customisation of an otherwise-legacy row: the operator chose
-        // a smaller team. It must NOT be widened by the refresh.
+        // a smaller team AND ranked it. It must NOT be widened by the refresh, and the
+        // RANK MAP is part of that decision — a row whose authority differs from this
+        // build's shipped map is a customisation like any other executable field.
         restoreHarnessRegistry(registry, [
             legacyRecord('instruct', {
                 title: 'Instruct (mine)',
-                subagents: ['summarizer'],
+                ranks: { instruct: 'A', summarizer: 'B' },
                 agents: ['instruct', 'summarizer']
             })
         ]);
 
         const current = registry.find('instruct')!;
         expect(current.title).toBe('Instruct (mine)');
-        expect(current.subagents).toEqual(['summarizer']);
+        expect(current.entry).toBe('instruct');
+        expect(juniorsOf(current)).toEqual(['summarizer']);
+        expect(current.ranks).toEqual({ instruct: 'A', summarizer: 'B' });
         expect(current.agents).toEqual(['instruct', 'summarizer']);
         expect(presetRecordEquals(presetToRecord(current), legacyRecord('instruct'))).toBe(false);
+    });
+
+    it('treats a saved RANK MAP that differs from the shipped one as a customisation', () => {
+        const registry = createHarnessRegistry();
+
+        // The same roster, a DIFFERENT authority: the operator flattened Explore's team so
+        // nobody delegates to anybody. Rank is an executable field, so a row that differs from
+        // this build's shipped map ONLY in its ranks is a customisation — refreshing it away
+        // would silently hand back a delegation surface the operator removed.
+        //
+        // The row is built from THIS build's record on purpose: a genuine pre-rank row also
+        // carries the old `environmentTools`, and `legacyRecord` would pin that field too. Here
+        // the rank map is the only variable under test. The map is COMPLETE — every member
+        // keyed — because that is what a durable record always holds (../persistence.ts
+        // `readRankMap` refuses one that is not).
+        const flatExploreRanks = {
+            research: 'B',
+            general: 'B',
+            instruct: 'B',
+            workspace: 'B',
+            reviewer: 'B',
+            debugger: 'B',
+            summarizer: 'B'
+        };
+
+        const flattenedRow: HarnessPresetRecord = {
+            ...presetToRecord(shipped('research')),
+            ranks: { ...flatExploreRanks }
+        };
+
+        restoreHarnessRegistry(registry, [flattenedRow]);
+
+        const current = registry.find('research')!;
+        expect(current.agents).toEqual(shipped('research').agents);
+        expect(current.entry).toBe('research');
+        expect(current.ranks).toEqual(flatExploreRanks);
+        expect(juniorsOf(current)).toEqual([]);
+        // The runtime agrees with the card rather than with the shipped template: a one-rank
+        // roster registers no `delegate` row at all.
+        expect(current.create(SETTINGS, progress).tools.delegate).toBeUndefined();
+        // The row is reproduced exactly, so the next save cannot drift it back to Rank A.
+        expect(presetRecordEquals(presetToRecord(current), flattenedRow)).toBe(true);
     });
 
     it('keeps an edited title and description across an executable refresh', () => {
@@ -286,8 +375,10 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         expect(current.title).toBe('My coder');
         expect(current.description).toBe('House coding harness.');
         // ...while the shipped executable default is adopted: the current team, which is
-        // every other live role except the Manager plus the summarizer.
-        expect(current.subagents).toEqual([
+        // every other live role except the Manager plus the summarizer, every one of them Rank
+        // B under an entry that holds Rank A. Prose is not executable; ranks are.
+        expect(current.entry).toBe('workspace');
+        expect(juniorsOf(current)).toEqual([
             'general',
             'instruct',
             'research',
@@ -295,6 +386,7 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'debugger',
             'summarizer'
         ]);
+        expect(current.ranks).toEqual(presetToRecord(shipped('workspace')).ranks);
         expect(current.agents).toEqual([
             'workspace',
             'general',
@@ -331,15 +423,27 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
     });
 
     it('replays a T3-era row (the old 5-role team) verbatim instead of refreshing it', () => {
-        // The T3 row no longer matches its single legacy snapshot (`subagents` moved) and it
-        // is not the current template either, so the policy treats it as a customisation and
-        // replays it exactly. That is SAFE because every id in that team is still a known
-        // profile — the roster pass changed titles and added profiles, never renamed one.
+        // The T3 row matches its single legacy snapshot in NEITHER field — the roster moved AND
+        // the rank map that comes with it — and it is not the current template either, so the
+        // policy treats it as a customisation and replays it exactly. That is SAFE because every
+        // id in that team is still a known profile — the roster pass changed titles and added
+        // profiles, never renamed one.
         const OLD_TEAM = ['research', 'workspace', 'reviewer', 'planner', 'summarizer'];
+        // The team written in THIS vocabulary: one entry agent above five peers. A durable record
+        // always states a COMPLETE map, so a replay cannot re-derive anyone's rank.
+        const OLD_RANKS = {
+            instruct: 'A',
+            research: 'B',
+            workspace: 'B',
+            reviewer: 'B',
+            planner: 'B',
+            summarizer: 'B'
+        };
         const t3Row: HarnessPresetRecord = {
             ...presetToRecord(shipped('instruct')),
             title: 'Instruct',
-            subagents: [...OLD_TEAM],
+            entry: 'instruct',
+            ranks: { ...OLD_RANKS },
             agents: ['instruct', ...OLD_TEAM]
         };
 
@@ -348,24 +452,27 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
 
         const current = registry.find('instruct')!;
         expect(current.title).toBe('Instruct');
-        expect(current.subagents).toEqual(OLD_TEAM);
+        expect(current.entry).toBe('instruct');
+        expect(current.ranks).toEqual(OLD_RANKS);
+        expect(juniorsOf(current)).toEqual(OLD_TEAM);
         expect(current.agents).toEqual(['instruct', ...OLD_TEAM]);
         // The saved row is reproduced exactly, so the next save cannot drift it.
         expect(presetRecordEquals(presetToRecord(current), t3Row)).toBe(true);
 
         // Restore did not merely keep the metadata: the rebuilt harness really runs that
-        // roster, Manager included, because each id still resolves to a trusted profile.
+        // roster, Manager included, and runs it with the saved RANKS — the Manager is a Rank B
+        // peer here, not a lead, and that is what the row said.
         const harness = current.create(SETTINGS, progress);
         expect(Object.keys(harness.agents)).toEqual(['instruct', ...OLD_TEAM]);
-        expect(Object.keys(harness.subagents)).toEqual(OLD_TEAM);
+        expect(harness.ranks).toEqual(OLD_RANKS);
         expect(harness.tools.delegate.visibility).toBe('core');
         expect(OLD_TEAM.filter((id) => !registry.agents().some((p) => p.name === id))).toEqual([]);
 
         // The same guarantee on the session side: a frozen record from that build rebuilds
-        // through `presetFromRecord` with the team it started with.
+        // through `presetFromRecord` with the team AND the ranks it started with.
         const frozen = presetFromRecord(t3Row).create(SETTINGS, progress);
         expect(Object.keys(frozen.agents)).toEqual(['instruct', ...OLD_TEAM]);
-        expect(Object.keys(frozen.subagents)).toEqual(OLD_TEAM);
+        expect(frozen.ranks).toEqual(OLD_RANKS);
     });
 
     it('treats a per-agent model map as a customisation, not a shipped default', () => {
@@ -378,7 +485,11 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         ]);
 
         const current = registry.find('instruct')!;
-        expect(current.subagents).toEqual([]);
+        // The row's own team stands: one agent, one rank, and therefore no delegation. A saved
+        // model map makes the row a customisation, and a customisation replays its executable
+        // fields — roster AND rank map — verbatim.
+        expect(juniorsOf(current)).toEqual([]);
+        expect(current.ranks).toEqual({ instruct: 'A' });
         expect(current.agentModels).toEqual({ instruct: 'small/fast' });
         expect(current.title).toBe('Instruct');
     });
@@ -412,6 +523,7 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'profiles',
             'chapters',
             'locations',
+            'knowledge',
             'agentManage',
             'agentResult',
             'threadFork',
@@ -438,7 +550,9 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
     });
 
     it('a frozen session still rebuilds from its own record after the refresh', () => {
-        // The old session's frozen preset: legacy instruct (no subagents).
+        // The old session's frozen preset: legacy instruct — one agent, ranked 'A', nobody below
+        // it. In the rank vocabulary that is a complete one-key map, and it is what the session
+        // runs with forever.
         const record = legacyRecord('instruct');
         const frozen = presetFromRecord(record);
         const harness = frozen.create(SETTINGS, progress);
@@ -446,14 +560,14 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         // It keeps the team it started with, so nothing it recorded becomes
         // unreachable and no new agent is silently introduced.
         expect(Object.keys(harness.agents)).toEqual(['instruct']);
-        expect(Object.keys(harness.subagents)).toEqual([]);
+        expect(harness.ranks).toEqual({ instruct: 'A' });
         expect(harness.tools.delegate).toBeUndefined();
 
         // The registry, meanwhile, has moved on (the refresh above): the current shipped
         // team, Manager excluded.
         const registry = createHarnessRegistry();
         restoreHarnessRegistry(registry, [record]);
-        expect(registry.find('instruct')?.subagents).toEqual([
+        expect(juniorsOf(registry.find('instruct')!)).toEqual([
             'general',
             'research',
             'workspace',
@@ -507,7 +621,7 @@ describe('restoreHarnessRegistry — durable deletions (T5)', () => {
 
         // The unmodified shipped default is refreshed (T3 policy, untouched by this),
         // while the deleted one is gone.
-        expect(registry.find('instruct')?.subagents).toEqual([
+        expect(juniorsOf(registry.find('instruct')!)).toEqual([
             'general',
             'research',
             'workspace',

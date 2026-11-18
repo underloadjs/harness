@@ -137,7 +137,7 @@ const text = (id: string, value: string): DisplayNode => ({ kind: 'text', id, te
 
 const rootSection = (figures: string[] = []): TurnSection => ({
     id: 'turn-1:0',
-    role: 'primary',
+    rank: 'A',
     agent: 'one',
     agentLabel: 'RR1',
     state: 'done',
@@ -150,7 +150,7 @@ const rootSection = (figures: string[] = []): TurnSection => ({
 const childSection = (id: string, figures: string[]): TurnSection => ({
     id,
     parentSectionId: 'turn-1:0',
-    role: 'subagent',
+    rank: 'B',
     agent: 'Workspace',
     agentLabel: 'RH1',
     state: 'done',

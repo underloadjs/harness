@@ -137,6 +137,11 @@ import {
 import type { InvalidThreadRow, RawTurnDocument, SessionView, ThreadRow, TurnRowView } from './view-model';
 // The instance key the shell renders a conversation with (`ensureInstance`, ./main.ts).
 import type { HarnessDescriptor } from '../server/protocol';
+// The rank vocabulary (../types/index.ts `AgentRank`/`isAgentRank`): the frozen descriptor's
+// `ranks` map is validated member by member, so a definition read that carries a stray value
+// cannot smuggle it into a required `Record<string, AgentRank>`.
+import type { AgentRank } from '../types';
+import { isAgentRank } from '../types';
 
 // Re-exported so the shell and the `ui/` renderers import the render model from the
 // facade that produces it, and there is one place to look for its shape.
@@ -1189,13 +1194,25 @@ export const frozenDescriptorOf = (definition: SessionDefinitionResource): Harne
     // an empty string and render the header of a harness that never existed.
     if (typeof card.name !== 'string' || card.name.length === 0) return undefined;
 
+    // R20: the frozen team keeps its ENTRY agent (routing) and its RANK map (authority). Dropping
+    // `ranks` here would be visible: this descriptor IS the team an archived conversation paints,
+    // so the tiles, the dialog badges and the composer would all lose the ladder the conversation
+    // actually ran. The protocol states `ranks` as a REQUIRED map, so a definition read with no
+    // letters becomes `{}` (every member unranked) rather than `undefined`. Copied member by member
+    // — dropping anything that is not a rank letter — so the descriptor owns a complete map and can
+    // never be mutated through the cached definition read.
+    const ranks: Record<string, AgentRank> = {};
+    for (const [member, rank] of Object.entries(card.ranks ?? {})) {
+        if (isAgentRank(rank)) ranks[member] = rank;
+    }
+
     return {
         name: card.name,
         title: card.title,
         description: card.description,
         requiresEndpoint: card.requiresEndpoint,
-        primary: card.primary,
-        subagents: [...card.subagents],
+        entry: card.entry,
+        ranks,
         agents: [...card.agents],
         tools: [...card.tools],
         ...(card.coreTools === undefined ? {} : { coreTools: [...card.coreTools] }),

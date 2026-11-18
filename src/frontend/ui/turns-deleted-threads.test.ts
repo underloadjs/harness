@@ -377,7 +377,7 @@ describe('F7 — a reload reads the deletion from the session header (T-W6)', ()
 
     const section = (overrides: Partial<TurnSection>): TurnSection => ({
         id: 'turn-1:0',
-        role: 'primary',
+        rank: 'A',
         agent: 'Instruct',
         agentLabel: 'IT4',
         state: 'done',
@@ -409,7 +409,7 @@ describe('F7 — a reload reads the deletion from the session header (T-W6)', ()
             section({
                 id: 'turn-1:1',
                 parentSectionId: 'turn-1:0',
-                role: 'subagent',
+                rank: 'B',
                 agent: 'Workspace',
                 agentLabel: 'WE7',
                 threadId: 'thread-15',
@@ -419,7 +419,7 @@ describe('F7 — a reload reads the deletion from the session header (T-W6)', ()
             section({
                 id: 'turn-1:2',
                 parentSectionId: 'turn-1:0',
-                role: 'subagent',
+                rank: 'B',
                 agent: 'Workspace',
                 agentLabel: 'WE8',
                 threadId: 'thread-16',

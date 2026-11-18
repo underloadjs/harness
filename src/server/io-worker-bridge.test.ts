@@ -108,8 +108,11 @@ const scriptedPreset = (name = 'one', text = 'hello'): HarnessPreset => ({
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
-    primary: name,
-    subagents: [],
+    // THE RANK PAIR (clean break): `entry` names the routing agent and `ranks` states its
+    // authority. One member, one rank — the rank map now SAYS directly what the retired
+    // `subagents: []` used to imply, so `delegate` is never registered here.
+    entry: name,
+    ranks: { [name]: 'A' as const },
     agents: [name],
     tools: [],
     builtin: true,
@@ -123,7 +126,11 @@ const scriptedPreset = (name = 'one', text = 'hello'): HarnessPreset => ({
                     stream: answerStream(text)
                 })
             },
-            primary: name,
+            // The library-side pair, renamed the same way: `entry` routes, and an absent
+            // `ranks` would default this one-member roster to Rank A anyway — stating it
+            // keeps the fixture honest about the authority it encodes.
+            entry: name,
+            ranks: { [name]: 'A' as const },
             presets: false,
             report: {
                 progress,
@@ -152,8 +159,10 @@ const gatedPreset = (name = 'gated'): { preset: HarnessPreset; started: Promise<
         title: name,
         description: `${name} gated preset`,
         requiresEndpoint: false,
-        primary: name,
-        subagents: [],
+        // Same rank pair as `scriptedPreset`: a one-member roster with a single stated rank,
+        // so the gated fixture has no delegation surface either.
+        entry: name,
+        ranks: { [name]: 'A' as const },
         agents: [name],
         tools: [],
         builtin: true,
@@ -172,7 +181,8 @@ const gatedPreset = (name = 'gated'): { preset: HarnessPreset; started: Promise<
                         }
                     })
                 },
-                primary: name,
+                entry: name,
+                ranks: { [name]: 'A' as const },
                 presets: false,
                 report: {
                     progress,

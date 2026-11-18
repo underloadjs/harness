@@ -1482,8 +1482,7 @@ const answeringPreset = (): HarnessPreset => ({
     title: 'probe',
     description: 'probe scripted preset',
     requiresEndpoint: false,
-    primary: 'probe',
-    subagents: [],
+    entry: 'probe',
     agents: ['probe'],
     tools: [],
     builtin: true,
@@ -1501,7 +1500,7 @@ const answeringPreset = (): HarnessPreset => ({
                     }
                 })
             },
-            primary: 'probe',
+            entry: 'probe',
             presets: false
         })
 });
