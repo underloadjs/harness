@@ -1171,6 +1171,33 @@ const createAgent = (
                             yield { type: 'reasoning', delta: event.delta };
                             break;
 
+                        // (T2) The transport's tool-call composition heartbeat, forwarded
+                        // as an EVENT and nothing else: it is not accumulated into
+                        // `content`/`reasoning`, not attached to the committed message, and
+                        // not part of any commit decision, so the invariant "partial
+                        // arguments are never executed" is untouched — the calls still
+                        // arrive only on the terminal frame.
+                        //
+                        // ATTEMPT SCOPING needs no work here and that is the point: the
+                        // retry loop re-CREATES the transport iterator for the next attempt
+                        // (a fresh `stream(...)` call above), and the transport's throttle
+                        // clock and counters live in THAT generator's closure. So when a
+                        // `retry` discards everything streamed since the last attempt
+                        // boundary, the progress state is discarded with it by construction —
+                        // nothing stale can leak into the next attempt.
+                        //
+                        // A frame that arrives AFTER `completed` (a chatty provider that
+                        // keeps streaming past its own `finish_reason`) is dropped by the
+                        // post-completion guard above, exactly like a late text delta.
+                        case 'progress':
+                            yield {
+                                type: 'progress',
+                                phase: event.phase,
+                                toolCallSlots: event.toolCallSlots,
+                                argumentChars: event.argumentChars
+                            };
+                            break;
+
                         case 'error':
                             // Error frames are terminal FOR THIS ATTEMPT: they surface
                             // as a thrown error so the retry loop above can decide

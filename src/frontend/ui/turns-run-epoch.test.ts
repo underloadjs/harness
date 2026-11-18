@@ -284,6 +284,16 @@ const recycledToolTurn = (epochs: [string | undefined, string | undefined]): Har
 // the tile advertising work that finished minutes ago.
 const metaOf = (board: TurnBoard): string => board.element.querySelector('.tile-meta')?.textContent ?? '';
 
+// T3 (frontend liveness honesty) — the COUNT plane of that line, with the new time-derived
+// quiet note cut off. Why this helper exists rather than the old exact match: every fixture in
+// this file stamps its frames at `1_000 + n*10` (so the duration pins stay countable), which is
+// decades before the real wall clock the quiet age is measured against, and the live door leaves
+// a tile `streaming` because a `done` EVENT does not settle state — only a record does. So the
+// note is legitimately present here, and it is not what these tests own: the counts are. No
+// assertion is dropped — each call site keeps its exact expected count string, and the note it
+// now also carries is pinned explicitly in the parity test below.
+const metaCounts = (board: TurnBoard): string => metaOf(board).split(' · still generating')[0];
+
 beforeEach(() => {
     document.body.innerHTML = '';
 });
@@ -466,7 +476,7 @@ describe('T-W15 — the epoch splits the tool-card plane', () => {
 
         // Nothing about the row fold moved: a root-shaped frame still owns one conversation card.
         expect(rowsOf(board)).toEqual([]);
-        expect(metaOf(board)).toBe('1 agent · 2 tool calls');
+        expect(metaCounts(board)).toBe('1 agent · 2 tool calls');
     });
 
     it('settles the card inside each row when a delegated run re-mints its tool-call id', () => {
@@ -486,7 +496,7 @@ describe('T-W15 — the epoch splits the tool-card plane', () => {
             ['call-1', 'ok', 'delegate', 'pre-restart answer'],
             ['call-1', 'ok', 'delegate', 'post-restart answer']
         ]);
-        expect(metaOf(board)).toBe('3 agents · 4 tool calls');
+        expect(metaCounts(board)).toBe('3 agents · 4 tool calls');
     });
 
     it('streams and replays the same cards — the live board and the reload cannot disagree', () => {
@@ -500,7 +510,16 @@ describe('T-W15 — the epoch splits the tool-card plane', () => {
         // frames, so a card that settles while streaming is settled after a refresh too.
         expect(rowsWithCards(live)).toEqual(rowsWithCards(reload));
         expect(rootCards(live)).toEqual(rootCards(reload));
-        expect(metaOf(reload)).toBe(metaOf(live));
+        // T3 note (this is a CHANGED pin, not a deleted assertion): the shared line now carries
+        // the quiet-state tail, so the parity claim is pinned on the COUNT plane this test owns,
+        // and the tail itself is pinned explicitly underneath instead of being swept under a
+        // `toBe`. The two doors legitimately differ in that tail: the live door folds frames but
+        // never settles the tile (a `done` EVENT is not a record), so its `streaming` tile whose
+        // last stamp is `1_090` is honestly quiet; the reload door is handed `status: 'done'`, and
+        // a SETTLED turn never claims it is still generating.
+        expect(metaCounts(reload)).toBe(metaCounts(live));
+        expect(metaOf(live)).toContain('still generating · quiet for');
+        expect(metaOf(reload)).toBe('3 agents · 4 tool calls');
 
         // And the shared value is the settled pair, not merely "the same on both doors": a rule
         // that hung the card in BOTH folds would still pass a parity-only assertion.
@@ -537,7 +556,7 @@ describe('T-W15 — the epoch splits the tool-card plane', () => {
             ['call-1', 'ok', 'delegate', 'pre-restart answer'],
             ['call-1', 'running', 'delegate', RUNNING]
         ]);
-        expect(metaOf(board)).toBe('3 agents · 4 tool calls');
+        expect(metaCounts(board)).toBe('3 agents · 4 tool calls');
 
         // The reload shows the SAME projection and the same waiting cards; the only difference is
         // the wording of the cards nothing answered, because the record's `status: 'done'` makes

@@ -2576,6 +2576,7 @@ try {
 | `usage` | `agent`, `usage` (`input`, `output`, `total`, optional `cached`) — one per model request, tool rounds included |
 | `done` | `agent`, `message`, optional `pending` |
 | `wakeup` | `agent`, `reason: 'pending-tools'`, `pending` |
+| `progress` | `agent`, `phase: 'tool-composition' \| 'idle'` (a live frame is always `tool-composition`; `idle` is how the DISPLAY plane spells "line cleared", never emitted by a provider leg), `toolCallSlots`, `argumentChars` — the model is writing a tool call **right now**: how many calls it has opened in THIS attempt and how many characters of arguments have reached the server. **Counters only — it never carries the argument text.** Emitted at most twice a second while that block is being written, absent when nothing was reported, and **informational only**: nothing may end, time out or reorder a run because of it, and a consumer that does not know the kind skips it |
 | `retry` | `agent`, `attempt`, `maxAttempts` (the failure CLASS's budget: 11 transient, 3 for `provider-connection`, 4 for `provider-timeout`), `delayMs`, `error` (`HarnessErrorInfo` — `message`, plus `code` when classified) and optional `provider` (`HarnessProviderAttemptDiagnostics` — redacted `url`, `port`, `errorClass`, `phase`, `timeoutMs`, `errno`) — the failed model attempt was discarded and the same request is re-sent |
 | `attempt_commit` | `agent`, `attempt`, `maxAttempts` — one model request SUCCEEDED and its answer is committed. Emitted for every committed response that does NOT get a `done`: a tool-calling round (closed after its tool calls) and a text response superseded before it could be reported. Everything before it is final, so a later `retry` of a NEWER request must not discard it |
 | `action_request` | `agent`, `callId`, `request` (parsed `HarnessActionRequest`) |
@@ -2627,6 +2628,32 @@ absent):
 the same-name/oldest-first fallback is no longer positional truth. Call ids must be
 non-empty and **unique for the whole conversation**: a duplicate or reused id is
 rejected before the call is launched, and never reaches persistence.
+
+### When a model is writing a tool call, the stream used to stop
+
+A model that is composing a tool call **used to send nothing at all**. The arguments stream in
+pieces inside the provider's response, the pieces are stitched together before the call is
+launched, and the client's first frame about that call was the `tool_call` that came after the
+model had already finished writing it. A relay in front of a local model makes this worse: it
+withholds the whole tool region and delivers one final update at the end. So a four-call
+delegation with a few thousand characters of arguments looked exactly like a hang — one live turn
+sat for 62 seconds with zero frames and was stopped by its user, and a second turn of the same
+shape finished normally after 27 seconds. Nothing had gone wrong, and nothing could have said so.
+
+That is what `progress` is for. While a tool block is being written you now get a small frame, at
+most twice a second, saying how many calls are being composed and how much of their arguments has
+arrived — and in the browser the turn's tile carries a line for it: `composing N tool call(s) ·
+<chars> chars` (`src/frontend/ui/turns.ts:891-893`). Two honest limits:
+
+- **"Composing" is not "running".** A call counted here has been *opened* by the model, not
+  launched: a tool starts only once its arguments are complete. The line is progress on the
+  request, not progress on the work.
+- **Absence is not failure.** A provider or relay that delivers the tool block in one piece sends
+  exactly one such frame, and an older recorded turn sends none. A tile that shows no composition
+  line is not a dead tile; when the screen has heard nothing for a while it says
+  `still generating · quiet for <duration>` (`src/frontend/ui/turns.ts:4829-4830`), and those
+  thresholds are about
+  what the VIEW can claim — nothing in this product stops a run on a clock.
 
 ### Declarative tool panels (R20.2)
 
@@ -4297,6 +4324,20 @@ an unrelated stream frame cannot destroy an in-progress repair.
   the reason. Switching agent while a conversation is expanded releases that focus, because each
   conversation runs its own agent, so the routing line above the field reads `New thread` and your
   message really does go to the agent you picked.
+- **A live turn can say WHY it looks quiet.** While a turn is running, its tile carries the
+  composition line from [`progress`](#progress-events) (a tool block being written) and, when
+  nothing has reached the browser
+  for a while, a quiet/silent note with the same fact phrased plainly — the composition line reads
+  `composing N tool call(s) · <chars> chars` (`src/frontend/ui/turns.ts:891-893`) and the note reads
+  `still generating · quiet for <duration>`, with "— the run is still working" added on the 30 s
+  grade (`src/frontend/ui/turns.ts:4829-4830`). Both are about what THIS VIEW received,
+  never a verdict on the run: the thresholds are 5 s and 30 s of silence, they change only what the
+  interface is allowed to say, and a note appears beside a turn that is still streaming. The
+  per-agent rings use the same two-step vocabulary, computed from their own per-agent receipt
+  stamps (`gradeActivityFromStamps` — cited by SYMBOL, `src/frontend/ui/activity.ts`) and repainted from the
+  document and stream paths (`src/frontend/main.ts:7455, 13988, 14437, 14601`); while an agent is
+  active a 1 000 ms clock re-grades them (`ACTIVITY_GRADE_TICK_MS`,
+  `src/frontend/main.ts:6732, 6761-6789`).
 - **Reload and switching recover from the record.** Selecting a session that still
   has work opens one `GET /v1/harness/stream` observer (a submit also opens or reopens
   it); a lost socket is re-opened with its

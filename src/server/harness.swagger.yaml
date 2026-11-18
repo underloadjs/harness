@@ -8894,6 +8894,32 @@ components:
             '`tool` only: the complete recorded `tool_result.content`. Absent while the call has no recorded
             result - still running, cancelled, or an abandoned attempt - which is the same honest absence the
             step's `preview` uses.'
+    TurnToolProgress:
+      type: object
+      description: >-
+        (T2) The ATTEMPT-SCOPED tool-composition line a section carries while the model is writing a
+        tool block - the field that makes a silent turn visibly alive instead of hung. It is projection
+        state ONLY: it mints no node, no step and no context segment, and it changes nothing about the
+        section's recorded order. WHY A FIELD AND NOT ONE NOTICE PER EVENT: the transport throttles to
+        one frame per 500 ms, so a minute of composition is up to ~120 frames; a field coalesces them
+        into one cheap `section:set` patch, and the projector SKIPS the patch when the value has not
+        changed, so a turn that never composes a tool call costs ZERO extra ops. Absent means "this
+        producer never reported composition" (a pre-T2 record, or a relay that buffered the whole tool
+        region and delivered nothing) - which is NOT the same as `idle`, the projector's own spelling
+        for "there was a line and it is now cleared".
+      required: [phase, toolCallSlots, argumentChars]
+      additionalProperties: false
+      properties:
+        phase:
+          $ref: '#/components/schemas/HarnessProgressPhase'
+        toolCallSlots:
+          type: integer
+          minimum: 0
+          description: Tool-call slots open in THIS attempt (how many parallel calls are being composed).
+        argumentChars:
+          type: integer
+          minimum: 0
+          description: Tool-call argument characters accumulated across those slots. A count, never the text.
     TurnSection:
       type: object
       description: >-
@@ -8972,6 +8998,12 @@ components:
           description: Background calls still running for this invocation.
           items:
             $ref: '#/components/schemas/HarnessPendingTool'
+        toolProgress:
+          $ref: '#/components/schemas/TurnToolProgress'
+          description: >-
+            (T2) Attempt-scoped tool-composition line; ABSENT means this producer never reported
+            composition, which is not the same as the projector's `idle` clear. Written only by a
+            `section:set` patch, and only when the value actually changed.
     TurnDisplay:
       type: object
       description: >-
@@ -9206,7 +9238,9 @@ components:
         tool rounds, so usage events rather than `done` are the complete cost record; `done` is the committed
         answer plus still-pending background calls; `retry` is a discarded attempt with its delay and preserved
         error; `attempt_commit` is the boundary that makes everything since the previous boundary final;
-        `wakeup` is a heartbeat while background calls are pending; `action_request` and `action_answer` are the
+        `wakeup` is a heartbeat while background calls are pending; `progress` is the tool-call composition
+        heartbeat (counters only, never argument text) that makes a silent tool block visibly alive;
+        `action_request` and `action_answer` are the
         owner-question pair; `branch_start` and `branch_end` delimit an automatic owner fork; `error` ends a run
         with a failure. A consumer must treat an unrecognised `type` as data to tolerate, not as a failure.
       enum:
@@ -9220,11 +9254,23 @@ components:
         - retry
         - attempt_commit
         - wakeup
+        - progress
         - action_request
         - action_answer
         - branch_start
         - branch_end
         - error
+    HarnessProgressPhase:
+      type: string
+      description: >-
+        (T2) The one tool-composition vocabulary, shared verbatim by the transport event, the recorded
+        harness event, and the display field, so no plane can drift on spelling. `tool-composition` =
+        the model is composing tool-call arguments RIGHT NOW. `idle` = nothing is in flight; only the
+        display projection writes it (an attempt boundary or a terminal frame clears a stale line),
+        because a transport's own `done`/`error` frame IS the settle.
+      enum:
+        - tool-composition
+        - idle
     HarnessUsage:
       type: object
       description: Token accounting, normalised from the provider's usage block.
@@ -9638,6 +9684,29 @@ components:
           description: '`done` only, and present when the run is NOT terminal because background calls are still live.'
           items:
             $ref: '#/components/schemas/HarnessPendingTool'
+        # (T2) The three payload fields of the `progress` variant ONLY. Aggregate counters
+        # by construction: the model's tool-call argument TEXT never rides this event,
+        # because the TEXT is kilobytes, is model-private, and every recorded event is
+        # journalled verbatim — a per-fragment text frame would multiply the turn record.
+        # Counters answer the only question a quiet turn raises ("alive? how far along?").
+        phase:
+          $ref: '#/components/schemas/HarnessProgressPhase'
+          description: >-
+            `progress` only. `tool-composition` = the model is composing tool-call arguments right now;
+            `idle` is a display-plane spelling only (the projector clears a stale line with it) and
+            is never emitted by a transport, whose own terminal frame IS the settle.
+        toolCallSlots:
+          type: integer
+          minimum: 0
+          description: >-
+            `progress` only: how many tool-call SLOTS the provider has opened in THIS attempt so far,
+            i.e. how many parallel calls are being composed. Attempt-scoped: a retry restarts at zero.
+        argumentChars:
+          type: integer
+          minimum: 0
+          description: >-
+            `progress` only: total tool-call argument characters accumulated across those slots in
+            THIS attempt. A character count, never the text.
         usage:
           description: '`usage` only: this request''s accounting, already summed into the turn tally.'
           allOf:

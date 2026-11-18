@@ -170,6 +170,32 @@ it('imports the agent dialog stylesheet and keeps the single-writer action botto
     expect(blockOf(".agent-dialog-agent[data-activity='active'] {", agentDialogRules)).toContain(
         'border-color: var(--accent)'
     );
+
+    // R1/R2 (T4): the chip's `entry` CAPTION is deleted — no rule, and no replacement
+    // `data-entry` chip styling either — and the rank moved out of the chip's text row
+    // into a pill that floats on its top-right corner. `position: relative` on the chip is
+    // what makes that possible: `.dialog`/`.dialog-body` are NOT positioned, so without a
+    // positioned containing block the pill would anchor to the fixed `.dialog-overlay`.
+    expect(agentDialogRules).not.toContain('.agent-dialog-agent-entry {');
+    expect(blockOf('.agent-dialog-tab {', agentDialogRules)).toContain('position: relative');
+
+    const rankPill = blockOf('.agent-dialog-tab .agent-dialog-agent-rank {', agentDialogRules);
+    // Out of flow, anchored to the chip's corner, and above every sibling (it is also the
+    // chip's LAST child in agent-dialog.ts, so DOM order agrees with the ring).
+    expect(rankPill).toContain('position: absolute');
+    expect(rankPill).toContain('top: -6px');
+    expect(rankPill).toContain('right: -6px');
+    expect(rankPill).toContain('z-index: 2');
+    // A fixed small centred square, so one letter always occupies the same slot whatever
+    // the chip's width, and the tokens are the sheet's own — `--bg-elevated` so the pill
+    // stays readable where it overhangs a neighbour, `--border` (NOT `--accent`, which this
+    // sheet reserves for selection and activity).
+    expect(rankPill).toContain('width: 16px');
+    expect(rankPill).toContain('height: 16px');
+    expect(rankPill).toContain('background: var(--bg-elevated)');
+    expect(rankPill).toContain('border: 1px solid var(--border)');
+    // Out of the pointer's way: the chip is the button, the pill is a caption.
+    expect(rankPill).toContain('pointer-events: none');
 });
 
 // Does a rule declare a `color:` property (as opposed to `border-color:` /
@@ -243,6 +269,13 @@ it('rounds every control with one shared token and keeps surfaces and circles on
     // The dialog sheet resolves the same token because styles.css @imports it (asserted
     // above); neither the old 999px capsules nor the one-off 7px radius survive in it.
     expect(blockOf('.agent-dialog-tab {', agentDialogRules)).toContain(
+        'border-radius: var(--radius-sm)'
+    );
+    // The rank corner pill (T4/R2) is the one shape in this sheet that COULD have taken the
+    // precedent's 999px circle (styles.css `.panel-new-pill`). It deliberately did not:
+    // taking the token keeps this guard total, so the ban below still covers every selector
+    // in the sheet — including any future one — instead of needing an exemption.
+    expect(blockOf('.agent-dialog-tab .agent-dialog-agent-rank {', agentDialogRules)).toContain(
         'border-radius: var(--radius-sm)'
     );
     expect(agentDialogRules).not.toContain('border-radius: 999px');

@@ -1143,6 +1143,11 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
         // (`paintAgentColor` writes the same canonical id). R20: `data-rank` carries the
         // letter (absent when no rank is stated) and `data-entry` marks the one routing
         // agent — several tabs may read `data-rank="A"` at the same time.
+
+        // The rank data is untouched (R3): the letter for the pill and the machine hook, and
+        // the FULL sentence for the accessible name below. `rankLabelOf` (contract.ts:163)
+        // still owns the `Rank A` wording, so nothing about the rank's MEANING moved — only
+        // where the letter is drawn.
         const memberRank = shownRankOf(options, state, member);
         const memberRankText = memberRank === undefined ? 'rank not stated' : rankLabelOf(memberRank);
 
@@ -1168,20 +1173,52 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
         // the editor can never disagree.
         const model = options.models.models[member] ?? (options.models.fallbackModel?.trim() ?? '');
 
-        // The badge states the member's RANK (R20) instead of a structural role word,
-        // and the entry role is flagged separately because it is a different fact:
-        // `entry · Rank A` and `entry · Rank C` are both legal, and so are two badges
-        // that both read `Rank A`.
+        // The chip's TEXT FLOW now holds two facts only: the identity name and the model
+        // string (R1/R2). Two things left this row:
+        //   - the `RANK A` caption — the letter floats instead, as the corner pill appended
+        //     below, which is what frees the chip's top-right corner;
+        //   - the `entry` caption (R1). It was a third word in a row that only ever had room
+        //     for two, and the fact it stated is still stated three times over: `data-entry`
+        //     above (the machine-readable half), the ` · entry agent` suffix in the accessible
+        //     name, and the detail panel's `Set as entry` / `Remove from team` pair
+        //     (`createMembershipActions`). No decision 2 replacement cue is added — styling
+        //     `data-entry` chips was explicitly out of scope.
+        // The model keeps `margin-left: auto` (`.agent-dialog-agent-model` in
+        // agent-dialog.css), so it still parks itself at the right edge of the row exactly
+        // as before.
         tab.append(
             el('span', 'agent-dialog-agent-name', title),
-            el('span', 'agent-dialog-agent-rank', memberRankText),
-            ...(member === options.entry ? [el('span', 'agent-dialog-agent-entry', 'entry')] : []),
             el('span', 'agent-dialog-agent-model', model.length > 0 ? model : UNKNOWN_MODEL_LABEL)
         );
 
         // A drafted addition has no saved team entry yet, so its tab says so.
         if (isDraftedAddition(options, state, member)) {
             tab.append(el('span', 'agent-dialog-agent-state', 'new'));
+        }
+
+        // R2/R4: the rank letter is a floating pill in the chip's top-right corner (see
+        // `.agent-dialog-tab .agent-dialog-agent-rank` in agent-dialog.css for the geometry),
+        // so its text is the bare letter — `A`, not `Rank A`. The class name is unchanged on
+        // purpose for ONE reason: it is a pinned CSS contract — the `.agent-dialog-agent-rank,`
+        // caption block in ui/compact-control-style.test.ts slices that rule, so renaming this
+        // class would break that suite.
+        //
+        // It is NOT kept because a host reads it. The activity hook queries the CHIP, never the
+        // rank node inside it: ui/activity.ts:159-160 selects
+        // `.agent-tile[data-agent], .agent-control[data-agent], .agent-dialog-agent[data-agent]`,
+        // and `.agent-dialog-agent` is the class on `tab` (the `data-agent` it matches is set
+        // above). Nothing anywhere selects `.agent-dialog-agent-rank`.
+        //
+        // A member with NO stated rank gets NO pill at all rather than a placeholder glyph:
+        // inventing a mark would read as a rank. The fact is not lost — the chip's accessible
+        // name above still says `rank not stated`, `data-rank` stays absent, and the detail
+        // panel's rank heading and footnote state it in words (`createRankActions`).
+        //
+        // It is the LAST child because it is out of flow and must paint above every sibling
+        // (an overhang onto the chip's border and into the strip's 6px gap) without relying on
+        // a `z-index` race with the `[+]` control.
+        if (memberRank !== undefined) {
+            tab.append(el('span', 'agent-dialog-agent-rank', memberRank));
         }
 
         tab.addEventListener('click', () => {

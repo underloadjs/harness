@@ -110,6 +110,10 @@ import { invocationRunKeyOf } from './protocol';
 // VALUE import on purpose: the fallback rank below is derived from the same ordered list every
 // other rank rule reads, never from a hard-coded letter that could drift from the vocabulary.
 import { AGENT_RANKS } from '../types';
+// (T2) The tool-composition payload, imported from the type module directly (the same
+// specifier ../shared/turn-display.ts:95 uses) so this file does not depend on what the
+// runtime barrel happens to re-export.
+import type { HarnessToolCallProgress } from '../types';
 
 // The turn's own root flow. INTERNAL key only: a section's wire identity is always
 // its minted `${turnId}:${ordinal}` id, which is why a delegation placeholder can
@@ -348,6 +352,57 @@ export const flowWindowPatch = (
 // A `pending` array only counts when every entry is usable — the same validator the
 // browser applies (../frontend/contract.ts:651). An ABSENT array is a different
 // answer, and the caller must keep that distinction.
+// (T2) Tolerant parse of a `progress` frame's counters (../types/index.ts
+// `HarnessToolCallProgress`) — same shape-first discipline as `pendingOf`, because a
+// projector replays JOURNAL data it did not write. `undefined` = "nothing to paint",
+// which leaves the section's last snapshot untouched rather than drawing zeroes: an
+// unknown phase spelling, a missing counter, or a negative count is malformed data,
+// not an instruction to clear. Counters are clamped to integers, never rounded from a
+// float, so a hand-written reporter cannot mint a value the op stream then cannot
+// dedupe.
+//
+// F3 + P2 (review, 2026-11-19) — A FRAME MUST SAY SOMETHING, ON EVERY CONSUMER. The
+// transport stopped emitting a zero-slot sample at the source (`../transport/openai.ts:2015`,
+// `sample.toolCallSlots > 0`), but the display side still accepted `{ slots: 0, chars: 0 }`,
+// so a CUSTOM transport, or a journal written before that fix, could make a live tile print
+// the self-contradictory `composing 0 tool calls · 0 chars`
+// (`../frontend/ui/turns.ts:891-893`) while the CLI validator refused the identical frame
+// (`./cli/render.ts:103`). The bound is now `slots >= 1` here too, so the projector, the CLI
+// and the transport agree on which frames exist.
+//
+// THE SUBTLETY THAT MAKES THIS SAFE: the rule is "reject a zero-slot TOOL-COMPOSITION
+// frame", NEVER "reject zero slots". `IDLE_TOOL_PROGRESS` below also carries
+// `toolCallSlots: 0`, and it MUST keep painting — it is the CLEAR, and it reaches
+// `paintToolProgress` as a constant, through no validator, from every attempt boundary and
+// from the F1 terminal edges (`:3213, 3287, 3405, 3420, 3481, 3685, 3925`). This function
+// only ever reads EVENT frames, so tightening it cannot touch the clear — pinned in
+// ./turn-projector-progress.test.ts ("a zero-slot tool-composition frame paints nothing" /
+// "the idle clear still paints", which is the same change with the other half proven).
+const toolProgressOf = (event: unknown): HarnessToolCallProgress | undefined => {
+    const candidate = event as { phase?: unknown; toolCallSlots?: unknown; argumentChars?: unknown };
+
+    if (candidate.phase !== 'tool-composition') return undefined;
+    if (typeof candidate.toolCallSlots !== 'number' || !Number.isInteger(candidate.toolCallSlots)) return undefined;
+    if (typeof candidate.argumentChars !== 'number' || !Number.isInteger(candidate.argumentChars)) return undefined;
+    // `slots < 1` = the frame names no open call, so it claims work while contradicting
+    // itself; `chars` keeps its `>= 0` bound, because a slot that has just opened legitimately
+    // carries zero argument characters so far (a fragment with only an `id`).
+    if (candidate.toolCallSlots < 1 || candidate.argumentChars < 0) return undefined;
+
+    return { phase: 'tool-composition', toolCallSlots: candidate.toolCallSlots, argumentChars: candidate.argumentChars };
+};
+
+// The cleared value of a section's `toolProgress` field. Counters are ZERO rather
+// than "last known", because a reader that sees `idle` must not be able to mistake a
+// stale count for live work, and because a fixed value is what makes the clear ONE
+// dedupable op: painting `idle` twice emits nothing.
+//
+// P2: this constant is NOT filtered by `toolProgressOf` — it is painted directly at every
+// boundary — so its `toolCallSlots: 0` is exempt from the `>= 1` slot bound on PURPOSE.
+// Zero slots is the IDLE spelling; it is only a zero-slot `tool-composition` FRAME that
+// means nothing.
+const IDLE_TOOL_PROGRESS: HarnessToolCallProgress = { phase: 'idle', toolCallSlots: 0, argumentChars: 0 };
+
 const pendingOf = (value: unknown): HarnessPendingTool[] | undefined => {
     if (!Array.isArray(value)) return undefined;
 
@@ -1880,6 +1935,41 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         syncPendingLine(record, ops);
     };
 
+    // (T2) Paint (or clear) this section's tool-composition line. THE CHEAP OP the
+    // design asks for: one `section:set` patch field, deduped by value, minting NO
+    // node, NO step and NO context block — so ~120 throttled frames over a minute of
+    // composition cost at most ~120 patches and the section's recorded order never
+    // moves, which is what keeps a reload byte-identical to the live stream.
+    //
+    // Two paths emit NOTHING:
+    //   - the value is unchanged (a repeat sample with the same counters, or a second
+    //     clear) — the transport already throttles, so this is rare;
+    //   - a CLEAR of an ABSENT field. `toolProgress` absent means "this producer never
+    //     reported composition" (a pre-T2 journal, or a relay that buffered the whole
+    //     tool region), and inventing an `idle` value there would rewrite every
+    //     historical display on the first replay. THIS is the branch that makes a
+    //     progress-free turn's display byte-identical with and without the feature.
+    const paintToolProgress = (
+        record: SectionRecord,
+        next: HarnessToolCallProgress,
+        ops: TurnDisplayOp[]
+    ): void => {
+        const current = record.section.toolProgress;
+
+        if (current === undefined && next.phase === 'idle') return;
+
+        if (
+            current !== undefined &&
+            current.phase === next.phase &&
+            current.toolCallSlots === next.toolCallSlots &&
+            current.argumentChars === next.argumentChars
+        ) {
+            return;
+        }
+
+        patchSection(record, { toolProgress: { ...next } }, ops);
+    };
+
     // -----------------------------------------------------------------------
     // Node / step emission
     // -----------------------------------------------------------------------
@@ -3105,6 +3195,22 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                             },
                             ops
                         );
+
+                        // F1 (review, 2026-11-19) — THE ONE TERMINAL EDGE `settle()` NEVER SEES.
+                        // A child CANCELLED by its parent's result for the spawn call emits no
+                        // `error` frame of its own (../harness.ts:9618 `if (run.aborted &&
+                        // run.parent)`), so this branch — not the child's `error` handler and not
+                        // the turn's `settle()` sweep — is the frame that ends that row. Without
+                        // the clear below the settled section keeps `toolProgress: { phase:
+                        // 'tool-composition', … }`, which contradicts the field contract
+                        // (../shared/turn-display.ts:1145-1147 "can never outlive the attempt that
+                        // produced it") and is USER-VISIBLE while the parent keeps streaming: the
+                        // tile's `composingProgressOf()` scans the nested sections
+                        // (../frontend/ui/turns.ts:4758-4770), so the parent's meta line prints
+                        // `composing 2 tool calls · 4,096 chars` for a child that stopped composing
+                        // several minutes earlier. Same dedupe rule as every other clear: a row
+                        // that never painted costs no op (AC5-d).
+                        paintToolProgress(child, IDLE_TOOL_PROGRESS, ops);
                     }
                 }
 
@@ -3174,6 +3280,11 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 // without streaming). Otherwise the deltas already counted those bytes,
                 // and counting them twice would inflate the bar.
                 const streamedProse = (record.attempt?.textKeys.length ?? 0) > 0;
+
+                // (T2) A `done` frame IS the terminal answer for this request, so the
+                // composition line is stale from here on. Same dedupe rule as every other
+                // clear: nothing is emitted unless a line was actually up.
+                paintToolProgress(record, IDLE_TOOL_PROGRESS, ops);
 
                 commitAttempt(record, ops);
 
@@ -3286,6 +3397,13 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
                 discardAttempt(record, ops);
 
+                // (T2) The failed attempt's progress goes WITH its partial output:
+                // `knowledge.md:6159-6161` defines `retry` as "everything streamed since the last
+                // attempt boundary belongs to the FAILED attempt", and a live
+                // "composing 4 calls" line is streamed output. The next attempt re-paints
+                // it from its own frames if it composes anything.
+                paintToolProgress(record, IDLE_TOOL_PROGRESS, ops);
+
                 if (providerNote !== undefined) {
                     noticeNode(record, 'error', providerNote, `n${index}`, stamp, undefined, ops);
                 }
@@ -3295,7 +3413,31 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             }
 
             case 'attempt_commit': {
+                // (T2) The round is COMMITTED, so whatever was being composed is now a
+                // recorded tool round: clear the live line before the boundary op, so a
+                // client that stops mid-batch never shows "composing" next to a committed
+                // answer. Emitted only when a line was actually up (see `paintToolProgress`).
+                paintToolProgress(record, IDLE_TOOL_PROGRESS, ops);
                 commitAttempt(record, ops);
+                break;
+            }
+
+            // (T2) Tool-composition heartbeat — the projection-only precedent set by
+            // `wakeup` below, taken further: this one mints not even a notice. It writes
+            // ONE attempt-scoped field on the section (`paintToolProgress`), so the whole
+            // stream of frames collapses to a cheap patch and the display tree — nodes,
+            // steps, context bar, tail — is byte-identical to the same turn without them.
+            //
+            // Deliberately does NOT call `closeWriters` or move the tail: a progress frame
+            // is server status about the request, not model content, and stealing the tail
+            // would hide the block the reader is looking at (R23, `tailKindOf`). It also
+            // does not open a prose window, so the deltas that follow keep their nodes.
+            case 'progress': {
+                const sample = toolProgressOf(event);
+
+                if (sample === undefined) break;
+
+                paintToolProgress(record, sample, ops);
                 break;
             }
 
@@ -3331,6 +3473,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
             case 'error': {
                 const message = messageOf(event.error);
+
+                // (T2) A failed request settles the attempt too, so its composition line
+                // must not outlive it — the `error` notice below is the reader's evidence of
+                // what actually happened, and a "composing 4 calls" line frozen under a
+                // failure reads as a run that is still working.
+                paintToolProgress(record, IDLE_TOOL_PROGRESS, ops);
 
                 // R23: the error LINE is server status, not a content block, so it does
                 // not take the tail and does not bound the block behind it. A reader who
@@ -3529,6 +3677,12 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     },
                     ops
                 );
+
+                // F1 (review, 2026-11-19): same rule as the child-settle edge above — a branch row
+                // CAN carry a `progress` frame (a fork/branch flow composes tool calls too, and the
+                // frame is routed by `event.thread`), and `branch_end` is that row's own terminal
+                // frame. The line goes with the attempt, whatever the row's last frame was.
+                paintToolProgress(target, IDLE_TOOL_PROGRESS, ops);
 
                 if (event.error !== undefined) {
                     noticeNode(target, 'error', messageOf(event.error), `n${index}`, stamp, undefined, ops);
@@ -3751,6 +3905,24 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         for (const record of sections) {
             record.pendingCalls.clear();
             syncPendingLine(record, ops);
+
+            // F1 (review, 2026-11-19) — THE ABORT CASE. A journal that ends ON a `progress` frame
+            // (the incident: the user aborts mid-composition, so no `done`/`error`/`retry`/
+            // `attempt_commit` frame ever follows it) reached `settle()` with the line still up, and
+            // `settle` is the LAST thing this projector will ever write. Left alone, the stored
+            // section carries `toolProgress: { phase: 'tool-composition', … }` forever, and every
+            // reload of that record replays a "composing 4 calls" line on a finished turn — exactly
+            // what the field contract forbids (../shared/turn-display.ts:1145-1147) and what the
+            // tile's `live` gate had been covering up rather than fixing
+            // (../frontend/ui/turns.ts:4801-4807). Runs for EVERY section, including rows this call
+            // skipped above because they were already terminal, so a document cut between a clear
+            // and a re-paint cannot resurrect the line either.
+            //
+            // `paintToolProgress` is the same deduped writer every other boundary uses, so this
+            // costs ZERO ops in the two cases that matter: a section whose field was never painted
+            // (a pre-T2 journal stays byte-identical, AC5-d) and one a `done`/`error` frame already
+            // cleared on the same turn (the clear stays exactly ONE op).
+            paintToolProgress(record, IDLE_TOOL_PROGRESS, ops);
         }
 
         syncTails(ops);

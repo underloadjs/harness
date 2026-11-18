@@ -13449,6 +13449,33 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                             await emit(run, { type: 'reasoning', agent: brain.name, delta: event.delta });
                             break;
 
+                        // (T2) Tool-call composition heartbeat, published so the quiet part
+                        // of a turn becomes evidence. Same class of event as `wakeup`: a
+                        // PROGRESS frame, never a transcript entry, and it does not touch
+                        // `run.streamedText`, the commit, or the attempt bookkeeping below —
+                        // a consumer that ignores it sees exactly the run it saw before.
+                        //
+                        // It IS journalled (server/sessions.ts `copyEvent` is a verbatim
+                        // clone), which is the point: after a restart or an abort, the
+                        // journal lines are what prove the turn was alive. Throttled to one
+                        // per 500 ms at the source (./transport/openai.ts), so the journal
+                        // cost is bounded and the frame carries counters only — never the
+                        // model's argument text.
+                        //
+                        // `emit` is the ONE publishing gate: it applies `runOwnsEvents` and
+                        // stamps `thread` (invocation identity) exactly like every other
+                        // frame, so a delegated child's composition shows up on its own
+                        // section instead of the parent's.
+                        case 'progress':
+                            await emit(run, {
+                                type: 'progress',
+                                agent: brain.name,
+                                phase: event.phase,
+                                toolCallSlots: event.toolCallSlots,
+                                argumentChars: event.argumentChars
+                            });
+                            break;
+
                         // R1/R3/R4: the agent abandoned this attempt and re-sends the
                         // SAME request after `delayMs`. Forwarded verbatim so a
                         // recorded turn and a live UI both see the retry count, the

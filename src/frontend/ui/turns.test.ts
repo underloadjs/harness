@@ -2598,3 +2598,166 @@ describe('inline reasoning chips (think)', () => {
         expect(pills(whole)).toEqual(['10%']);
     });
 });
+
+// ---------------------------------------------------------------------------
+// T3 — frontend liveness honesty: "still generating, and quiet about it"
+// ---------------------------------------------------------------------------
+//
+// The incident: a turn that says "launching four parallel delegates" then emits NOTHING
+// while the model composes its tool calls (the transport yields only `text`/`reasoning`,
+// and the next frame is the post-`done` `tool_call`), for 62s of identical pixels, then
+// an abort. The tile already had a live elapsed tick; what it lacked was the honesty to
+// say HOW LONG since the last frame. These cases pin that line, its thresholds, the
+// claims it must never make, and the reload parity of the age it prints.
+//
+// `formatDuration` is exact (ui/time.ts): tenths of a second below a minute, `NmSSs`
+// above, so every expected string below is a literal, not a range.
+describe('T3 liveness honesty — the quiet-state line', () => {
+    const T = 1_700_000_000_000;
+
+    const start = (agent = 'writer'): HarnessEvent => ({ type: 'start', agent, model: 'm1' });
+    const text = (delta: string): HarnessEvent => ({ type: 'text', agent: 'writer', delta });
+
+    const metaOf = (tile: { element: HTMLElement }): string =>
+        tile.element.querySelector('.tile-meta')?.textContent ?? '';
+
+    // `title` (not the `.title` property, which reads '' for an absent attribute) so the
+    // "no explanation was attached" pin can assert absence, not an empty string.
+    const quietOf = (tile: { element: HTMLElement }): string | null =>
+        tile.element.querySelector('.tile-meta')?.getAttribute('title') ?? null;
+
+    it('stays honest about liveness until 5s of silence, then says the run is quiet', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const { board } = mount();
+        const turn = board.begin('ask');
+        turn.apply(start(), T);
+
+        // 4.75s: frames are recent enough that the ordinary live line is the truth.
+        vi.advanceTimersByTime(4_750);
+        expect(metaOf(turn)).toBe('1 agent');
+        expect(turn.element.dataset.quiet).toBeUndefined();
+        expect(quietOf(turn)).toBeNull();
+
+        // 5.0s exactly (QUIET_AFTER_MS): the tile states what it knows — it is still
+        // generating and nothing has arrived for 5s. The ring grade follows in the same
+        // paint, so the sweep and the words can never disagree.
+        vi.advanceTimersByTime(250);
+        expect(metaOf(turn)).toBe('1 agent · still generating · quiet for 5.0s');
+        expect(turn.element.dataset.quiet).toBe('quiet');
+        expect(quietOf(turn)).toContain('a model composing a tool call sends no frames at all');
+
+        // A frame lands: the claim is withdrawn immediately (the next paint, which is the
+        // 250ms tick the tile already runs — no extra timer is introduced for this).
+        turn.apply(text('working'), T + 5_000);
+        vi.advanceTimersByTime(250);
+        expect(metaOf(turn)).toBe('1 agent');
+        expect(turn.element.dataset.quiet).toBeUndefined();
+
+        vi.useRealTimers();
+    });
+
+    it('takes the stronger phrasing past 30s, and never says cancelled or timed out', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const { board } = mount();
+        const turn = board.begin('ask');
+        turn.apply(start(), T);
+        vi.advanceTimersByTime(30_000);
+
+        expect(metaOf(turn)).toBe(
+            '1 agent · still generating · quiet for 30.0s — the run is still working'
+        );
+        expect(turn.element.dataset.quiet).toBe('silent');
+
+        // Nothing external ends a run on a clock (knowledge.md:5205-5209), so the line
+        // may not imply one did — no past-tense cancellation, no timeout vocabulary.
+        const line = metaOf(turn).toLowerCase();
+        for (const forbidden of ['cancel', 'timeout', 'timed out', 'expired', 'stalled', 'lost']) {
+            expect(line).not.toContain(forbidden);
+        }
+
+        vi.useRealTimers();
+    });
+
+    it('invents no tool count while quiet: no pending snapshot exists in this state', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const { board } = mount();
+        const turn = board.begin('run it');
+        turn.apply(start(), T);
+        // A call the MODEL asked for, never answered: the honest figure is the fold's own
+        // `1 tool call`. The `N tools still running` clause comes ONLY from a server
+        // `pending` snapshot (done/tool_result/wakeup), which a model mid-tool-block has
+        // never sent — so printing it here would be the incident's own false claim.
+        turn.apply(
+            { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'read', arguments: '{}' } },
+            T
+        );
+        vi.advanceTimersByTime(5_000);
+
+        expect(metaOf(turn)).toBe('1 agent · 1 tool call · still generating · quiet for 5.0s');
+        expect(metaOf(turn)).not.toContain('still running');
+
+        vi.useRealTimers();
+    });
+
+    it('clears the quiet line the moment the turn settles', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const { board } = mount();
+        const turn = board.begin('ask');
+        turn.apply(start(), T);
+        vi.advanceTimersByTime(41_000);
+        expect(metaOf(turn)).toBe(
+            '1 agent · still generating · quiet for 41.0s — the run is still working'
+        );
+
+        turn.setState('done', 'm1');
+        expect(metaOf(turn)).toBe('1 agent · m1');
+        expect(turn.element.dataset.quiet).toBeUndefined();
+
+        // A settled tile keeps no quiet claim even if the clock keeps running.
+        vi.advanceTimersByTime(30_000);
+        expect(metaOf(turn)).toBe('1 agent · m1');
+        expect(metaOf(turn)).not.toContain('still generating');
+
+        vi.useRealTimers();
+    });
+
+    it('paints the same age from the journaled record as from the live frames', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const { board } = mount();
+        const live = board.begin('tasks');
+        // The live door: a start frame stamped 41s ago, then nothing.
+        live.apply(start(), T - 41_000);
+
+        // The reload door: the same turn as a RUNNING record, its own stamps 41s old.
+        const record = {
+            id: 't1',
+            index: 0,
+            prompt: 'tasks',
+            status: 'running',
+            startedAt: T - 41_000,
+            updatedAt: T - 41_000,
+            events: [start()],
+            eventTimes: [T - 41_000]
+        } as SessionTurn;
+        const [reload] = board.hydrate([record]);
+
+        // The age is derived at paint time from SERVER stamps (an `eventTimes` entry on the
+        // live door, the record's `updatedAt` on the reload), never stored, so a refresh
+        // mid-run shows what the live view showed instead of resetting to "just now".
+        expect(metaOf(live)).toBe('1 agent · still generating · quiet for 41.0s — the run is still working');
+        expect(metaOf(reload)).toBe(metaOf(live));
+        expect(reload.element.dataset.quiet).toBe('silent');
+
+        vi.useRealTimers();
+    });
+});

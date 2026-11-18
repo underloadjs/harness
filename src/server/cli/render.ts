@@ -9,6 +9,12 @@
 // CLI therefore prints the authoritative `durationMs` on a result, a `pending`
 // line for calls still running, and a wake line. It never treats `done` with a
 // non-empty `pending` list as the end of the work.
+//
+// Tool-composition visibility (T2/R5, and F4 of the 2026-11-19 review): the `progress`
+// heartbeat has an EXPLICIT arm below, not an implicit fall-through. It is the only frame
+// that says the model is still writing while a tool block composes, so the terminal prints
+// it as one dim line when the counters move — the same event the tile turns into
+// `composing N tool calls · M chars`.
 
 import type { HarnessAssistantMessage, HarnessEvent, HarnessPendingTool } from '../../harness';
 
@@ -75,6 +81,29 @@ const durationOf = (event: HarnessEvent): number | undefined => {
 
     const duration = event.durationMs;
     return typeof duration === 'number' && Number.isFinite(duration) && duration >= 0 ? duration : undefined;
+};
+
+// (T2 / F4) The tool-composition heartbeat, VALIDATED. A `progress` frame is untrusted
+// input like every other frame this file reads (a persisted/older/hand-written journal is
+// replayed verbatim), so the rules mirror src/server/turn-projector.ts `toolProgressOf`
+// and src/frontend/contract.ts: shape first, then a real phase, then non-negative integer
+// counters. `undefined` = "paint nothing": an unknown phase, an `idle` frame (that spelling
+// is the DISPLAY plane's clear, the transport never sends it), a zero-slot frame (F3 — the
+// same reason the transport stopped emitting it: `composing 0 tool calls · 0 chars` claims
+// work and contradicts itself, and PRE-F3 journals on disk really do contain those frames),
+// or a malformed counter. Nothing is ever printed as a guess.
+const progressOf = (event: HarnessEvent): { agent: string; slots: number; chars: number } | undefined => {
+    if (event.type !== 'progress') return undefined;
+    if (typeof event.agent !== 'string' || event.agent.length === 0) return undefined;
+    if (event.phase !== 'tool-composition') return undefined;
+
+    const slots = event.toolCallSlots;
+    const chars = event.argumentChars;
+
+    if (typeof slots !== 'number' || !Number.isInteger(slots) || slots < 1) return undefined;
+    if (typeof chars !== 'number' || !Number.isInteger(chars) || chars < 0) return undefined;
+
+    return { agent: event.agent, slots, chars };
 };
 
 // Mirror of `formatDuration` in src/frontend/ui/time.ts (tests assert exact text):
@@ -149,6 +178,15 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
     let lineOpen = false;
     let streamKind: 'text' | 'reasoning' | undefined;
 
+    // (T2 / F4) The composition line already on screen, so a heartbeat that repeats the
+    // SAME numbers costs no line. The transport throttles to one frame per 500 ms, so
+    // printing every accepted frame would be two lines per second of composition; what a
+    // reader wants is the numbers MOVING. Cleared at the same four attempt boundaries the
+    // projector clears its field on (`retry` / `attempt_commit` / `done` / `error`,
+    // src/server/turn-projector.ts:3245, 3363, 3378, 3439 — plus the F1 terminal edges), so
+    // a re-sent attempt is allowed to print the same figures again.
+    let lastProgress: { agent: string; slots: number; chars: number } | undefined;
+
     const endLine = (): void => {
         if (!lineOpen) return;
         process.stdout.write('\n');
@@ -165,6 +203,10 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
         switch (event.type) {
             case 'start': {
                 endLine();
+                // A new flow composes its own numbers: the previous flow's line must not
+                // suppress this one's first heartbeat (a delegated child re-opening the same
+                // counters is a fact worth printing).
+                lastProgress = undefined;
                 process.stdout.write(`\n${dim(`── ${event.agent} · ${event.model} ──`)}\n`);
                 break;
             }
@@ -191,6 +233,11 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
             // itself for anything that tallies retries. A frame without a usable
             // attempt/delay/error is malformed and prints nothing (F6).
             case 'retry': {
+                // The attempt is over: forget the line it printed (see `lastProgress` above).
+                // Done BEFORE validation, because a malformed boundary frame still ends the
+                // attempt even though it prints nothing.
+                lastProgress = undefined;
+
                 const frame = retryOf(event);
                 if (frame === undefined) break;
 
@@ -201,12 +248,44 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
                 break;
             }
 
+            // (T2 / F4) The tool-composition heartbeat, printed EXPLICITLY rather than
+            // falling through to the switch's implicit default. This is the frame that makes
+            // a silent 60 s of tool-block composition readable, and the terminal is exactly
+            // where the reported incident was watched, so it gets the same dim status-line
+            // treatment as `retry`/`wakeup`: one line, only when the counters moved. It
+            // changes nothing else — no `endLine()` of the stream is skipped, no prose is
+            // touched, and `--json` above still carries the event verbatim.
+            case 'progress': {
+                const frame = progressOf(event);
+                if (frame === undefined) break;
+
+                const same =
+                    lastProgress !== undefined &&
+                    lastProgress.agent === frame.agent &&
+                    lastProgress.slots === frame.slots &&
+                    lastProgress.chars === frame.chars;
+
+                if (same) break;
+
+                lastProgress = frame;
+
+                endLine();
+                process.stdout.write(
+                    `${dim(
+                        `~ ${frame.agent} composing ${frame.slots} tool call${frame.slots === 1 ? '' : 's'} \u00b7 ${frame.chars} chars`
+                    )}\n`
+                );
+                break;
+            }
+
             // R3: one model request committed its answer (a tool-calling round ends
             // with no `done`, so this is the only visible boundary it has). The
             // terminal needs no line of its own: the committed prose is already on
             // screen and `--json` carries the frame for anything that tallies
             // attempts.
             case 'attempt_commit': {
+                // The attempt is over, so its composition line is stale (see above).
+                lastProgress = undefined;
                 break;
             }
 
@@ -269,12 +348,16 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
             }
 
             case 'done': {
+                // The attempt answered: its composition line is over (see `lastProgress`).
+                lastProgress = undefined;
                 endLine();
                 process.stdout.write(`${dim(`  ${describeDone(event.message, pendingOf(event))}`)}\n`);
                 break;
             }
 
             case 'error': {
+                // Same boundary rule as `done`: a failure ends the attempt whose line this was.
+                lastProgress = undefined;
                 endLine();
                 process.stderr.write(`${red(`error: ${event.error.message}`)}\n`);
                 break;

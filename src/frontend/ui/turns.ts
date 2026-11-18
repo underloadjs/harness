@@ -160,6 +160,7 @@ import type {
     HarnessActionRequest,
     HarnessAttachment,
     HarnessBranchSummary,
+    HarnessToolCallProgress,
     HarnessToolOutcome
 } from '../../types';
 // The rank guard is the kernel's own (../../types/index.ts `isAgentRank`): one letter
@@ -195,7 +196,8 @@ import {
     contextBarReplacesChips,
     contextTailCaptionOf,
     contextTailOf,
-    contextTailShowsProse
+    contextTailShowsProse,
+    formatContextCharCount
 } from '../view-context';
 import type { ContextBarModel, ContextTail } from '../view-context';
 import { mountContextBar } from './context-bar';
@@ -269,7 +271,7 @@ import type { AgentBlockDescriptor } from './references';
 // tile opens no layer of its own and only the copy helper is still needed.
 import { createTextCopyButton } from './dialog';
 import { markdownFragment, plainPreview } from './markdown';
-import { elapsedBetween, formatDuration } from './time';
+import { elapsedBetween, formatDuration, quietGradeOf } from './time';
 import { formatTokens } from './tokens';
 import { createReasoningCard, createToolCallCard } from './tools';
 import type { ReasoningCard, ToolCallCard, ToolState } from './tools';
@@ -801,6 +803,106 @@ const STATE_TEXT: Readonly<Record<TurnState, string>> = {
 // it visually.
 const isLive = (state: TurnState): boolean => state === 'waiting' || state === 'streaming';
 
+// --- T3 frontend liveness honesty ------------------------------------------
+//
+// A turn in `streaming` used to be ONE picture no matter what the server was doing:
+// the model generating a tool call emits no frames at all, and a dead stream emits
+// none either, so the tile claimed activity the same way in both (the user report:
+// 62s of identical pixels, then an abort). Every input below is a signal the frontend
+// ALREADY has — the frame the tile is applying, its stamp when the wire carries one,
+// and the 250ms clock the elapsed label already runs — so the fix needs no new server
+// frame and mints no new transcript node (a card/segment is minted only by a
+// committed frame, knowledge.md:7612-7616).
+//
+// Newest moment a frame can honestly be said to have reached a tile:
+//   - the frame's SERVER stamp when it carries one (the raw path's `at`, a recorded
+//     `eventTimes` entry, a row frame's `updatedAt`) — journaled data, which is what
+//     makes a reload derive the same age the live view showed;
+//   - otherwise the LOCAL clock at receipt (the documented fallback for a frame with
+//     no stamp, ../contract.ts `frameAtOf`).
+// `Math.max` keeps it monotone: an out-of-order replay or a late duplicate can never
+// move the clock backwards and re-quiet a tile that has since received frames.
+const frameStampOf = (previous: number | undefined, at: number | undefined): number => {
+    const stamp = typeof at === 'number' && Number.isFinite(at) ? at : Date.now();
+
+    return previous === undefined ? stamp : Math.max(previous, stamp);
+};
+
+// T3: the newest SERVER stamp a journaled display tree carries (the recorded span
+// endpoints of its sections). A whole-tree paint is not a live frame — a poll hands
+// back the same journaled state — so the quiet-state age is seeded from these stamps
+// and never from the local clock, which is what keeps a reload of a silent run reading
+// quiet at once. `frameStampOf` still takes the newest of everything, so the row's
+// `updatedAt` (a stronger figure) wins whenever the tile has it.
+const newestSectionStampOf = (display: TurnDisplay): number | undefined => {
+    let newest: number | undefined;
+
+    for (const section of sectionsOf(display)) {
+        for (const value of [section.startedAt, section.endedAt]) {
+            const at = finiteOf(value);
+            if (at === undefined) continue;
+            if (newest === undefined || at > newest) newest = at;
+        }
+    }
+
+    return newest;
+};
+
+// --- T4: the tool-composition line -----------------------------------------
+//
+// WHY IT EXISTS: the transport yields NOTHING while the model writes a tool block
+// (../../transport/openai.ts:1965-1989), which is the reported incident — a four-call
+// `delegate` of thousands of argument characters read as a 62 s hang. T2 put the counters
+// on the wire as `TurnSection.toolProgress` (../shared/turn-display.ts:1154), the ops fold
+// already applies them (../view-state.ts:429), and this is the renderer.
+//
+// THE CLAIM IT MAY MAKE, AND THE ONE IT MAY NEVER MAKE: the two counters describe the
+// REQUEST the model is still writing. A slot is a call the provider has OPENED, never one
+// that launched, was queued, or is running — partial arguments are never executed
+// (knowledge.md:5864-5865) — so "composing" is the only honest verb available here.
+//
+// WHY THE EXACT GROUPED CHARACTER COUNT (`formatContextCharCount`, ../view-context.ts:542)
+// instead of a hand-rolled "6.5k": it is the SAME formatter the context bar prints character
+// counts with, so one kind of figure has one shape everywhere in the tile, and the number
+// the reader sees is the number the server counted.
+const COMPOSITION_PHASE = 'tool-composition';
+
+// A type guard, not a boolean: the two counters may only be read once the phase has been
+// proven, so a `tool-composition` value can never be narrowed away by hand.
+const isComposing = (
+    progress: HarnessToolCallProgress | undefined
+): progress is HarnessToolCallProgress & { phase: 'tool-composition' } =>
+    progress !== undefined && progress.phase === COMPOSITION_PHASE;
+
+// The clause text, or undefined when there is nothing to draw. `undefined` (the producer
+// never reported composition — a pre-T2 journal, or a relay that withholds the whole tool
+// region) and `idle` (the server CLEARING the line because a retry / commit / done / error
+// landed, turn-projector.ts:3245/3363/3378/3439) both paint NOTHING, and neither may be
+// rendered as an elapsed figure: this field carries no clock.
+const compositionClauseOf = (progress: HarnessToolCallProgress | undefined): string | undefined => {
+    if (!isComposing(progress)) return undefined;
+
+    // A malformed counter reads as 0, never as `NaN`: the tile never prints a figure it
+    // cannot stand behind.
+    const slots = Number.isFinite(progress.toolCallSlots)
+        ? Math.max(0, Math.trunc(progress.toolCallSlots))
+        : 0;
+
+    return `composing ${slots} tool call${slots === 1 ? '' : 's'} \u00b7 ${formatContextCharCount(
+        progress.argumentChars
+    )} chars`;
+};
+
+// The full claim behind the clause, in the same voice as T3's quiet title below: what the
+// view received, what it means, and the misreading it must not invite.
+const COMPOSITION_TITLE =
+    'the model is writing the arguments of these tool calls right now, and the figure is how ' +
+    'many calls it has opened plus how many characters of arguments have reached the server so ' +
+    'far. None of them has launched, been queued or started running: a call is executed only ' +
+    'once its arguments are complete, so this is progress on the request, not progress on the ' +
+    'work. The line comes from the server\u2019s journaled progress frames and disappears the ' +
+    'moment the attempt commits, retries, finishes or fails.';
+
 // Unique ids for `aria-controls`. A module counter is enough: one document.
 let nextId = 0;
 
@@ -974,7 +1076,14 @@ type BlockMeta = {
     recorded: () => boolean;
 };
 
-const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMeta => {
+const createBlockMeta = (
+    classes: { elapsed: string; tokens: string },
+    // T3: called at the END of every paint, including the 250ms live tick, so a
+    // time-derived line that lives SOMEWHERE ELSE in the header (the tile's quiet-state
+    // meta note) re-derives on the SAME clock instead of needing a second timer. A child
+    // row passes nothing: only the tile header owns that note.
+    onPaint?: () => void
+): BlockMeta => {
     const elapsed = el('span', classes.elapsed);
     elapsed.hidden = true;
     const tokens = el('span', classes.tokens);
@@ -1028,6 +1137,10 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
 
         elapsed.textContent = span === undefined ? '' : formatDuration(span);
         elapsed.hidden = span === undefined;
+
+        // T3: one clock, two time-derived labels (see `createBlockMeta`).
+        // T3: one clock, two time-derived labels (see `createBlockMeta`).
+        onPaint?.();
     };
 
     const stop = (): void => {
@@ -4128,7 +4241,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // fabricated "0ms"); the tally stays hidden until a request reports usage.
         // The `|` is CSS decoration (styles.css), not part of any value, so every span stays
         // a clean, copy-pastable figure; it is dropped together with the label it follows.
-        const blockMeta = createBlockMeta({ elapsed: 'tile-elapsed', tokens: 'tile-tokens' });
+        // T3: the tile's own paint hook — the 250ms elapsed tick is the only clock the
+        // tile runs, and the quiet-state note in the meta line is derived from the same
+        // instant, so it re-grades without a second timer. `paintQuietState` keeps that
+        // repaint conditional, which is what makes the cost zero for a run that is talking.
+        const blockMeta = createBlockMeta(
+            { elapsed: 'tile-elapsed', tokens: 'tile-tokens' },
+            () => paintQuietState()
+        );
         // R3: the state word measures the BLOCK (what it did and how it ended), it is
         // not part of the conversation's identity, so it closes the measurement line
         // instead of sitting beside the thread badge. T26: the measurement line itself now
@@ -4318,6 +4438,23 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // --- per-turn state ------------------------------------------------
         let state: TurnState = 'queued';
         let detail: string | undefined;
+        // T3 liveness honesty: the newest moment a frame reached THIS tile (see
+        // `frameStampOf`). Undefined means "no frame yet" or "the turn has settled", and
+        // both must paint NO quiet claim: without a stamp there is no honest age to
+        // print. Never persisted — the age is always re-derived at paint time from
+        // `Date.now()`, so a reload of the same journaled turn paints the same line.
+        let lastFrameAt: number | undefined;
+        const noteFrame = (at?: number): void => {
+            lastFrameAt = frameStampOf(lastFrameAt, at);
+        };
+        // True while a quiet note is actually painted in the meta line (maintained by
+        // `updateMeta`). It exists so the 250ms elapsed tick can stay a CLOCK READ during
+        // normal streaming: while the tile reads as live and no note shows, the tick has
+        // nothing to say and must not touch the meta DOM at all (the tile already repaints
+        // the elapsed label on that clock, and adding a full meta rebuild to every tick cost
+        // ~25% of the wall time of the heaviest live-stream tests, which run right up
+        // against their time budget).
+        let quietShown = false;
         // The FIRST agent the data named for this turn — the one whose flow is the
         // tile's root. Structural, not an authority claim (R20).
         let firstAgentOfTurn: string | undefined;
@@ -4604,6 +4741,34 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // the stored answer instead of rendering actionable controls.
         const actionAnswers = new Map<string, HarnessActionAnswer>();
 
+        // (T4) Which section's composition line THIS tile prints, read at paint time
+        // straight off the wire section the entry was last painted from
+        // (`ThreadEntry.compiledSection`, held by reference because the ops fold mutates
+        // that object in place — see T22 at :8420). No copy is kept, so a progress patch
+        // that arrives on a frame the tile only SYNCs (the unchanged-tree skip in
+        // `syncCompiledDisplay` :9322 never counts `toolProgress` as content) still lands:
+        // that path always ends in `updateMeta`, and the object it reads is current.
+        //
+        // Ordering is deliberate: the turn's OWN section first, because `.tile-meta` is the
+        // tile's line and the root flow is what it speaks about; then the nested invocations
+        // in the order the server allocated them. A section whose field is `idle` or absent
+        // is skipped rather than treated as an answer — an idle section is one the server
+        // already cleared, and a delegated member composing is the fact worth printing when
+        // the root has nothing to say.
+        const composingProgressOf = (): HarnessToolCallProgress | undefined => {
+            const rootProgress = threads.get(ROOT_KEY)?.compiledSection?.toolProgress;
+            if (isComposing(rootProgress)) return rootProgress;
+
+            for (const [key, entry] of threads) {
+                if (key === ROOT_KEY) continue;
+
+                const progress = entry.compiledSection?.toolProgress;
+                if (isComposing(progress)) return progress;
+            }
+
+            return undefined;
+        };
+
         const updateMeta = (): void => {
             const live = isLive(state);
             const parts: string[] = [];
@@ -4624,10 +4789,103 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (pendingTotal > 0) {
                 parts.push(`${pendingTotal} tool${pendingTotal === 1 ? '' : 's'} still running`);
             }
+
+            // (T4) The tool-composition line, BEFORE the quiet clause: when progress frames
+            // are flowing, `applyCompiledOps` has just noted a frame (see its T3 note), so
+            // the quiet grade is undefined and only this clause shows. When they BOTH show,
+            // the stream died mid-composition: the composition counters are the last thing
+            // the server reported and the silence since is a separate, also-true fact — this
+            // is the case the incident actually looked like, and dropping either half would
+            // put back the lie that got the run aborted.
+            //
+            // Gated on the tile being LIVE for the same reason T3 gates the quiet clause one
+            // line below: "composing … right now" is a present-tense claim, and a settled turn
+            // has no present. The projector clears the field at commit/retry/done/error, so a
+            // journal never carries a live value on a finished turn — the gate is what keeps a
+            // record that predates that clearing (or a document cut between the two ops) from
+            // printing one.
+            const composing = live ? compositionClauseOf(composingProgressOf()) : undefined;
+            if (composing !== undefined) parts.push(composing);
+
+            // T3: the honest SILENCE line, and the one place its grade reaches the DOM.
+            //
+            // Only a LIVE turn can be quiet, and only a stamp can measure it: with no
+            // `lastFrameAt` (a tile that never received a frame, or a settled one) there
+            // is no age to claim. The wording names no tool count on purpose — this state
+            // has NO `pending` snapshot (the count above comes only from a server
+            // snapshot carried by `done`/`tool_result`/`wakeup`), so asserting one here
+            // would invent the exact fact the incident got wrong. It also never says
+            // cancelled or timed out: nothing ended this run.
+            const quietAge = elapsedBetween(lastFrameAt, Date.now());
+            const quietGrade = live ? quietGradeOf(quietAge) : undefined;
+
+            // The grade currently on screen, so the 250ms clock can skip the whole repaint
+            // while nothing about it changes (see `paintQuietState`).
+            quietShown = quietGrade !== undefined;
+
+            if (quietGrade !== undefined) {
+                parts.push(
+                    quietGrade === 'silent'
+                        ? `still generating · quiet for ${formatDuration(quietAge ?? 0)} — the run is still working`
+                        : `still generating · quiet for ${formatDuration(quietAge ?? 0)}`
+                );
+            }
+
             if (detail !== undefined && detail.length > 0) parts.push(detail);
             if (parts.length === 0) parts.push(live ? 'waiting for the first event' : 'no events yet');
 
-            meta.textContent = parts.join(' · ');
+            // Guarded writes: the meta line is repainted on every frame AND while a run is
+            // quiet on every 250ms tick, and an unchanged `setAttribute` still queues a
+            // mutation record for every observer on the transcript. Same value = no write.
+            const line = parts.join(' · ');
+            if (meta.textContent !== line) meta.textContent = line;
+
+            // The full, non-abbreviated claim lives on `title`, so a reader who wants to
+            // know WHY the line went quiet gets the reason instead of a worse guess. It
+            // speaks about THIS VIEW (what reached the browser), never about what the
+            // server is doing right now. (T4: when the composition clause is on the line
+            // too, its explanation is prepended, so hovering either clause gives both facts
+            // instead of leaving the newer one unexplained.)
+            const titles: string[] = [];
+
+            if (composing !== undefined) titles.push(COMPOSITION_TITLE);
+
+            if (quietGrade !== undefined) {
+                titles.push(
+                    `quiet for ${formatDuration(quietAge ?? 0)} — no frame has reached this view for ` +
+                        'that long and the tile is still streaming. Nothing here ends a run on a clock; a ' +
+                        'model composing a tool call sends no frames at all, so a quiet stretch is expected.'
+                );
+            }
+
+            if (titles.length === 0) meta.removeAttribute('title');
+            else {
+                const note = titles.join(' ');
+                if (meta.title !== note) meta.title = note;
+            }
+
+            // The same grade drives the RING (styles.css keys the compact tile's arc off
+            // `data-quiet`): a silent run keeps a live ring but stops its sweep, so the
+            // spinning indicator no longer claims frames are arriving when none are. It is
+            // removed the moment a frame lands or the turn settles, which is what restores
+            // the normal live affordance.
+            if (quietGrade === undefined) delete card.dataset.quiet;
+            else card.dataset.quiet = quietGrade;
+        };
+
+        // T3: the 250ms tick's cheap repaint. While the tile reads as live AND no note is on
+        // screen, the quiet line cannot change, so the clock read IS the whole job — no meta
+        // DOM write and no attribute churn (a quiet run repaints ~4 times a second, which is
+        // what makes the age the reader watches honest; a run that is streaming frames paints
+        // nothing beyond the elapsed label it already painted before this affordance existed).
+        const paintQuietState = (): void => {
+            const grade = isLive(state)
+                ? quietGradeOf(elapsedBetween(lastFrameAt, Date.now()))
+                : undefined;
+
+            if (grade === undefined && !quietShown) return;
+
+            updateMeta();
         };
 
         const setState = (next: TurnState, nextDetail?: string): void => {
@@ -4640,6 +4898,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // started (cancelled while queued) had no span, so leave the label
             // hidden rather than printing a fabricated 0ms.
             if (next === 'done' || next === 'error' || next === 'cancelled') {
+                // T3: a settled turn is never "quiet" — it is OVER, and a line that says
+                // `still generating` beside a `done` tile would be a fresh lie. Dropping
+                // the stamp also drops the note and the `data-quiet` ring grade, which
+                // `updateMeta` (called at the end of this function) repaints.
+                lastFrameAt = undefined;
+
                 // `finish` freezes the span: a non-recorded run ends at the local
                 // clock, a recorded one keeps the server's `updatedAt` (or the last
                 // span it painted when the record carried no end stamp).
@@ -4739,6 +5003,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     }
                 }
             } else {
+                // T3: a tile that becomes live with NO stamp at all is an optimistic
+                // submit — the server has sent nothing for it yet — so its own start is
+                // the only honest baseline for "nothing has arrived since", and it is the
+                // same instant `reopen` below adopts for the elapsed clock. A JOURNALED
+                // turn reaches this branch only after `merge`/`setCompiledSummary` noted
+                // the server's stamp, so the seed never overwrites journaled data.
+                if (isLive(next) && lastFrameAt === undefined) lastFrameAt = Date.now();
+
                 // A non-terminal transition: clear a local end and tick while the task
                 // actually runs (R4 — `queued` deliberately does not start a clock).
                 // A recorded baseline keeps its stamps: hydration/replay owns them.
@@ -9080,6 +9352,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // says "the document IS the state", so anything left over from a previous
         // projection (including sections the document no longer names) is dropped.
         const renderCompiledDisplay = (display: TurnDisplay): void => {
+            // T3: a whole-tree paint is JOURNALED state, not a live frame, so the
+            // quiet-state age is seeded from the tree's own server stamps (and the row's
+            // `updatedAt`, already noted by `setCompiledSummary`) — never from the local
+            // clock. That is what makes a reload of a run that has really been silent
+            // paint the quiet line at once instead of waiting for the threshold.
+            noteFrame(newestSectionStampOf(display));
+
             // V1: a full paint replaces the DOM wholesale, so THIS tree is what the tile now
             // shows — the previous stamp is meaningless and is re-recorded here (the
             // action-card repaint path, `./main.ts` `repaintActionCard`, goes through this
@@ -9134,6 +9413,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // are detached. Text can never duplicate, because a node's content is painted
         // FROM the node (the raw path needs prefix matching for that guarantee).
         const syncCompiledDisplay = (display: TurnDisplay): void => {
+            // T3: same journaled-only seed as `renderCompiledDisplay` — a sync pass is the
+            // store repainting state the server already recorded, so it may move the
+            // quiet-state age only with a stamp that is NEWER than what the tile holds.
+            // A poll tick that changes nothing therefore lets the age keep growing, which
+            // is exactly the point: nothing new reached the reader.
+            noteFrame(newestSectionStampOf(display));
+
             // V1 — the unchanged-tree skip. A document apply that carries the SAME content the
             // tile is already painted from must not run the node-level pass at all: every
             // committed text node in that pass re-parses its Markdown and replaces its DOM
@@ -9361,6 +9647,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             ops: readonly TurnDisplayOp[],
             display?: TurnDisplay
         ): void => {
+            // T3: the display wire's ops carry no per-op clock, so RECEIPT of the batch is
+            // the honest "a frame arrived" moment on the path the live app uses. The `turn`
+            // op routes through `setCompiledSummary`, which additionally notes the row's own
+            // server `updatedAt`; `frameStampOf` keeps the pair monotone, so neither write
+            // can undo the other.
+            noteFrame();
+
             // One flag per frame, so the bar is repainted at most once per frame however many
             // `context:*` ops it carried (a settled tool round sends several).
             let contextTouched = false;
@@ -9799,6 +10092,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
             applyRowFigures(summary);
 
+            // T3: a row frame is a frame, and it is the one compiled-path frame that is
+            // SERVER-STAMPED (`TurnSummary.updatedAt`, ../shared/turn-display.ts:1194). Noting
+            // it here is what lets a browser that reloads mid-run paint the quiet line
+            // immediately instead of waiting 5s: the age it prints comes from journaled data,
+            // re-derived against `Date.now()` at paint time. It runs BEFORE `setState` so a
+            // journaled stamp is in place before the optimistic seed in that function could
+            // supply a local one.
+            noteFrame(finiteOf(summary.updatedAt));
+
             // R1: the state comes from the wire, and `setState` performs the whole
             // terminal cleanup (abandon unsettled cards, expire questions, clear the
             // pending lines) that the fold used to reach through events.
@@ -9934,6 +10236,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // on the new server; local date is only the fallback. `origin` keeps the
         // replay path honest for records that predate timing support.
         const apply = (event: HarnessEvent, at?: number, origin: ApplyOrigin = 'live'): void => {
+            // T3: FIRST thing the fold does is record that a frame arrived. `at` is the
+            // server clock when the wire carries one (SSE `at`, a recorded `eventTimes`
+            // entry) and the local receipt time otherwise, so the quiet-state age is
+            // journaled-derived whenever the data allows it (reload parity) and never
+            // invented from a missing clock.
+            noteFrame(at);
+
             // A queued tile receiving its first event is now running: transition
             // locally (the server may batch the status upsert). `waiting` is the
             // pre-first-event state; both become `streaming`.
@@ -10506,6 +10815,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 startedAt: finiteOf(source.startedAt),
                 endedAt: terminal ? finiteOf(source.updatedAt) : undefined
             });
+
+            // T3: the record's own `updatedAt` is the server's last write for this turn, so
+            // a reload of a run that has really been silent 41s paints the quiet line at once
+            // (the events it replays below carry older stamps, and `frameStampOf` takes the
+            // newest of the pair). A settled record needs no stamp at all — `setState` drops
+            // it, because a finished turn is not quiet, it is over.
+            if (!terminal) noteFrame(finiteOf(source.updatedAt));
 
             const times = eventTimesOf(source);
             const events = Array.isArray(source.events) ? source.events : [];

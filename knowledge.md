@@ -2,7 +2,25 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-11-18 (ranks) for the RANK MODEL that replaced the
+> **Last verified:** 2026-11-19 (composition) for TOOL-CALL COMPOSITION VISIBILITY and the four
+> transport liveness fixes that came with it, documented from the code and from two live captures,
+> not from a brief: the `progress` event kind (projection-only, counters-only, NEVER argument text —
+> `HarnessProgressPhase` / `HarnessToolCallProgress`, `src/types/index.ts:468, 477`), the one
+> tool-call de-multiplexing rule (`slotForFragment`, `src/transport/openai.ts:979`), the name-echo
+> guard (`:1046`), the minted id for an anonymous call (`harness-call-<slot>`, `:1076, 1112`), the
+> completeness rule that stops a complete tool block from being re-generated ten times
+> (`completeToolRound`, `:2054`), the 500 ms throttle (`:1091`, monotonic, no new timer), the
+> display field that mints no node and no context block (`TurnSection.toolProgress`,
+> `src/shared/turn-display.ts:1154`; `src/server/turn-projector.ts:1926, 3393`), the journal-index
+> shift it causes (ids derived from the event position move, exactly as a journaled `wakeup` moves
+> them), and the timeout-boundary arithmetic (27 s and 62 s of silence are inside EVERY bound; only
+> a tool block past the 120 s between-reads bound trips `provider-timeout` and its 4-attempt ladder
+> — no default changed). The dated brief is
+> `docs/tasks/2026-11-19-tool-call-composition-visibility.md`; what remains open is
+> `docs/issues/minor-relay-gateway-silence-adds-no-per-request-provider-log.md` (0037) and
+> `docs/issues/minor-long-tool-block-has-no-per-attempt-total-clock.md` (0038). The claims still
+> being written by that pass — the exact frontend strings — are named where they live rather than
+> quoted here. Before that, 2026-11-18 (ranks) for the RANK MODEL that replaced the
 > `primary`/`subagent`/`subagents` vocabulary across this package's contract, documented from
 > the code rather than from a brief. The premise of the redesign is that AUTHORITY IS A LADDER,
 > NOT A SINGLETON: `AgentRank` is a 26-letter scale (`'A'` highest), any number of agents may
@@ -1151,6 +1169,7 @@ reach into `src/`.
 - [Lane workers](#lane-workers-threadexecution-worker) — One conversation per worker thread
 - [IO workers](#io-workers-ioexecution-worker) — Checkpoint and journal writes off the request loop
 - [Agents and the harness registry](#agents-and-the-harness-registry) — Trusted profiles, create/patch, frozen teams, live models
+- [Tool-composition visibility](#tool-composition-visibility) — The `progress` frame, the display field it paints, and what the UI may claim
 
 ### Document
 - [Decisions worth remembering](#decisions-worth-remembering) — The rulings a change must not undo
@@ -5064,6 +5083,114 @@ threadFork({ input: string; label?: string; timeoutMs?: number })
 
 ---
 
+### Tool-composition visibility
+
+A model writing a TOOL CALL emits NOTHING while it writes it: fragments are merged
+inside the stream reader with no yield (`src/transport/openai.ts:1976-1979`), `tool_call`
+events exist only AFTER the terminal frame, and only the terminal frame carries them. Pre-tool
+reasoning and content still stream — the engine's filter withholds only from the first potential
+tool marker onward
+(`services/modal/deploy/qwen3.8-27b/modal_qwen3_8_rtx6000_ninfer.py:1000-1005`) — so the silence
+begins exactly at the tool block and ends when the calls launch. This workspace's relay family
+makes it worse: it withholds the whole tool region and flushes one final SSE frame
+(`services/modal/deploy/qwen3.8-27b/modal_qwen3_8_rtx6000_ninfer.py:97-100, 993-1003`), and
+its own deploy doc says the consequence out loud: "progressive write buffers, stall
+detectors, and live progress consumers all stop working for the duration of the generation"
+(`services/modal/deploy/qwen3.8-27b/modal_qwen3_8_l40s_ninfer.py:984-993`). SSE keep-alive
+comments are no help either: the OpenAI SDK's decoder discards any `:`-prefixed line
+(`node_modules/openai/src/core/streaming.ts:321-324`) and the relay re-emits only `data:`
+lines (`runtime/endpoint/provider/private/chat-completion/private-chat-completion.ts:162-164`).
+A 60 s silent request and a dead stream produced the SAME pixels — and one user aborted on
+that ambiguity (`docs/tasks/2026-11-19-tool-call-composition-visibility.md`, Finding 1).
+
+The answer is ONE new informational event kind and ONE new display field, not a new timeout:
+
+- **Source.** After each `delta.tool_calls[]` merge the reader yields
+  `{ type: 'progress', phase: 'tool-composition', toolCallSlots, argumentChars }` — the first
+  fragment of an attempt emits IMMEDIATELY, later ones at most once per
+  `TOOL_CALL_PROGRESS_INTERVAL_MS = 500` (`src/transport/openai.ts:1091, 1983-1989`), on
+  `performance.now()`, and **no timer is armed** for it (the transport's only `setTimeout`
+  arms are the provider idle bounds, `:744-790`, and those `unref()`).
+- **It changes nothing about the turn.** `agent()` forwards it as an event and accumulates
+  nothing (`src/core/agent.ts:1174-1199`); attempt scoping is free because a retry re-creates
+  the transport iterator and the throttle clock lives in that generator's closure.
+  `harness()` publishes it through the one `emit` gate, so it carries `thread` — a delegated
+  child's composition lands on the CHILD's section, not the parent's
+  (`src/harness.ts:13452-13478`). A frame after `completed` is dropped like a late text delta.
+- **Contract.** `progress` joined the CLOSED event-kind list
+  (`src/shared/harness-stream.ts:130-146`) and the generated swagger / API types
+  (`src/server/harness.swagger.yaml:9241, 9257, 9687-9709`;
+  `src/shared/harness-api.ts:3956, 4057-4068`) — all three are generator output
+  (`scripts/generate-harness-contract.ts`), never hand-edited.
+- **Counters, never text.** `toolCallSlots` is `pending.size` — a slot exists exactly when the
+  provider opened a call, because `slotForFragment` mints slots and never removes them
+  (`src/transport/openai.ts:979-1005`) — and `argumentChars` is the summed length
+  (`src/transport/openai.ts:1099-1107`). Argument text is deliberately excluded: it is
+  kilobytes per block, model-private, and every harness event is journalled VERBATIM
+  (`src/server/sessions.ts:1372`), so carrying it would multiply the turn record by the
+  throttle rate (`src/types/index.ts:470-476`).
+- **Journal.** A `progress` line is journalled on purpose — after an abort or a restart it is
+  the evidence that the turn was ALIVE — at ≤ ~2 lines per second per composing turn. It
+  consumes a journal position, so node / context-block / step ids derived from that position
+  move for everything that follows (`src/server/journal.ts:118, 143`), exactly as a journaled
+  `wakeup` already moves them; the parity pin states both halves instead of hiding one
+  (`src/server/journal-progress.test.ts:166, 192`).
+- **Display plane.** ONE attempt-scoped field, `TurnSection.toolProgress`
+  (`src/shared/turn-display.ts:1154`, patch copy `:1181`), painted by `paintToolProgress`
+  (`src/server/turn-projector.ts:1926-1945`, dispatched at `:3393-3400`). It **mints no node,
+  no step and no context block**, takes no tail, opens no prose window, costs ZERO ops when the
+  counters did not move, and clears to `phase: 'idle'` at `done` / `retry` / `attempt_commit` /
+  `error` (`:3245, 3363, 3378, 3439` with `IDLE_TOOL_PROGRESS`). A CLEAR of an ABSENT field
+  emits nothing, so a pre-T2 record, or a relay that sent nothing, keeps a byte-identical
+  display (`:1931-1934`). **`absent` is not `idle`**: absent means "this producer never
+  reported composition" and must never be rendered as an elapsed figure.
+- **Frontend.** The ops fold applies the field as a whole-value replace
+  (`src/frontend/view-state.ts:424-429`). The tile renders the composition clause
+  `composing N tool call(s) · <chars> chars` (`src/frontend/ui/turns.ts:891-893`, full claim on
+  `title` at `:898-904`) and the silence grade beside it — `still generating · quiet for …`,
+  extended with "— the run is still working" on the 30 s grade
+  (`src/frontend/ui/turns.ts:4829-4830`, title at `:4855-4857`). The
+  thresholds there (`QUIET_AFTER_MS = 5 000`, `SILENT_AFTER_MS = 30 000`,
+  `src/frontend/ui/time.ts:52-53`) are **presentation thresholds, not timeouts** — crossing
+  them changes only what the UI is allowed to SAY about a run that is still running, in a
+  package where no external clock ends a run. The per-agent ring grades use the same
+  vocabulary, and they are WIRED, not a capability waiting for a pass: the stamps come from
+  every ops frame (`src/frontend/main.ts:14593-14600`), the graded paint runs from the document
+  and patch paths (`:6845-6849` does the paint, `:6855` arms the clock; call sites `:7455,
+  13988, 14437, 14601`), and while any agent is active a 1 000 ms clock re-grades those stamps
+  (`ACTIVITY_GRADE_TICK_MS` `:6732`, `tickActivityClock` `:6761-6779`, `window.setInterval`
+  `:6789`). The grading itself is `gradeActivityFromStamps`
+  (`src/frontend/ui/activity.ts`, exported symbol `gradeActivityFromStamps` — cited BY SYMBOL
+  because that file's line numbers move every pass), and that file's own header comment states the same
+  wired fact (`:31-42`).
+- **What it must never imply.** A SLOT is a call the provider has OPENED, not one that
+  launched, was queued or is running — partial arguments are never executed — so "composing"
+  is the only honest verb this signal supports. Nothing may end, time out or reorder a run
+  because of a `progress` frame (`src/types/index.ts:4185-4192`).
+
+**Timeout interaction, stated once:** the two recorded spans (27.683 s and 62.232 s of zero
+frames) sit **inside** every shipped bound — head 300 000 ms, first token 300 000 ms,
+between-reads 120 000 ms (`src/transport/provider-timeouts.ts:150-152`) — so no timeout could
+have ended either turn, and no default was retuned to ship this. The first genuine danger
+zone is a tool block past **120 s of silence**: the coded `provider-timeout` fires, which
+takes the 4-attempt ladder (1 + 3, 2 s/4 s/8 s capped at 30 s, under a 900 000 ms
+ladder-wide deadline — `src/core/agent.ts:1361-1385, 1402-1424`, `src/core/agent-limits.ts:179-207, 209-221`) and
+re-sends the SAME request from token 1 with the generated arguments discarded. A stream that
+trickles within the bounds is bounded by NOTHING on a total clock (pinned at
+`src/transport/openai.tool-call-liveness.test.ts:653` ("lets a default-configured stream TRICKLE past
+3 600 000 ms without any bound firing"); `MODEL_TIMEOUT_MAX_MS` = 3 600 000
+is not a request clock (`src/core/agent-limits.ts:74-81`). See issues 0037 and 0038.
+
+Tests: `src/transport/openai.tool-call-liveness.test.ts` (the four accumulation fixes, the
+62 s/120 s bound pair), `src/transport/openai.tool-call-progress.test.ts` (phase entry, the
+throttle, payload discipline, the one-frame relay shape), `src/harness.progress.test.ts`
+(ordering, attempt boundaries, a reader that ignores it),
+`src/server/turn-projector-progress.test.ts` (no node/step/block, coalescing, the four
+clears, live-vs-reload parity), `src/server/journal-progress.test.ts` (verbatim round trip,
+order, projection parity apart from the field).
+
+---
+
 
 ## harness
 
@@ -5158,7 +5285,8 @@ await writer('tell me about new year');
       than "the network died": a gateway mid-stream frame whose code is `decode`, `unknown`,
       absent, or `upstream_status` carrying a status that is NOT a refusal — which is exactly
       408 / 429 / any 5xx, 504 included, because `isTerminalProviderStatus` names only
-      400/401/403/404 (`src/transport/provider-timeouts.ts:418-419`) — plus any body that closed
+      400/401/403/404 (`isTerminalProviderStatus` `src/transport/provider-timeouts.ts:510`, rationale
+      `:590-597`) — plus any body that closed
       without reporting a completion (`src/transport/openai.ts`, the truncation guard). Each of
       those is CODELESS **with** the transit diagnosis, so each is a `provider-network` death,
       raises the streak, and can therefore consume the WHOLE resume ceiling on an endpoint that is
@@ -5735,10 +5863,82 @@ const stream = openAICompatible(
 - `reasoning` on an assistant message is **dropped** from the payload: local
   replay data, and several providers reject unknown message fields.
 - Tool declarations default `parameters` to `{ type: 'object', properties: {} }`.
-- Accumulates streamed tool-call fragments by `index` and reports complete calls
-  on the terminal frame, ordered by index. Partial arguments are never executed.
+- Accumulates streamed tool-call fragments and reports complete calls on the terminal
+  frame, ordered by slot. Partial arguments are never executed. CORRECTED IN PLACE
+  2026-11-19: this line used to say only "by `index`", which was one quarter of the rule —
+  four parallel calls arriving WITHOUT an `index` all fall into slot 0 and become one
+  unresolvable call. CORRECTED AGAIN the same day (independent review): that sentence then
+  called the shape "the cause of a real merge", and that claim is NOT evidenced — no capture
+  in this workspace shows an index-less parallel block. The merge is a **test-demonstrated
+  behaviour of the old code**: `name: 'alphabeta'` over `'{}{}'` is the LIVENESS-FIXTURE value
+  asserted by `src/transport/openai.tool-call-liveness.test.ts:588` ("opens its own slot for
+  an id-less-index provider reporting a SECOND id"), i.e. what the `index ?? 0` rule PRODUCES
+  for that stream, not a string a live relay was ever observed to produce. The rule below is
+  therefore stated as code behaviour pinned by tests, and nothing here should be read as a
+  witnessed relay defect. The de-multiplexing rule is now ONE function, `slotForFragment`
+  (`src/transport/openai.ts:979-1004`): a numeric `index` is authoritative → else an `id`
+  this stream already uses → else an unseen `id` OPENS a slot one past the highest in use
+  (flush order stays equal to the order the provider introduced them in) → else the slot
+  last known to be streaming, which is `0` exactly when the provider never sent an index
+  (the shape the old `?? 0` was written for). Pinned both directions by
+  `src/transport/openai.tool-call-liveness.test.ts:265, 528, 561, 588`.
+- A non-empty `function.name` fragment is APPENDED, and the ONLY drop is a fragment that is
+  byte-identical to the name the slot already holds — an ECHO of the whole name, never a piece
+  of it (`nameIsEcho`, `src/transport/openai.ts:1067-1072`, rationale comment `:1019-1066`).
+  CORRECTED IN PLACE: the reader used to concatenate unconditionally, so a relay that REPEATS
+  the full name on every delta of the block turned `delegate` into `delegatedelegate`; that
+  name resolves to no tool and ONE unresolvable call fails the WHOLE multi-call block.
+  CORRECTED AGAIN THE SAME DAY (review F2): the first version of the guard ALSO dropped every
+  name once the slot had taken an argument byte — "a name fragment is appended only while that
+  slot has taken no argument bytes, or is still unnamed" — and that clause was strictly broader
+  than the echo: it regressed a shape the OpenAI schema permits, a name piece arriving AFTER the
+  first argument byte (`name:'deleg'` → `arguments:'{"a":1}'` → `name:'ate'` flushed `deleg`,
+  where concatenation gives `delegate` — the byte-exact value of `deleg` + `ate`). Pinned in
+  every direction: pieces before any argument
+  still concatenate, an echoed full name is ignored, a late name on an unnamed slot is taken,
+  and an interleaved piece concatenates
+  (`src/transport/openai.tool-call-liveness.test.ts:304, 333, 371, 400`). RESIDUAL RISK, stated
+  rather than hidden: a relay that re-sends a NAME PREFIX (`delegate`, later `deleg`) is not an
+  echo by this test and becomes `delegatedeleg`; HEAD's unconditional append produced the same
+  value from the same stream, so nothing that worked before breaks, and any rule strong enough
+  to catch it must guess whether a repeated prefix is a prefix or the next piece of a longer
+  legitimate name. Pinned as a fact on disk at
+  `src/harness.tool-composition-review.test.ts` ("RESIDUAL RISK: a relay that re-sends a PREFIX
+  of the name is not an echo"). DEFENSIVE, NOT OBSERVED: no capture in this workspace shows a
+  name-echoing relay (`Temp/d1/session/events.jsonl` carries clean `call_*` ids and predates the
+  change), and the stalled session emitted no tool-call frame at all, so it can neither confirm
+  nor refute the shape.
+- A tool call the provider left anonymous gets a MINTED id — `harness-call-<slot>`, with a
+  collision bump so it can never duplicate an id the provider really sent
+  (`SYNTHETIC_TOOL_CALL_ID_PREFIX` `src/transport/openai.ts:1093`, minted in
+  `finishToolCalls` `:1129-1155`). It is not cosmetic: replay pairs a `tool` result with
+  its call BY id (`tool_call_id`, `src/transport/openai.ts:452`), so the old `id: ''`
+  made several parallel calls unpairable, and the same string lands on BOTH sides of the
+  pair because both are built from this one object (`src/core/agent.ts:1505` commits
+  `outcome.toolCalls` verbatim; `src/harness.ts:9798` stamps `toolCallId: call.id`).
+  Pinned at `:791, 810, 873` of the liveness test ("mints a distinct id per anonymous
+call", "replays the SAME minted id on both sides of the pair", "never mints an id that duplicates
+one the provider really sent"). Also defensive:
+  no observed relay omitted the id.
 - A provider that reports tool calls without `finish_reason` is treated as a
   tool turn (`stopReason: 'tool_calls'`).
+- A body that closes WITHOUT the `[DONE]` sentinel and without a `finish_reason` is a
+  truncated generation and FAILS the request (the `provider-transit` error below) — UNLESS
+  every accumulated slot's arguments parse to a plain JSON OBJECT, which is a COMPLETE tool
+  round and is flushed as `done` / `stopReason: 'tool_calls'` (`completeToolRound`
+  `src/transport/openai.ts:2083`, gated on the same `isPlainJsonObject` the outbound wire
+  uses, `:317-333`). CORRECTED IN PLACE 2026-11-19: the reader used to DISCARD a fully
+  generated block in that case — the engine family at the end of this workspace's relay leg
+  withholds the whole tool region and flushes one final frame
+  (`services/modal/deploy/qwen3.8-27b/modal_qwen3_8_rtx6000_ninfer.py:97-100, 993-1003`), so
+  "no `[DONE]`" and "fully generated" are compatible facts — and the discarded error was
+  CODELESS, which walks the generic 11-attempt ladder: up to TEN full re-generations of the
+  same ~60 s block, the loop the user watched. A half-written `arguments` string still fails
+  the guard (`:432, 457` of the liveness test), and a no-argument call streamed as
+  `arguments: ''` keeps its old retry because `''` is not a JSON object — the transport
+  cannot tell "no arguments" from "cut before the first byte", conservative on purpose.
+  **The disclosed trade-off:** a socket cut *between two complete calls* now launches the
+  partial set instead of retrying the block.
 - Does **not** send `stream_options` BY DEFAULT — several gateways reject unknown
   request fields. Usage is parsed when a provider volunteers it. A host that needs
   the opt-in asks for it per agent:
@@ -5749,9 +5949,14 @@ const stream = openAICompatible(
   Flushes a final frame that arrived without a newline.
 - Failures become `error` events: non-2xx (`HTTP <status>: <body>`), a
   `chunk.error` on a 200 stream, a malformed frame, a TRUNCATED stream (a body that
-  closes without `[DONE]` and without a `finish_reason`), or a connection failure.
+  closes without `[DONE]` and without a `finish_reason`) **unless that body was a complete
+  tool round — see the `completeToolRound` bullet above**, or a connection failure.
   The agent retries whatever its class allows (see "agent" — R1 and the three
   ladders); the transport itself never retries, so there is exactly one retry owner.
+  A `progress` frame never follows the terminal frame: the emission site sits inside the
+  data-frame loop, so `done`, `error` and every early `return` are unreachable behind it
+  (`src/transport/openai.ts:1959-1990`, pinned at
+  `src/transport/openai.tool-call-progress.test.ts:185, 293`).
 - **A gateway error frame is read STRUCTURALLY (2026-11-17).** A proxy in front of
   another provider does not fail the HTTP request when ITS upstream dies: it answers
   200, streams a while, and attaches `{"error":{"code":…,"status":…,"errno":…}}` to
@@ -5843,6 +6048,7 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 | { type: 'usage';         agent: string; usage: HarnessUsage }
 | { type: 'done';           agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
 | { type: 'wakeup';         agent: string; reason: 'pending-tools'; pending: HarnessPendingTool[] }
+| { type: 'progress';       agent: string; phase: HarnessProgressPhase; toolCallSlots: number; argumentChars: number }
 | { type: 'retry';          agent: string; attempt: number; maxAttempts: number; delayMs: number; error: HarnessErrorInfo; provider?: HarnessProviderAttemptDiagnostics }
 | { type: 'attempt_commit'; agent: string; attempt: number; maxAttempts: number }
 | { type: 'action_request'; agent: string; callId: string; request: HarnessActionRequest }
@@ -5958,6 +6164,45 @@ pre-concurrency rendering when they are absent (old persisted turns):
 - `wakeup` is a RESUME. It resolves no tool and ends nothing; it says background
   work progressed and the agent continued. Its `pending` list is required: a wake
   without one is malformed and produces no update.
+- `progress` (ADDED 2026-11-19) is the TOOL-COMPOSITION heartbeat:
+  `{ phase, toolCallSlots, argumentChars }` with
+  `HarnessProgressPhase = 'tool-composition' | 'idle'` (`src/types/index.ts:468, 477`).
+  It is **PROJECTION-ONLY**: it never becomes a transcript entry, never joins a commit
+  decision, and **no consumer may act on it** — the calls still arrive only on the terminal
+  frame and partial arguments are still never executed (`src/types/index.ts:487-494`,
+  `src/core/agent.ts:1174-1199`). It carries **counters and never argument text** (the text
+  is kilobytes per block, it is model-private, and every event is journalled verbatim —
+  `src/types/index.ts:470-476`). `'idle'` is spelled only by the DISPLAY plane when an
+  attempt boundary clears a stale line; a transport never emits it, because its own
+  `done`/`error` frame IS the settle (`src/types/index.ts:462-467`). It IS journalled, in
+  recorded order, and it consumes a journal POSITION — so the ordinals of every later event,
+  and the node / context-block / step ids derived from that position, shift relative to a
+  turn that never composed a tool call, exactly as they already shift for a journaled
+  `wakeup` (`src/server/journal.ts:118, 143`; pinned honestly at
+  `src/server/journal-progress.test.ts:192` — the two projections agree once the
+  position-derived keys are set aside and do NOT agree with their real ids). Emission is
+  gated at the source by **"is a slot open"**: the first sample of an attempt that has
+  `toolCallSlots > 0` emits IMMEDIATELY, later ones at most once per
+  `TOOL_CALL_PROGRESS_INTERVAL_MS = 500` (`src/transport/openai.ts:1109, 1853, 2002-2019`),
+  monotonic clock, **no new timer**; a relay that flushes the whole tool region in one frame
+  costs exactly one line, and an empty `tool_calls: []` delta costs NOTHING — it emits no
+  frame and does not consume that first emission, so the fragment that really does open a
+  slot still reports at once. CORRECTED IN PLACE 2026-11-19 (review F3, then P2): this
+  sentence read "once at phase entry, then at most one per 500 ms", which is stale on both
+  halves — phase entry alone no longer buys a frame (only an OPEN SLOT does, and an empty
+  delta may not spend it), and the same `slots >= 1` bound was extended to the DISPLAY side
+  so the projector refuses the frame the transport refuses
+  (`src/server/turn-projector.ts:381-391` `toolProgressOf`); before that, a custom transport
+  or a pre-F3 journal could paint the self-contradictory `composing 0 tool calls · 0 chars`
+  while the CLI validator (`src/server/cli/render.ts:103`) rejected the identical frame. The
+  clear is exempt: `IDLE_TOOL_PROGRESS` also carries zero slots and still clears
+  (`src/server/turn-projector.ts:404`). Pins:
+  `src/transport/openai.tool-call-progress.test.ts:307`,
+  `src/server/turn-projector-progress.test.ts`. A reader that does
+  not know the kind skips it and sees the run it saw before (`src/harness.progress.test.ts:103`).
+  CORRECTED IN PLACE 2026-11-19: the transport's own event vocabulary used to be FOUR kinds
+  — `text | reasoning | done | error` — and is now FIVE, `progress` added
+  (`src/types/index.ts:495-522`); this section's union omitted the variant entirely.
 - `retry` (R1) says the agent abandoned ONE failed model request and re-sent the
   same one after `delayMs`. Text/reasoning/tool calls streamed since the previous
   boundary (`start`/`retry`/`attempt_commit`/`done`) belong to the FAILED attempt: a
@@ -5969,7 +6214,16 @@ pre-concurrency rendering when they are absent (old persisted turns):
   emit NO `retry` frame at all, because it was terminal). `delayMs` is the capped,
   jitter-free wait the ladder publishes (see "agent" — Retries), and `provider`
   carries the redacted endpoint, effective port and failure class of THAT attempt
-  when the transport classified it.
+  when the transport classified it. **What a `retry` of class `provider-timeout` costs a tool
+  round (2026-11-19):** the re-send is the SAME request from token 1, so every argument byte the
+  model had already generated in the abandoned attempt is DISCARDED and the block is
+  re-generated — a 4-attempt ladder on a 60 s block is up to 4 minutes of the same work, under a
+  900 000 ms ladder-wide deadline (`src/core/agent-limits.ts:192-202, 221`). `progress` frames
+  streamed since the last attempt boundary are discarded with it, by construction: the retry
+  re-creates the transport iterator and the throttle clock lives in that closure
+  (`src/core/agent.ts:1174-1199`). Nothing in that sequence is a TOTAL clock — one attempt that
+  keeps producing bytes within the idle bounds is unbounded
+  (`src/transport/openai.tool-call-liveness.test.ts:653`, "lets a default-configured stream TRICKLE past 3 600 000 ms without any bound firing"; issue 0038).
 - A terminal `error` frame carries the SAME machine-readable half since 2026-11-17:
   `error.code` plus `error.provider` (the diagnosis of the attempt that ended the run),
   emitted through the same `providerDiagnosticsOf` reader, so a failure that was
@@ -6634,7 +6888,7 @@ as their own entries.
     will otherwise narrow it back:** the transport's codeless `provider-transit` diagnosis is what
     the classifier trusts, and it covers a gateway frame the producer routes as `upstream_status`
     with a NON-refusal status (408 / 429 / any 5xx — `isTerminalProviderStatus` refuses to call an
-    upstream's own 504 our request's fault, `src/transport/provider-timeouts.ts:418-419`), a
+    upstream's own 504 our request's fault, `src/transport/provider-timeouts.ts:510, 590-597`), a
     `decode`/`unknown`/absent code, and a body that closed without reporting a completion. Each of
     those is a network death that raises this streak, so a merely truncated or merely
     upstream-throttled endpoint can consume the FULL ceiling before the conversation rests — an

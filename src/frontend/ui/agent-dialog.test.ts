@@ -1500,6 +1500,17 @@ describe('a custom agent in a session (R7)', () => {
                 'aria-label'
             )
         ).toBe('Configure note-taker · rank not stated');
+        // T4/R4: a member with NO stated rank gets NO corner pill at all — a placeholder
+        // glyph would read as a rank. Nothing is LOST: the accessible name above still says
+        // `rank not stated`, the machine hook stays absent (R3), and the detail panel's rank
+        // heading/footnote state the fact in words. A ranked member's pill is pinned in
+        // main.test.ts (`'A'`).
+        expect(
+            document.querySelector('.agent-dialog-tab[data-agent="note-taker"] .agent-dialog-agent-rank')
+        ).toBeNull();
+        expect(
+            document.querySelector<HTMLElement>('.agent-dialog-tab[data-agent="note-taker"]')?.dataset.rank
+        ).toBeUndefined();
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · note-taker');
         expect(instructionBox().value).toBe('');
         expect(instructionBox().disabled).toBe(false);

@@ -3691,6 +3691,26 @@ export interface ContextBlock {
 export type DisplayTail = DisplayTailModel;
 
 /**
+ * (T2) The ATTEMPT-SCOPED tool-composition line a section carries while the model is writing a tool block - the
+ * field that makes a silent turn visibly alive instead of hung. It is projection state ONLY: it mints no node,
+ * no step and no context segment, and it changes nothing about the section's recorded order. WHY A FIELD AND
+ * NOT ONE NOTICE PER EVENT: the transport throttles to one frame per 500 ms, so a minute of composition is up
+ * to ~120 frames; a field coalesces them into one cheap `section:set` patch, and the projector SKIPS the patch
+ * when the value has not changed, so a turn that never composes a tool call costs ZERO extra ops. Absent means
+ * "this producer never reported composition" (a pre-T2 record, or a relay that buffered the whole tool region
+ * and delivered nothing) - which is NOT the same as `idle`, the projector's own spelling for "there was a line
+ * and it is now cleared".
+ * Closed object: the server sends no property outside this set (additionalProperties: false).
+ */
+export interface TurnToolProgress {
+    phase: HarnessProgressPhase;
+    /** Tool-call slots open in THIS attempt (how many parallel calls are being composed). */
+    toolCallSlots: number;
+    /** Tool-call argument characters accumulated across those slots. A count, never the text. */
+    argumentChars: number;
+}
+
+/**
  * One agent flow: the turn's root invocation, or one nested invocation or branch. Nesting is resolved by the
  * SERVER from the recorded invocation identity, so a renderer never infers a parent.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
@@ -3739,6 +3759,12 @@ export interface TurnSection {
     tail?: DisplayTail;
     /** Background calls still running for this invocation. */
     pending?: HarnessPendingTool[];
+    /**
+     * (T2) Attempt-scoped tool-composition line; ABSENT means this producer never reported composition, which
+     * is not the same as the projector's `idle` clear. Written only by a `section:set` patch, and only when the
+     * value actually changed.
+     */
+    toolProgress?: TurnToolProgress;
 }
 
 /**
@@ -3921,6 +3947,17 @@ export interface TurnStepDetailResponse {
 export type HarnessErrorInfo = HarnessErrorInfoModel;
 
 /**
+ * (T2) The one tool-composition vocabulary, shared verbatim by the transport event, the recorded harness event,
+ * and the display field, so no plane can drift on spelling. `tool-composition` = the model is composing
+ * tool-call arguments RIGHT NOW. `idle` = nothing is in flight; only the display projection writes it (an
+ * attempt boundary or a terminal frame clears a stale line), because a transport's own `done`/`error` frame IS
+ * the settle.
+ */
+export type HarnessProgressPhase = 
+    | "tool-composition"
+    | "idle";
+
+/**
  * Verbatim alias of the in-repo model `HarnessUsage` from ../types; shape equivalence is probed in
  * src/shared/harness-api.test.ts.
  * Not a duplicate: the model stays the single definition of this shape.
@@ -4016,6 +4053,22 @@ export interface HarnessEvent {
     durationMs?: number;
     /** `done` only, and present when the run is NOT terminal because background calls are still live. */
     pending?: HarnessPendingTool[];
+    /**
+     * `progress` only. `tool-composition` = the model is composing tool-call arguments right now; `idle` is a
+     * display-plane spelling only (the projector clears a stale line with it) and is never emitted by a
+     * transport, whose own terminal frame IS the settle.
+     */
+    phase?: HarnessProgressPhase;
+    /**
+     * `progress` only: how many tool-call SLOTS the provider has opened in THIS attempt so far, i.e. how many
+     * parallel calls are being composed. Attempt-scoped: a retry restarts at zero.
+     */
+    toolCallSlots?: number;
+    /**
+     * `progress` only: total tool-call argument characters accumulated across those slots in THIS attempt. A
+     * character count, never the text.
+     */
+    argumentChars?: number;
     /** `usage` only: this request's accounting, already summed into the turn tally. */
     usage?: HarnessUsage;
     /** `error`, `retry`, and a failed `done`: the serialised failure. */

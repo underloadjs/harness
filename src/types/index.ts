@@ -444,12 +444,58 @@ export type HarnessStreamTool = {
     parameters?: Record<string, unknown>;
 };
 
+// ---------------------------------------------------------------------------
+// Tool-call composition progress (T2, the stalled-delegation visibility fix)
+// ---------------------------------------------------------------------------
+//
+// THE PROBLEM THIS EXISTS FOR: a live session streamed its last `text` delta and
+// then produced ZERO frames for 62 s while the model composed a four-call
+// `delegate` block, after which the user aborted. Nothing in the stack could tell
+// "the model is writing tool arguments" from "the request is dead", because
+// tool-call fragments are merged into an accumulator with no yield
+// (./transport/openai.ts) and `tool_call` events exist only AFTER the terminal
+// frame. The relay leg in front of this workspace makes it worse: it withholds the
+// WHOLE tool region and flushes one final SSE frame, so the harness may receive no
+// data frames at all mid-block — which is why this signal is driven by what the
+// harness actually sees and may legitimately be absent.
+//
+// ONE VOCABULARY FOR EVERY PLANE (stream, agent, harness event, display field):
+//   'tool-composition' — the model is composing tool-call arguments RIGHT NOW.
+//   'idle'             — nothing is in flight. The transport never emits it (its
+//                        `done`/`error` frame IS the settle); only the display
+//                        projection writes it, when an attempt boundary or a
+//                        terminal frame clears a stale live line.
+export type HarnessProgressPhase = 'tool-composition' | 'idle';
+
+// One progress sample. DELIBERATELY AGGREGATE: slots opened and total argument
+// characters, never the argument TEXT. The text is up to several kilobytes per
+// block, it is model-private content the operator does not need to see a
+// heartbeat of, and every harness event is journalled verbatim (server/sessions.ts
+// `copyEvent`), so carrying it would multiply the turn record by the throttle rate.
+// Counters answer the only question the outage raised — "is it alive, and how far
+// along?" — in a fixed number of bytes.
+export type HarnessToolCallProgress = {
+    phase: HarnessProgressPhase;
+    // Tool-call SLOTS the provider has opened in this attempt, i.e. distinct
+    // `delta.tool_calls[].index` values seen so far. This is "N parallel calls are
+    // being composed", the exact shape of the delegation case.
+    toolCallSlots: number;
+    // Total argument characters accumulated across those slots.
+    argumentChars: number;
+};
+
 // Low-level events yielded by a transport. Tool calls arrive on the terminal
 // frame rather than as deltas: the harness only acts once the model has stopped
 // generating, and partial arguments are not executable.
+//
+// `progress` does NOT change that rule — it is a projection-only, INFORMATIONAL
+// signal about the SAME accumulation, throttled by the transport, and no consumer
+// may act on it. It never becomes a message and never affects commit semantics
+// (./core/agent.ts, ./harness.ts).
 export type HarnessStreamEvent =
     | { type: 'text'; delta: string }
     | { type: 'reasoning'; delta: string }
+    | ({ type: 'progress' } & HarnessToolCallProgress)
     | {
           type: 'done';
           stopReason: HarnessStopReason;
@@ -796,6 +842,13 @@ export type AgentStreamOptions = {
 export type AgentStreamEvent =
     | { type: 'text'; delta: string }
     | { type: 'reasoning'; delta: string }
+    // (T2) The transport's tool-call composition heartbeat, forwarded verbatim and
+    // ATTEMPT-SCOPED: `progress` is never accumulated into `content`/`reasoning` and
+    // is never part of a commit, so when the agent discards a failed attempt there is
+    // nothing to roll back — the next attempt re-creates the transport accumulator
+    // and the counters restart on their own. A consumer that does not know this
+    // variant ignores it.
+    | ({ type: 'progress' } & HarnessToolCallProgress)
     | {
           type: 'retry';
           // The attempt that just failed (1-based).
@@ -4121,6 +4174,22 @@ export type HarnessEvent =
           pending: HarnessPendingTool[];
           thread?: HarnessThread;
       }
+    // (T2) Tool-call composition heartbeat — the SAME precedent as `wakeup` above:
+    // a PROGRESS event, never a transcript entry. It exists because a model
+    // composing a large parallel tool block (the four-call `delegate` that read as
+    // a 62 s hang) emits NO text frames and no `tool_call` until the round
+    // completes, and a relay that buffers the whole tool region can withhold even
+    // the fragments. Counters only — slots opened and accumulated argument
+    // characters, NEVER argument text — so one frame costs a fixed number of bytes
+    // in the journal.
+    //
+    // CONTRACT FOR READERS: informational only. Nothing may end, time out or
+    // reorder a run because of it (no external clock ends a run), it must never
+    // become a message, and a consumer that does not know the `type` skips it
+    // without touching anything else. It is journalled in recorded order, so it
+    // sits BETWEEN the `text` deltas of its attempt and BEFORE the `tool_call`
+    // frames the terminal round produces.
+    | ({ type: 'progress'; agent: string; thread?: HarnessThread } & HarnessToolCallProgress)
     // N3: the model asked its owner a bounded question. `callId` is the
     // actionRequest tool call; `request` is already parsed and bounds-checked.
     | {

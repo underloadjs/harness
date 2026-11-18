@@ -1515,7 +1515,7 @@ export type RecordStoreWindow = {
 // WHY IT IS READ OFF THE RETAINED EVENTS AND NEVER DERIVED FROM `storeRev`
 // -----------------------------------------------------------------------
 // `storeRev` steps once per RECORDED event, and a no-op patch or a lease-style write
-// records nothing (knowledge.md:1085-1086), so `storeRev - RECORD_MAX_CHANGES` is not
+// records nothing (knowledge.md:1899), so `storeRev - RECORD_MAX_CHANGES` is not
 // the floor. An EMPTY window means nothing at or below `storeRev` survives — a trimmed
 // window, or the epoch floor a re-`define` inherits (`freshState(definition, storeRev)`
 // below) — so the floor is then `storeRev + 1`: the reader is current only at
@@ -3910,7 +3910,7 @@ export const createRecordEngine = (): RecordEngine => {
 
         // The summary/body split is the ONE part of the action-wrapper contract a generic
         // engine cannot guess: `chapters` `get` returns `{ chapter, content, counts }`
-        // (knowledge.md:971, and the tool's own description in its entry), i.e. every
+        // (knowledge.md:2243, and the tool's own description in its entry), i.e. every
         // `getOnly` field rides BESIDE the singular key, never inside it. So the body
         // leaves the entry here — the engine's full read stays untouched for `records`.
         const bodyFields = definition.fields.filter((field) => field.getOnly === true);

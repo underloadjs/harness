@@ -415,9 +415,19 @@ describe('worker mode: one conversation across re-spawns (T10 M1/M3/M4)', () => 
 
         // The frame sequence that carries identity, in recorded order (the deltas in between are the
         // scripted provider's pacing, which this assertion deliberately does not pin).
+        //
+        // (T2) `progress` joins this list, and its presence here is the point of the
+        // assertion rather than an annoyance: the heartbeat is published through the ONE
+        // `emit` gate (../harness.ts:9604), which stamps `thread` exactly like every other
+        // frame, so a delegated lane's tool composition carries the SAME invocation identity
+        // as its text and its calls — the `named.length === frames.length` pin above is what
+        // proves it, and it holds only because no frame in a lane run is identity-less. It is
+        // recorded between the text deltas and the `tool_call` because that is when the model
+        // was composing the call.
         expect([...new Set(named.map((frame) => frame.type))]).toEqual([
             'start',
             'text',
+            'progress',
             'tool_call',
             'attempt_commit',
             'tool_result',

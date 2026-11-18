@@ -2323,7 +2323,7 @@ describe('records engine — chapters: declared facets, sort and projection (F9)
         const got = await run(engine, 'chapters', { action: 'get', id: '2' });
 
         // The documented wrapper shape for `get` is `{ chapter, content, counts }`
-        // (knowledge.md:971 and the tool's own description): the body is a SIBLING of the
+        // (knowledge.md:2243 and the tool's own description): the body is a SIBLING of the
         // summary, and the summary carries no body. Key order is the canonical field order
         // minus `content`.
         const chapter = got.chapter as RecordEntry;
@@ -3093,7 +3093,7 @@ describe('records engine — a batch names every id it touched, whatever the cou
 describe('records engine — the change feed names its floor (0011)', () => {
     // 100 adds + 2 real patches per record = 300 events in one collection. A patch counts
     // only when a field actually changes, so the two passes flip `completed` rather than
-    // repeating themselves (knowledge.md:1085-1086 — a no-op records nothing).
+    // repeating themselves (knowledge.md:1899 — a no-op records nothing).
     const fillThreeHundredEvents = async (engine: ReturnType<typeof createRecordEngine>) => {
         await tasks(engine, { tasks: Array.from({ length: 100 }, (_, index) => ({ text: `t${index + 1}` })) });
 

@@ -163,11 +163,13 @@ import type { DisplayPlane, ThreadTranscriptLoader, ViewStreamItem } from './vie
 // `startWatching`). Accessing the singleton here cannot dial anything: `harnessStream()` only
 // creates the client the first time, and the observer above already did.
 import { harnessStream } from './stream';
-// (T9) Provider-target diagnosis: the persistent "which provider does this conversation
-// dial" line, the live provider-retry line, and the classified terminal failure. All three
-// are pure text/decision helpers in ./provider-diagnostics.ts (pinned there); this file
-// only owns the nodes and when they are painted.
-import { providerFailureOf, providerTargetNote, providerTimeoutsNote } from './provider-diagnostics';
+// (T9) Provider diagnosis: the settings-surface provider-timeouts bounds line, and the
+// classified terminal failure. Both are pure text/decision helpers in
+// ./provider-diagnostics.ts (pinned there); this file only owns the nodes and when they
+// are painted. `providerTargetNote` is NOT imported here any more: the persistent header
+// provider-target line it fed was removed as unnecessary, while the helper itself stays
+// exported (it is still pinned in ./provider-diagnostics.test.ts).
+import { providerFailureOf, providerTimeoutsNote } from './provider-diagnostics';
 import type { ProviderTimeouts } from './provider-diagnostics';
 // The lazy payload reads the display plane needs: one turn's tree (the focused
 // subscription's resync recovery), the out-of-band pending figure a cold tree states,
@@ -204,6 +206,9 @@ import {
     displayOf as viewDisplayOf,
     isPendingView,
     panelEntriesOf,
+    // T4 (ring grading): the sections of one turn's tree, which is where a per-agent
+    // JOURNALED stamp lives on the display wire (`startedAt`/`endedAt`).
+    sectionsOf,
     stepIndex,
     summariesOf,
     transcriptTurnIdsOf,
@@ -383,7 +388,16 @@ import {
     referencesOfChips
 } from './ui/references';
 import type { AgentBlockDescriptor, MentionTrigger } from './ui/references';
-import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
+import {
+    applyActivity,
+    activityOfTurns,
+    gradeActivityFromStamps,
+    newestAgentStampsOf,
+    paintActivity,
+    stampActivityFromOps,
+    syncActivityStamps,
+    type ActivityGrade
+} from './ui/activity';
 import { looksLikeJson, prettyJson } from './ui/markdown';
 // The one payload viewer every dialog surface uses (ui/tools.ts). The runner's response
 // box used to hand-roll `highlightCode` into a bare `pre.card-body`, which lost its wrap
@@ -3720,24 +3734,6 @@ const headName = el('span', 'harness-id', '');
 const headNote = el('p', 'harness-note', '');
 headNote.id = 'harness-note';
 
-// (T9/AC1) The persistent provider-target line: `provider localhost:5500 · model basalt`.
-//
-// WHY A SEPARATE NODE: `.harness-note` is owned by every head painter (chat, tools,
-// plugins) and its exact text is pinned by main.test/compact-ui/catalogue, so a session
-// fact must not be appended into it. This is a sibling under the same head, so it sits in
-// the always-visible detail line under the title — next to where the user reads the
-// conversation label — and it is app-wide-visible without opening settings, which is the
-// whole point: "5500 or 6660?" has to be answerable while the run is stuck.
-//
-// It states the EFFECTIVE per-session endpoint (`SessionView.endpoint`, ./view-api.ts:167
-// from `GET /sessions/:id`), not the shipped default. `providerTargetNote` returns
-// undefined when the endpoint is unknown AND no model is known, and then this line is
-// `hidden` — an unknown target prints nothing rather than the built-in default, because a
-// default is exactly the answer that misled the user.
-const providerLine = el('p', 'harness-provider', '');
-providerLine.id = 'harness-provider';
-providerLine.hidden = true;
-
 // T7 (user feedback, phone): "Lower screen … needed to highlight which session is being
 // viewed, but I want a pill next to the instruct button … clicking it will rotate through
 // the session available. There is no need for delete button in this mode."
@@ -3834,48 +3830,6 @@ const paintHeadTitleTrigger = (mode: 'harness' | 'sessions'): void => {
     // The tools head names the catalogue or a tool, so the popup it opens is the session
     // dashboard, never "harness details" for a harness the head is not describing.
     headTitleButton.title = mode === 'sessions' ? 'Show sessions' : 'Show harness details';
-    // (T9/AC1) Same hook, same rule: this function is the ONE place every head painter
-    // passes through (`renderHarnessChrome` with 'harness', the tools/plugins heads with
-    // 'sessions'), so the provider-target line can never be left showing another view's
-    // conversation, and no new painter has to remember it.
-    paintProviderLine(mode);
-};
-
-// Paints the persistent provider-target line (T9/AC1): `provider localhost:5500 · model
-// basalt`, so "which provider is this run dialling?" is answerable without opening
-// settings and without reading a failure message.
-//
-// WHY THE VALUES ARE CHOSEN THIS WAY:
-//   - `endpoint.base_url` is the session's EFFECTIVE value (`GET /sessions/:id` →
-//     ./view-api.ts:167), which is what the stuck sessions actually dial. A row-only
-//     document reports `''` (./view-api.ts:232: a `SessionSummary` row never carries an
-//     endpoint) and a harness with no conversation yet reports nothing at all — in both
-//     cases this browser's COMMITTED `settings.baseURL` is the address its next submit
-//     dials (`createSession` sends exactly that), so it is the honest fallback. The
-//     shipped `DEFAULT_SETTINGS` is deliberately NOT the fallback: after the reader has
-//     re-pointed the app, a default is precisely the wrong answer to print.
-//   - `view.model` is the entry agent's live model; `settings.model` is the value a new
-//     session starts with. Both are facts about what runs, never about what was shipped.
-//   - Absence prints nothing: `providerTargetNote` answers `undefined` when neither side
-//     is known, and the line goes `hidden` rather than showing an empty reserved row
-//     (the same rule `.harness-note` follows two lines below `headNote`).
-const paintProviderLine = (mode: 'harness' | 'sessions'): void => {
-    // Only the chat head describes a conversation; Tools and Plugins own the head with a
-    // catalogue title, where a provider claim would be about the wrong subject.
-    const view = mode === 'harness' && current !== undefined ? renderDocument(current) : undefined;
-
-    const stated = (view?.endpoint?.base_url ?? '').trim();
-    const baseUrl = stated.length > 0 ? stated : settings.baseURL;
-    const statedModel = (view?.model ?? '').trim();
-    const model = statedModel.length > 0 ? statedModel : settings.model;
-
-    const note = providerTargetNote({ baseUrl, model });
-
-    providerLine.textContent = note ?? '';
-    providerLine.hidden = note === undefined;
-    // The visible text is the host:port; the full base URL (path included) is the tooltip,
-    // because a reader who spots the wrong port is about to go fix it in settings.
-    providerLine.title = `Provider base URL: ${baseUrl}`;
 };
 
 // The open harness-details layer, if any. One at a time (a second open would stack a
@@ -4305,7 +4259,7 @@ const harnessTitleTools = el('div', 'harness-title-tools');
 harnessTitleTools.append(toolsToggle, pluginsToggle);
 
 titleRow.append(headTitle, sessionCycle, sessionNew, headName, harnessTitleTools);
-mainHead.append(titleRow, headNote, providerLine);
+mainHead.append(titleRow, headNote);
 
 const agentSlot = el('div', 'agent-slot');
 
@@ -5981,6 +5935,13 @@ type Instance = {
     // Per-instance live activity set for the tile rings. Never a module global:
     // two harness views must not share who is busy.
     activity: Set<string>;
+    // T4 (liveness honesty): the moment a frame for each busy agent reached THIS view,
+    // kept beside `activity` so `paintActivity` can grade a ring ('active' | 'quiet' |
+    // 'silent') instead of always claiming 'active'. Seeded from the journaled stamps of
+    // that agent's own sections when a name arrives with no frames (a reload), refreshed
+    // by every ops frame, and pruned to the active set. Same per-instance rule as the set
+    // above: it is a view's knowledge, never a fact about the run.
+    activityStamps: Map<string, number>;
     // T1 (agent cycle): the agent the composer has SELECTED for the next send, when it
     // is not the team's entry agent. Pending state only — cycling sends nothing (D2) and
     // the choice is committed by the next `run()` (D3). Cleared rather than carried
@@ -6633,6 +6594,7 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
             resumeThreadForSession
         ),
         activity: new Set<string>(),
+        activityStamps: new Map<string, number>(),
         panels: new Map<string, PanelMedia>(),
         panelDetails: new Map<string, PanelMedia>(),
         panelRequests: new Set<string>(),
@@ -6750,21 +6712,155 @@ const paintPluginsToggle = (): void => {
     pluginsToggle.setAttribute('aria-pressed', showingPlugins ? 'true' : 'false');
 };
 
+// --- T4 (liveness honesty): graded rings, and the clock that grades them ------
+//
+// `paintActivity` has taken an optional `grades` map since T3, but nothing could pass one:
+// a quiet grade has to be RE-TAKEN from a clock to show up during the silence it describes,
+// and every ring repaint this app had (a settling row, a document patch, an ops frame) fires
+// exactly when a frame arrives — i.e. never while the stream is silent. That is why
+// `styles.css` `.agent-tile[data-activity='quiet'|'silent']` was inert. These three pieces
+// close it: a per-instance receipt stamp (kept next to `activity`), the grades derived from
+// it, and ONE interval that runs only while somebody is active.
+//
+// WHY 1 s AND WHY IT IS CHEAP: the thresholds are 5 s and 30 s (ui/time.ts), so a finer
+// clock buys nothing; the tick is one `Date.now()`, one small Map and a string compare, and
+// it writes NO DOM unless a grade actually changed (the same value-guard T3 uses for the
+// tile's meta line, and the reason this cannot cost the near-budget live-stream tests
+// anything). The interval is armed by a paint that found an active agent and cleared the
+// moment the set empties — so an idle app holds no timer at all, which is the `unref`-style
+// cheapness the task asked for: nothing to wake the page for when nothing is running.
+const ACTIVITY_GRADE_TICK_MS = 1_000;
+
+let activityClock: number | undefined;
+// The exact state the last paint wrote, so the clock skips every DOM write while the
+// picture is unchanged. Reset on stop so a re-armed clock paints once.
+let paintedRings = '';
+
+// The painted state as one comparable string. Sorted, so a Map/Set iteration order change
+// cannot fake a change; `=` separated, so an agent name containing `,` is still unambiguous
+// enough for a cache key (a roster name is a slug, and this is only a change detector).
+const ringsSignatureOf = (
+    active: ReadonlySet<string>,
+    grades: ReadonlyMap<string, ActivityGrade> | undefined
+): string =>
+    [...active]
+        .sort()
+        .map((name) => `${name}=${grades?.get(name) ?? 'active'}`)
+        .join(',');
+
+const stopActivityClock = (): void => {
+    if (activityClock === undefined) return;
+
+    window.clearInterval(activityClock);
+    activityClock = undefined;
+    paintedRings = '';
+};
+
+// One tick: re-grade from the clock and repaint ONLY if a grade moved. While the page sits
+// in the silence this affordance exists for, this is the only thing that can change it.
+const tickActivityClock = (): void => {
+    const instance = current;
+
+    if (instance === undefined || instance.activity.size === 0) {
+        stopActivityClock();
+        return;
+    }
+
+    const grades = gradeActivityFromStamps(instance.activity, instance.activityStamps, Date.now());
+    const signature = ringsSignatureOf(instance.activity, grades);
+
+    if (signature === paintedRings) return;
+
+    paintedRings = signature;
+    // The dialog's team rows are NOT re-painted here: `agentDialog.paintActivity` takes a
+    // bare set (it has no graded vocabulary yet, and that file is not in this task's
+    // scope), so the clock pushes only the host that understands grades.
+    paintActivity(agentSlot, instance.activity, grades);
+};
+
+const armActivityClock = (active: ReadonlySet<string>): void => {
+    if (active.size === 0) {
+        stopActivityClock();
+        return;
+    }
+
+    if (activityClock !== undefined) return;
+
+    activityClock = window.setInterval(tickActivityClock, ACTIVITY_GRADE_TICK_MS);
+};
+
+// Bring an instance's per-agent stamps in line with the active set it just re-derived.
+//
+//   - a name that stopped being active loses its stamp, so a much later `wakeup` starts
+//     from "just now" instead of inheriting a minutes-old age and reading as silent;
+//   - a name that became active and has never had a frame takes the newest JOURNALED stamp
+//     its own sections carry, or the turn row's `updatedAt` when it is newer — the exact
+//     seed the tile uses for its quiet line, which is what makes a reload of a 60 s-silent
+//     run go quiet immediately instead of sweeping for another 5 s.
+const syncInstanceActivityStamps = (instance: Instance, now: number): void => {
+    const stamps = instance.activityStamps;
+
+    for (const name of [...stamps.keys()]) {
+        if (!instance.activity.has(name)) stamps.delete(name);
+    }
+
+    const pending: string[] = [];
+
+    for (const name of instance.activity) {
+        if (!stamps.has(name)) pending.push(name);
+    }
+
+    if (pending.length === 0) return;
+
+    const journaled = new Map<string, number>();
+    const view = instance.compiled;
+
+    if (view !== undefined) {
+        for (const summary of summariesOf(view)) {
+            for (const [name, at] of newestAgentStampsOf(
+                sectionsOf(viewDisplayOf(view, summary.id)),
+                summary.updatedAt
+            )) {
+                if ((journaled.get(name) ?? 0) < at) journaled.set(name, at);
+            }
+        }
+    }
+
+    for (const name of pending) stamps.set(name, journaled.get(name) ?? now);
+};
+
 // Remove every activity ring. Called on terminal frames, cancel, delete, new
 // session, harness switch and pagehide: after those there is no in-flight agent
 // in view, and a leftover ring would claim work that is not happening.
+//
 // Paints the live agent ring on BOTH hosts of `data-agent`: the composer control
 // (`agentSlot`) and the team rows of an OPEN configuration dialog. The dialog's rows
 // are not inside `agentSlot`, and its body is deliberately NOT rebuilt for an activity
 // frame (a rebuild would throw the reader's caret away mid-instruction, T3), so the
 // ring has to be pushed here for the two hosts to stay in step.
-const paintAgentRings = (active: ReadonlySet<string>): void => {
-    paintActivity(agentSlot, active);
+//
+// T4: `stamps` is what turns the same paint into a GRADED one. Omitted (a terminal
+// repaint that has an empty set anyway, or a caller that has no per-agent figure) paints
+// exactly the pre-T3 `'active'`/none, so no call site can accidentally invent a silence.
+const paintAgentRings = (active: ReadonlySet<string>, stamps?: ReadonlyMap<string, number>): void => {
+    const grades =
+        active.size === 0 || stamps === undefined
+            ? undefined
+            : gradeActivityFromStamps(active, stamps, Date.now());
+
+    paintedRings = ringsSignatureOf(active, grades);
+    paintActivity(agentSlot, active, grades);
     agentDialog?.paintActivity(active);
+
+    armActivityClock(active);
 };
 
 const clearActivity = (): void => {
-    for (const instance of instances.values()) instance.activity.clear();
+    for (const instance of instances.values()) {
+        instance.activity.clear();
+        instance.activityStamps.clear();
+    }
+
     paintAgentRings(new Set<string>());
 };
 
@@ -7348,6 +7444,15 @@ const paintAgentSlot = (instance: Instance, fromGesture = false): void => {
     // Issue B: this is the place the agent button is rebuilt, so it is the one funnel
     // through which the pill's width changes.
     paintComposerTarget();
+
+    // T4: a rebuilt control painted `data-activity='active'` from the BARE set
+    // (ui/agent-control.ts:243 — it has no clock to ask), so every chrome rebuild, team edit
+    // and poll-driven document re-read put a sweeping ring back on an agent whose grade the
+    // shell had already dropped. This is the one place the node is (re)born, so this is where
+    // the GRADED paint has to be re-pushed: the chip carries the truth the moment it exists,
+    // and the clock's change-detector keeps describing what is actually on screen instead of
+    // what it last wrote into a node that has since been replaced.
+    paintAgentRings(instance.activity, instance.activityStamps);
 };
 
 // One derived description of the agent UI for the selected instance. Both the
@@ -13791,6 +13896,13 @@ const applyView = (instance: Instance, session: SessionView): void => {
         for (const name of activeAgentsOf(session)) instance.activity.add(name);
     }
 
+    // T4: the stamps track the set. A document is exactly the moment this view learns it
+    // has NO fresh knowledge about a name, so the seed comes from the document's own
+    // journaled stamps — which is what makes a reload of a run that has been silent for a
+    // minute paint a still ring at once, the same way the tile paints its quiet line at
+    // once from the row's `updatedAt`.
+    syncInstanceActivityStamps(instance, Date.now());
+
     // R21.3 + T5 R1: the tool panels are DERIVED from the compiled display trees on
     // every document — reload, poll, session open, enqueue answer, drain frame. A
     // completed turn's panels are valid scratch state (they describe work that
@@ -13873,7 +13985,7 @@ const applyView = (instance: Instance, session: SessionView): void => {
 
     if (current !== instance) return;
 
-    paintAgentRings(instance.activity);
+    paintAgentRings(instance.activity, instance.activityStamps);
     renderHarnessChrome();
     paintPanels();
     runner.sync();
@@ -14316,7 +14428,13 @@ const refreshActivity = (instance: Instance): void => {
 
     for (const name of activeAgentsOf(instance.compiled)) instance.activity.add(name);
 
-    if (current === instance) paintAgentRings(instance.activity);
+    // T4: the document just re-derived WHO is working, so the per-agent stamps move with
+    // it — names that left lose their stamp, names that arrived take the newest journaled
+    // one their own sections carry (the tile's seed, ui/turns.ts:1021), so a reload cannot
+    // paint a ring that sweeps for a silence that ended minutes ago.
+    syncInstanceActivityStamps(instance, Date.now());
+
+    if (current === instance) paintAgentRings(instance.activity, instance.activityStamps);
 };
 
 const stopPolling = (): void => {
@@ -14464,7 +14582,23 @@ const applyOpsFrame = (
         refreshActivity(instance);
     } else {
         applyOpsToActivity(instance.activity, before, item.turnId, item.ops ?? []);
-        if (current === instance) paintAgentRings(instance.activity);
+
+        // T4: THIS frame is the evidence. Every agent its ops address has just produced a
+        // frame in THIS view, which is the only clock the display wire offers (it carries no
+        // per-op stamp, so receipt time is the honest figure — the same rule the tile's
+        // `frameStampOf` documents). This is what makes a streaming agent's ring keep
+        // sweeping, and what lets a composing one still the instant the frames stop.
+        const frameNow = Date.now();
+
+        stampActivityFromOps(
+            instance.activityStamps,
+            viewDisplayOf(view, item.turnId),
+            item.ops ?? [],
+            frameNow
+        );
+        syncInstanceActivityStamps(instance, frameNow);
+
+        if (current === instance) paintAgentRings(instance.activity, instance.activityStamps);
     }
 
     if (current === instance) {

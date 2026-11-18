@@ -421,6 +421,12 @@ export const applyOpToDisplay = (
             if (patch.latestInput !== undefined) section.latestInput = patch.latestInput;
             if (patch.cachedInput !== undefined) section.cachedInput = patch.cachedInput;
             if (patch.answerNodeId !== undefined) section.answerNodeId = patch.answerNodeId;
+            // (T2) Tool-composition line: a whole-value replace, never a field merge
+            // (`TurnSectionPatch.toolProgress`, ../shared/turn-display.ts:1188). The
+            // projector coalesces its throttled frames into this ONE op kind, so the live
+            // fold and a cold reload apply the identical patch stream — which is what keeps
+            // view-state-live-parity honest when a turn carries progress at all.
+            if (patch.toolProgress !== undefined) section.toolProgress = patch.toolProgress;
 
             return true;
         }

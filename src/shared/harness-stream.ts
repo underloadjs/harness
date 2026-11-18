@@ -122,9 +122,10 @@ export interface WsUpdateRecords {
  * rounds, so usage events rather than `done` are the complete cost record; `done` is the committed answer plus
  * still-pending background calls; `retry` is a discarded attempt with its delay and preserved error;
  * `attempt_commit` is the boundary that makes everything since the previous boundary final; `wakeup` is a
- * heartbeat while background calls are pending; `action_request` and `action_answer` are the owner-question
- * pair; `branch_start` and `branch_end` delimit an automatic owner fork; `error` ends a run with a failure. A
- * consumer must treat an unrecognised `type` as data to tolerate, not as a failure.
+ * heartbeat while background calls are pending; `progress` is the tool-call composition heartbeat (counters
+ * only, never argument text) that makes a silent tool block visibly alive; `action_request` and `action_answer`
+ * are the owner-question pair; `branch_start` and `branch_end` delimit an automatic owner fork; `error` ends a
+ * run with a failure. A consumer must treat an unrecognised `type` as data to tolerate, not as a failure.
  */
 export type HarnessEventType = 
     | "start"
@@ -137,6 +138,7 @@ export type HarnessEventType =
     | "retry"
     | "attempt_commit"
     | "wakeup"
+    | "progress"
     | "action_request"
     | "action_answer"
     | "branch_start"

@@ -4,8 +4,11 @@
    --accent/--bg-input/--border/--mono) and the shared `.field-input` /
    `.button` primitives. ui/dialog.css owns the modal frame
    (`.dialog`, `.dialog-body` padding/scroll, the close button); this file styles
-   ONLY the body content, which is why nothing here sets a width or a position:
-   the modal already does, and the body scrolls.
+   ONLY the body content, which is why nothing here sets a width — the modal already
+   does, and the body scrolls. The one POSITIONING exception is the roster chip
+   (`.agent-dialog-tab`) plus its rank corner pill: a floating badge needs a
+   positioned containing block, and that block is the chip itself (see the rules
+   around `.agent-dialog-tab .agent-dialog-agent-rank` for why the overhang is safe).
 
    R3 layout, one column: the roster strip of clickable badges (the ONLY listing of
    the team — the dropdown and the duplicate "Team" section are gone), the viewed
@@ -48,13 +51,21 @@
 
 /* A badge is a real button so Enter/Space and a screen reader's button verb work
    with no ARIA scripting; `role="tab"` (set in the TS) layers the tablist semantics
-   on top. Name + role + model stay inside it, so the strip still answers "who is on
-   this team and what do they run" — that is why the separate Team section died. */
+   on top. Name + model stay inside it, so the strip still answers "who is on
+   this team and what do they run" — that is why the separate Team section died.
+
+   `position: relative` exists ONLY to be the containing block for the rank corner
+   pill (`.agent-dialog-tab .agent-dialog-agent-rank`, further down): `.dialog` and
+   `.dialog-body` are NOT positioned (ui/dialog.css:49, :207), so without it the pill
+   would anchor to the fixed `.dialog-overlay` and land in the viewport corner instead
+   of the chip's corner. It changes nothing else — the pill is out of flow, so the
+   chip's flex row lays out exactly as before. */
 /* Radius comes from `--radius-sm` (defined in styles.css `:root`): one control token shared
    by every pressable box in the app, so a tab, an input, a chip and the `.tool` chip all round
    the same. Surfaces keep `--radius`, and round badges/circular icon buttons keep 999px. This
    sheet is @imported into styles.css, so the token always resolves here. */
 .agent-dialog-tab {
+    position: relative;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -94,7 +105,11 @@
     border-style: dashed;
 }
 
-/* The model text inside a badge is a fact, not a label the reader acts on. */
+/* The model text inside a badge is a fact, not a label the reader acts on.
+   `margin-left: auto` parks it at the row's right edge — the reason the rank pill can
+   overhang the chip's top-right corner without touching it: the pill stops at the chip's
+   padding column (see the geometry note on
+   `.agent-dialog-tab .agent-dialog-agent-rank`), never reaching this text. */
 .agent-dialog-agent-model {
     margin-left: auto;
     color: var(--muted);
@@ -339,12 +354,11 @@
     flex: 1 1 100%;
 }
 
-/* The entry caption on a roster badge (routing, not authority). Same green as the deck's
-   entry tile (`styles.css` `.agent-tile[data-entry='true']`) so a reader who learned the
-   colour in one surface reads the same fact in the other. */
-.agent-dialog-agent-entry {
-    color: var(--ok);
-}
+/* The green `entry` caption the roster chip used to carry is GONE (R1) — this rule was
+   its colour. The routing fact is still stated three times: `data-entry` on the chip, the
+   ` · entry agent` suffix in the chip's accessible name, and the detail panel's
+   `Set as entry` control. No replacement cue is added, and no `data-entry` chip styling
+   either (explicitly out of scope). */
 
 /* A locked team keeps its controls visible and disabled with the reason in `title`,
    so the lock is stated where it bites instead of in a paragraph nobody reads. */
@@ -381,12 +395,16 @@
     color: var(--agent-color);
 }
 
-/* The badge's rank and entry captions (R20). They replace the old `role` caption: a
-   rank letter is a FACT about the agent's authority (and several members can carry the
-   same one), while the `entry` caption names the routing member — the one distinction
-   the old single caption could not make. Both stay mono-caps like the other caption, and
-   `entry` takes the same green the deck's entry tile uses, so one colour means one thing
-   across the surfaces. */
+/* The two small mono captions a roster chip paints: the rank (R20) and the `new` state
+   of a drafted addition. They replace the old single `role` caption, which could not tell
+   authority and routing apart. Both stay mono-caps, both stay `--muted` — they are facts
+   ABOUT the agent, never the agent's identity tone (`.agent-dialog-agent-name` above).
+
+   The rank half is shared TYPOGRAPHY only; the letter itself is drawn as the floating
+   corner pill below, and the `entry` caption is gone (R1). The selector list keeps the
+   comma form on purpose: the CSS contract suite slices this block through
+   `.agent-dialog-agent-rank,` (compact-control-style.test.ts), and splitting it must not
+   change how `new` renders. */
 .agent-dialog-agent-rank,
 .agent-dialog-agent-state {
     color: var(--muted);
@@ -394,6 +412,67 @@
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.08em;
+}
+
+/* R2: the rank letter is a PILL floating on the chip's top-right corner, not a word in
+   the chip's text row — which is what the `position: relative` on `.agent-dialog-tab`
+   exists for. Geometry and the two traps it has to answer:
+
+   - `top/right: -6px` + a 16px box puts the pill centred on the chip's corner, so it
+     reads as attached to THAT chip even in a wrapped multi-row strip. The offsets resolve
+     against the chip's PADDING box, so with the 1px border the pill spans x
+     [W-11, W+5] × y [-5, 11] in border-box coordinates (W = chip width): the padding column
+     sits at W-1, `right: -6px` puts the pill's RIGHT edge at W+5, and its 16px width puts the
+     LEFT edge at W-11. The overhang past the chip's OUTER edge (x = W) is therefore 5px, and
+     a sibling chip — the strip's `gap: 6px` starts the next one at W+6 — keeps 1px of
+     clearance, not 0. The chip's text is bounded by its CONTENT box (`padding: 6px 10px`),
+     whose right edge is W-11 and whose top is 7; W-11 is exactly the pill's left edge, so the
+     row's right-most in-flow item — the model string, or the `new` caption when a member is
+     drafted — has exactly 0 horizontal overlap with the pill: the boxes touch at x = W-11 and
+     nothing is covered. Nor is there a horizontal NEIGHBOUR to collide with: `[+]` is NOT on
+     the chip's row. `chooser.append(tabs, createAddControl(...))` (ui/agent-dialog.ts:1253)
+     puts it in the same `.agent-dialog-section` as the strip, and that section is
+     `flex-direction: column` with `gap: 8px` (`.agent-dialog-section`, top of this sheet), so
+     `[+]` sits 8px BELOW the strip — clear of the pill's 5px overhang and of its y band.
+   - Nothing clips the overhang. The ancestors are `.agent-dialog-tabs` (no `overflow`
+     in this sheet), `.agent-dialog` / `.agent-dialog-chooser` (also none), then
+     `.dialog-body` (`overflow: auto`, ui/dialog.css:207-216) inside `.dialog`
+     (`overflow: hidden`, ui/dialog.css:49-56). Both clip at their PADDING box, and the
+     strip is the first child of the body, which is padded `16px 18px` — so the 5px
+     overhang has 16px of clearance above and 18px at the right. (Had the strip been the
+     body's first row with no padding, this would need the inset fallback instead.)
+
+   Styling reuses existing tokens only, in the family of the floating `.panel-new-pill`
+   (styles.css:9704): `--bg-elevated` so the pill stays readable over the chip border and
+   over a neighbour it overlaps, `--border` (NOT `--accent`, which is reserved here for
+   selection and activity), `--muted` for the glyph, and `--radius-sm` for the frame —
+   deliberately the shared control token rather than the 999px circle the pill precedent
+   uses, because the CSS contract suite bans `border-radius: 999px` (and a one-off `7px`)
+   anywhere in this sheet, and taking the token keeps that guard total instead of needing an
+   exemption. `letter-spacing: 0` overrides the shared caption rule above: a single
+   centred glyph must not carry trailing tracking, and `text-transform: uppercase` is
+   re-declared (already inherited) so the letter stays typography-stable if that shared
+   rule is ever split. `z-index: 2` + being the chip's LAST child (ui/agent-dialog.ts)
+   keeps it above every sibling and above the `[+]`. */
+.agent-dialog-tab .agent-dialog-agent-rank {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    box-shadow: 0 1px 3px rgb(0 0 0 / 35%);
+    letter-spacing: 0;
+    line-height: 1;
+    text-transform: uppercase;
+    pointer-events: none;
 }
 
 /* The footer. The action is the ONLY writer in this dialog, so it is the last thing

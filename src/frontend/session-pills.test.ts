@@ -266,15 +266,11 @@ it('lists every saved session of the harness in the dashboard behind the Instruc
     expect(rail.getAttribute('aria-label')).toBe('Scratch board');
 
     // R1 (T9): the header is the title row and the note — the pill strip that used to sit
-    // between them is gone, and the directory is behind the title button instead. T9's
-    // provider-target line (`.harness-provider`) is the third child: an always-visible fact,
-    // a sibling of the note rather than text inside it.
+    // between them is gone, and the directory is behind the title button instead. The
+    // provider-target line (`.harness-provider`) T9 added as a third child was later removed
+    // as unnecessary, so the head is back to these two children.
     const head = byClass('.harness-head', 'header');
-    expect([...head.children].map((node) => node.className)).toEqual([
-        'harness-title-row',
-        'harness-note',
-        'harness-provider'
-    ]);
+    expect([...head.children].map((node) => node.className)).toEqual(['harness-title-row', 'harness-note']);
     // The row itself carries the two compact session controls: the cycler and its `+`.
     expect([...byClass('.harness-title-row', 'div').children].map((node) => node.className)).toEqual([
         'main-title',

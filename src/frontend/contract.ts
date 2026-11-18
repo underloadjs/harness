@@ -160,6 +160,14 @@ export const LOWEST_RANK: AgentRank =
 // The one wording the UI shows for a rank. Every label (tile, tab, dialog, tooltip)
 // goes through this so a rank never reads as a bare letter in one surface and a
 // worded rank in another.
+//
+// ONE deliberate exception, and it is USER-REQUESTED — do not "fix" it back: the
+// roster-chip corner pill (./ui/agent-dialog.ts, `.agent-dialog-agent-rank`) draws the
+// BARE LETTER (`A`) because a 16px badge has no room for the word. That pill is a
+// rendering of the letter, not a label built here, so the rule above still holds for every
+// real label: the deck tiles (./ui/agents.ts), the detail panel's rank heading and its
+// raise/lower tooltips, the create form's rank chips, and every aria-label — the chip's own
+// accessible name included — still read `Rank A` through this helper.
 export const rankLabelOf = (rank: AgentRank): string => `Rank ${rank}`;
 
 // Move a rank by `delta` steps of authority (`-1` = one rank HIGHER, `+1` = one

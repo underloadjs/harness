@@ -103,6 +103,7 @@ import type {
     HarnessAttachmentLimits,
     HarnessExtraBody,
     HarnessMessage,
+    HarnessProgressPhase,
     HarnessProviderConfiguration,
     HarnessResponseFormat,
     HarnessSampling,
@@ -112,6 +113,7 @@ import type {
     HarnessStreamRequest,
     HarnessStreamTool,
     HarnessToolCall,
+    HarnessToolCallProgress,
     HarnessTransportBody,
     HarnessTransportOptions,
     HarnessUsage
@@ -312,6 +314,24 @@ const allowsVideoFor = (url: string): boolean => {
     }
 };
 
+// True when `raw` is JSON that parses to a plain OBJECT — not `null`, not an array,
+// not a scalar. ONE answer to "is this a complete argument payload?", shared by the
+// outbound repair below and by the early-close tool-round rule in the stream reader
+// (see `completeToolRound`), so the transport never treats a block as finished when
+// it would have to repair that same block on the way back out.
+const isPlainJsonObject = (raw: string): boolean => {
+    try {
+        const parsed: unknown = JSON.parse(raw);
+
+        // A plain object and nothing else: `null` and arrays are objects to
+        // `typeof`, and the gateway rejects the array anyway.
+        return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed);
+    } catch {
+        // Not JSON at all.
+        return false;
+    }
+};
+
 // The provider's contract for `function.arguments` is "a JSON string holding an
 // OBJECT". Measured against the local gateway, anything else is not merely
 // ignored, it fails the WHOLE request with `500 {"error":"Internal Server
@@ -333,21 +353,7 @@ const allowsVideoFor = (url: string): boolean => {
 //
 // An empty/blank string is tolerated by the gateway but is not an object, so it
 // is normalized too: one rule, one shape, no provider-specific exception.
-const wireArguments = (raw: string): string => {
-    try {
-        const parsed: unknown = JSON.parse(raw);
-
-        // A plain object and nothing else: `null` and arrays are objects to
-        // `typeof`, and the gateway rejects the array anyway.
-        if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            return raw;
-        }
-    } catch {
-        // Not JSON at all: fall through to the placeholder.
-    }
-
-    return '{}';
-};
+const wireArguments = (raw: string): string => (isPlainJsonObject(raw) ? raw : '{}');
 
 // Map an internal transcript entry onto the provider payload. The internal shape
 // is uniform (strings, explicit tool ids); the wire shape is not.
@@ -932,39 +938,221 @@ type PendingToolCall = {
     arguments: string;
 };
 
+// The accumulator for ONE response stream (issue T1, the stalled-delegation fix).
+//
+// This used to be a bare `Map<number, PendingToolCall>` in which every fragment
+// that did not carry `index` was merged into slot 0 (`?? 0`). That default is only
+// right for the single-call provider that never sends an `index` at all. Once a
+// stream IS multiplexed, the guess silently appends a foreign fragment to call #0
+// — corrupted `arguments`, i.e. a tool the model never asked for. The two extra
+// fields make an index-less fragment attributable instead of guessed:
+//
+//   `openIndex` — the slot the provider was LAST known to be streaming (its most
+//                 recent explicit `index`). A provider that drops `index` on a
+//                 continuation fragment is continuing THAT call, not call #0.
+//   `slotsById` — every provider id seen, mapped to the slot holding it. An id
+//                 names exactly one call, so it outranks the positional guess.
+type ToolCallStream = {
+    pending: Map<number, PendingToolCall>;
+    slotsById: Map<string, number>;
+    openIndex: number | undefined;
+};
+
+// Which slot a `delta.tool_calls[]` fragment belongs to. The whole de-multiplexing
+// rule, pinned both directions by ./openai.tool-call-liveness.test.ts:
+//
+//   1. a NUMERIC `index` is authoritative — the provider is naming the slot;
+//   2. no `index`, but an `id` this stream already uses → that slot;
+//   3. no `index`, and an `id` this stream has NEVER used → the fragment is OPENING
+//      a second call. A gateway that sends ids but no indexes is still describing
+//      parallel calls, and merging them into slot 0 produced `name: 'alphabeta'` over
+//      `'{}{}'` — two unresolvable calls instead of two calls. It gets a fresh
+//      slot one past the highest in use, which keeps flush order equal to the order
+//      the provider introduced them in;
+//   4. no `index`, no `id` → `openIndex`, the slot currently being streamed. That is
+//      0 exactly when the provider never sent an index (the single-call shape the
+//      old `?? 0` was written for), and it can never land a late fragment in a slot
+//      the provider has already moved on from.
+//
+// It MUTATES `stream.openIndex`: answering "which slot?" is also the moment the
+// accumulator learns which slot the provider is on.
+const slotForFragment = (stream: ToolCallStream, fragment: any): number => {
+    if (typeof fragment.index === 'number') {
+        stream.openIndex = fragment.index;
+
+        return fragment.index;
+    }
+
+    const id = typeof fragment.id === 'string' && fragment.id.length > 0 ? fragment.id : undefined;
+
+    if (id === undefined) return stream.openIndex ?? 0;
+
+    const known = stream.slotsById.get(id);
+
+    if (known !== undefined) return known;
+
+    let next = 0;
+
+    for (const key of stream.pending.keys()) {
+        next = Math.max(next, key + 1);
+    }
+
+    stream.openIndex = next;
+
+    return next;
+};
+
 // Merge one `delta.tool_calls[]` fragment into the accumulator. The provider
 // sends `id` and `function.name` once and `function.arguments` in pieces.
-const mergeToolCallDelta = (pending: Map<number, PendingToolCall>, fragment: any): void => {
+const mergeToolCallDelta = (stream: ToolCallStream, fragment: any): void => {
     if (!fragment || typeof fragment !== 'object') return;
 
-    const index = typeof fragment.index === 'number' ? fragment.index : 0;
-    const entry = pending.get(index) ?? { id: '', name: '', arguments: '' };
+    const index = slotForFragment(stream, fragment);
+    const entry = stream.pending.get(index) ?? { id: '', name: '', arguments: '' };
 
     if (typeof fragment.id === 'string' && fragment.id.length > 0) {
         entry.id = fragment.id;
+        stream.slotsById.set(fragment.id, index);
     }
 
+    // NAME FRAGMENTS — the splitting rule, pinned both directions by
+    // ./openai.tool-call-liveness.test.ts. A non-empty `function.name` fragment is
+    // APPENDED — always — UNLESS it is byte-identical to the name the slot already
+    // holds, which makes it an ECHO of the whole name rather than a piece of it.
+    //
+    // WHY this rule: OpenAI streams a name in PIECES before the first argument byte
+    // (`{"name":"de"}` then `{"name":"legate"}`), so those pieces MUST concatenate.
+    // Several relays instead REPEAT the whole name on EVERY delta of the block
+    // (including each argument delta), and the old unconditional `entry.name += name`
+    // turned `delegate` into `delegatedelegate`. That name resolves to no tool
+    // (../harness.ts:11115-11128) and ONE unresolvable call fails the WHOLE
+    // multi-call block, so a name that survives this rule is what makes a parallel
+    // block executable at all. (The echoing relay is DEFENSIVE, not observed: no
+    // capture in this workspace shows one — see the honest framing in
+    // ../knowledge.md "Tool-call accumulation" and
+    // ../docs/tasks/2026-11-19-tool-call-composition-visibility.md, Finding 1 +
+    // "Not tested / not confirmed". The stalled session emitted no tool-call frame at
+    // all, so it could neither confirm nor refute the shape.)
+    //
+    // `entry.name === name` is the ONLY drop. An incoming fragment equal to the name
+    // the slot already holds is by definition a repetition of the whole name, never a
+    // piece of it, and it is the half of the echo the arguments rule cannot catch: a
+    // relay that repeats the FULL name on the delta that also OPENS the arguments has
+    // not delivered an argument byte YET (pinned by
+    // ./openai.tool-call-liveness.test.ts:193 in the review probe). The trade-off of
+    // THAT is a name legitimately streamed as two byte-identical pieces (`'a'` + `'a'`
+    // → `'a'`), which no provider in this workspace does.
+    //
+    // REVISED 2026-11-19 (independent review, F2): this rule used to ALSO drop every
+    // name once the slot had taken an argument byte (`entry.arguments.length === 0 ||
+    // entry.name.length === 0`). That clause was aimed at the same echo, but it is
+    // strictly broader and it regressed a shape the OpenAI schema legitimately permits:
+    // a name piece that arrives AFTER the first argument byte. `name:'deleg'` →
+    // `arguments:'{"a":1}'` → `name:'ate'` flushed `deleg`, which resolves to no tool
+    // and killed the whole block — where plain concatenation gives the correct
+    // `delegate` (the real tool, and the byte-exact value of `deleg` + `ate`). Dropping the
+    // clause keeps every echo case correct (an echo is
+    // caught by the equality test, not by the arguments), and puts the interleaved
+    // piece back on the working side.
+    //
+    // RESIDUAL RISK, stated on purpose: with no arguments guard left, a relay that
+    // re-sends a PREFIX of the name it already streamed — `delegate`, later `deleg` —
+    // is not an echo by this test, so the slot becomes `delegatedeleg` and the call is
+    // unresolvable. That shape is ACCEPTABLE because it is previously unavoidable too:
+    // HEAD (unconditional append) produced `delegatedeleg` from exactly the same
+    // stream, so nothing that worked before breaks now, and any stronger rule would
+    // have to guess whether a repeated prefix is a prefix or a second piece of a longer
+    // legitimate name (`'deleg'` + `'ate'`) — a guess that can only be wrong in one
+    // direction or the other. The pins below hold both directions of every case the
+    // workspace has evidence for.
     const name = fragment.function?.name;
-    if (typeof name === 'string' && name.length > 0) {
+    const nameIsEcho = typeof name === 'string' && name === entry.name;
+
+    if (typeof name === 'string' && name.length > 0 && !nameIsEcho) {
         entry.name += name;
     }
 
     const args = fragment.function?.arguments;
+
     if (typeof args === 'string') {
         entry.arguments += args;
     }
 
-    pending.set(index, entry);
+    stream.pending.set(index, entry);
+};
+
+// Prefix of the id the transport MINTS for a tool call the provider sent without
+// one. `id: ''` used to be flushed as-is, and replay pairs a `tool` result with
+// its call BY ID: the `case 'tool'` wire arm (./openai.ts:449-453, `tool_call_id`
+// at :452) over the `role: 'tool'` message variant (../types/index.ts:253-257,
+// `toolCallId` at :256). Several id-less parallel calls therefore all answered
+// `''` and became unpairable. The minted id is not cosmetic and not re-derived —
+// it is the ONE string on the assistant message (`tool_calls[].id`, :434-439) and
+// on the matching result (:449-453), both built from the single object returned
+// here (../core/agent.ts:1505 commits `outcome.toolCalls` verbatim, and
+// ../harness.ts:9798 stamps `toolCallId: call.id`). Pins: ./openai.tool-call-liveness.test.ts:745, :764, :827.
+const SYNTHETIC_TOOL_CALL_ID_PREFIX = 'harness-call-';
+
+// ---------------------------------------------------------------------------
+// Tool-call composition progress (T2, the stalled-delegation visibility fix)
+// ---------------------------------------------------------------------------
+
+// Minimum span between two `progress` frames of one attempt, in milliseconds.
+//
+// WHY A THROTTLE AT ALL: the same turn that was blind for 62 s can stream a tool
+// block as hundreds of SSE fragments, and every harness event is journalled
+// VERBATIM (../server/sessions.ts `copyEvent`). One frame per 500 ms caps the
+// journal at ~120 lines per minute of composition — evidence without a flood.
+// The first fragment of an attempt always emits (see the merge site), so the
+// signal still appears the moment the model starts composing, and a relay that
+// flushes the whole tool region in ONE final frame costs exactly one line.
+const TOOL_CALL_PROGRESS_INTERVAL_MS = 500;
+
+// Aggregate snapshot of the accumulator. Counters only — see
+// ../types/index.ts `HarnessToolCallProgress` for why argument TEXT never rides
+// this signal. Slot count is `pending.size` because a slot exists exactly when the
+// provider has opened a call (`slotForFragment` mints slots, it never removes
+// them), so it means "N calls are being composed" without a second counter that
+// could drift from the map it describes.
+const progressSampleOf = (stream: ToolCallStream, phase: HarnessProgressPhase): HarnessToolCallProgress => {
+    let argumentChars = 0;
+
+    for (const call of stream.pending.values()) {
+        argumentChars += call.arguments.length;
+    }
+
+    return { phase, toolCallSlots: stream.pending.size, argumentChars };
 };
 
 // Flush the accumulator in stream-index order, which is the order the model
-// emitted the calls in.
-const finishToolCalls = (pending: Map<number, PendingToolCall>): HarnessToolCall[] => {
-    if (pending.size === 0) return [];
+// emitted the calls in, minting an id for every slot the provider left anonymous.
+// Deterministic: the fragments fully determine the ids, so the pins stay exact.
+const finishToolCalls = (stream: ToolCallStream): HarnessToolCall[] => {
+    if (stream.pending.size === 0) return [];
 
-    return [...pending.entries()]
-        .sort(([left], [right]) => left - right)
-        .map(([, call]) => ({ id: call.id, name: call.name, arguments: call.arguments }));
+    const slots = [...stream.pending.entries()].sort(([left], [right]) => left - right);
+
+    // A minted id must never duplicate an id the provider DID send in the same
+    // block, nor another minted one.
+    const taken = new Set<string>();
+
+    for (const [, call] of slots) {
+        if (call.id.length > 0) taken.add(call.id);
+    }
+
+    return slots.map(([index, call]) => {
+        if (call.id.length > 0) return { id: call.id, name: call.name, arguments: call.arguments };
+
+        let id = `${SYNTHETIC_TOOL_CALL_ID_PREFIX}${index}`;
+
+        for (let bump = 1; taken.has(id); bump += 1) {
+            id = `${SYNTHETIC_TOOL_CALL_ID_PREFIX}${index}-${bump}`;
+        }
+
+        taken.add(id);
+
+        return { id, name: call.name, arguments: call.arguments };
+    });
 };
 
 // ---------------------------------------------------------------------------
@@ -1642,7 +1830,27 @@ export const openAICompatible = (
 
             let finishReason: unknown = null;
             let usage: HarnessUsage | undefined;
-            const pendingToolCalls = new Map<number, PendingToolCall>();
+            // Tool-call accumulation for THIS response. See `ToolCallStream`: it carries
+            // the attribution state an index-less or id-less fragment needs, not just the
+            // partial calls.
+            const toolCallStream: ToolCallStream = {
+                pending: new Map<number, PendingToolCall>(),
+                slotsById: new Map<string, number>(),
+                openIndex: undefined
+            };
+            // (T2) Monotonic timestamp of the last `progress` frame emitted for THIS
+            // request, or -Infinity before the first one. -Infinity is what makes the
+            // phase-entry emission fall out of the SAME comparison as the throttle: the
+            // first fragment always clears a 500 ms window measured against -Infinity.
+            // A per-request `let` (not a module global) is what makes the signal
+            // attempt-scoped — the next attempt re-enters this closure with a fresh
+            // accumulator, so its counters restart at zero.
+            //
+            // `performance.now()`, not `Date.now()`: the throttle measures an ELAPSED
+            // span, and only a monotonic clock is immune to the operator's clock moving.
+            // Called inline (never captured into a const) so a test can pin the throttle
+            // against a fixed clock — see ./openai.tool-call-liveness.test.ts.
+            let lastProgressEmittedAt = Number.NEGATIVE_INFINITY;
             // `sentinel`: whether the provider terminated the stream (`[DONE]`).
             // `delivered` / `stalled` / `stallError` are the T6 additions: how much of the
             // body arrived, and what stopped it.
@@ -1768,7 +1976,55 @@ export const openAICompatible = (
 
                 if (Array.isArray(delta?.tool_calls)) {
                     for (const fragment of delta.tool_calls) {
-                        mergeToolCallDelta(pendingToolCalls, fragment);
+                        mergeToolCallDelta(toolCallStream, fragment);
+                    }
+
+                    // (T2) THE ONE BLIND SPOT IN THE WHOLE STACK. The fragments above are
+                    // merged with no yield, so while the model composes a parallel tool
+                    // block the harness sees NOTHING: no text deltas, no `tool_call`
+                    // (those exist only after the terminal frame), no usage. A four-call
+                    // `delegate` of ~6.5k argument tokens read as a 62 s hang, and the user
+                    // aborted. Emitting a counters-only `progress` frame here is the
+                    // earliest signal that exists — it is produced from what the transport
+                    // ACTUALLY received, which matters because the relay in front of this
+                    // workspace withholds the whole tool region and flushes one final SSE
+                    // frame: then exactly one line lands, and an honest "one update" beats
+                    // a silent 60 s.
+                    //
+                    // Rules, pinned by ./openai.tool-call-liveness.test.ts: the first
+                    // fragment of an attempt emits IMMEDIATELY (phase entry), later ones at
+                    // most once per TOOL_CALL_PROGRESS_INTERVAL_MS, and never after the
+                    // terminal frame — this branch only runs inside the data-frame loop, so
+                    // `done`, `error` and every early `return` below are all unreachable
+                    // behind a progress frame. Informational only: it never touches the
+                    // accumulator, the truncation guard, or the flushed calls.
+                    //
+                    // F3 (review, 2026-11-19) — A FRAME MUST SAY SOMETHING. `tool_calls: []`
+                    // is an array-shaped delta that composed NOTHING, and the sample it
+                    // produces is `{ slots: 0, chars: 0 }`. The tile turns that into the
+                    // printable line `composing 0 tool calls · 0 chars`
+                    // (../frontend/ui/turns.ts:891-893), which claims work while contradicting
+                    // itself. So a zero-slot sample emits NOTHING and — the important half — does
+                    // NOT consume the attempt's phase-entry emission: `lastProgressEmittedAt`
+                    // stays where it was, so the first fragment that DOES open a slot still
+                    // reports the attempt immediately. The rule no longer stops here either: a
+                    // custom transport, or a pre-F3 journal that still carries the frame, is
+                    // refused downstream as well — by the projector
+                    // (../server/turn-projector.ts:390 rejects `toolCallSlots < 1` on a
+                    // `tool-composition` frame) and by the CLI (../server/cli/render.ts:103) — so
+                    // all three surfaces accept the same frames. The IDLE clear is the one frame
+                    // that still carries `toolCallSlots: 0`: `IDLE_TOOL_PROGRESS`
+                    // (../server/turn-projector.ts:404) is painted as a CONSTANT at every attempt
+                    // boundary and never passes through that validator, so tightening it cannot
+                    // touch the clear. Pins: ./openai.tool-call-progress.test.ts and
+                    // ../server/turn-projector-progress.test.ts.
+                    const now = performance.now();
+                    const sample = progressSampleOf(toolCallStream, 'tool-composition');
+
+                    if (sample.toolCallSlots > 0 && now - lastProgressEmittedAt >= TOOL_CALL_PROGRESS_INTERVAL_MS) {
+                        lastProgressEmittedAt = now;
+
+                        yield { type: 'progress', ...sample };
                     }
                 }
 
@@ -1809,11 +2065,42 @@ export const openAICompatible = (
                 throw streamState.stallError;
             }
 
+            // Flushed BEFORE the truncation guard, because the guard has to know whether
+            // the tool round it is looking at is finished (issue T1).
+            const toolCalls = finishToolCalls(toolCallStream);
+
+            // A tool round counts as COMPLETE when every accumulated call carries arguments
+            // that parse to a JSON object — the same shape test the outbound wire applies
+            // (`isPlainJsonObject`), so a block that would have to be repaired on the way
+            // back out is never accepted as finished here. Consequence worth naming: a
+            // no-argument call whose provider streamed `arguments: ''` (or nothing) does NOT
+            // count, because `''` is not a JSON object and the transport cannot tell "no
+            // arguments" from "cut before the first argument byte". That shape keeps the
+            // retry it always kept — conservative on purpose.
+            //
+            // WHY this changes the early-close answer (issue T1, the stalled-delegation
+            // report): the relay leg in front of this workspace's model withholds the WHOLE
+            // tool region and terminates with one final frame
+            // (services/modal/deploy/qwen3.8-27b/modal_qwen3_8_rtx6000_ninfer.py:97-100,
+            // 993-1003), so a body that ends without `[DONE]` and without any
+            // `finish_reason` can still be carrying a FULLY generated tool block. Discarding
+            // it was not neutral: the error below is CODELESS, so it walks the generic
+            // 11-attempt ladder (../core/agent.ts:943-945 sets `maxAttempts`; :1402-1415
+            // picks the class; ../core/agent-limits.ts:105-120, delay ceiling :169) — up
+            // to 10 full re-generations of that ~60 s block, the loop the user watched for 62 s. Treating it as
+            // the completed tool round it is means the calls LAUNCH, exactly as they do when
+            // `[DONE]` arrived (the rule already at `stopReasonOf` below).
+            const completeToolRound =
+                toolCalls.length > 0 && toolCalls.every((call) => isPlainJsonObject(call.arguments));
+
             // Truncation guard (R1): a body that ends WITHOUT the `[DONE]` sentinel and
             // without a finish_reason never reported a completed generation, so whatever
             // arrived is half a response (a dropped socket, a proxy closing the body).
-            // It is a FAILED request, not an empty answer: the agent retries it.
-            if (!streamState.sentinel && !finishReason) {
+            // It is a FAILED request, not an empty answer: the agent retries it. The one
+            // exception is the complete tool round above — that generation IS finished, it
+            // just never said so. A half-written `arguments` string still fails here, which
+            // is the case the guard exists for.
+            if (!streamState.sentinel && !finishReason && !completeToolRound) {
                 // (2026-11-17) Still CODELESS — a body that closed without saying how is a
                 // transient failure and keeps the generic ladder it has always had. What it
                 // now ALSO carries is the transit diagnosis: "the socket died mid-answer" is
@@ -1832,10 +2119,9 @@ export const openAICompatible = (
                 return;
             }
 
-            const toolCalls = finishToolCalls(pendingToolCalls);
-
             // A provider that reports tool calls without a finish_reason still
-            // requested tools; treat that as a tool turn rather than a stop.
+            // requested tools; treat that as a tool turn rather than a stop. That is also
+            // the answer for a complete tool round whose body simply closed (see above).
             const stopReason = stopReasonOf(toolCalls.length > 0 && !finishReason ? 'tool_calls' : finishReason);
 
             yield { type: 'done', stopReason, toolCalls, usage };

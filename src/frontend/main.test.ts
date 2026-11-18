@@ -710,9 +710,17 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
             tab.getAttribute('aria-selected') === 'true',
             tab.querySelector('.agent-dialog-agent-rank')?.textContent
         ])
-    // The tab states TWO facts in one line: the rank letter (authority) and, for the routing
-    // member, that it is the entry agent. `data-entry` is the machine-readable half.
-    ).toEqual([['instruct', true, 'Rank A']]);
+    // The chip states TWO facts: the rank LETTER, shown as the floating corner pill (R2 —
+    // the bare letter, not the `Rank A` sentence, which now lives only in the accessible
+    // name), and, for the routing member, `data-entry` / the ` · entry agent` name suffix.
+    // The `entry` CAPTION that used to sit in the chip's text row is gone (R1), which is
+    // why the row reads `Instruct … local/basalt` with a pill on its corner.
+    ).toEqual([['instruct', true, 'A']]);
+
+    // R1: the `entry` word is nowhere on screen in the roster strip. `data-entry` (above)
+    // and the accessible name (below) still carry the fact, so nothing was LOST — only the
+    // third word in a row that had room for two.
+    expect(document.querySelector('.agent-dialog-agent-entry')).toBeNull();
 
     // The picker, not the strip, is where the other trusted agents are offered.
     byClass('.agent-dialog-add', 'button').click();
@@ -756,16 +764,12 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     // are the compact cycler and its `+`. The pill strip that used to sit under the title is
     // gone at every width; the directory is the dashboard behind the title button.
     //
-    // T9 adds the THIRD child: `.harness-provider`, the always-visible provider-target line
-    // (`provider localhost:5500 · model basalt-8k`). It is a sibling of the note, never part
-    // of it, because `.harness-note`'s text is owned by every head painter and pinned by its
-    // own assertions, and a session fact must not be appended into a shared line.
+    // The T9 provider-target line (`.harness-provider`, `provider localhost:5500 · model
+    // basalt-8k`) was later REMOVED as unnecessary, so the head has exactly the two children
+    // again — and it stays asserted here so nothing can quietly re-add a third row under the
+    // title.
     const head = document.querySelector<HTMLElement>('.harness-head');
-    expect([...(head?.children ?? [])].map((node) => node.className)).toEqual([
-        'harness-title-row',
-        'harness-note',
-        'harness-provider'
-    ]);
+    expect([...(head?.children ?? [])].map((node) => node.className)).toEqual(['harness-title-row', 'harness-note']);
     expect(document.querySelector('.session-pills-bar-head')).toBeNull();
     expect(head?.querySelector('.session-pills')).toBeNull();
     expect([...byClass('.harness-title-row', 'div').children].map((node) => node.className)).toEqual([

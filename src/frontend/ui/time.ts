@@ -31,6 +31,42 @@ export const formatDuration = (milliseconds: number): string => {
     return `${minutes}m${String(rest).padStart(2, '0')}s`;
 };
 
+// --- Liveness presentation thresholds (T3 frontend liveness honesty) ----------
+//
+// A model composing a TOOL CALL emits no content at all: the transport's content yields
+// are only the delta pair (../../transport/openai.ts:1952-1956) plus the counter-only
+// `progress` heartbeat (:1983-1989); `HarnessStreamEvent` still has no tool frame
+// (../../types/index.ts:495-522), and the UI's first frame about a call is the post-`done`
+// `tool_call` (../../harness.ts:10887). A 60s silent request and a dead stream produced the
+// SAME pixels — these thresholds tell them apart from signals this view already carries.
+//
+// THEY ARE PRESENTATION THRESHOLDS, NOT TIMEOUTS. Nothing in this project ends a
+// run on a wall clock — the documented policy is that no external clock kills a run
+// (knowledge.md:5205-5209); the only real bounds are the provider idle bounds in
+// ../transport/provider-timeouts.ts. Crossing these numbers changes only what the UI
+// is allowed to SAY about a run that is still running.
+//
+//   < QUIET_AFTER_MS   — frames are arriving; the normal live affordances apply.
+//   QUIET .. SILENT    — the run is live and the UI has heard nothing for a while.
+//   >= SILENT_AFTER_MS — a long silence: the same fact, phrased plainly.
+export const QUIET_AFTER_MS = 5_000;
+export const SILENT_AFTER_MS = 30_000;
+
+export type QuietGrade = 'quiet' | 'silent';
+
+// Grade an age since "the last thing the UI received", or undefined while the view
+// still honestly reads as live. An undefined/non-finite age means "unknown" (a turn
+// that never received a frame, or a record with no stamps): NOT quiet, because a
+// claim of silence needs a stamp to measure from. A negative age (a server clock
+// running ahead of the local one, or a frame the caller had already timed newer) is
+// a FRESH frame, never a silent one.
+export const quietGradeOf = (ageMs: number | undefined): QuietGrade | undefined => {
+    if (ageMs === undefined || !Number.isFinite(ageMs)) return undefined;
+    if (ageMs < QUIET_AFTER_MS) return undefined;
+
+    return ageMs >= SILENT_AFTER_MS ? 'silent' : 'quiet';
+};
+
 // Difference between two epoch-millisecond stamps, or undefined when either side
 // is missing or the clock went backwards. Never NaN.
 export const elapsedBetween = (start: unknown, end: unknown): number | undefined => {

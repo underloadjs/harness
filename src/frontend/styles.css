@@ -2109,25 +2109,6 @@ body.is-resizing-rail {
     font-size: 12px;
 }
 
-/* (T9/AC1) The persistent provider-target line: `provider localhost:5500 · model basalt`.
-   Same register as `.harness-note` above it — a muted fact under the title, never a badge
-   or a control — and MONO with `font-variant-numeric: tabular-nums` because the whole
-   point is reading a PORT off it and comparing it against the one you expected. The line
-   is `hidden` (attribute, not a rule) when the target is unknown, so there is no
-   empty-state styling to design. */
-.harness-provider {
-    margin: 2px 0 0;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11.5px;
-    font-variant-numeric: tabular-nums;
-    /* Long base URLs must not push the head wide on a phone; the ellipsis is the graceful
-       end of the line and `title` carries the full text. */
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
 /* R2: the harness title IS the details trigger — no disclosure arrow. The button is
    reset to look exactly like the plain `h1` text (no border/background/padding), so
    the header keeps its previous visual shape while gaining a real, keyboard
@@ -2674,6 +2655,20 @@ body.is-resizing-rail {
    is when the reader most wants to know which one it is. */
 .agent-control[data-activity='active'] .agent-control-button {
     border-color: var(--accent);
+}
+
+/* T4 (liveness honesty, now WIRED): the same grades on the compact control. A chip has no
+   sweeping arc, so its live claim is the accent BORDER — a quiet run therefore keeps the
+   border (the run is unfinished and `aria-busy` stays `true`) and loses its strength:
+   `paintAgentRings` (main.ts) writes `data-activity='quiet'|'silent'` from the per-agent
+   receipt stamps, on ui/time.ts's thresholds, and the clock that re-takes them while nothing
+   arrives is main.ts `tickActivityClock`. Weaker claim, same fact. */
+.agent-control[data-activity='quiet'] .agent-control-button {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--muted));
+}
+
+.agent-control[data-activity='silent'] .agent-control-button {
+    border-color: color-mix(in srgb, var(--accent) 30%, var(--muted));
 }
 
 .agent-row-wrap {
@@ -3992,6 +3987,37 @@ body.is-resizing-rail {
     mask-composite: exclude;
     animation: agent-ring-spin 900ms linear infinite;
     pointer-events: none;
+}
+
+/* T3 liveness honesty: a live run whose stream has gone SILENT ------------------
+   A model composing a TOOL CALL emits no frames at all, so a streaming tile can be
+   genuinely working while receiving nothing (the user report: 62s of identical
+   spinning pixels, read as a hang). ui/turns.ts stamps `data-quiet='quiet'|'silent'`
+   on the compact tile from the SAME 250ms clock that paints its meta line, and
+   ui/activity.ts `gradeActivityOfTurns` grades a NAMED agent the same way from that
+   turn's server stamps, for any host that reports the grades to `paintActivity`.
+
+   The ring stays DRAWN — the run really is unfinished and `aria-busy` still reads
+   `true` — but its SWEEP stops. Motion is the claim being withdrawn, not the fact of
+   an open run; the words carry the truth (`still generating · quiet for 41.2s`).
+   Nothing here ends a run: the thresholds are presentation only (ui/time.ts
+   QUIET_AFTER_MS / SILENT_AFTER_MS). T4 WIRED the named-agent hosts: main.ts grades the
+   ring hosts from per-agent receipt stamps (ui/activity.ts `gradeActivityFromStamps`) and
+   re-paints them from a clock, so `data-activity='quiet'|'silent'` below is now written —
+   the compact control's own grade is styled above, next to its `='active'` rule. */
+:is(.tile, .thread-tile):not(.is-expanded)[data-quiet]::before,
+.agent-tile[data-activity='quiet']::before,
+.agent-tile[data-activity='silent']::before {
+    animation: none;
+    opacity: 0.5;
+}
+
+/* Past the stronger threshold the arc recedes further: the longer the silence, the
+   less the surface should advertise itself. Same fact as the meta line's `— the run
+   is still working` phrasing, one step quieter in ink. */
+:is(.tile, .thread-tile):not(.is-expanded)[data-quiet='silent']::before,
+.agent-tile[data-activity='silent']::before {
+    opacity: 0.3;
 }
 
 .tile-prompt {

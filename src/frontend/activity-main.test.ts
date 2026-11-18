@@ -461,3 +461,89 @@ it('derives rings from a still-running polled turn and never from completed hist
     expect(tileActivity()).toEqual([undefined, undefined]);
     expect(tileBusy()).toEqual([null, null]);
 });
+
+// T4 (the wiring T3 left open): a quiet agent's RING must still during the silence, not on
+// the next frame. Before T4 the shell painted `data-activity='active'` from a fold with no
+// time component, so `styles.css:3978-4007` (`.agent-tile[data-activity='quiet'|'silent']`)
+// could never be reached — the ring kept sweeping through the 62 s of the incident and the
+// reader aborted a live run.
+//
+// This case uses the no-socket host on purpose: `pollSession` re-reads the SAME document
+// every second, so it proves the second half of the rule as well — a re-read that carries no
+// new evidence for an agent must not re-louden its ring. Grades come from per-agent stamps,
+// and only a clock (main.ts `tickActivityClock`) may move them while nothing arrives.
+it('stills a silent agent ring on the clock, and a no-change re-read does not louden it', async () => {
+    vi.stubGlobal('WebSocket', undefined);
+    vi.useFakeTimers();
+    // The clock is pinned to the fixture's own stamps, so every age below is arithmetic the
+    // test controls, not the wall.
+    vi.setSystemTime(new Date(T));
+
+    const running = turn({
+        id: 't1',
+        index: 0,
+        prompt: 'long task',
+        status: 'running',
+        startedAt: T,
+        updatedAt: T,
+        // The ENTRY agent is the one the compact control shows (it is the agent a
+        // conversation runs as), so it is also the agent whose ring this case can read
+        // without opening the dialog.
+        events: [start('instruct'), toolCall('instruct')]
+    });
+    const live = snapshot({ id: 'r1', status: 'running', turns: [running] });
+
+    localStorage.setItem(SESSION_KEY, 'r1');
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(
+            viewAwareFetch(async (input: RequestInfo | URL) => {
+                const url = String(input);
+
+                if (url === '/api') return json(bootstrap({ sessions: [live] }));
+                if (url === '/api/models') return json({ models: ['m1'] });
+                if (url === '/api/sessions/r1') return json({ session: live });
+
+                throw new Error(`unexpected request: ${url}`);
+            }, { root: '/api' })
+        )
+    );
+
+    // The compact control is the host that understands grades: `agentSlot` holds it
+    // (main.ts:7432) and `paintActivity` selects `.agent-control[data-agent]`. It names the
+    // agent this conversation runs as, which is why the busy agent above is `instruct`. The
+    // dialog's team rows are NOT graded (that `paintActivity` takes a bare set).
+    const ring = (): string | undefined =>
+        document.querySelector<HTMLElement>('.agent-control[data-agent="instruct"]')?.dataset.activity;
+    const busy = (): string | null =>
+        document
+            .querySelector<HTMLElement>('.agent-control[data-agent="instruct"]')
+            ?.getAttribute('aria-busy') ?? null;
+
+    await import('./main');
+    await vi.advanceTimersByTimeAsync(50);
+
+    // Frames are recent: the ordinary live ring, exactly as before T4.
+    expect(ring()).toBe('active');
+    expect(busy()).toBe('true');
+
+    // 5 s of silence (QUIET_AFTER_MS): the ring grade drops WHILE the agent is still busy.
+    // `aria-busy` is the point of this line — the claim got weaker, the run did not end.
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(ring()).toBe('quiet');
+    expect(busy()).toBe('true');
+
+    // 30 s: the stronger word, still the same busy signal.
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(ring()).toBe('silent');
+    expect(busy()).toBe('true');
+
+    // A poll that answers the SAME document is not evidence: the stamp it seeds from is older
+    // than the one this view already holds, so the ring must stay still. (Bumping the epoch is
+    // the fixture's statement that the read is a fresh answer, not a memoised one.)
+    bumpFixtureEpoch();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ring()).toBe('silent');
+    expect(busy()).toBe('true');
+});

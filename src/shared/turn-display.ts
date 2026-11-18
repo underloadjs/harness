@@ -92,7 +92,10 @@ import type { AgentResultBlock, AgentResultReference, AgentResultStatus } from '
 // label is a RANK, never a role. Imported from the type module directly (the same specifier
 // ./harness-api.ts:258 uses) so this contract file never depends on what the runtime barrel
 // happens to re-export.
-import type { AgentRank } from '../types';
+// (T2) The tool-composition vocabulary: `HarnessToolCallProgress` is the SAME type the
+// transport emits and the harness journals (../types/index.ts), reused here verbatim so
+// a browser, a journal reader and the projector cannot drift apart on spelling.
+import type { AgentRank, HarnessToolCallProgress } from '../types';
 
 // ---------------------------------------------------------------------------
 // Bounds — the ONLY reason the display wire is smaller than the raw wire
@@ -1123,6 +1126,37 @@ export type TurnSection = {
      * byte-compatible.
      */
     context?: ContextBlock[];
+    /**
+     * (T2) ATTEMPT-SCOPED live state of the tool block the model is composing RIGHT NOW —
+     * the line that makes a silent turn visibly alive instead of hung. It is NOT a
+     * transcript entry: this field mints no `DisplayNode`, no `DisplayStep` and no
+     * `ContextBlock`, and it changes nothing about the section's recorded order. A client
+     * draws it where a "working" line belongs and must delete the line as soon as it is
+     * not `phase: 'tool-composition'`.
+     *
+     * WHY A FIELD AND NOT A NOTICE PER EVENT: the transport throttles to one frame per
+     * 500 ms, so a 60 s composition is up to ~120 frames. Minting a node each time would
+     * bury the section's real content in server chatter and re-stamp the tail; a field
+     * coalesces the whole stream into one cheap `section:set` patch, and the projector
+     * SKIPS the op entirely when the value is unchanged (so a turn that never composes a
+     * tool call, and every repeat of the same counters, costs ZERO ops and leaves the
+     * display byte-identical).
+     *
+     * LIFECYCLE (all server-side, all to `phase: 'idle'` with zero counters): a retry /
+     * `attempt:discard`, an `attempt_commit`, a `done` and an `error` each clear it, and so
+     * does every edge that puts a SECTION into a terminal state — `settle()` clearing the
+     * turn's rows (the abort case: a journal that simply ENDS on a progress frame), the
+     * parent's `tool_result` completing a delegated child's spawning call (a child cancelled
+     * by its tree emits no `error` frame of its own, ../server/turn-projector.ts:3159-3192),
+     * and a `branch_end`. So a stale "composing 4 calls" can never outlive the attempt that
+     * produced it, and a finished section never carries a live value (review F1, 2026-11-19).
+     *
+     * ABSENT means "this producer never reported composition" — a pre-T2 record, or a
+     * relay that buffers the whole tool region and delivered nothing. Absent is NOT
+     * "idle": a renderer that distinguishes them may show nothing for absent and a
+     * settled line for idle; either way it must never invent elapsed time from this field.
+     */
+    toolProgress?: HarnessToolCallProgress;
 };
 
 /** Field-level patch for an existing section (`section:set`). Absent = unchanged;
@@ -1146,6 +1180,10 @@ export type TurnSectionPatch = {
     latestInput?: number;
     cachedInput?: number;
     answerNodeId?: string;
+    /** (T2) Whole-value replace, never a merge — see `TurnSection.toolProgress`
+     *  (./turn-display.ts:1108). A `section:set` naming this field is the ONLY op the
+     *  progress stream produces, and it is skipped when the value has not changed. */
+    toolProgress?: HarnessToolCallProgress;
 };
 
 /** The compiled tree of ONE turn: root section first, then nested invocations in
