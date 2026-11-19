@@ -35,6 +35,12 @@ import * as commandRunEntry from '../tools/command/shell.tool';
 import * as gitDiffEntry from '../tools/command/gitDiff.tool';
 import * as downloadEntry from '../tools/webdownload/download.tool';
 import * as coreMetadata from './metadata';
+// Data-only import of the GENERATED descriptor table — the same table `./metadata.ts`
+// projects, one row per package entry. Importing it evaluates no tool body (every row's
+// implementation sits behind a dynamic `import()` in the generated loader), and it is
+// the authoritative inventory of what `runtimeEntries` plus `unprojectedRuntimeEntries`
+// must account for. Read by the coverage guard below.
+import { BUILTIN_TOOL_DESCRIPTORS } from './tool-manifest';
 import { ACTION_REQUEST_LIMITS } from './action';
 import {
     AGENT_MANAGE_LIST_PER_AGENT,
@@ -99,6 +105,24 @@ type RuntimeEntry = {
 
 // Every harness-owned runtime entry, now under tools/runtime (R7). The aggregated
 // row comes from the compatibility facade, which projects the generated manifest.
+//
+// MEMBERSHIP RULE (stated because the matrix was being read wrongly). A runtime row
+// belongs HERE when all three legs of `RuntimeEntry` exist:
+//   1. the entry's own metadata literal,
+//   2. the same-file `metadata` alias (the identity leg), and
+//   3. a NAMED `*_METADATA` projection constant in `core/metadata.ts` (the leg the
+//      field is literally called `aggregated` for, and the one that makes a facade
+//      projection assertable at all).
+// Anything missing leg 3 is listed in `unprojectedRuntimeEntries` below with its reason,
+// and the coverage guard ('accounts for every runtime row the generated manifest
+// carries') fails if a runtime row from the generated table lands in neither list.
+//
+// This is NOT "the matrix projects only always-declared rows" — that justification is
+// wrong in both directions and should not be repeated: `toolList`, `toolManage`,
+// `toolCreate`, `records`, `profiles`, `chapters`, `locations`, `agentManage` and
+// `agentResult` are rows here with `alwaysDeclared: false` (see the generated table),
+// while the always-declared `search` (240) and `fetch` (250) are not rows here at all.
+// Order and activation decide nothing here; the facade projection does.
 const runtimeEntries: RuntimeEntry[] = [
     {
         wireName: 'toolRequest',
@@ -238,6 +262,44 @@ const runtimeEntries: RuntimeEntry[] = [
     }
 ];
 
+// The runtime rows the generated table carries that CANNOT fill the `RuntimeEntry`
+// shape, each with the reason and where its own contract is pinned instead. This list
+// exists so an omission is a decision on the record rather than an accident: before it,
+// the coverage in this file could stay green while a new runtime entry went uncovered
+// (2026-11-19: the `sleep` entry, order 145, arrived and nothing here noticed).
+//
+// Every reason below is the same structural fact with different details — `core/metadata.ts`
+// exports NO named `*_METADATA` constant for these names (`grep -n "SEARCH_\|FETCH_\|
+// KNOWLEDGE_\|SLEEP_" src/core/metadata.ts` → no matches), so leg 3 of the row shape has
+// no source object to deep-equal the entry literal against.
+const unprojectedRuntimeEntries: Record<string, string> = {
+    // Its metadata has two honest forms (baseline + per-caller `agent` enum), so the
+    // facade projects a FACTORY (`coreMetadata.agentDelegateMetadata(targets)`), not a
+    // constant. Pinned by the dedicated `keeps delegate metadata literal and pins the
+    // inlined bounds` test in this file.
+    delegate: 'facade projects a factory (agentDelegateMetadata), not a *_METADATA constant',
+    // The always-declared web pair. They reach the facade through the manifest-filtered
+    // `coreToolMetadata()` list (`core/metadata.ts:282-286`), never as named constants,
+    // and their registration is option-gated (`activation: 'websearch'` / `'webfetch'`).
+    // Pinned here by `keeps the always-registered projection in its historical order`.
+    search: 'projected only through coreToolMetadata(); no SEARCH_METADATA constant',
+    fetch: 'projected only through coreToolMetadata(); no FETCH_METADATA constant',
+    // The cross-session knowledge base (order 95). No `KNOWLEDGE_METADATA` projection
+    // exists, so the `aggregated` leg has no source. Its model-facing visibility IS
+    // pinned, from the live registry, at `src/harness.metadata.test.ts:108` / `:133`;
+    // its registration row is pinned by `src/core/tool-discovery.test.ts`.
+    knowledge: 'no KNOWLEDGE_METADATA projection; visibility pinned in harness.metadata.test.ts',
+    // THE 2026-11-19 ADDITION (order 145). `src/tools/runtime/sleep.tool.ts` exports
+    // `metadata` with no historical `SLEEP_METADATA` alias, and the facade exports no
+    // `SLEEP_METADATA` either, so legs 1+2 collapse into the same object and leg 3 does
+    // not exist — adding a row here would need a new shape, not a new row. Its contract
+    // is pinned where the other unprojected rows' are: `visibility: 'searchable'` from
+    // `harness().tools` in `src/harness.metadata.test.ts`, the entry bounds in
+    // `src/tools/runtime/sleep.test.ts`, and the registration row (`mode: 'sync'`,
+    // `order: 145`) in `src/core/tool-discovery.test.ts:130-138` / `:304-312`.
+    sleep: 'entry exports only `metadata`; no SLEEP_METADATA projection in core/metadata.ts'
+};
+
 type PresetEntry = {
     key: keyof typeof PRESET_TOOLS;
     metadataName: string;
@@ -353,6 +415,47 @@ describe('runtime entry metadata ownership', () => {
             expect(entry.metadata).not.toHaveProperty('group');
             expect(entry.metadata).not.toHaveProperty('activation');
             expect(entry.metadata).not.toHaveProperty('order');
+        }
+    });
+
+    it('accounts for every runtime row the generated manifest carries', () => {
+        // THE COVERAGE GUARD. The generated table is the authoritative inventory of
+        // package-owned runtime entries, so the matrix plus the exclusion map must equal
+        // it exactly. A new entry under `src/tools/runtime/` with `group: 'runtime'`
+        // therefore FAILS this test until someone decides which list belongs in — the
+        // decision is forced at the moment the row appears, which is precisely what did
+        // not happen for `sleep` (order 145) when it landed.
+        const accountedFor = [
+            ...runtimeEntries.map((entry) => entry.wireName),
+            ...Object.keys(unprojectedRuntimeEntries)
+        ].sort();
+
+        // Sorted so one diff names every missing AND every extra row, and so the
+        // comparison is not hostage to scan order.
+        const manifestRuntimeRows = BUILTIN_TOOL_DESCRIPTORS.filter(
+            (descriptor) => descriptor.group === 'runtime'
+        )
+            .map((descriptor) => descriptor.name)
+            .sort();
+
+        expect(accountedFor).toEqual(manifestRuntimeRows);
+
+        // A name may not be in BOTH lists: the moment `core/metadata.ts` grows a
+        // `*_METADATA` constant for an excluded entry, that entry must move into
+        // `runtimeEntries` and its reason string here must go. (The equality above
+        // already fails on a duplicate; this names the cause.)
+        expect(
+            runtimeEntries
+                .map((entry) => entry.wireName)
+                .filter((name) =>
+                    Object.prototype.hasOwnProperty.call(unprojectedRuntimeEntries, name)
+                )
+        ).toEqual([]);
+
+        // The exclusion map is not a dumping ground: every entry in it is a row the
+        // table really carries. Without this, a stale reason could outlive the entry.
+        for (const name of Object.keys(unprojectedRuntimeEntries)) {
+            expect(manifestRuntimeRows).toContain(name);
         }
     });
 

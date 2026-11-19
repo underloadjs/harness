@@ -1181,7 +1181,7 @@ describe('recurring wakeup covers every schedule site', () => {
         expect(vi.getTimerCount()).toBe(0);
     });
 
-    it('announces and pings a board whose only work is an actionRequest answer', async () => {
+    it('announces a board whose only work is an actionRequest answer, and never pings it', async () => {
         const ownerGate = deferred<HarnessActionChoice>();
         const events: HarnessEvent[] = [];
         const seen: SeenRequest[] = [];
@@ -1226,14 +1226,13 @@ describe('recurring wakeup covers every schedule site', () => {
         expect(drained).toEqual([]);
 
         await advance(600_000);
-        expect(wakeupsOf(events)).toEqual([
-            {
-                type: 'wakeup',
-                agent: 'writer',
-                reason: 'pending-tools',
-                pending: [{ callId: 'q1', name: 'actionRequest', elapsedMs: 600_000 }]
-            }
-        ]);
+        // actionRequest declares `mode:'sync'`, so this board is NOT async-pending:
+        // `isAsyncPending` (src/plugins/async-ping.plugin.ts) ignores sync work, the
+        // heartbeat never arms, and the ten-minute jump mints no `wakeup` frame. The
+        // question is held by the harness itself — the run parks instead of burning a
+        // model turn on a placeholder, which is what the old recurring ping existed
+        // to paper over.
+        expect(wakeupsOf(events)).toEqual([]);
         expect(state.status).toBe('pending');
 
         ownerGate.resolve({ kind: 'option', optionId: 'slow' });

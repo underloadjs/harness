@@ -219,6 +219,7 @@ describe('live toolbox harness', () => {
             'agentResult',
             'delegate',
             'threadFork',
+            'sleep',
             'toolCancel',
             'syntax',
             'read',

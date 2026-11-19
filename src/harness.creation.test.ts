@@ -266,6 +266,7 @@ describe('toolCreate', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'toolCancel',
             'existing',
             'delegate',
@@ -336,15 +337,16 @@ describe('toolCreate', () => {
             });
         }
 
-        // Thirteen harness-owned baseline entries (toolRegistry, toolRequest,
+        // Fourteen harness-owned baseline entries (toolRegistry, toolRequest,
         // toolList, toolManage, toolCreate, the four record tools,
-        // agentManage/agentResult, threadFork, and the pending-only toolCancel)
-        // plus the 32 creations.
-        // 47, not 46: the record engine added ONE core tool (`records`) ahead of its
+        // agentManage/agentResult, threadFork, the always-registered `sleep` pause, and the
+        // pending-only toolCancel) plus the 32 creations.
+        // 48, not 47: the record engine added ONE core tool (`records`) ahead of its
         // four wrappers, the cross-session `knowledge` row adds one more (order 95,
-        // src/tools/runtime/knowledge.tool.ts:503), and the created-tool budget is
+        // src/tools/runtime/knowledge.tool.ts:503), the wall-clock pause adds one more
+        // (order 145, src/tools/runtime/sleep.tool.ts), and the created-tool budget is
         // unchanged.
-        expect(Object.keys(writer.tools)).toHaveLength(47);
+        expect(Object.keys(writer.tools)).toHaveLength(48);
         expect(() =>
             writer.createTool({
                 name: 'generated32',

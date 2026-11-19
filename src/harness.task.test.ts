@@ -245,7 +245,10 @@ const DEMOTED_RUNTIME_TOOLS = [
     'knowledge',
     'agentManage',
     'agentResult',
-    'threadFork'
+    'threadFork',
+    // The wall-clock pause is demoted the same way: registered always, searchable, and
+    // therefore never declared. src/tools/runtime/sleep.tool.ts.
+    'sleep'
 ] as const;
 
 describe('tasks', () => {
@@ -540,6 +543,7 @@ describe('tasks', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'toolCancel'
         ]);
     });
@@ -634,6 +638,7 @@ describe('tasks', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'toolCancel'
         ]);
     });

@@ -417,6 +417,7 @@ describe('session record tools', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'toolCancel'
         ]);
     });

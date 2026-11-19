@@ -107,7 +107,13 @@ describe('core tool metadata', () => {
                 // this list stays the catalogue reading order rather than an arbitrary one.
                 'knowledge',
                 'agentManage',
-                'agentResult'
+                'agentResult',
+                // sleep sits where its registration order puts it (145, after actionRequest 140
+                // and before toolCancel 150 — src/tools/runtime/sleep.tool.ts:165), so this list
+                // stays the catalogue reading order. It is also the case this pin exists for: a
+                // NEW runtime entry (added 2026-11-19) that was not in it, which is exactly the
+                // silent escape the comment on the `knowledge` value below warns about.
+                'sleep'
             ].map((name) => writer.tools[name].visibility)
         ).toEqual([
             'core', // toolRequest — the discovery bootstrap stays declared
@@ -132,7 +138,14 @@ describe('core tool metadata', () => {
             // `harness().tools`, the surface a model actually sees, not from a named export.
             'searchable', // knowledge
             'searchable', // agentManage
-            'searchable' // agentResult
+            'searchable', // agentResult
+            // T-sleep (2026-11-19): the wall-clock pause. `searchable`, stated in the entry's own
+            // literals — `visibility: 'searchable'` (src/tools/runtime/sleep.tool.ts:111) and
+            // `alwaysDeclared: false` (`:166`) — so a provider pays its description and schema only
+            // on a request where `toolRequest` pulled it in. A pause is not needed on every turn,
+            // which is the same posture as the stores above it; `core` would spend bootstrap context
+            // on a tool most runs never call. Read from `writer.tools`, i.e. the live registry.
+            'searchable' // sleep
         ]);
 
         expect(writer.tools.toolCreate.description).toEqual(

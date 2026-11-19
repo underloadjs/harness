@@ -48,6 +48,12 @@ export type ActionRequestCardOptions = {
     request: HarnessActionRequest;
     // Root request = human-interactive. Non-root (autoanswer/fork child) = read-only.
     interactive: boolean;
+    // PROVENANCE, not interactivity (C2/R4): true only when this request belongs to a
+    // CHILD thread whose immediate owner answers it automatically. The note below
+    // claims "the owner fork answered it", so it may rest ONLY on this flag — a settled
+    // ROOT request is `interactive:false` as well, and deriving the note from that flag
+    // is what printed "Auto-answered by the owner fork" under a human answer.
+    forkAnswered?: boolean;
     // Initial authoritative answer (a replayed action_answer) or expiry (a settled
     // historical turn). Both are optional; a live pending root request has neither.
     answer?: HarnessActionAnswer;
@@ -109,12 +115,24 @@ export const createActionRequestCard = (options: ActionRequestCardOptions): Acti
     question.id = questionId;
     root.append(question);
 
-    // Non-root requests are answered by the owner's automatic fork; make that
-    // provenance explicit without exposing agent ids or branch internals.
-    if (!options.interactive) {
-        root.dataset.readonly = 'true';
-        root.append(el('p', 'action-note', 'Auto-answered by the owner fork.'));
-    }
+    // A settled ROOT request has no controls either, so `readonly` stays tied to
+    // interactivity (no radios/textarea/button). The note is a different fact.
+    if (!options.interactive) root.dataset.readonly = 'true';
+
+    // C2/R4: the note states WHO answered, so it rests on provenance alone — a CHILD
+    // request (`forkAnswered`, from `entry.key !== ROOT_KEY`) whose recorded answer did
+    // not come from the human. A root card, settled or reloaded, never claims a fork.
+    const ownerForkNote =
+        options.forkAnswered === true && options.answer?.source !== 'owner'
+            ? el('p', 'action-note', 'Auto-answered by the owner fork.')
+            : undefined;
+    if (ownerForkNote !== undefined) root.append(ownerForkNote);
+
+    // An `action_answer` with `source:'owner'` is the human speaking, so a fork note
+    // mounted earlier is false from that frame on and must leave the DOM.
+    const clearOwnerForkNote = (): void => {
+        ownerForkNote?.remove();
+    };
 
     const { recommended, options: ordered } = orderedOptions(request);
 
@@ -312,6 +330,8 @@ export const createActionRequestCard = (options: ActionRequestCardOptions): Acti
         // --- authoritative updates ---------------------------------------
         const setAnswer = (answer: HarnessActionAnswer): void => {
             state = 'answered';
+            // C2/R4: a human answer retires the owner-fork note (see `ownerForkNote`).
+            if (answer.source === 'owner') clearOwnerForkNote();
             selected =
                 answer.choice.kind === 'option'
                     ? answer.choice.optionId
@@ -372,6 +392,8 @@ export const createActionRequestCard = (options: ActionRequestCardOptions): Acti
 
     const setAnswer = (answer: HarnessActionAnswer): void => {
         state = 'answered';
+        // C2/R4: a human answer retires the owner-fork note (see `ownerForkNote`).
+        if (answer.source === 'owner') clearOwnerForkNote();
         const prefix = answer.source === 'auto' ? 'Auto-answered' : 'Answered';
         status.textContent = `${prefix}: ${actionChoiceText(request, answer.choice)}`;
         paint();

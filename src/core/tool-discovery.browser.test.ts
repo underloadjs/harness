@@ -43,11 +43,12 @@ describe('browser discovery fallback', () => {
         expect(descriptors.map((descriptor) => descriptor.name)).toEqual(
             BUILTIN_TOOL_DESCRIPTORS.map((descriptor) => descriptor.name)
         );
-        // 33 package rows: the 23 harness-owned runtime entries (21 before issue 0027
-        // added the `threadDelete` door, 22 before the `knowledge` entry at order 95)
+        // 34 package rows: the 24 harness-owned runtime entries (21 before issue 0027
+        // added the `threadDelete` door, 22 before the `knowledge` entry at order 95, 23
+        // before the `sleep` entry at order 145)
         // plus the 10 presets (the 9 historical ones
         // plus the R3/R4 `download` entry, order 235).
-        expect(descriptors).toHaveLength(33);
+        expect(descriptors).toHaveLength(34);
     });
 
     it('returns detached copies, not the manifest rows themselves', () => {
@@ -60,8 +61,8 @@ describe('browser discovery fallback', () => {
 
     it('honours includePresets without touching the filesystem', () => {
         // 21 runtime rows + the `threadDelete` release door (issue 0027) + the
-        // `knowledge` entry (order 95) = 23.
-        expect(discoverToolMetadata({ includePresets: false })).toHaveLength(23);
+        // `knowledge` entry (order 95) + the `sleep` pause (order 145) = 24.
+        expect(discoverToolMetadata({ includePresets: false })).toHaveLength(24);
     });
 
     it('rejects a folder request with a clear unsupported error', () => {

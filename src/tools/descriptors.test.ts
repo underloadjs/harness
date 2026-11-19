@@ -108,6 +108,9 @@ const ALL_PACKAGE_NAMES = [
     'delegate',
     'threadFork',
     'actionRequest',
+    // The wall-clock pause (2026-11-19): `order: 145`, so it registers after
+    // actionRequest (140) and before toolCancel (150).
+    'sleep',
     'toolCancel',
     'syntax',
     'read',
@@ -156,13 +159,13 @@ describe('live Node descriptor catalogue (T24)', () => {
         expect(BUILTIN_TOOL_DESCRIPTORS.map((descriptor) => descriptor.name)).not.toContain(
             'syntax'
         );
-        // The generated manifest ships 33 package rows (the 32 historical entries,
-        // plus the `threadDelete` runtime entry at order 255 and the `knowledge`
-        // runtime entry at order 95); the filter
-        // above removes `syntax`, so 32 is the stale table this simulation really
+        // The generated manifest ships 34 package rows (the 32 historical entries,
+        // plus the `threadDelete` runtime entry at order 255, the `knowledge`
+        // runtime entry at order 95 and the `sleep` runtime entry at order 145); the filter
+        // above removes `syntax`, so 33 is the stale table this simulation really
         // contains. Kept exact on purpose: a row count that silently moves is how a
         // new `.tool.ts` stops being covered by this file.
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(32);
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(33);
 
         // The live scan still reports the whole package tree, in scan order. The
         // generated table is one row shorter: it lost `syntax` to the filter above.
@@ -306,6 +309,10 @@ describe('live Node descriptor catalogue (T24)', () => {
         'knowledge',
         'agentManage',
         'agentResult',
+        // `sleep` is listable (`listed: true`) with a BASELINE activation ('always'),
+        // so it keeps descriptor order — after agentResult (110), before the
+        // capability rows the ordering puts last.
+        'sleep',
         'delegate',
         'actionRequest',
         'threadFork',

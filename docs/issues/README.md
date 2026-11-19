@@ -12,8 +12,8 @@ security rule, a dependency rule, a gateway-compatibility rule) that is stated i
 **Why it is the way it is**, and the proposal works inside the rule instead
 of against it.
 
-The log currently holds **seven entries**: 0007 (the review list) plus six live gaps —
-0017, 0023, 0026, 0032, 0037 and 0038. Every other entry these passes produced has closed — fixed at
+The log currently holds **eight entries**: 0007 (the review list) plus seven live gaps —
+0017, 0023, 0026, 0032, 0037, 0038 and 0039. Every other entry these passes produced has closed — fixed at
 HEAD, refuted, or reduced to an alternative the owner declined — and the file and the
 index row are deleted as the Format section below requires, with any surviving note moved
 into 0007 or into one of the entries above. The paragraphs that used to introduce those
@@ -70,6 +70,15 @@ rather than a request clock (`src/core/agent-limits.ts:74-81`). Both carry the d
 note: the generous defaults are recorded on purpose at `src/transport/provider-timeouts.ts:41-66`,
 and nothing was retuned to ship the visibility fix.
 
+**0039** is a **latent** one, recorded rather than fixed: a `toolFolders` entry that declares
+`registration.mode` has that mode **inert at runtime** — discovery hands back `mode:'async',
+origin:'folder'` while the published registry object answers `.mode === undefined` and the call runs
+sync. Harness and the `async-ping` plugin currently **agree** on sync, so nothing shipped loses
+hang-visibility; what keeps the entry open is that discovery already advertises a policy the runtime
+does not honour, and that the plugin's `'sync'` fallback turns into under-pinging the moment core
+starts honouring the row it is shown. None of the five shipped folder tools declares a mode, and no
+shipped test covers the folder-mode contract.
+
 ## Index
 
 | Issue | Area | Severity | One line |
@@ -82,6 +91,7 @@ and nothing was retuned to ship the visibility fix.
 
 | [0037](./minor-relay-gateway-silence-adds-no-per-request-provider-log.md) | upstream relay / gateway (**owning code outside this package**) | Minor | **Open, filed 2026-11-19.** A silent upstream cannot be seen or attributed: the relay's only per-request line is a token tally written AFTER the stream settles (`runtime/endpoint/provider/private/chat-completion/private-chat-completion.ts:174-181, 210-217`), upstream SSE keep-alive comments are consumed by the OpenAI SDK's decoder inside the relay hop (`node_modules/openai/src/core/streaming.ts:321-324`, and the relay re-emits only `data:` lines at `:162-164`), the SEVEN named basalt relays rotate only on a 404-class failover while the registry clients are shared process-wide (`config/vault/src/services/basalt.ts:2-37`; `packages/agentic/provider/src/local/local-basalt.ts:156-159, 231-246`; `…/private-chat-completion.ts:99, 108-122`), and the client has no heartbeat during upstream silence — so its only mid-stream bound is the 120 s between-reads one, and a tool block over 120 s of silence is killed and re-generated from token 1. Consequence of the engine at the end of that chain withholding the whole tool region (`services/modal/deploy/qwen3.8-27b/modal_qwen3_8_rtx6000_ninfer.py:97-100, 993-1003`). The generous bounds are deliberate and recorded (`src/transport/provider-timeouts.ts:41-66`); the proposal is flight logging, a heartbeat that survives the hop, and silence-triggered rotation — never a tighter default. |
 | [0038](./minor-long-tool-block-has-no-per-attempt-total-clock.md) | transport / timeouts | Minor | **Open, filed 2026-11-19 — deliberate policy, recorded not refuted.** One model attempt has no total wall clock: head 300 000 ms, first token 300 000 ms and between-reads 120 000 ms are all IDLE bounds (`src/transport/provider-timeouts.ts:150-152`), so a stream that trickles one frame every 119 s runs forever — pinned by `src/transport/openai.tool-call-liveness.test.ts:607` (past 3 600 000 ms with no bound firing), with `:688` pinning the pair (nothing fires at 62 s, `stream-chunk` fires at exactly 120 s). The 900 000 ms deadline belongs to the 4-attempt `provider-timeout` LADDER and only exists once a bound tripped (`src/core/agent-limits.ts:192-202, 221`; `src/core/agent.ts:1380-1385, 1402-1424`). `MODEL_TIMEOUT_MAX_MS` = 3 600 000 is a ceiling on what a MODEL may ask `delegate`/`threadFork` to wait, not a request clock (`src/core/agent-limits.ts:74-81`). Proposal: publish the worst-case arithmetic, then an OPT-IN `provider.totalTimeoutMs` (default `0` = no bound) that trips the existing `provider-timeout` class — no new code, no new ladder, no default changed. |
+| [0039](./minor-folder-tool-registration-mode-is-inert-at-runtime.md) | tool registration / `toolFolders` entries | Minor (**latent — record only, nothing user-visible today**) | **Open, filed 2026-11-19.** A folder entry's declared `registration.mode` is inert: `discoverToolMetadata` returns `{ mode: 'async', origin: 'folder' }` for it, yet the published registry object answers `.mode === undefined` and the run PARKS (measured 2026-11-19 with `Temp/review-sleep/probe10.ts` + the `foldertool` fixture: 2 model requests, 0 heartbeat wakeups). Mechanism: folder entries are registered by the separate ordered loop (`src/harness.ts:6003-6019` → `registerAtStartup:3102-3103`) and never pass through `registerDescriptor`, the one site that binds a discovered mode into the `modeDefinitions` WeakMap `effectiveToolMode` reads (`src/harness.ts:3945`, `:1927-1928`); the plugin's table is package-rows-only (`src/core/tool-metadata.ts:157`), so a folder name is a registry hit with no row → step 3, `'sync'` (`src/plugins/async-ping.plugin.ts:288-297`). Harness and plugin therefore AGREE today — no shipped configuration loses hang-visibility — and none of the five shipped folder tools declares a mode at all; the risk is the flip: discovery already reports the row as async, so the moment core honours it the plugin UNDER-pings, the one direction its header promises to protect against (`:50-55`). Fix proposal: carry the mode onto the published definition the way `harness({ tools })` already does (`src/harness.ts:6045`), so both consumers see it — no shipped test covers this contract today. |
 
 ## Format
 

@@ -182,6 +182,8 @@ const TOOL_NAMES = [
     'knowledge',
     'agentManage',
     'agentResult',
+    // The always-registered wall-clock pause (order 145) joins the baseline block.
+    'sleep',
     'delegate',
     // N4: conditional harness-owned tools, appended to the global catalogue.
     'actionRequest',

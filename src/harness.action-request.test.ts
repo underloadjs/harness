@@ -93,6 +93,17 @@ const toolMessages = (request: HarnessStreamRequest) =>
         (message): message is Extract<HarnessMessage, { role: 'tool' }> => message.role === 'tool'
     );
 
+// The canonical tool results a scripted turn can branch on.
+//
+// WHY THE PLACEHOLDER FILTER STILL EXISTS UNDER THE NEW CONTRACT: a run that owns an
+// unsettled `actionRequest` no longer gets a turn at all (src/harness.ts
+// `waitForActionRequests`), so the `{"status":"pending"}` projection of ITS OWN question
+// never reaches a request — that placeholder used to be the whole point of this filter,
+// and `src/harness.action-request-hold.test.ts` is what pins it away. The filter stays for
+// the placeholder that legitimately still rides along: an ASYNC sibling such as the
+// owner's `delegate` call, whose pending card the owner run is still prompted with while
+// the child works. Without it, every script below would have to distinguish "the child
+// answered" from "the child is still running but printed a pending card".
 const realToolContents = (request: HarnessStreamRequest): string[] =>
     toolMessages(request)
         .map((message) => message.content)
@@ -166,8 +177,17 @@ const REQUEST_ARGS = JSON.stringify({
     ]
 });
 
-const REQUEST: HarnessActionRequest = {
-    requestId: 'request-1',
+// A request id is `<prefix><process epoch>-<sequence>` (src/harness.ts
+// `launchActionRequest`): the epoch is minted once per process (`core/agent-limits.ts`
+// `HARNESS_PROCESS_EPOCH`), because a bare per-harness counter restarts at 1 and a fresh
+// `request-1` after a restart collides with a DEAD id the owner still remembers. The id is
+// opaque everywhere downstream (the server routes and the Rust mirror only re-validate it
+// against the recorded options), so a test pins its exact SHAPE here and then pins its
+// VALUE by carrying it from the frame that first reports it into every later assertion.
+const REQUEST_ID = /^request-[0-9a-z]+-[0-9a-z]+-\d+$/;
+
+const requestOf = (requestId: string): HarnessActionRequest => ({
+    requestId,
     question: 'Which path should I take?',
     recommended: 'fast',
     options: [
@@ -175,7 +195,7 @@ const REQUEST: HarnessActionRequest = {
         { id: 'slow', label: 'Slow path' }
     ],
     allowCustom: true
-};
+});
 
 const rootRoute = (request: HarnessStreamRequest): HarnessStreamEvent[] => {
     const results = realToolContents(request);
@@ -221,11 +241,17 @@ describe('actionRequest runtime', () => {
         const running = writer('go');
         await flush();
 
+        // The id's value is minted per process (see `REQUEST_ID`), so the shape is pinned
+        // here and the value is pinned by carrying it into every later assertion, where it
+        // must agree with the frames that echo it.
+        const requestId = context!.requestId;
+        expect(requestId).toMatch(REQUEST_ID);
+
         expect(context).toEqual({
-            requestId: 'request-1',
+            requestId,
             agent: 'writer',
             callId: 'q1',
-            request: REQUEST
+            request: requestOf(requestId)
         });
 
         expect(events.some((event) => event.type === 'action_request')).toBe(true);
@@ -248,9 +274,9 @@ describe('actionRequest runtime', () => {
         expect(events[answerIndex]).toMatchObject({
             type: 'action_answer',
             agent: 'writer',
-            requestId: 'request-1',
+            requestId,
             answer: {
-                requestId: 'request-1',
+                requestId,
                 choice: { kind: 'option', optionId: 'slow' },
                 source: 'owner'
             }
@@ -262,7 +288,7 @@ describe('actionRequest runtime', () => {
         );
 
         expect(JSON.parse(result!.content)).toEqual({
-            requestId: 'request-1',
+            requestId,
             answeredBy: 'owner',
             choice: { kind: 'option', optionId: 'slow', label: 'Slow path' }
         });
@@ -276,11 +302,17 @@ describe('actionRequest runtime', () => {
 
     it('returns a custom answer unchanged', async () => {
         const entry = brain(routed(rootRoute));
+        // The handler's context is where a process-minted id is readable (see `REQUEST_ID`).
+        let requestId = '';
+
         const writer = harness({
             agents: { writer: entry },
             presets: false,
             interaction: {
-                actionRequest: async () => ({ kind: 'custom', text: 'Neither — split it.' })
+                actionRequest: async (context) => {
+                    requestId = context.requestId;
+                    return { kind: 'custom', text: 'Neither — split it.' };
+                }
             }
         });
 
@@ -292,8 +324,9 @@ describe('actionRequest runtime', () => {
                 message.role === 'tool' && message.name === 'actionRequest'
         );
 
+        expect(requestId).toMatch(REQUEST_ID);
         expect(JSON.parse(result!.content)).toEqual({
-            requestId: 'request-1',
+            requestId,
             answeredBy: 'owner',
             choice: { kind: 'custom', text: 'Neither — split it.' }
         });
@@ -476,12 +509,20 @@ describe('actionRequest runtime', () => {
         expect(quotedSystem).toBeDefined();
         expect(messages.filter((message) => message.role === 'system')).toHaveLength(1);
 
+        // ONE id, minted per process (see `REQUEST_ID`), and every frame that names the
+        // request must carry that same value: the request event, the answer event, the
+        // branch record, and the tool result the child reads.
+        const requestEvent = events.find((event) => event.type === 'action_request');
+        const requestId = (requestEvent as Extract<HarnessEvent, { type: 'action_request' }>).request
+            .requestId;
+        expect(requestId).toMatch(REQUEST_ID);
+
         const answerEvent = events.find((event) => event.type === 'action_answer');
         expect(answerEvent).toMatchObject({
             type: 'action_answer',
-            requestId: 'request-1',
+            requestId,
             answer: {
-                requestId: 'request-1',
+                requestId,
                 choice: { kind: 'option', optionId: 'fast' },
                 source: 'auto'
             }
@@ -496,7 +537,7 @@ describe('actionRequest runtime', () => {
         // The autoanswer branch inherits the OWNER's rank (`actorRanks`), and the entry agent
         // of a two-rank roster holds Rank A. This replaces `role: 'primary'`.
         expect(autoBranch.rank).toBe('A');
-        expect(autoBranch.requestId).toBe('request-1');
+        expect(autoBranch.requestId).toBe(requestId);
         expect(autoBranch.status).toBe('completed');
         expect((answerEvent as Extract<HarnessEvent, { type: 'action_answer' }>).answer.branchId).toBe(
             autoBranch.branchId
@@ -514,7 +555,7 @@ describe('actionRequest runtime', () => {
                 message.role === 'tool' && message.name === 'actionRequest'
         );
         expect(JSON.parse(helperResult!.content)).toEqual({
-            requestId: 'request-1',
+            requestId,
             answeredBy: 'auto',
             choice: { kind: 'option', optionId: 'fast', label: 'Fast path', description: 'Ship quickly.' }
         });

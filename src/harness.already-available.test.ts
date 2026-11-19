@@ -84,10 +84,11 @@ const AGENT_QUERY_ENABLED = ['agentManage', 'agentResult', 'toolCreate'];
 const AGENT_QUERY_TOOLS = [...AGENT_MATCHES, TOOL_CREATE_MATCH];
 
 // R9-R11: the searchable vocabulary a no-match query reports for this harness.
-// It is the sorted union of the eleven demoted rows' tags - toolRegistry, toolList,
+// It is the sorted union of the twelve demoted rows' tags - toolRegistry, toolList,
 // toolManage, toolCreate, profileManage, chapterManage, locationManage, agentManage,
-// agentResult, actionRequest, and threadFork. delegate/toolRequest/task are declared
-// core, so their tags are not part of the discoverable vocabulary.
+// agentResult, actionRequest, threadFork, and sleep (whose seven tags
+// sleep/wait/delay/timer/pause/seconds/time land here). delegate/toolRequest/task are
+// declared core, so their tags are not part of the discoverable vocabulary.
 const SEARCHABLE_TAGS = [
     'agents',
     'answer',
@@ -102,6 +103,7 @@ const SEARCHABLE_TAGS = [
     'compile',
     'create',
     'define',
+    'delay',
     'dynamic',
     'edit',
     'entries',
@@ -117,6 +119,7 @@ const SEARCHABLE_TAGS = [
     'manage',
     'outline',
     'output',
+    'pause',
     'people',
     'person',
     'place',
@@ -138,16 +141,21 @@ const SEARCHABLE_TAGS = [
     'results',
     'scene',
     'search',
+    'seconds',
     'self-modifying',
     'setting',
     'settings',
+    'sleep',
     'source',
     'store',
     'story',
     'summarize',
     'team',
     'thread',
+    'time',
+    'timer',
     'tools',
+    'wait',
     'world',
     'writing'
 ];

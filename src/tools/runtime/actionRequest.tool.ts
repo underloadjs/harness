@@ -87,13 +87,21 @@ export const metadata = ACTION_REQUEST_METADATA;
 export const registration = {
     group: 'runtime',
     activation: 'interaction',
-    // T2/R2: ASYNC — the policy a host integration depends on. The answer arrives from
-    // the owner (a human or an owner fork) at an unpredictable time, so the requester
-    // stays PAUSED with the pending card rather than parked inside a sync batch, and the
-    // answer triggers its own turn the moment it lands. Changing this to 'sync' would
-    // hold the whole message's batch hostage to an out-of-band reply, so it is stated
-    // here explicitly (the control dispatch is async by construction either way).
-    mode: 'async',
+    // T2/R2: SYNC — the question is directed AT the owner, so the run that raised it has
+    // nothing to look at until the answer lands. The Rust mirror states the same
+    // semantics (packages/typecrate/harness/src/store/actions.rs:7-13: "the run
+    // that raised the question is blocked inside the tool call until its owner answers"),
+    // and the host integration contract is the run-level hold, not a placeholder turn:
+    // while this run owns an unsettled request the turn loop issues NO further model
+    // request (see `waitForActionRequests` in ../harness.ts), so the pending card stays
+    // the only thing on screen and the model never answers its own question with a
+    // `{"status":"pending"}` placeholder. A batch of questions in one message therefore
+    // costs ONE turn after the last answer, which is the normal sync-group contract.
+    //
+    // It is deliberately NOT a block on a thread or a lane: the owner fork that answers a
+    // CHILD request is a distinct agent (actor key `branch:<id>`, its own scope), and the
+    // hold is per run, so a child never waits on itself and a lane never head-of-lines.
+    mode: 'sync',
     order: 140,
     sessionBound: true,
     alwaysDeclared: false,

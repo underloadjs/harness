@@ -194,7 +194,14 @@ describe('createActionRequestCard (interactive root)', () => {
 
 describe('createActionRequestCard (read-only child)', () => {
     it('renders a static recommended list with no human controls', () => {
-        const card = createActionRequestCard({ request: request(), interactive: false });
+        // C2/R4: the provenance note is a CHILD fact (`forkAnswered`), not a
+        // consequence of `interactive:false` — a settled ROOT card is read-only too and
+        // must not claim a fork answered it.
+        const card = createActionRequestCard({
+            request: request(),
+            interactive: false,
+            forkAnswered: true
+        });
         const root = card.element;
 
         expect(root.dataset.readonly).toBe('true');

@@ -416,6 +416,9 @@ describe('harness', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            // The wall-clock pause registers with the run-control block (order 145,
+            // between threadFork 130 and toolCancel 150): src/tools/runtime/sleep.tool.ts.
+            'sleep',
             'toolCancel'
         ]);
     });

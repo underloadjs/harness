@@ -895,6 +895,12 @@ export type Session = {
     // cancelled, expired, or restored after a restart). A late answer for one of
     // these is a 409, not a 404.
     completedActions: string[];
+    // C2/R5: the subset of `completedActions` that reached a HUMAN/FORK ANSWER (an
+    // `action_answer` outcome), kept in the same bounded FIFO order. `completedActions`
+    // means "no longer answerable" — it is NOT a statement that the question expired,
+    // and feeding it to the fold as `expiredRequestIds` is what re-marked an answered
+    // card as expired (see `expiredActionRequestIds`).
+    answeredActions: string[];
     // Set by remove()/dispose(): the pump stops, pending turns are discarded, and
     // no later frame is published for this session.
     disposed: boolean;
@@ -1395,6 +1401,43 @@ const expiredActionIds = (turns: readonly SessionTurn[]): string[] => {
 
     return ids.slice(Math.max(0, ids.length - MAX_COMPLETED_ACTIONS));
 };
+
+// Collect the request ids of every actionRequest that REACHED AN ANSWER, oldest
+// first, with the same bound as `expiredActionIds` (C2/R5).
+//
+// `completedActions` means "no longer answerable"; an answer and an expiry both land
+// there, so on its own it cannot tell the fold which questions expired. After a
+// restart the recorded `action_answer` events are the only witness that a human (or a
+// fork) answered, and those ids must be EXCLUDED from `expiredRequestIds` — otherwise
+// a settled turn re-folds with its answered question marked expired, which is the
+// mislabel the question card showed. Ids are opaque, so nothing here depends on the
+// `request-N` spelling the runtime mints.
+const answeredActionIds = (turns: readonly SessionTurn[]): string[] => {
+    const ids: string[] = [];
+
+    for (const turn of turns) {
+        for (const event of turn.events) {
+            if (event.type !== 'action_answer') continue;
+
+            // Same tolerance as `expiredActionIds`: a malformed record contributes
+            // nothing rather than failing the restore.
+            const requestId = event.answer?.requestId;
+            if (typeof requestId !== 'string' || requestId.length === 0) continue;
+            if (!ids.includes(requestId)) ids.push(requestId);
+        }
+    }
+
+    return ids.slice(Math.max(0, ids.length - MAX_COMPLETED_ACTIONS));
+};
+
+// THE expiry set a fold reads (C2/R5): settled ids that never reached an answer.
+// `displayContext` feeds this to `DisplayProjectContext.expiredRequestIds`, and
+// `expiredRequestIds()` exposes the same derivation for tests and diagnostics. Id
+// format is irrelevant — both inputs are opaque recorded strings.
+export const expiredActionRequestIds = (
+    completed: readonly string[],
+    answered: readonly string[]
+): Set<string> => new Set(completed.filter((requestId) => !answered.includes(requestId)));
 
 // A turn copy is the only shape a client ever receives. The live SessionTurn stays
 // private to the store; list()/get()/terminal frames all go through here.
@@ -2729,6 +2772,8 @@ export class SessionStore {
             settlers: new Map(),
             pendingActions: new Map(),
             completedActions: [],
+            // C2/R5: answers are tracked apart from settlements from the first frame.
+            answeredActions: [],
             disposed: false,
             // R1/R3/R4: compiled display state, its observers, and the durable log.
             // A fresh session has no turns, so every map starts empty; the journal is
@@ -3344,6 +3389,16 @@ export class SessionStore {
         this.finishActionRequest(session, pending, { ok: true, choice: validated });
     }
 
+    // The request ids this session's fold marks EXPIRED (C2/R5): settled but never
+    // answered. Public so a caller — and the store tests — read the ONE derivation the
+    // projection context is built from (`displayContext`), rather than re-deriving it
+    // from `completedActions`, which also holds answered ids.
+    expiredRequestIds(id: string): ReadonlySet<string> {
+        const session = this.require(id);
+
+        return expiredActionRequestIds(session.completedActions, session.answeredActions);
+    }
+
     // Settle one pending entry exactly once, detach its abort listener, and record
     // the id as no-longer-answerable (bounded FIFO) so a repeated/stale answer is a
     // 409 instead of a 404.
@@ -3355,6 +3410,11 @@ export class SessionStore {
         pending.signal.removeEventListener('abort', pending.onAbort);
 
         this.rememberCompletedAction(session, pending.requestId);
+
+        // C2/R4/R5: an OK settlement IS an answer. The id still belongs in
+        // `completedActions` (a repeat answer stays a 409), but it must never be read
+        // as an expiry, so it is recorded here as well and excluded downstream.
+        if (outcome.ok) this.rememberAnsweredAction(session, pending.requestId);
 
         // T16: one `action.closed` per settlement, from the ONE settlement point, so a client
         // clears exactly one question card and the `actions` counter moves whether the answer
@@ -3382,6 +3442,19 @@ export class SessionStore {
         session.completedActions.push(requestId);
         while (session.completedActions.length > MAX_COMPLETED_ACTIONS) {
             session.completedActions.shift();
+        }
+    }
+
+    // Record one request id as ANSWERED, with the same bound as
+    // `rememberCompletedAction` (C2/R5). Every answered id is also a completed id —
+    // this list only says WHY it is completed, and both lists drop their oldest entry
+    // at the same cap, so an answer never outlives the settlement it belongs to.
+    private rememberAnsweredAction(session: Session, requestId: string): void {
+        if (session.answeredActions.includes(requestId)) return;
+
+        session.answeredActions.push(requestId);
+        while (session.answeredActions.length > MAX_COMPLETED_ACTIONS) {
+            session.answeredActions.shift();
         }
     }
 
@@ -4660,6 +4733,11 @@ export class SessionStore {
                 // Keeping the ids (bounded) turns a stale UI card's answer into a
                 // 409 instead of a misleading 404.
                 completedActions: expiredActionIds(turns),
+                // C2/R5: the answered subset, rebuilt from the `action_answer` events
+                // the record already holds. An answered question stays OUT of the
+                // expiry set even after a restart; a recorded request with no answer
+                // is genuinely expired (its runtime is gone).
+                answeredActions: answeredActionIds(turns),
                 disposed: false,
                 // R1/R3/R4: the compiled state is rebuilt from the durable records
                 // right after registration (`restoreProjections`), so a restart starts
@@ -5720,7 +5798,10 @@ export class SessionStore {
             },
             threadLabels,
             invocationThreadIds: threadIds,
-            expiredRequestIds: new Set(session.completedActions),
+            // C2/R5: settled ids that never reached an answer. Feeding raw
+            // `completedActions` here is what marked an ANSWERED question expired in
+            // the fold (and re-marked it after every restart).
+            expiredRequestIds: expiredActionRequestIds(session.completedActions, session.answeredActions),
             // The callback is handed the LIVE turn record the projector holds, so the
             // cast is exact (see `DisplayTurnInput`, ../shared/turn-display.ts).
             blocksOf: (turn) => this.blocksFor(session, turn as unknown as SessionTurn),
@@ -12669,6 +12750,8 @@ export class SessionStore {
         // so an old card cannot claim a 409 for a session that no longer knows it.
         session.pendingActions.clear();
         session.completedActions = [];
+        // C2/R5: the answered list is the same history, so it is forgotten together.
+        session.answeredActions = [];
         // R1/R4: the compiled state and the durable per-step log start over with the
         // conversation. A truncate is required, not optional: without it a restart
         // would replay the OLD turns' events onto the new record as ghost steps, and

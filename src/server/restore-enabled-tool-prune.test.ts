@@ -3,7 +3,7 @@
 // WHY THIS FILE EXISTS. `create` seeds a brand-new session with every name the kernel can
 // switch (src/server/sessions.ts `buildHarness(preset, settings, ..., { enableAllTools: true })`,
 // ../types/index.ts `HarnessConfiguration.enableAllTools`), so a persisted
-// `core.discovery.enabled` is ~23 names on the FIRST save rather than the handful a couple of
+// `core.discovery.enabled` is ~24 names on the FIRST save rather than the handful a couple of
 // `toolRequest` rounds used to leave behind. The kernel refuses an enabled name the rebuilt
 // harness does not register:
 //   `Snapshot discovery names "X", which is not registered in this harness.`
@@ -209,6 +209,7 @@ const ENABLED_NAMES = [
     'agentResult',
     'threadFork',
     'actionRequest',
+    'sleep',
     'syntax',
     'files',
     'shell',
@@ -221,7 +222,7 @@ const ENABLED_NAMES = [
     'textSummarize'
 ];
 
-// The same toolbox as the ROW LIST, in the server's own order: the 23 capped names above plus the
+// The same toolbox as the ROW LIST, in the server's own order: the 24 capped names above plus the
 // ten that hold no `maxEnabledTools` slot. T6 states the row's `enabled` as the CALL AXIS, so every
 // one of these is `true` on a seeded session that has switched nothing off — the ten slotless names
 // are in context through their declaration list, not through a slot the seed filled.
@@ -242,6 +243,7 @@ const ROW_ORDER = [
     'delegate',
     'threadFork',
     'actionRequest',
+    'sleep',
     'toolCancel',
     'syntax',
     'read',
@@ -392,7 +394,7 @@ describe('a stale enabled tool name is tolerated on restore (R1 seed)', () => {
 
         tamperDiscovery(root, sessionId, 'commandRun');
 
-        // The tampered document is the shape a real stale record has: 23 live names plus one
+        // The tampered document is the shape a real stale record has: 24 live names plus one
         // that resolves nowhere.
         expect(readDocument(root).sessions[0].core.discovery?.enabled).toEqual([...ENABLED_NAMES, 'commandRun']);
 
@@ -407,7 +409,7 @@ describe('a stale enabled tool name is tolerated on restore (R1 seed)', () => {
         expect(enabledOf(second, sessionId)).toEqual(ENABLED_NAMES);
 
         // The rows the pane renders state the same fact from the other side: every row this build
-        // registers is still ON — all 33, not just the 23 capped ones, because T6's `enabled` is the
+        // registers is still ON — all 34, not just the 24 capped ones, because T6's `enabled` is the
         // call axis and the ten slotless names are callable through their declaration list — and a
         // name this build does not register is not a row at all.
         const rows = await rowsOf(second, sessionId);

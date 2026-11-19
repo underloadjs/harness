@@ -58,11 +58,11 @@ describe('browser catalogue fallback (T24)', () => {
         // Field for field: no live row may sneak in, and no generated row may be
         // rewritten by the projection.
         expect(TOOL_DESCRIPTORS).toEqual([...BUILTIN_TOOL_DESCRIPTORS]);
-        // 33 rows: the browser bundle carries the same generated inventory as the
+        // 34 rows: the browser bundle carries the same generated inventory as the
         // Node build, including the new `download` preset, the `threadRead` runtime
-        // entry, the `threadDelete` release door (issue 0027) and the `knowledge`
-        // runtime entry (order 95).
-        expect(TOOL_DESCRIPTORS).toHaveLength(33);
+        // entry, the `threadDelete` release door (issue 0027), the `knowledge`
+        // runtime entry (order 95) and the `sleep` pause (order 145).
+        expect(TOOL_DESCRIPTORS).toHaveLength(34);
     });
 
     it('derives the preset and runtime groups from the generated data', () => {
@@ -100,6 +100,10 @@ describe('browser catalogue fallback (T24)', () => {
         'knowledge',
         'agentManage',
         'agentResult',
+        // `sleep` joins the listable runtime set: `group: 'runtime'` + `listed: true`
+        // and a BASELINE activation ('always'), so it keeps descriptor order and sits
+        // before the capability rows (delegate → actionRequest → threadFork).
+        'sleep',
         'delegate',
         'actionRequest',
         'threadFork',

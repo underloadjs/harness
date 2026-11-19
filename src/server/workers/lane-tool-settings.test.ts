@@ -801,6 +801,7 @@ describe('R3 lane propagation: a worker lane omits a disabled tool from its requ
             'agentManage',
             'agentResult',
             'actionRequest',
+            'sleep',
             'syntax',
             'files',
             'shell',

@@ -178,7 +178,15 @@ const STARTUP_SOURCE_ENTRIES = {
     // looks at — the silent coverage loss the header above warns about.
     knowledge: 'tools/runtime/knowledge.tool.ts',
     agentManage: 'tools/runtime/agentManage.tool.ts',
-    agentResult: 'tools/runtime/agentResult.tool.ts'
+    agentResult: 'tools/runtime/agentResult.tool.ts',
+    // The wall-clock pause (2026-11-19): `group: 'runtime'` + `activation: 'always'`
+    // (src/tools/runtime/sleep.tool.ts), so it registers from source on EVERY harness
+    // at startup exactly like the record family, and the gate needs its row — a missing
+    // row is the silent coverage loss the header above warns about. The entry is
+    // self-contained (type-only `../../core` + `../../types`, plus the value import of
+    // `tool` that knowledge.tool.ts and download.tool.ts already ship), so the
+    // `dependencies: []` assertion below holds.
+    sleep: 'tools/runtime/sleep.tool.ts'
 };
 
 const FIXTURE_ROOT = 'self-modify-fixture';

@@ -403,6 +403,7 @@ describe('creating a harness', () => {
             'agentResult',
             'delegate',
             'threadFork',
+            'sleep',
             'toolCancel',
             ...SHARED_TOOL_NAMES,
             'fetch'
@@ -1008,6 +1009,7 @@ describe('updating a harness', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'toolCancel',
             'timeNow'
         ]);

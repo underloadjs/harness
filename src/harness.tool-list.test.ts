@@ -76,6 +76,7 @@ describe('toolList', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'toolCancel',
             'enabledFixture',
             'disabledFixture'

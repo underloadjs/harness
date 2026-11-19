@@ -527,6 +527,7 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'toolCancel',
             'timeNow'
         ]);

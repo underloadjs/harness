@@ -255,7 +255,7 @@ const asyncPingRow = (): Row => ({
     name: 'async-ping',
     title: 'Background Ping',
     description:
-        'Keeps a conversation waiting on background tool work moving by emitting a periodic ping with the calls that are still running, replacing the fixed scheduler heartbeat.',
+        "Keeps a conversation waiting on background tool work moving by emitting a periodic ping only while at least one pending call resolves to mode 'async', replacing the fixed scheduler heartbeat.",
     version: '1.0.0',
     tags: ['background', 'async', 'lifecycle'],
     hooks: ['async.pending', 'async.drained', 'run.failed', 'thread.stopped', 'thread.deleted', 'harness.dispose'],
@@ -271,7 +271,7 @@ const asyncPingRow = (): Row => ({
             default: 600000,
             min: 1000,
             step: 1000,
-            description: 'How often a still-running background tool is reported while work is pending.'
+            description: "How often a conversation is pinged while at least one pending call resolves to mode 'async'. Defaults to the historical 10-minute wake."
         }
     ],
     values: { intervalMs: 600000 }

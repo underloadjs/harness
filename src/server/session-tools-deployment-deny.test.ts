@@ -14,8 +14,8 @@
 //   1. FRESH SESSION UNDER A DENY — the denied row reports `enabled: false` / `protected: false`
 //      / `origin: 'catalogue'` (the seed filtered the deny list out before the pass,
 //      ../harness.ts `seedSwitchableTools`), while every other switchable row keeps its seeded
-//      slot. T6 states the enabled figure as the call axis, so the count is 32 of 33 rows and not
-//      22 of 33: the ten names that hold no cap slot are `true` through their declaration list, and
+//      slot. T6 states the enabled figure as the call axis, so the count is 33 of 34 rows and not
+//      23 of 34: the ten names that hold no cap slot are `true` through their declaration list, and
 //      the one false row is the denied name; the GLOBAL row for the same name states the
 //      deployment's answer (`enabled: false`), which is the read a client uses for that figure;
 //   2. NO SESSION ROW FIELD STATES THE DENIAL — the two figures a session row does carry for a
@@ -84,6 +84,7 @@ const SEEDED_NAMES = [
     'agentResult',
     'threadFork',
     'actionRequest',
+    'sleep',
     'syntax',
     'files',
     'shell',
@@ -98,11 +99,11 @@ const SEEDED_NAMES = [
 
 // The ten names that hold NO `maxEnabledTools` slot. Since T6 the session row's `enabled` is the
 // CALL AXIS, not this capped list: these ten answer `true` through their declaration list, so the
-// enabled figure below is 32 of 33 rows with `shell` denied, not 22 of 33. `shell` is one of the
+// enabled figure below is 33 of 34 rows with `shell` denied, not 23 of 34. `shell` is one of the
 // capped names, which is exactly why the deny is visible on it and invisible on a core row.
 const SLOTLESS_NAMES = ['toolRequest', 'tasks', 'delegate', 'toolCancel', 'read', 'write', 'edit', 'glob', 'grep', 'fetch'];
 
-// All 33 rows in the server's own order (`SEEDED_NAMES` interleaved with `SLOTLESS_NAMES`), so the
+// All 34 rows in the server's own order (`SEEDED_NAMES` interleaved with `SLOTLESS_NAMES`), so the
 // enabled figure cannot be satisfied by a reordered or partially populated list.
 const ROW_ORDER = [
     'toolRegistry',
@@ -121,6 +122,7 @@ const ROW_ORDER = [
     'delegate',
     'threadFork',
     'actionRequest',
+    'sleep',
     'toolCancel',
     'syntax',
     'read',
@@ -340,7 +342,7 @@ describe('a brand-new session under a deployment-wide deny', () => {
 
         // Every OTHER switchable row keeps its seeded slot, so the deny removed exactly one name —
         // and the ten rows with no slot are on anyway, through their declaration list. T6 states the
-        // figure as the call axis (32 of 33), where the pre-T6 cap figure read 22 of 33.
+        // figure as the call axis (33 of 34), where the pre-T6 cap figure read 23 of 34.
         expect(namesWhere(rows, (row) => row.enabled)).toEqual(ROW_ORDER.filter((name) => name !== 'shell'));
         expect(namesWhere(rows, (row) => !row.enabled)).toEqual(['shell']);
         expect(namesWhere(rows, (row) => SLOTLESS_NAMES.includes(row.name as string) && row.enabled)).toEqual(SLOTLESS_NAMES);

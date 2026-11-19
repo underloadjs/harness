@@ -6755,9 +6755,38 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // answered by its immediate owner and renders read-only.
         const isSettledTurn = (): boolean => state === 'done' || state === 'error' || state === 'cancelled';
 
+        // The recorded facts the caller already holds for this request (C2/R4/R5/R6).
+        // The COMPILED plane knows the answer at mount time (`step.action.answered`),
+        // while the raw event plane only learns it from the later `action_answer`
+        // frame; passing it in is what stops a settled tile from mounting an answered
+        // card as expired and then silently missing its repair.
+        type ActionCardRecord = {
+            answer?: HarnessActionAnswer;
+            // Extra keys this card answers to. A provisional card is registered under
+            // `step.callId`/`step.id` (see `paintCompiledAction`), so the answer may be
+            // applied under either spelling.
+            aliasIds?: readonly string[];
+        };
+
+        // Remove EVERY key pointing at this card (canonical id + aliases). The hydration
+        // path retires a provisional card, and a half-retired alias would hand a
+        // destroyed card back to the next `applyActionAnswer`.
+        const unregisterActionCard = (card: ActionRequestCard): void => {
+            for (const [key, candidate] of [...actionCards]) {
+                if (candidate !== card) continue;
+
+                actionCards.delete(key);
+                forgetAnswerCard(key);
+            }
+        };
+
         // Create/register one card. `request` is already parsed by the contract
         // guard, so the card never sees a partially-malformed payload.
-        const mountActionCard = (entry: ThreadEntry, request: HarnessActionRequest): ActionRequestCard => {
+        const mountActionCard = (
+            entry: ThreadEntry,
+            request: HarnessActionRequest,
+            recorded: ActionCardRecord = {}
+        ): ActionRequestCard => {
             const existing = actionCards.get(request.requestId);
             if (existing !== undefined) {
                 // T29: a re-paint rebuilds the section flow, and a card registered under
@@ -6774,10 +6803,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
 
             const interactive = entry.key === ROOT_KEY && !isSettledTurn();
-            const stored = actionAnswers.get(request.requestId);
+            // C2/R4: provenance is WHICH flow asked the question, never whether the
+            // turn settled. Only a child flow's question is answered by its owner fork,
+            // so only that card may carry the owner-fork note.
+            const forkAnswered = entry.key !== ROOT_KEY;
+            // C2/R4/R5: the step's own recorded answer outranks the per-tile cache; the
+            // card is created already ANSWERED rather than repaired afterwards.
+            const stored = recorded.answer ?? actionAnswers.get(request.requestId);
             const card = createActionRequestCard({
                 request,
                 interactive,
+                forkAnswered,
                 ...(stored === undefined ? {} : { answer: stored }),
                 ...(interactive
                     ? {
@@ -6796,9 +6832,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                           }
                       }
                     : {}),
-                // A settled historical turn is not a live question: the card is
-                // shown for the record but its controls are already expired.
-                ...(isSettledTurn()
+                // A settled historical turn is not a live question: the card is shown
+                // for the record and its controls are already expired. C2/R4 (Bug 2): a
+                // settled turn whose step carries an answer is NOT expired — the answer
+                // is the record, so the expiry line is never passed and the card opens
+                // in the answered state instead of depending on a later repair that can
+                // miss (the screenshot's "This question expired when the turn ended.").
+                ...(isSettledTurn() && stored === undefined
                     ? {
                           expired:
                               state === 'cancelled'
@@ -6813,6 +6853,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             entry.section.flow.append(card.element);
             if (entry.section.pending !== undefined) entry.section.flow.append(entry.section.pending);
             actionCards.set(request.requestId, card);
+            // C2/R6 (Bug 3): a compiled step may name the request by `step.callId` or
+            // `step.id` when its `action` summary carries no `requestId`, and a
+            // provisional card is registered under exactly those spellings. Registering
+            // them as aliases means `applyActionAnswer` can never target a key the card
+            // is not registered under (the silent miss that left the card expired).
+            // Duplicate entries in `actionCards.values()` are harmless: every consumer
+            // (the settle sweep, the destroy loops) is idempotent per card.
+            for (const aliasId of recorded.aliasIds ?? []) {
+                if (aliasId === request.requestId) continue;
+
+                actionCards.set(aliasId, card);
+            }
             rememberAnswerCard(card);
             return card;
         };
@@ -9011,7 +9063,30 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             closeText(entry.section);
             closeToolGroup(entry.section);
 
-            const card = mountActionCard(entry, request);
+            // C2/R4/R6: ONE canonical id for the mount AND for the recorded answer. The
+            // card registers under `request.requestId`, so the recorded answer must name
+            // that key; `requestId`/`step.callId`/`step.id` are registered as ALIASES, so
+            // an answer applied under a provisional spelling still reaches this card
+            // instead of silently missing it (`../shared/turn-display.ts:790-796` is the
+            // call-scoped pairing rule this implements).
+            const canonicalId = request.requestId;
+            const recordedAnswer: HarnessActionAnswer | undefined =
+                action?.answered === undefined
+                    ? undefined
+                    : {
+                          requestId: canonicalId,
+                          choice: action.answered.choice,
+                          source: action.answered.source
+                      };
+
+            const aliasIds = [canonicalId, requestId, step.callId ?? '', step.id].filter(
+                (id) => id.length > 0 && id !== canonicalId
+            );
+
+            const card = mountActionCard(entry, request, {
+                ...(recordedAnswer === undefined ? {} : { answer: recordedAnswer }),
+                aliasIds
+            });
 
             // One lazy read per step, and only when the card has no real choices.
             if (action === undefined && supplied === undefined && !hydratedAttempts.has(hydratedKey)) {
@@ -9033,8 +9108,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         const provisional = actionCards.get(requestId);
 
                         if (provisional !== undefined) {
-                            actionCards.delete(requestId);
-                            forgetAnswerCard(requestId);
+                            // C2/R6: retire EVERY key the provisional card answers to
+                            // (canonical id + aliases), not just the one spelling this
+                            // step guessed; a leftover alias would hand the destroyed
+                            // card back to the next answer frame.
+                            unregisterActionCard(provisional);
                             provisional.destroy();
                             provisional.element.remove();
                         }
@@ -9049,14 +9127,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     .catch(() => undefined);
             }
 
-            // The recorded answer, when there is one, is authoritative: the card
-            // shows it instead of an open question (the same `action_answer` effect).
-            if (action?.answered !== undefined)
-                applyActionAnswer({
-                    requestId,
-                    choice: action.answered.choice,
-                    source: action.answered.source
-                });
+            // The recorded answer, when there is one, is authoritative: the card was
+            // already created in the answered state (see `recordedAnswer`), and this
+            // frame is what re-applies it on a re-paint or a session switch.
+            if (recordedAnswer !== undefined) applyActionAnswer(recordedAnswer);
 
             // The server knows an id is dead (a restored/expired request,
             // sessions.ts:679); the card must not guess that from elapsed time.

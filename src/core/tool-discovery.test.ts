@@ -85,6 +85,9 @@ describe('tools folder consolidation (R7)', () => {
             'profiles.tool.ts',
             'records.tool.ts',
             'search.tool.ts',
+            // The wall-clock pause (2026-11-19). Sorted with the rest of the folder
+            // listing (search < sleep < tasks).
+            'sleep.tool.ts',
             'tasks.tool.ts',
             // Issue 0027: the release door for a finished conversation. Sorted with
             // the rest of the folder listing (D before F).
@@ -125,6 +128,10 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'delegate',
             'threadFork',
             'actionRequest',
+            // The wall-clock pause (2026-11-19): `order: 145` slots it between
+            // actionRequest (140) and toolCancel (150), at the end of the run-control
+            // block, and it registers BEFORE the tool that can cut the wait short.
+            'sleep',
             'toolCancel',
             'syntax',
             'read',
@@ -296,6 +303,9 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'delegate',
             'threadFork',
             'actionRequest',
+            // Same row as the full-catalogue list above: order 145, after
+            // actionRequest and before toolCancel.
+            'sleep',
             'toolCancel',
             'search',
             'fetch',
@@ -489,12 +499,13 @@ describe('generated manifest parity (R9)', () => {
     });
 
     it('describes every package entry, and no folder entry', () => {
-        // 33 generated rows: the 32 package entries before the knowledge tool (the 29
+        // 34 generated rows: the 33 rows that shipped before the pause tool (the 29
         // historical rows including the `download` preset at order 235, plus the
         // `threadRead` runtime entry at order 265) plus the `threadDelete` runtime
         // entry (order 255) that releases a finished conversation (issue 0027), plus
-        // the `knowledge` runtime entry (order 95, src/tools/runtime/knowledge.tool.ts).
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(33);
+        // the `knowledge` runtime entry (order 95, src/tools/runtime/knowledge.tool.ts),
+        // plus the `sleep` runtime entry (order 145, src/tools/runtime/sleep.tool.ts).
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(34);
 
         for (const descriptor of BUILTIN_TOOL_DESCRIPTORS) {
             expect(descriptor.origin).toBe('package');

@@ -16,6 +16,12 @@
 //           group;
 //         - a lone sync call therefore starts its next turn AFTER it finished;
 //         - groups are per run: two runs never share one.
+//   R5  The PERIODIC wake answers for ASYNC pending work only. A run parked because its
+//       outstanding calls are all `mode:'sync'` is never woken on the heartbeat (it is
+//       woken by its own group settling), so a long sync call costs no placeholder
+//       turn; a run with async work pending still is. Pinned by the `heartbeat policy`
+//       block at the end of this file — the plugin-side halves of the same rule are in
+//       src/plugin/async-ping.test.ts.
 //
 // Determinism: every gate below is resolved by the test, one at a time, so each request
 // COUNT and each request PROJECTION is an exact expected value. Fake timers own the
@@ -141,9 +147,25 @@ type Fixture = {
     events: HarnessEvent[];
 };
 
-// One single-agent harness with exactly these tools (no presets, so nothing else is
-// declared and the recorded projections stay readable).
-const fixture = (script: HarnessStreamEvent[][], tools: Record<string, Tool>): Fixture => {
+// Move the clock by an exact amount and let the resulting work settle. The heartbeat
+// tests below are the only ones in this file that let time pass at all: every R2/R3
+// gate is resolved by the test itself, and a heartbeat boundary is the one trigger that
+// is NOT under the test's hand.
+const advance = async (ms: number): Promise<void> => {
+    await vi.advanceTimersByTimeAsync(ms);
+    await flush();
+};
+
+// A single-agent harness with exactly these tools (no presets, so nothing else is
+// declared and the recorded projections stay readable). `options.wakeIntervalMs` is
+// the legacy heartbeat field: it seeds the `async-ping` plugin's `intervalMs` setting,
+// so passing a small value here makes a wake boundary reachable in fake time
+// (the chain is pinned end to end in src/harness.background.test.ts).
+const fixture = (
+    script: HarnessStreamEvent[][],
+    tools: Record<string, Tool>,
+    options: { wakeIntervalMs?: number } = {}
+): Fixture => {
     const seen: string[][] = [];
     const events: HarnessEvent[] = [];
     const brain = agent({ model: 'test/model', stream: scripted(script, seen) });
@@ -152,11 +174,21 @@ const fixture = (script: HarnessStreamEvent[][], tools: Record<string, Tool>): F
         agents: { writer: brain },
         tools,
         presets: false,
+        ...(options.wakeIntervalMs === undefined ? {} : { wakeIntervalMs: options.wakeIntervalMs }),
         report: { progress: async (event) => void events.push(event) }
     });
 
     return { run, brain, seen, events };
 };
+
+// The `wakeup` frames a run produced, narrowed to the fields a heartbeat test needs.
+const wakeupsOf = (events: readonly HarnessEvent[]): Array<{ agent: string; reason: string }> =>
+    events
+        .filter((event) => event.type === 'wakeup')
+        .map((event) => ({
+            agent: (event as { agent: string }).agent,
+            reason: (event as { reason: string }).reason
+        }));
 
 // The canonical tool results in transcript order: `<callId>:<content>`. Positions are
 // the ORIGINAL call positions, so this also pins "out-of-order settlement never
@@ -217,7 +249,12 @@ describe('tool turn policy (R2)', () => {
             .sort();
 
         expect(declared).toEqual([
-            'actionRequest:async',
+            // R2: the question tool states 'sync' because the run that raised it has
+            // nothing to look at until the owner answers (the same sentence the Rust
+            // mirror states: "the run that raised the question is blocked inside the tool
+            // call until its owner answers"). src/harness.action-request-hold.test.ts pins
+            // the behaviour; this row is what stops the declaration drifting from it.
+            'actionRequest:sync',
             'delegate:async',
             // R3/R4: `download` declares 'sync' because the file IS the input to
             // the next turn (same reasoning as read/search/fetch).
@@ -227,6 +264,12 @@ describe('tool turn policy (R2)', () => {
             'read:sync',
             'search:sync',
             'shell:async',
+            // `sleep` STATES 'sync' instead of inheriting the default, and the
+            // declaration is load-bearing: a run parked on a sleep is re-entered by
+            // its own settled call, with no async wake (the heartbeat-gating rule in
+            // docs/tasks/2026-11-19-heartbeat-async-only.md keys off exactly this
+            // stated mode).
+            'sleep:sync',
             // Issue 0027: the release door STATES 'sync' rather than inheriting the
             // default, because its caller needs the receipt (`removedThreadIds`) in the
             // tool message of the same turn.
@@ -234,13 +277,15 @@ describe('tool turn policy (R2)', () => {
             'threadFork:async'
         ]);
 
-        // The two controls must stay async: their dispatch IS background work whose
-        // completion wakes the requester on its own (a fork never holds its origin's
-        // batch; an owner answer arrives out of band). toolCancel answers inline, so it
-        // declares nothing and the default is inert for it.
+        // The two controls state OPPOSITE policies, and each dispatch honours its own:
+        // a `threadFork` branch is background work whose completion wakes the requester on
+        // its own (a fork never holds its origin's batch), while an `actionRequest` holds
+        // its run until the owner answers — the answer arrives out of band, and the
+        // requester has nothing new to read until it does. `toolCancel` answers inline, so
+        // it declares nothing and the default is inert for it.
         const byName = new Map(rows.map((row) => [row.name, row]));
         expect(byName.get('threadFork')?.mode).toBe('async');
-        expect(byName.get('actionRequest')?.mode).toBe('async');
+        expect(byName.get('actionRequest')?.mode).toBe('sync');
         expect(byName.get('toolCancel')?.mode).toBeUndefined();
     });
 
@@ -727,6 +772,263 @@ describe('batch gate races (T4 verification)', () => {
         expect(world.seen.length).toBe(2);
         expect(world.seen[1]).toContain('tool:c1:instant-value');
         expect(toolMessages(world.brain.messages)).toEqual(['c1:instant-value']);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R5 — the PERIODIC wake answers for ASYNC pending work only.
+//
+// The heartbeat is a plugin (src/plugins/async-ping.plugin.ts) and every branch of its
+// predicate is pinned case-by-case in src/plugin/async-ping.test.ts. What THIS block
+// owns is the runtime consequence through a real harness: TURN COUNTS, `wakeup` FRAMES,
+// and timer hygiene. `wakeIntervalMs: 250` seeds the plugin's `intervalMs` setting
+// (harness() -> plugin settings provider -> api.settings -> the plugin's own timer);
+// that seeding chain is pinned end to end in src/harness.background.test.ts.
+//
+// Why the rule exists: a `sync` group re-enters the model when its LAST member settles,
+// so a sync-parked run is guaranteed a turn the moment it can act on anything. Waking it
+// on a timer instead buys a `status:'pending'` placeholder turn — a model turn that
+// cannot decide anything. An `async` completion has no such guarantee: it releases the
+// parked gate on its own and the run has to be told.
+//
+// The policy source matters: a DISCOVERED built-in publishes no `mode` on its registry
+// object at all (../harness.ts binds the row's policy in a private WeakMap), so the last
+// two tests below pin the two directions of the plugin's discovery-table lookup —
+// `read` (row says sync → stays quiet) and `shell` (row says async → keeps pinging, which
+// is also the one disclosed divergence against a mode-less host replacement).
+// ---------------------------------------------------------------------------
+
+describe('heartbeat policy (R5 — async work only)', () => {
+    // Settled-state capture WITHOUT awaiting: the run is still parked while the test
+    // inspects the boundary, so "still pending" is an observation rather than an
+    // inference from the request count.
+    const probe = (
+        promise: Promise<unknown>
+    ): { status: 'pending' | 'resolved' | 'rejected' } => {
+        const state: { status: 'pending' | 'resolved' | 'rejected' } = { status: 'pending' };
+        promise.then(
+            () => {
+                state.status = 'resolved';
+            },
+            () => {
+                state.status = 'rejected';
+            }
+        );
+        return state;
+    };
+
+    it('never wakes a run parked on a lone sync call, and holds no heartbeat timer', async () => {
+        const gate = deferred<string>();
+
+        // The scripted transport REPEATS its last entry, so any wake at all would show
+        // up as an extra request.
+        const world = fixture(
+            [calls(call('c1', 'solo', '{"value":"x"}')), answer('after-sync')],
+            { solo: gated('solo', 'sync', gate) },
+            { wakeIntervalMs: 250 }
+        );
+
+        const running = world.run('go');
+        const state = probe(running);
+        await flush();
+
+        // Parked on the sync group: one request, and the run is genuinely waiting.
+        expect(world.seen.length).toBe(1);
+        expect(state.status).toBe('pending');
+
+        // Four whole heartbeats pass. A sync-only board arms NO heartbeat, so there is
+        // not even a handle to fire: no wake, no turn, and nothing left on the clock.
+        await advance(1_000);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(wakeupsOf(world.events)).toEqual([]);
+        expect(world.seen.length).toBe(1);
+        expect(state.status).toBe('pending');
+
+        // The call's OWN settlement is the only releaser of the park: exactly one turn,
+        // built from the real result — the run never saw a placeholder.
+        gate.resolve('solo-value');
+        await flush();
+
+        expect(world.seen.length).toBe(2);
+        expect(world.seen[1]).toContain('tool:c1:solo-value');
+        expect(wakeupsOf(world.events)).toEqual([]);
+        await expect(running).resolves.toMatchObject({ content: 'after-sync' });
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('still wakes a run with async work pending at the heartbeat boundary', async () => {
+        const gate = deferred<string>();
+
+        const world = fixture(
+            [
+                calls(call('a1', 'long', '{"value":"x"}')),
+                answer('parked-1'),
+                answer('parked-2'),
+                answer('settled')
+            ],
+            { long: gated('long', 'async', gate) },
+            { wakeIntervalMs: 250 }
+        );
+
+        const running = world.run('go');
+        await flush();
+
+        // Unchanged R3 behaviour: an async call never parks the loop, so the launch
+        // round already bought request 2 with the call outstanding.
+        expect(world.seen.length).toBe(2);
+
+        // 249 ms is not a boundary yet — and the heartbeat IS armed, because the board
+        // holds async work (this is the timer the sync case above never created).
+        await advance(249);
+        expect(wakeupsOf(world.events)).toEqual([]);
+        expect(world.seen.length).toBe(2);
+        expect(vi.getTimerCount()).toBe(1);
+
+        // Exactly 250 ms: one `wakeup`, one inspecting turn, and the plugin re-arms
+        // while the work is still out (the contract src/harness.background.test.ts pins
+        // at the historical 600000 ms cadence — this is the same rule at 250 ms).
+        await advance(1);
+        expect(wakeupsOf(world.events)).toEqual([
+            { agent: 'writer', reason: 'pending-tools' }
+        ]);
+        expect(world.seen.length).toBe(3);
+        expect(vi.getTimerCount()).toBe(1);
+
+        // The completion still buys its own turn with the real payload, and the drained
+        // board takes the heartbeat with it.
+        gate.resolve('long-value');
+        await flush();
+
+        expect(world.seen.length).toBe(4);
+        expect(toolMessages(world.brain.messages)).toEqual(['a1:long-value']);
+        await expect(running).resolves.toMatchObject({ content: 'settled' });
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('applies the DISCOVERED policy of a built-in name when the host definition declares none', async () => {
+        const gate = deferred<string>();
+
+        // A host tool registered under the discovered name `read` and declaring NO mode:
+        // the harness parks on it (its effective mode is the 'sync' default — the same
+        // shape `harness.sync-async.test.ts`'s replacement test pins), and the plugin
+        // must agree by reading the generated ROW for `read`, because a discovered
+        // definition object carries no `mode` of its own.
+        const world = fixture(
+            [calls(call('r1', 'read', '{"value":"x"}')), answer('read-settled')],
+            { read: gated('read', undefined, gate) },
+            { wakeIntervalMs: 250 }
+        );
+
+        const running = world.run('go');
+        const state = probe(running);
+        await flush();
+
+        expect(world.seen.length).toBe(1);
+        expect(state.status).toBe('pending');
+
+        await advance(1_000);
+        expect(vi.getTimerCount()).toBe(0);
+        expect(wakeupsOf(world.events)).toEqual([]);
+        expect(world.seen.length).toBe(1);
+
+        gate.resolve('read-value');
+        await flush();
+
+        expect(world.seen.length).toBe(2);
+        expect(world.seen[1]).toContain('tool:r1:read-value');
+        await expect(running).resolves.toMatchObject({ content: 'read-settled' });
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('over-pings — never under-pings — a mode-less replacement of an async built-in name', async () => {
+        const gate = deferred<string>();
+
+        // THE ONE DISCLOSED DIVERGENCE, pinned as an observation. `shell`'s row is
+        // async; a host REPLACEMENT under that wire name declares nothing, so the
+        // HARNESS treats it as sync and parks (../harness.ts `effectiveToolMode` binds
+        // the policy to the definition, not the name). The plugin cannot see that
+        // binding, so it sees the row and keeps the heartbeat. The run therefore gets a
+        // wake the harness did not strictly need — one extra turn — which is the safe
+        // direction: the alternative would be a silent loss of hang-visibility.
+        const world = fixture(
+            [calls(call('x1', 'shell', '{"value":"x"}')), answer('parked'), answer('late-shell')],
+            { shell: gated('shell', undefined, gate) },
+            { wakeIntervalMs: 250 }
+        );
+
+        const running = world.run('go');
+        await flush();
+
+        // Parked (the harness's sync rule), and armed (the plugin's row lookup).
+        expect(world.seen.length).toBe(1);
+        expect(vi.getTimerCount()).toBe(1);
+
+        await advance(250);
+        expect(wakeupsOf(world.events)).toEqual([
+            { agent: 'writer', reason: 'pending-tools' }
+        ]);
+        expect(world.seen.length).toBe(2);
+
+        // The call's own settlement is still what finishes the story.
+        gate.resolve('shell-value');
+        await flush();
+
+        expect(toolMessages(world.brain.messages)).toEqual(['x1:shell-value']);
+        await expect(running).resolves.toMatchObject({ content: 'late-shell' });
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('drops the heartbeat once the async call settles and only a sync call is left', async () => {
+        const asyncGate = deferred<string>();
+        const syncGate = deferred<string>();
+
+        // ONE message, one async call and one sync call: the sync member parks the loop
+        // (R3) while the async member is exactly what a heartbeat is worth.
+        const world = fixture(
+            [
+                calls(call('a1', 'branch', '{"value":"1"}'), call('s1', 'io', '{"value":"2"}')),
+                answer('waiting'),
+                answer('done')
+            ],
+            { branch: gated('branch', 'async', asyncGate), io: gated('io', 'sync', syncGate) },
+            { wakeIntervalMs: 250 }
+        );
+
+        const running = world.run('go');
+        await flush();
+
+        // Parked: the async launch bought no turn, and the heartbeat is armed for it.
+        expect(world.seen.length).toBe(1);
+        expect(vi.getTimerCount()).toBe(1);
+
+        // The async completion releases the park on its own (the R3 contract): turn 2.
+        asyncGate.resolve('branch-value');
+        await flush();
+        expect(world.seen.length).toBe(2);
+
+        // The board now reads SYNC-ONLY, and `async.drained` never fired for it (the
+        // core emits that transition only when the WHOLE board empties), so the handle
+        // is still armed. At the boundary it must drop itself: no wake, no re-arm, and
+        // no timer left while the sync call keeps running.
+        await advance(250);
+        expect(wakeupsOf(world.events)).toEqual([]);
+        expect(world.seen.length).toBe(2);
+        expect(vi.getTimerCount()).toBe(0);
+
+        // It stays silent for as long as the sync call takes — the board cannot be
+        // trapped in a permanent heartbeat.
+        await advance(2_000);
+        expect(wakeupsOf(world.events)).toEqual([]);
+        expect(world.seen.length).toBe(2);
+        expect(vi.getTimerCount()).toBe(0);
+
+        // And the sync group still delivers its one turn, with both real results.
+        syncGate.resolve('io-value');
+        await flush();
+
+        expect(toolMessages(world.brain.messages)).toEqual(['a1:branch-value', 's1:io-value']);
+        await expect(running).resolves.toMatchObject({ content: 'done' });
         expect(vi.getTimerCount()).toBe(0);
     });
 });

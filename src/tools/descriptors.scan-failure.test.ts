@@ -60,9 +60,10 @@ describe('live catalogue scan failures (T24)', () => {
         const { TOOL_DESCRIPTORS, PRESET_DESCRIPTORS } = await freshDescriptors('missing-root');
 
         expect(TOOL_DESCRIPTORS).toEqual([...BUILTIN_TOOL_DESCRIPTORS]);
-        // 33 package rows: the 31 historical entries plus the `threadDelete` runtime
-        // entry (order 255, issue 0027) and the `knowledge` runtime entry (order 95).
-        expect(TOOL_DESCRIPTORS).toHaveLength(33);
+        // 34 package rows: the 31 historical entries plus the `threadDelete` runtime
+        // entry (order 255, issue 0027), the `knowledge` runtime entry (order 95) and
+        // the `sleep` pause (order 145).
+        expect(TOOL_DESCRIPTORS).toHaveLength(34);
         expect(PRESET_DESCRIPTORS.map((descriptor) => descriptor.name)).toEqual([
             'syntax',
             'read',

@@ -11070,6 +11070,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // result is queued on the mailbox and the late implementation result
             // (if any) is ignored by the scheduler.
             scheduler.cancel(run.scope, callId);
+
+            // R1/AC4 — the same release on the QUESTION side. A cancelled `actionRequest`
+            // can no longer be answered, but the task body may never return (a host handler
+            // that ignores its signal keeps its promise open), so the run's question hold
+            // cannot wait for that task's `finally`. Releasing here is what makes
+            // `toolCancel` a real release door instead of a permanent park; for every other
+            // call this is a lookup miss and a no-op.
+            releaseActionRequestForCall(run.scope, callId);
+
             await immediateResult(
                 run,
                 call,
@@ -11088,13 +11097,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // control definition dispatches to a runtime handler. A replacement has no
         // marker and therefore executes through definition.execute like any tool.
         //
-        // T2/R3: both controls are declared `mode: 'async'` in their own entries, and
-        // this dispatch implements exactly that: the branch/owner task is scheduled on the
-        // board, delivered through the mailbox, and its completion wakes the requester on
-        // its own. They therefore never join a sync group (`syncGroup` is unused here),
-        // which is what keeps a fork from holding its requester's batch hostage. The
-        // descriptors test pins those two rows to 'async' so the declaration and the
-        // dispatch cannot drift.
+        // T2/R3 — the two controls have OPPOSITE policies, and each dispatch honours its
+        // own declaration:
+        //   - `threadFork` stays `mode: 'async'`: its branch is background work whose
+        //     completion wakes the requester on its own, and a fork must never hold its
+        //     origin's batch (the requester keeps taking turns as the branch lands).
+        //   - `actionRequest` declares `mode: 'sync'` (R2): the question is directed at the
+        //     owner, so this call DOES join the message's sync group. The join happens
+        //     inside `launchActionRequest` at its schedule site — not here — because every
+        //     validation failure in that helper answers inline and never schedules, and a
+        //     call with no task must not hold the gate (same rule the ordinary path states
+        //     at `joinSyncBatch` below).
+        // The descriptors test pins both rows, so declaration and dispatch cannot drift.
         const runtimeControl = runtimeControlDefinitions.get(definition);
 
         if (runtimeControl === 'threadFork' && forks.enabled) {
@@ -11103,7 +11117,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         if (runtimeControl === 'actionRequest' && interaction !== undefined) {
-            await launchActionRequest(run, call, parseArguments);
+            await launchActionRequest(run, call, parseArguments, syncGroup);
             return;
         }
 
@@ -11478,12 +11492,69 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // their requester is abandoned (the scheduler does not notify for that path).
     const actionRequestScopes = new Map<string, string>();
 
+    // requestId -> `callTraceKey(requester scope, callId)`. The hold this map exists for
+    // is keyed on the RUN, but the release doors (`toolCancel`) are keyed on the CALL, so
+    // the two sides need one address shared between them. Same composite key the fork
+    // bookkeeping already uses (`callTraceKey`), so no second naming scheme appears.
+    const actionRequestCalls = new Map<string, string>();
+
+    // Drop the pending bookkeeping for one request id. Idempotent: the request task's own
+    // `finally` runs this same removal when its owner answer (or its failure) lands, and a
+    // door that releases early (a cancellation) must not leave the entry behind — see
+    // `releaseActionRequestForCall`.
+    const forgetActionRequest = (requestId: string): void => {
+        pendingActionRequests.delete(requestId);
+        actionRequestScopes.delete(requestId);
+
+        // The call-address side goes with the request. This map is bounded by the pending
+        // cap (every entry belongs to a request that is still awaiting an owner), so the
+        // scan is bounded too, and dropping the entry HERE means no release door can leave
+        // a stale `call -> id` that a later `toolCancel` would mis-release.
+        for (const [key, mapped] of [...actionRequestCalls.entries()]) {
+            if (mapped === requestId) actionRequestCalls.delete(key);
+        }
+    };
+
     const releaseActionRequestsForScope = (scope: string): void => {
         for (const [requestId, ownerScope] of [...actionRequestScopes.entries()]) {
             if (ownerScope !== scope) continue;
-            actionRequestScopes.delete(requestId);
-            pendingActionRequests.delete(requestId);
+            forgetActionRequest(requestId);
         }
+    };
+
+    // R1/AC4 — `toolCancel` released one pending question.
+    //
+    // WHY THE EARLY RELEASE IS REQUIRED (and not just the task's own `finally`): the
+    // requester's wait is a hold on the RUN (see `waitForActionRequests`), and a cancelled
+    // call's task body may never return — a host handler that ignores its cancellation
+    // signal keeps its promise open indefinitely, and an owner fork whose abort it does not
+    // observe does the same. `scheduler.cancel` settles the CALL (the mailbox posts the
+    // cancelled result and the sync group drains), so the harness already knows the request
+    // will never be answered by anyone. Leaving the bookkeeping in place would keep the
+    // predicate true and park the run behind a question that has been cancelled: the exact
+    // "stuck question" this change removes.
+    //
+    // The task's `finally` still runs its own removal later, and removal is idempotent, so
+    // an abandoned handler that resolves after the cancellation cannot resurrect the entry.
+    const releaseActionRequestForCall = (scope: string, callId: string): void => {
+        const requestId = actionRequestCalls.get(callTraceKey(scope, callId));
+        if (requestId === undefined) return;
+
+        // `forgetActionRequest` drops the call-address side along with the rest.
+        forgetActionRequest(requestId);
+    };
+
+    // R1 — "does THIS run own at least one unsettled question?" Derived from the same
+    // bookkeeping the cap and the release doors use, comparing the OWNER scope to this
+    // run's scope: a child request belongs to the child (so a delegate is held exactly like
+    // a root run), the owner fork owns nothing (so it can answer), and two runs of the same
+    // agent never hold each other.
+    const ownsUnsettledActionRequest = (run: RunState): boolean => {
+        for (const ownerScope of actionRequestScopes.values()) {
+            if (ownerScope === run.scope) return true;
+        }
+
+        return false;
     };
 
     const failBranchTool = (
@@ -11834,10 +11905,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // handler (no automatic selection, no owner to fork). A CHILD/FORK run is
     // answered by an autoanswer fork of its immediate owner run, with the owner's
     // FULL history plus the requester's FULL history at request instant.
+    //
+    // `group` is the calling message's SYNC GROUP (R2 — the tool declares `mode: 'sync'`).
+    // It is threaded down here rather than joined by the dispatcher because only this
+    // function knows whether the call became a task at all; see `joinSyncBatch` inside.
     const launchActionRequest = async (
         run: RunState,
         call: HarnessToolCall,
-        parseArguments: (schema: Record<string, unknown> | undefined) => unknown
+        parseArguments: (schema: Record<string, unknown> | undefined) => unknown,
+        group?: Set<string>
     ): Promise<void> => {
         let parameters: unknown;
 
@@ -11908,7 +11984,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
-        const requestId = `request-${++actionRequestSequence}`;
+        // THE ID MUST SURVIVE A RESTART. A bare per-harness counter restarts at 1 for every
+        // process, so after a restart a fresh `request-1` collides with a DEAD id the owner
+        // (the server's `completedActions`, a browser card) still remembers, and the answer
+        // to the new question is filed against the old one. `HARNESS_PROCESS_EPOCH` is the
+        // per-process discriminator this repo already mints for exactly this purpose (it
+        // stamps run thread identities, and the server aliases it as `HARNESS_RUNTIME_EPOCH`),
+        // so the shape keeps the `request-` prefix and the trailing counter and only inserts
+        // the process discriminator between them: `request-<epoch>-<n>` (epoch is
+        // `<time36>-<random>`, so a full id reads `request-lz4k3x9m-6f2h1k8d3-1`). Nothing
+        // parses the number — the id is opaque to the server routes and to the Rust mirror,
+        // which re-validates it against the recorded options only.
+        const requestId = `request-${HARNESS_PROCESS_EPOCH}-${String(++actionRequestSequence)}`;
         const request: HarnessActionRequest = {
             requestId,
             question: body.question,
@@ -12040,6 +12127,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         pendingActionRequests.add(requestId);
         actionRequestScopes.set(requestId, run.scope);
+        // The call-address side of the same entry, so `toolCancel` (which resolves a CALL)
+        // can release the RUN's hold. See `releaseActionRequestForCall`.
+        actionRequestCalls.set(callTraceKey(run.scope, call.id), requestId);
 
         // The request frame is reported BEFORE the host (or owner fork) is invoked,
         // so a client can render the pending card while it awaits.
@@ -12054,10 +12144,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // The action_request could not be reported: fail the run (a reporter
             // failure is a run failure). The branch, if created, is released by
             // the requester run's finally, which marks it cancelled.
-            pendingActionRequests.delete(requestId);
-            actionRequestScopes.delete(requestId);
+            forgetActionRequest(requestId);
             throw error;
         }
+
+        // R2 — THE SYNC GROUP. `actionRequest` now declares `mode: 'sync'`, and the group
+        // membership has to be recorded HERE, at the point where the call is really about to
+        // become a scheduled task, for the same reason the ordinary dispatch joins at
+        // schedule time (src/harness.ts `launchToolCall`): every validation failure above
+        // (no handler, forks disabled, the pending cap, a fork that could not be created)
+        // answers through `failBranchTool` and never schedules, and a call that never
+        // schedules must never hold the batch gate. Joining in the dispatch branch, before
+        // this function's early returns, would strand the gate on a call with no task.
+        joinSyncBatch(run, group, call.id);
 
         // R4 plugin hook — the owner answer (a host handler or an autoanswer fork) is
         // background work on this run's board for as long as it is unanswered, so the
@@ -12196,8 +12295,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                     return actionResultOf(request, choice, source);
                 } finally {
-                    pendingActionRequests.delete(requestId);
-                    actionRequestScopes.delete(requestId);
+                    forgetActionRequest(requestId);
+                    actionRequestCalls.delete(callTraceKey(run.scope, call.id));
                     if (autoMetadata !== undefined) {
                         activeBranches.delete(autoMetadata.branchId);
                         branchScopes.delete(autoMetadata.branchId);
@@ -13622,6 +13721,43 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         });
     };
 
+    // R1 — THE QUESTION HOLD. A run that owns an unsettled `actionRequest` may not ask its
+    // model anything until that request settles.
+    //
+    // WHY THE SOFT SYNC GATE IS NOT ENOUGH ON ITS OWN: the batch gate
+    // (`waitForSyncBatch`) parks the loop, but `markRunDirty` deliberately releases EVERY
+    // parked gate on ANY wake — an async sibling's completion, a steer, or the periodic
+    // `async-ping` heartbeat (`plugins/async-ping.plugin.ts` -> `api.async.wake`). A release
+    // is a notification, not a decision, and the loop then restarts at the top of
+    // `runAgentCore` and re-projects the transcript — which is precisely how a run that had
+    // just asked a question came to prompt its model again with a
+    // `{"status":"pending"}` placeholder for its OWN unanswered question, and how a host
+    // that answers late found the question "stuck" behind turns that had already answered it.
+    // This helper re-parks on such a wake: it waits until the run no longer owns a request
+    // (`ownsUnsettledActionRequest` reads the same bookkeeping the cap and the release doors
+    // use), so the only event that ends it is a real settlement.
+    //
+    // What releases it, and why none of them can hang:
+    //   - an owner answer / an owner failure: the request task's `finally` clears the
+    //     bookkeeping, and the scheduler's settle notification runs `deliverTask` ->
+    //     `settleCompletion` -> `markRunDirty`, which is the wake;
+    //   - `toolCancel`: releases the bookkeeping itself (`releaseActionRequestForCall`,
+    //     because an abandoned handler may never settle) and the cancelled task still
+    //     settles through `deliverTask`, which wakes the run;
+    //   - a run abort: `onAbort` marks the run dirty (the wake) and the abort check below
+    //     stops the wait, so the loop reaches its R10 rollback instead of parking forever;
+    //   - a run that ends any other way: the run's `finally` calls
+    //     `releaseActionRequestsForScope`, and this wait sits inside that run's own loop.
+    //
+    // No clock is involved: like every other wait here, this is a notification on the run's
+    // waiter list, never a timer, so the scheduler stays timer-free and a parked question
+    // costs nothing while it waits.
+    const waitForActionRequests = async (run: RunState): Promise<void> => {
+        while (ownsUnsettledActionRequest(run) && run.signal?.aborted !== true) {
+            await waitForWork(run);
+        }
+    };
+
     // Bounded microtask window after a launch. Tools that settle without yielding
     // to real I/O (synchronous bodies, resolved promises, a delegated child whose
     // scripted transport is microtask-only) finish in the SAME round, preserving
@@ -13968,6 +14104,40 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // rejects: one bad delivery must not poison the agent's chain).
                 if (run.deliveryError !== undefined) throw run.deliveryError;
 
+                // R1 — THE QUESTION HOLD, at the one place every turn passes through.
+                //
+                // It sits at the TOP of the loop rather than only beside the two parks
+                // below, because every wake in this harness is a soft notification: the
+                // batch gate, the `done`-with-`pending` pause, the mailbox, a steer and the
+                // heartbeat all release a wait and let the loop restart here. Guarding the
+                // two parks would still let a wake that arrives between them (or a
+                // `changedDuringRequest` re-entry) fall through to `requestTurn` and re-prompt
+                // with a placeholder for the run's own open question. Parking here makes the
+                // rule structural: this run asks its model nothing while it owns a question.
+                //
+                // It is also BEFORE the turn-bound check on purpose: an unanswered question is
+                // not a turn the run spent. Previously the placeholder turns burned the
+                // iteration budget, so a host that took long enough to answer could fail the
+                // run with `turn-cap` while it was simply waiting to be told what to do.
+                //
+                // The predicate guard is load-bearing, not cosmetic: an UNANSWERED-QUESTION-FREE
+                // round must stay await-free. An unconditional `await` here added a microtask
+                // yield to EVERY turn, which moved the turn's publishes across the host's
+                // `setTimeout(0)` boundaries (it shifted a replaced run's `event:text` publish
+                // past an observer's `unsubscribe()` in `src/server/queue.test.ts:1393`). With
+                // the guard, the await — and therefore any scheduling change — exists only on
+                // the exact path R1 governs: a run that owns a request.
+                if (ownsUnsettledActionRequest(run)) {
+                    await waitForActionRequests(run);
+
+                    // The wait above can end because the run was cancelled rather than because
+                    // the question was answered, and this is the R10 boundary again: re-check
+                    // before a request may be spent on a cancelled run. It lives inside the
+                    // guard because the abort can only arrive DURING the park; on an await-free
+                    // round the loop-head `throwIfAborted` above already covers it.
+                    throwIfAborted(run);
+                }
+
                 // I5 (2026-11-13): the effective turn bound is the TIGHTER of the
                 // harness-wide `maxIterations` (an OPTIONAL safeguard, unarmed unless a
                 // host names one) and this run's own `maxTurns` (the per-child bound a
@@ -14175,6 +14345,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                     // Paused, not finished: report the response with the work it
                     // is waiting on, then wait for a completion or the wake timer.
+                    //
+                    // R1 interaction, stated here because this is the other place a question
+                    // turn could otherwise leak into a second request: the pending list still
+                    // includes an open `actionRequest` on purpose — the pending card, and the
+                    // answerable UI card, are built from it, and excluding the task from
+                    // `runPending`/`scheduler.pendingOfScope` would erase both. A wake here
+                    // (including the heartbeat that exists because of that very card) goes
+                    // through `continue` into the loop head, where `waitForActionRequests`
+                    // parks again unless the question has settled. Under the new contract a
+                    // run that owns a question rarely reaches this branch at all — the loop
+                    // head holds it before the request that produced this turn — but a
+                    // question that settled WHILE a request was in flight does land here, and
+                    // its answer then correctly buys the next turn.
                     if (pending.length > 0) {
                         await emit(run, { type: 'done', agent: brain.name, message, pending });
 
@@ -14263,6 +14446,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 //     by the group;
                 //   - an abort releases the gate too, so a cancelled run reaches its
                 //     rollback instead of waiting here.
+                //
+                // ONE exception to "any wake takes a turn", and it lives at the top of the
+                // loop rather than here: a run that owns an UNSETTLED `actionRequest`. Such a
+                // wake (typically the heartbeat, because an unanswered question is exactly a
+                // pending call on the board) still releases this gate — the release is a
+                // notification — but `waitForActionRequests` parks the run again before a
+                // request can be spent, so a question can never be re-projected to its own
+                // model as a `{"status":"pending"}` placeholder. The gate itself stays soft
+                // for every other combination, which is what the sync/async contract pins.
                 if (run.syncGroups.size > 0) await waitForSyncBatch(run);
             }
         } catch (error) {

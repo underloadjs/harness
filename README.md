@@ -667,9 +667,13 @@ harness({ tools: { read } });                // the model calls read
     its own declared mode (an undeclared replacement is `'sync'`). The shipped
     built-ins state theirs in their own `registration` literal, which is what the
     scanner, the generated manifest and the lazy loader all carry through: `read`,
-    `edit`, `search` and `fetch` are `'sync'`; `shell`, `delegate`, `threadFork`
-    and `actionRequest` are `'async'` (a long command, a child run, a detached
-    clone and a human at a prompt must never hold a batch hostage).
+    `edit`, `search`, `fetch` and `actionRequest` are `'sync'`; `shell`, `delegate`
+    and `threadFork` are `'async'` (a long command, a child run and a detached clone
+    must never hold a batch hostage). `actionRequest` is `'sync'` on purpose: the
+    question is directed AT the owner, so while a run owns an unsettled request the
+    turn loop issues no model request at all — the run is held until the answer, a
+    `toolCancel` or an expiry releases it, instead of spending a turn on a
+    `{"status":"pending"}` placeholder for its own open question.
 - `parameters` is plain JSON Schema. A TypeBox schema works as-is, so no schema
   dependency is needed.
 - **Single-property rule.** When the schema declares exactly one property, the
@@ -2170,25 +2174,44 @@ completion joins its message's sync group and only the drained group buys a turn
 while an `async` completion re-prompts the model on its own — immediately, even
 while a `sync` call from an earlier message is still running. A parked group is a
 **park, never a block**: any other wake (an async completion, the periodic wake
-below, steering input, or the run's abort) releases it, and the loop re-reads real
-state after waking. This changes four things a caller must know:
+below while async work is pending, steering input, or the run's abort) releases it, and
+the loop re-reads real state after waking. This changes four things a caller must know:
 
 - **A sync batch is one turn.** A message whose calls are all `sync` produces no
   intermediate request: the follow-up turn is built after the last one settled, so
   the model sees every result of the batch at its original call position. `shell`,
-  `delegate`, `threadFork` and `actionRequest` are `async`, so they keep the
-  per-completion wake below.
+  `delegate` and `threadFork` are `async`, so they keep the per-completion wake
+  below. `actionRequest` is `sync`: the question is directed at the owner, so a
+  message of questions costs one turn after the LAST answer, and a run that owns an
+  unsettled question issues no request at all until the answer, a `toolCancel` or an
+  expiry releases the hold.
 - **The top-level promise is the drain point.** `await writer(input)` resolves only
   when the entry agent's response is complete AND every pending call — delegated
   child runs included — has finished. A per-agent `done` event is one response, not
   terminal session work: it can arrive while that agent's own calls are still
   running (listed in the event's `pending`), and the agent is woken when outcomes
   land (`wakeup`, or once its message's sync group drains).
-- **A periodic wake keeps a turn honest.** While calls are pending the runtime also
-  wakes the agent on a timer (default **600000 ms**), so a hung call is visible and
-  can be killed instead of blocking forever. There is **no automatic hard tool
-  timeout**: pending calls are interrupted, not resumed, on restart, and a hanging
-  call ends only through an explicit cancel (or the tool's own configured timeout).
+- **A periodic wake keeps a turn honest — for `async` work only.** While an **`async`**
+  call is pending the runtime also wakes the agent on a timer (default **600000 ms**), so
+  a hung background call stays visible and can be killed instead of blocking forever. A
+  board whose outstanding calls are ALL `sync` is **not** woken on that timer: a sync
+  group already re-enters the model the moment its last member settles, so a timed wake
+  there would buy nothing but a `status:'pending'` placeholder turn. The mode a call
+  RESOLVES TO is what counts, so a mixed board (one `async` plus one `sync`) still pings
+  — that async completion is what releases the parked gate — and a heartbeat armed for an
+  async call stops the moment only sync work is left. The rule lives in the `async-ping`
+  plugin, not in the loop, and `harness({ wakeIntervalMs })` (or that plugin's
+  `intervalMs` setting) sets the cadence.
+  - **The trade-off this makes.** There is **no automatic hard tool timeout**: pending
+    calls are interrupted, not resumed, on restart, and a hanging call ends only through
+    an explicit cancel (or the tool's own configured timeout). For a run parked on `sync`
+    work alone, the agent's own chance to notice and `toolCancel` is now whatever the
+    caller supplies: steering input, a thread stop, or aborting the run's `signal` — all
+    three release the park, and the turn they buy can call `toolCancel`. A `read`/`edit`/
+    `fetch`/`sleep` call wedged with no bound of its own therefore stays parked until the
+    host acts; `shell` (`timeoutMs`), `fetch` and `delegate` (`timeoutMs`) carry their
+    own bound and are unaffected. Recorded with its evidence in
+    [`docs/tasks/2026-11-19-heartbeat-async-only.md`](./docs/tasks/2026-11-19-heartbeat-async-only.md).
   - **A THREAD has no wall-clock limit either (policy 2026-11-09).** A conversation —
     a delegated child, a `threadFork` branch, a host thread, a steered turn — stops
     when its agent gives its final answer, and nothing external ends it on a clock.
@@ -4357,7 +4380,11 @@ an unrelated stream frame cannot destroy an in-progress repair.
   `N tools still running` count is visible in the expanded tile's meta (compact
   rows clip the meta visually, as they do the status word). The periodic wake
   (600 s) exists so a hung call stays visible and can be killed rather than
-  silently blocking the turn.
+  silently blocking the turn — and it fires only while an **`async`** call is pending.
+  A board waiting on `sync` work alone therefore produces no `wakeup` line at all: its
+  pending line stays the static snapshot taken when the call launched, until the call's
+  own result closes the card. Nothing in the pane advances that line on a clock, and
+  nothing has to — the run is woken by the settlement itself.
 - **The timeline shows state by colour.** One linear vertical timeline: completed
   rows are grey, the single active row is green (amber while a request is on the
   wire), queued rows are neutral, failed rows are red, and cancelled rows are

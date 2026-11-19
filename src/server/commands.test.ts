@@ -606,6 +606,9 @@ describe('POST /sessions/:id/tasks slash commands', () => {
             'locations',
             'profiles',
             'records',
+            // The wall-clock pause is searchable and seeded like every other switchable
+            // name, so /tools lists it here too (alphabetically).
+            'sleep',
             'tasks',
             'threadFork',
             'toolCancel',

@@ -818,10 +818,10 @@ describe('PATCH with metadata only', () => {
 // report wiring (`SessionStore.buildHarness`), and the real shared toolbox.
 //
 // EXPECTED POPULATION (a keyless host: `search` needs a provider key, `fetch` does not):
-//   - 33 rows total, in the registry order `ROW_ORDER` states below (the order the model sees
+//   - 34 rows total, in the registry order `ROW_ORDER` states below (the order the model sees
 //     them, and the order `namesWhere` compares against);
-//   - 33 of them `enabled: true` on a session that has never run. T6 is why the number is 33 and
-//     not 23: `enabled` answers "may an agent of this conversation call it", so the 23 names that
+//   - 34 of them `enabled: true` on a session that has never run. T6 is why the number is 34 and
+//     not 24: `enabled` answers "may an agent of this conversation call it", so the 24 names that
 //     hold a cap slot are on because the seed filled the slots, and the 10 that hold NO slot
 //     (`SLOTLESS_NAMES`) are on because their declaration list puts them in context on every
 //     request. Before T6 the second group read `enabled: false`, which is a row calling a live,
@@ -882,6 +882,7 @@ const ENABLED_NAMES = [
     'agentResult',
     'threadFork',
     'actionRequest',
+    'sleep',
     'syntax',
     'files',
     'shell',
@@ -894,7 +895,7 @@ const ENABLED_NAMES = [
     'textSummarize'
 ];
 
-// All 33 rows in the server's own order, so an "everything is on" assertion cannot be satisfied
+// All 34 rows in the server's own order, so an "everything is on" assertion cannot be satisfied
 // by a reordered or partially populated list.
 const ROW_ORDER = [
     'toolRegistry',
@@ -913,6 +914,7 @@ const ROW_ORDER = [
     'delegate',
     'threadFork',
     'actionRequest',
+    'sleep',
     'toolCancel',
     'syntax',
     'read',
@@ -981,9 +983,9 @@ describe('R1 — a brand-new session starts with the whole toolbox on', () => {
         const rows = await rowsOf(api, sessionId);
 
         // The reconciliation for a fresh harness, stated as exact name lists.
-        expect(rows.length).toBe(33);
+        expect(rows.length).toBe(34);
         expect(rows.map((row) => row.name)).toEqual(ROW_ORDER);
-        // T6: EVERY row is callable on a fresh session - 23 through their seeded cap slots, 10
+        // T6: EVERY row is callable on a fresh session - 24 through their seeded cap slots, 10
         // through a declaration list that needs no slot. "0 enabled for a core row" was the lie.
         expect(namesWhere(rows, (row) => row.enabled)).toEqual(ROW_ORDER);
         expect(namesWhere(rows, (row) => row.protected)).toEqual(PROTECTED_NAMES);
@@ -1048,9 +1050,9 @@ describe('R1 — a brand-new session starts with the whole toolbox on', () => {
         expect(namesWhere(after, (row) => row.enabled)).toEqual([]);
         expect(namesWhere(after, (row) => row.protected)).toEqual(PROTECTED_NAMES);
 
-        // Off is not gone: the operator still sees all 33 rows, which is the point of a switch that
+        // Off is not gone: the operator still sees all 34 rows, which is the point of a switch that
         // hides a tool from the MODEL only.
-        expect(after.length).toBe(33);
+        expect(after.length).toBe(34);
     });
 
     it('treats the seeded set as the session state: a restart keeps it, and a disable stays disabled', async () => {

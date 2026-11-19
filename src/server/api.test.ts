@@ -190,6 +190,9 @@ const TOOL_NAMES = [
     'knowledge',
     'agentManage',
     'agentResult',
+    // `sleep` is an always-registered, listed runtime row (order 145), so the global
+    // catalogue emits it in the baseline block: src/tools/runtime/sleep.tool.ts.
+    'sleep',
     'delegate',
     'actionRequest',
     'threadFork',
@@ -2762,6 +2765,10 @@ describe('task submit and recorded history', () => {
         const discovery = state.events.find((row) => row.event.type === 'tool_result' && row.event.name === 'toolRequest');
         if (discovery === undefined) throw new Error('expected a recorded toolRequest result');
         expect(JSON.parse(discovery.event.content).enabled).toEqual([
+            // The scripted discovery round queries `{"tags":["time"]}` (see the recorded
+            // call at the top of this case), and `sleep` carries that tag, so it is enabled
+            // alongside `timeNow`: src/tools/runtime/sleep.tool.ts.
+            'sleep',
             'timeNow',
             'actionRequest',
             'knowledge',

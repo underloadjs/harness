@@ -650,12 +650,12 @@ src/
       *.test.ts
     runtime/            the SESSION-BOUND tool entries: one `.tool.ts` per harness-owned
                         tool, each carrying only its name/description/schema/routing —
-                        the state lives in the harness, not in the entry (23 entries):
+                        the state lives in the harness, not in the entry (24 entries):
                         tasks, records, profiles, chapters, locations, knowledge, toolRequest,
                         toolList, toolManage, toolRegistry, toolCreate, toolCancel,
                         delegate, threadFork, threadList, threadRead, threadSend,
                         threadDelete, actionRequest, agentManage, agentResult, search,
-                        fetch (`threadRead.ts` is the reader helper; `threadDelete.test.ts`
+                        fetch, sleep (`threadRead.ts` is the reader helper; `threadDelete.test.ts`
                         and `threadRead.test.ts` test the thread tools' own entries).
                         `knowledge.tool.ts` is the one entry of this group whose state is NOT
                         per-harness: it writes through the `harness.knowledge` seam, which the
@@ -697,7 +697,8 @@ src/
     context-compaction.plugin.ts  the two compaction modes — `exclude` and the default
                         `summarize` (the conversation compacts ITSELF, one of its own turns)
     context-trimmer.plugin.ts     the shipped preset trimmer over `core/context-pruning`
-    async-ping.plugin.ts          the recurring wake while background calls are pending
+    async-ping.plugin.ts          the recurring wake, armed ONLY while at least one pending
+                        call resolves to `mode:'async'` (a sync group re-enters the run itself)
   util/
     index.ts            barrel: HarnessError, toErrorInfo
     errors.ts           HarnessError, toErrorInfo
@@ -1386,6 +1387,7 @@ Harness tools are named for what the model calls them. Two shapes coexist on pur
 | `thread*` | `threadFork` (conditional private history fork; forks enabled), `threadSend`, `threadList`, `threadRead` (paged FIRST-page transcript read: one message by index, regex/role/includeSystem filters, per-message content paging under a byte budget), `threadDelete` (release one finished thread you own — issue 0027) |
 | `file*` | `files` (the domain-named manager of list/move/copy/delete/mkdir; the single-action halves stay bare verbs: `read`, `write`, `edit`, `glob`, `grep`) |
 | (verbs) | `read`, `write`, `edit`, `glob`, `grep`, `shell`, `search`, `fetch`, `delegate` |
+| (bare verb) | `sleep` (a wall-clock pause the run sets for itself; ONE argument `seconds`, 0–3600 — the `MODEL_TIMEOUT_MAX_MS` ceiling restated — `activation: always` + `mode: sync` + `visibility: searchable` + `order: 145`, so the settled call rather than a timer event is what re-enters the parked run) |
 | `text*` | `textCount`, `textSummarize` |
 | `time*` | `timeNow` |
 | `dice*` | `diceRoll` |
@@ -1461,16 +1463,25 @@ Behaviour (`runAgentCore`, `deliverTask`, `launchToolCall` in `src/harness.ts`):
 - The batch gate (`waitForSyncBatch`) is a PARK, never a block: any other wake (an async
   completion, the recurring heartbeat, a steer, a parked delivery failure) or the run's
   abort signal releases it, and no delivery is ever delayed by a pending sibling. The
+  heartbeat is not on hand for a `sync`-only park, though: it arms only while at least one
+  pending call resolves to `mode: 'async'` (`src/plugins/async-ping.plugin.ts`), so such a
+  park releases on its own group settling, on a steer, or on the abort signal. The
   implementation stays background work — scheduled on the board, cancelable per call,
   delivered through the agent mailbox in canonical order.
 - Groups are per run, so a delegated, `ctx.run`, or branch run never holds its parent's
   batch.
 
-Shipped values: `read`, `edit`, `search`, and `fetch` are `'sync'`; `shell`, `delegate`,
-`threadFork`, and `actionRequest` declare `'async'`. The last two are the deliberate
-control-tool exception: a fork's answer and an owner's `actionRequest` answer arrive
-independently of the requester's batch (that dispatch never joins a group), and making
-them sync would hold a batch hostage to a detached clone or to a human at a prompt.
+Shipped values: `read`, `edit`, `search`, `fetch`, and `actionRequest` are `'sync'`;
+`shell`, `delegate`, and `threadFork` declare `'async'`. `threadFork` is the deliberate
+control-tool exception: a fork's answer arrives independently of the requester's batch
+(that dispatch never joins a group), and making it sync would hold a batch hostage to a
+detached clone. `actionRequest` is `'sync'` because the requester's wait IS the hold, not
+a placeholder turn: while a run owns an unsettled request the turn loop issues no model
+request (`waitForActionRequests`, `src/harness.ts`), and an owner answer, a `toolCancel`,
+or expiry is what releases it — the scheduler owns no clock. The owner that answers a
+CHILD request is a distinct agent (actor key `branch:<id>`, its own scope), so a child
+never waits on itself and no lane head-of-lines. A batch of questions in one message
+therefore costs ONE turn, after the last answer.
 `toolCancel` is answered inline and declares nothing, so its default is inert.
 
 `src/harness.sync-async.test.ts` pins the whole contract — the completion orders of a
@@ -1510,7 +1521,7 @@ The harness-owned `toolRequest` and `tasks` are core too, and so is the
 environment-backed web pair: `search` when a provider key resolved, `fetch` when
 the host opted into `webfetch` (R9-R11). The remaining harness-owned rows
 (`toolList`, `toolManage`, `toolCreate`, `records`, `profiles`, `chapters`,
-`locations`, `knowledge`, `agentManage`, `agentResult`) stay registered but SEARCHABLE —
+`locations`, `knowledge`, `agentManage`, `agentResult`, `sleep`) stay registered but SEARCHABLE —
 `records` deliberately so (R4): it is the escalation surface an agent reaches by NAME
 when a wrapper's schema is what stops it, and its tags are the ENGINE's words only
 (`records`, `record`, `store`, `entries`, `define`), never the wrappers' collection words,
@@ -4465,8 +4476,9 @@ then declared for every agent in the session. Declaration order stays roster-fir
 the group registers in DESCENDING `order` (threadList 270, threadRead 265,
 threadSend 260, threadDelete 255), so the declarations arrive roster, reader,
 writer, reaper — an id is always discoverable before a tool that addresses it.
-With `threadDelete` added, the generated `core/tool-manifest.ts` carries **32**
-descriptors (22 runtime entries).
+With `threadDelete` added the generated `core/tool-manifest.ts` carried 32 descriptors
+(22 runtime entries); as of `sleep` (2026-11-19) it carries **34** — 24 of them
+`group: "runtime"`, counted from the generated rows in `src/core/tool-manifest.ts`.
 
 - **THREAD FAMILY is the address space (B3/B4, fifth member added 2026-11-14).** A
   model-facing thread tool is scoped to the caller's thread family: the thread itself, its
@@ -4921,7 +4933,11 @@ type HarnessActionRequest = {
 - The model-visible result is `HarnessActionResult`
   `{ requestId, answeredBy: 'owner' | 'auto', choice }`. An option choice is
   widened with the resolved `label`/`description`; a custom choice is verbatim.
-- The runtime request id is `request-<n>` (process-local monotonic).
+- The runtime request id is `request-<epoch>-<n>`: a process-local epoch nonce
+  (`HARNESS_PROCESS_EPOCH`, `src/core/agent-limits.ts`) and a monotonic counter, so an
+  id from an earlier process can never collide with a live one. It is minted per
+  request, so a client must carry the value from the frame that reports it rather than
+  construct it.
 - Pending limit: at most 4 unresolved requests per harness (`src/harness.ts`) and
   per session (`MAX_PENDING_ACTIONS` in `src/server/sessions.ts`). A fifth is
   rejected for the model, never auto-answered.
@@ -5312,7 +5328,10 @@ await writer('tell me about new year');
   one serialized model stream; its tool calls are async work scheduled together.
   An agent's `done` event is one RESPONSE: it may list `pending` calls still running
   and the agent is woken (`wakeup`) when outcomes land. A periodic wake
-  (**600000 ms** default) keeps a hung call visible so it can be killed; there is
+  (**600000 ms** default) keeps a hung call visible so it can be killed — for `async` work
+  only: the `async-ping` plugin arms it only while at least one pending call resolves to
+  `mode: 'async'` (`src/plugins/async-ping.plugin.ts`), because a `sync` group re-enters the
+  run itself when its last member settles, so a `sync`-only park is never pinged; there is
   **no automatic hard tool timeout**. Pending work is interrupted, not resumed,
   across a restart, and a hung call ends only through an explicit cancel (or the
   tool's own configured timeout). The same sentence holds for a whole THREAD since
@@ -5493,9 +5512,9 @@ await writer('tell me about new year');
   host path `harness.toolCreate()` still works, because an operator action is not a model
   privilege. A letter outside the union fails construction, naming the whole accepted set.
   **This is the only rank-shaped capability gate left in the package.**
-- `wakeIntervalMs` (`:3130`) — how often a run with background calls emits `wakeup`
-  (the 600000 ms default is stated above); a `pluginSettings` value for
-  `async-ping.intervalMs` wins over it.
+- `wakeIntervalMs` (`:3130`) — how often a run with ASYNC background calls emits `wakeup`
+  (the 600000 ms default is stated above, and the async-only trigger rule with it); a
+  `pluginSettings` value for `async-ping.intervalMs` wins over it.
 - `maxCreatedTools` (`:3139`) — the LIFETIME creation budget for this instance.
   Created tools outlive `reset()`, so `reset()` deliberately does not refill it.
 - `toolSources` (`:3158`) — `name → source text` for tools compiled at startup. A

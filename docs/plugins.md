@@ -831,7 +831,21 @@ with different rules.
   this seam decided.
 - `async.pending(agent?)` / `async.wake(agent?)` — the background board and
   the wake. The scheduler owns NO timer: the wake is a plugin policy
-  (`async-ping`), and `wake()` is the only way one is produced.
+  (`async-ping`), and `wake()` is the only way one is produced. The shipped
+  policy pings only while that board holds at least ONE `async` call — a
+  `sync` group re-enters the model when its last member settles, so a timed
+  wake for a sync-only board buys a `status:'pending'` placeholder turn and
+  nothing else, while one async completion among sync calls still pings
+  (that completion is what releases the parked gate). Turning a pending entry
+  into a decision takes TWO reads, because `HarnessPendingTool` carries no
+  policy: the live `api.tools` definition FIRST (a host `tool({ mode })`),
+  then the GENERATED `BUILTIN_TOOL_DESCRIPTORS` row by name — a DISCOVERED
+  built-in's registry object carries no `mode` at all (the harness binds the
+  row's policy to the definition in a private WeakMap), so an override that
+  reads only the definition object classifies `shell`, `delegate`,
+  `threadFork` and `actionRequest` as sync and silently removes their
+  heartbeat. An unregistered name is treated as async, so a policy the plugin
+  cannot answer for over-pings rather than going quiet.
 - `config` — read-only, exactly `{ wakeIntervalMs }` (legacy compat).
 
 ---

@@ -490,10 +490,10 @@ describe('toolRequest selection', () => {
         await writer('go');
 
         // R9-R11: an empty query reports the whole searchable vocabulary. Besides
-        // the two 'widgets' fixtures, that is the tag union of the eleven demoted
+        // the two 'widgets' fixtures, that is the tag union of the twelve demoted
         // runtime rows (toolRegistry, toolList, toolManage, toolCreate,
         // profileManage, chapterManage, locationManage, agentManage, agentResult,
-        // actionRequest, threadFork); the declared core pair contributes nothing.
+        // actionRequest, threadFork, sleep); the declared core pair contributes nothing.
         expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual({
             enabled: [],
             tools: [],
@@ -517,6 +517,7 @@ describe('toolRequest selection', () => {
                 'compile',
                 'create',
                 'define',
+                'delay',
                 'dynamic',
                 'edit',
                 'entries',
@@ -532,6 +533,7 @@ describe('toolRequest selection', () => {
                 'manage',
                 'outline',
                 'output',
+                'pause',
                 'people',
                 'person',
                 'place',
@@ -554,16 +556,21 @@ describe('toolRequest selection', () => {
                 'results',
                 'scene',
                 'search',
+                'seconds',
                 'self-modifying',
                 'setting',
                 'settings',
+                'sleep',
                 'source',
                 'store',
                 'story',
                 'summarize',
                 'team',
                 'thread',
+                'time',
+                'timer',
                 'tools',
+                'wait',
                 'widgets',
                 'world',
                 'writing'
@@ -604,8 +611,8 @@ describe('toolRequest selection', () => {
 // gets an empty enabled set, exactly as before.
 // ---------------------------------------------------------------------------
 
-// The twelve names this fixture registers that MAY occupy an enabled slot, in
-// registration order: the eleven demoted runtime rows (no `interaction` is configured, so
+// The thirteen names this fixture registers that MAY occupy an enabled slot, in
+// registration order: the twelve demoted runtime rows (no `interaction` is configured, so
 // `actionRequest` is not registered) plus the two 'widgets' fixtures. `toolRequest`/`tasks`
 // (core) and `toolCancel` (pending-only) are deliberately absent.
 const SEEDABLE_RUNTIME_NAMES = [
@@ -620,7 +627,10 @@ const SEEDABLE_RUNTIME_NAMES = [
     'knowledge',
     'agentManage',
     'agentResult',
-    'threadFork'
+    'threadFork',
+    // Searchable, never pending-only, so the seed admits it like any other demoted row:
+    // src/tools/runtime/sleep.tool.ts.
+    'sleep'
 ];
 
 const seedOf = (names: string[]): string[] => [...SEEDABLE_RUNTIME_NAMES, ...names];
@@ -672,6 +682,7 @@ describe('configuration.enableAllTools — starting with the whole switchable to
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'file-00',
             'file-01'
         ]);
@@ -1206,6 +1217,7 @@ describe('the conversation tool switch (the withheld set)', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'file-00',
             'file-02'
         ]);
@@ -1242,7 +1254,8 @@ describe('the conversation tool switch (the withheld set)', () => {
             'knowledge',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'sleep'
         ]);
         expect(writer.withheldTools).toEqual(['file-01']);
     });
@@ -1343,6 +1356,7 @@ describe('the conversation tool switch (the withheld set)', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            'sleep',
             'file-00',
             'file-01',
             'file-02'
@@ -1383,7 +1397,8 @@ describe('the conversation tool switch (the withheld set)', () => {
                 'knowledge',
                 'agentManage',
                 'agentResult',
-                'threadFork'
+                'threadFork',
+                'sleep'
             ],
             offsets: []
         });

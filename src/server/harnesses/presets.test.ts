@@ -227,9 +227,10 @@ const CORE = [
 const REAL = ['general', 'instruct', 'research', 'workspace', 'reviewer', 'planner', 'debugger'] as const;
 
 // The harness-owned rows the kernel registers on EVERY harness, including a tool-less one
-// (issue 0005-D): the core set plus the two session tools that trail it. `chat` gets
-// exactly this and nothing else, which is the whole point of the card.
-const HARNESS_OWNED = [...CORE, 'threadFork', 'toolCancel'];
+// (issue 0005-D): the core set plus the session tools that trail it — `threadFork` (130),
+// `sleep` (145) and `toolCancel` (150), all `activation: 'always'`. `chat` gets exactly
+// this and nothing else, which is the whole point of the card.
+const HARNESS_OWNED = [...CORE, 'threadFork', 'sleep', 'toolCancel'];
 
 // The six that get a built-in team. `general` is deliberately NOT here: its card passes
 // `subagents: []`, so `delegate` is not registered for it at all — every assertion about
@@ -655,6 +656,7 @@ describe('one toolbox, different agents', () => {
                 ...CORE,
                 'delegate',
                 'threadFork',
+                'sleep',
                 'toolCancel',
                 ...TOOLBOX,
                 'search',
@@ -666,6 +668,9 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('flaky')).toEqual([
             ...CORE,
             'threadFork',
+            // `sleep` is `activation: 'always'` at order 145, so it rides EVERY card,
+            // including the tool-less one: src/tools/runtime/sleep.tool.ts.
+            'sleep',
             'toolCancel',
             ...TOOLBOX,
             'testFlaky',
@@ -677,6 +682,9 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('demo')).toEqual([
             ...CORE,
             'threadFork',
+            // `sleep` is `activation: 'always'` at order 145, so it rides EVERY card,
+            // including the tool-less one: src/tools/runtime/sleep.tool.ts.
+            'sleep',
             'toolCancel',
             'timeNow'
         ]);
@@ -695,6 +703,9 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('general')).toEqual([
             ...CORE,
             'threadFork',
+            // `sleep` is `activation: 'always'` at order 145, so it rides EVERY card,
+            // including the tool-less one: src/tools/runtime/sleep.tool.ts.
+            'sleep',
             'toolCancel',
             ...TOOLBOX,
             'search',
@@ -706,6 +717,9 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('general')).toEqual([
             ...CORE,
             'threadFork',
+            // `sleep` is `activation: 'always'` at order 145, so it rides EVERY card,
+            // including the tool-less one: src/tools/runtime/sleep.tool.ts.
+            'sleep',
             'toolCancel',
             ...TOOLBOX,
             'fetch'
@@ -914,6 +928,7 @@ describe('one toolbox, different agents', () => {
                 ...CORE,
                 'delegate',
                 'threadFork',
+                'sleep',
                 'toolCancel',
                 ...TOOLBOX,
                 'fetch'

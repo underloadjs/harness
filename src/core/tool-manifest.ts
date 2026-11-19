@@ -1746,10 +1746,51 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     origin: "package",
     group: "runtime",
     activation: "interaction",
-    mode: "async",
+    mode: "sync",
     order: 140,
     control: "action",
     sessionBound: true,
+    listed: true,
+    alwaysDeclared: false
+},
+{
+    name: "sleep",
+    metadata: {
+        name: "sleep",
+        description: "Pause this agent for a wall-clock delay and resume it when the timer expires. Pass `seconds`: how long to wait, from 0 to 3600 (one hour) — 0 yields the rest of the turn without waiting, and a fraction is honoured (0.5 waits half a second). The sleep is not a background task: this tool call stays open for exactly that long, and the timer expiring is what wakes the run and lets it continue, so use it when the wait itself is the work (let a child you spawned land, space out polls) rather than something to fill a turn with. A stop of the run, or a request to abandon this call, ends the wait early rather than failing it: the timer is cleared and nothing waits out the rest of the delay. Out-of-range or non-numeric values are refused before anything is waited.",
+        tags: [
+            "sleep",
+            "wait",
+            "delay",
+            "timer",
+            "pause",
+            "seconds",
+            "time"
+        ],
+        parameters: {
+            type: "object",
+            properties: {
+                seconds: {
+                    type: "number",
+                    minimum: 0,
+                    maximum: 3600,
+                    description: "How long to wait, in seconds: 0 to 3600 (one hour). A fraction is honoured (0.5 waits half a second); 0 returns without waiting. Values outside that range, and anything that is not a number, are refused and nothing is slept."
+                }
+            },
+            required: [
+                "seconds"
+            ],
+            additionalProperties: false
+        },
+        visibility: "searchable"
+    },
+    sourcePath: "tools/runtime/sleep.tool.ts",
+    label: "tools/runtime/sleep.tool.ts",
+    origin: "package",
+    group: "runtime",
+    activation: "always",
+    mode: "sync",
+    order: 145,
     listed: true,
     alwaysDeclared: false
 },
@@ -2800,6 +2841,8 @@ export const loadDiscoveredTool = (label: string): Promise<unknown> => {
             return import("../tools/runtime/threadFork.tool");
         case "tools/runtime/actionRequest.tool.ts":
             return import("../tools/runtime/actionRequest.tool");
+        case "tools/runtime/sleep.tool.ts":
+            return import("../tools/runtime/sleep.tool");
         case "tools/runtime/toolCancel.tool.ts":
             return import("../tools/runtime/toolCancel.tool");
         case "tools/syntax/syntax.tool.ts":
