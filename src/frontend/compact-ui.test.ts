@@ -670,8 +670,10 @@ it('keeps the agent configuration reachable from the composer button at every wi
     // One writer, and it is the action in the footer.
     expect(document.querySelectorAll('.agent-dialog-apply')).toHaveLength(1);
 
-    // Closing removes the form with the modal layer; nothing dead is left behind.
-    byClass('.dialog-close', 'button').click();
+    // Dismissing through the backdrop removes the form with the modal layer; nothing
+    // dead is left behind. The agent dialog itself carries no X any more.
+    expect(document.querySelector('.dialog-close')).toBeNull();
+    byClass('.dialog-overlay', 'div').click();
     expect(document.querySelector('.agent-dialog')).toBeNull();
 });
 

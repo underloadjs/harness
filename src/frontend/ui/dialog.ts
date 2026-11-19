@@ -112,6 +112,16 @@ export type DialogOptions = {
     // Pure confirmation/input dialogs and binary previews omit this: a Copy button
     // must copy meaningful text, not configuration controls or an image payload.
     copy?: DialogCopySource;
+    // A control that belongs in the header rather than in `content` (the agent
+    // configuration dialog puts its `[+]` here, where the close button used to be).
+    // It sits after the title and Copy and before Close, so a caller can hand the
+    // header its ONE shell-level action without teaching this module what that action
+    // means. The node is adopted, exactly like `content`.
+    headerAction?: Node;
+    // Opt-out of the close button. A dialog that states its own dismissal path (the
+    // agent dialog's Save press and backdrop) passes false so the header carries only
+    // its own action; Escape and a backdrop click still close the layer.
+    showClose?: boolean;
     // Opt-in layout class for `.dialog-body`, appended AFTER the base class. A content
     // surface that scrolls itself (the transcript document) passes `dialog-body--fill`,
     // which turns the body into a stretched, NON-scrolling flex column so the caller's
@@ -142,6 +152,9 @@ export type DialogUpdate = {
     title?: string;
     content?: Node;
     copy?: DialogCopySource | null;
+    // Replace the header action, or remove it with null. Omitted keeps the current
+    // node, so a caller that only edits its body never has to rebuild the header.
+    headerAction?: Node | null;
 };
 
 export type DialogHandle = {
@@ -291,6 +304,17 @@ const assertTitle = (title: unknown): string => {
 const assertContent = (content: unknown): Node => {
     if (!(content instanceof Node)) throw new TypeError('openDialog: content must be a DOM Node');
     return content;
+};
+
+// `headerAction` is the same data-only contract as `content`: a caller may hand the
+// header a built node, never markup. A bad value fails at the boundary instead of
+// disappearing during an append.
+const assertHeaderAction = (action: unknown): Node => {
+    if (!(action instanceof Node)) {
+        throw new TypeError('openDialog: headerAction must be a DOM Node');
+    }
+
+    return action;
 };
 
 // ---------------------------------------------------------------------------
@@ -502,7 +526,12 @@ type DialogEntry = {
     overlay: HTMLElement;
     head: HTMLElement;
     title: HTMLElement;
-    closeButton: HTMLButtonElement;
+    // Absent when `showClose: false`: the caller owns dismissal through its own
+    // action, Escape and the backdrop.
+    closeButton: HTMLButtonElement | undefined;
+    // The caller's one header control, if any. Kept so `update()` can replace it and
+    // so the Copy button (when present) inserts before it rather than at the tail.
+    headerAction: Node | undefined;
     body: HTMLElement;
     copy: DialogCopySource | undefined;
     copyButton: HTMLButtonElement | undefined;
@@ -702,7 +731,7 @@ const installCopyButton = (entry: DialogEntry, source: DialogCopySource): void =
         void runCopy(entry, button);
     });
 
-    entry.head.insertBefore(button, entry.closeButton);
+    entry.head.insertBefore(button, entry.headerAction ?? entry.closeButton ?? null);
     entry.copyButton = button;
 };
 
@@ -861,11 +890,25 @@ export const createDialogHost = (parent?: HTMLElement): DialogHost => {
             title.id = titleId;
             title.textContent = titleText;
 
-            const closeButton = document.createElement('button');
-            closeButton.type = 'button';
-            closeButton.className = CLOSE_CLASS;
-            closeButton.setAttribute('aria-label', CLOSE_LABEL);
-            closeButton.textContent = CLOSE_GLYPH;
+            // A caller that supplies its own dismissal path may omit the close
+            // button. The property is optional all the way down, so Copy and a header
+            // action still have a defined insertion point (they append).
+            const closeButton =
+                options.showClose === false
+                    ? undefined
+                    : (() => {
+                          const button = document.createElement('button');
+                          button.type = 'button';
+                          button.className = CLOSE_CLASS;
+                          button.setAttribute('aria-label', CLOSE_LABEL);
+                          button.textContent = CLOSE_GLYPH;
+                          return button;
+                      })();
+
+            const headerAction =
+                options.headerAction === undefined
+                    ? undefined
+                    : assertHeaderAction(options.headerAction);
 
             const body = document.createElement('div');
             // `bodyClassName` is appended after the base class (see `bodyClassOf`), so a
@@ -874,9 +917,12 @@ export const createDialogHost = (parent?: HTMLElement): DialogHost => {
             // `content` is adopted as-is. No innerHTML path exists in this module.
             body.append(content);
 
-            // Title + close first; `installCopyButton` inserts Copy immediately
-            // before Close, keeping Close at the far edge.
-            head.append(title, closeButton);
+            // Title first; Copy is inserted before the caller's action and the close
+            // control, so the header's right edge belongs to the caller when it opted
+            // out of Close.
+            head.append(title);
+            if (headerAction !== undefined) head.append(headerAction);
+            if (closeButton !== undefined) head.append(closeButton);
             panel.append(head, body);
             overlay.append(panel);
 
@@ -886,6 +932,7 @@ export const createDialogHost = (parent?: HTMLElement): DialogHost => {
                 head,
                 title,
                 closeButton,
+                headerAction,
                 body,
                 copy: undefined,
                 copyButton: undefined,
@@ -926,10 +973,31 @@ export const createDialogHost = (parent?: HTMLElement): DialogHost => {
                         if (next.copy === null || next.copy === undefined) removeCopyButton(entry);
                         else installCopyButton(entry, next.copy);
                     }
+
+                    // `headerAction: null` removes the caller's control; a node
+                    // replaces it in place. The node is inserted before Close when
+                    // that exists, so Close stays at the far edge; otherwise it
+                    // appends after Copy.
+                    if ('headerAction' in next) {
+                        if (entry.headerAction?.parentNode !== null && entry.headerAction?.parentNode !== undefined) {
+                            entry.headerAction.parentNode.removeChild(entry.headerAction);
+                        }
+                        entry.headerAction =
+                            next.headerAction === null || next.headerAction === undefined
+                                ? undefined
+                                : assertHeaderAction(next.headerAction);
+
+                        if (entry.headerAction !== undefined) {
+                            entry.head.insertBefore(
+                                entry.headerAction,
+                                entry.closeButton ?? null
+                            );
+                        }
+                    }
                 }
             };
 
-            closeButton.addEventListener('click', () => {
+            closeButton?.addEventListener('click', () => {
                 closeEntry(entry);
             });
 

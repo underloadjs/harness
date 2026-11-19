@@ -142,7 +142,7 @@ const configuredAgent = (): string | undefined => {
 };
 const selectConfigured = (name: string): void => {
     openDialog();
-    byClass(`.agent-dialog-tab[data-agent="${name}"]`, 'button').click();
+    byClass(`.agent-dialog-tab[data-agent="${name}"]`, 'div').click();
 };
 const addAgent = (name: string): void => {
     openDialog();
@@ -311,9 +311,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-    // A leaked modal owns the next test's Escape/focus handling.
-    for (const button of document.querySelectorAll<HTMLButtonElement>('.dialog-close')) {
-        button.click();
+    // A leaked modal owns the next test's Escape/focus handling. The agent dialog has
+    // no X any more, so dismissal goes through its backdrop.
+    for (const overlay of document.querySelectorAll<HTMLElement>('.dialog-overlay')) {
+        overlay.click();
     }
     vi.unstubAllGlobals();
 });
@@ -374,11 +375,11 @@ it('saves an edited instruction as one harness PATCH that keeps every other over
     );
 
     // Confirmed on screen: the refreshed box reads the SERVER's answer, R4 leaves no separate
-    // revert affordance (the box's own text is the undo), and the action is asleep again because
-    // nothing is pending any more.
+    // revert affordance (the box's own text is the undo), and the action carries no delta —
+    // another press would simply dismiss the dialog.
     expect(instructionBox().value).toBe('Answer in one sentence.');
     expect(document.querySelector('.agent-dialog-revert')).toBeNull();
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 });
 
 it('clears one stored override when the box is emptied and keeps the other member intact', async () => {
@@ -402,7 +403,7 @@ it('clears one stored override when the box is emptied and keeps the other membe
     expect(box.getAttribute('title')).toBe(
         'The instruction this agent runs. Saved on this harness template for new sessions.'
     );
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 
     // The undo is the box's own text: clearing it is a draft, exactly like typing into it.
     box.value = '';
@@ -485,13 +486,14 @@ it('sends nothing while configuring and discards the drafts on every dismissal',
     // typing on the way back is local too.
     openDialog();
 
-    byClass('.agent-dialog-tab[data-agent="summarizer"]', 'button').click();
+    byClass('.agent-dialog-tab[data-agent="summarizer"]', 'div').click();
     expect(instructionBox().value).toBe('Compress into one paragraph.');
-    // Viewing a teammate is not a team edit: the action has nothing to send.
+    // Viewing a teammate is not a team edit: the action has nothing to send, so a
+    // press would only dismiss the dialog.
     expect(patches).toEqual([]);
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 
-    byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').click();
+    byClass('.agent-dialog-tab[data-agent="instruct"]', 'div').click();
     typeInstruction('Answer in one sentence.');
 
     // The armed action states what closing costs, so the no-op is not a guess.
@@ -509,7 +511,7 @@ it('sends nothing while configuring and discards the drafts on every dismissal',
     // Reopening reads the server again: the typed draft is gone, not queued.
     openDialog();
     expect(instructionBox().value).toBe('Answer directly.');
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 
     // --- dismissal 2: the backdrop ------------------------------------------
     typeInstruction('Answer in one sentence.');
@@ -517,12 +519,16 @@ it('sends nothing while configuring and discards the drafts on every dismissal',
     expect(document.querySelector('.dialog')).toBeNull();
     expect(patches).toEqual([]);
 
-    // --- dismissal 3: the close button --------------------------------------
+    // --- dismissal 3: Save with no delta -------------------------------------
+    // The action remains the one explicit writer, but an empty draft has nothing to
+    // send, so the same press dismisses exactly like the backdrop and Escape. The X is
+    // gone by design: this is the only "close" affordance left in the footer.
     openDialog();
     expect(instructionBox().value).toBe('Answer directly.');
-    typeInstruction('Answer in one sentence.');
-    byClass('.dialog-close', 'button').click();
+    expect(document.querySelector('.dialog-close')).toBeNull();
+    applyAction().click();
     expect(document.querySelector('.dialog')).toBeNull();
+    expect(patches).toEqual([]);
 
     openDialog();
     expect(instructionBox().value).toBe('Answer directly.');
@@ -605,7 +611,7 @@ it('saves an instruction on a saved conversation on the session agent, never on 
     // And the refreshed box reads the CONVERSATION's new text back from the live route, not the
     // draft it held in flight.
     expect(instructionBox().value).toBe('Answer in one sentence.');
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 });
 
 it('sends null for a cleared instruction so the conversation restores its default', async () => {
@@ -807,7 +813,7 @@ it('surfaces a 409 when a conversation starts using the agent mid-save, and keep
 
     // The server's roster never moved. Dismissing drops the drafts, and the next open reads the
     // truth back: both members are still there, with the secondary's own live prompt.
-    byClass('.dialog-close', 'button').click();
+    byClass('.dialog-overlay', 'div').click();
     await flush();
     openDialog();
     expect(agentEntries()).toEqual(['instruct', 'summarizer']);

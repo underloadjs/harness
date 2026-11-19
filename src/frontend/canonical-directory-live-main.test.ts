@@ -1254,7 +1254,7 @@ describe('the harness agent write', () => {
             agent_instructions: { summarizer: 'Compress into one paragraph.' }
         });
 
-        byClass('.dialog-close', 'button').click();
+        byClass('.dialog-overlay', 'div').click();
     });
 });
 

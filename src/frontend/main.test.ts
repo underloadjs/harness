@@ -443,12 +443,20 @@ const applyAction = (): HTMLButtonElement => {
 
     return byClass('.agent-dialog-apply', 'button');
 };
+// The model select inside the chip the dialog currently views. Every chip carries its
+// own select (2026-11-20), so an unscoped `.agent-model-select` would find the entry
+// agent's control even after the reader moved to a teammate.
+const viewedModelSelect = (): HTMLSelectElement => {
+    openAgents();
+
+    return byClass('.agent-dialog-tab[aria-selected="true"] .agent-model-select', 'select');
+};
 // Views another agent's configuration by clicking its badge (it sends nothing on its
 // own, and R3: it never promotes).
 const selectConfigured = (name: string): void => {
     openAgents();
 
-    byClass(`.agent-dialog-tab[data-agent="${name}"]`, 'button').click();
+    byClass(`.agent-dialog-tab[data-agent="${name}"]`, 'div').click();
 };
 // R3: `[+]` is the only route to an agent the team does not select. It drafts the
 // membership and moves the view to the new badge.
@@ -937,7 +945,7 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     // R4: no manual refresh control survives anywhere.
     expect(document.querySelector('.refresh-sessions')).toBeNull();
     // ...but the MODELS are live (R2): the dialog's strip still edits this session.
-    const modelSelect = byClass('.agent-model-select', 'select');
+    const modelSelect = viewedModelSelect();
     expect(modelSelect.disabled).toBe(false);
     expect(modelSelect.title).toBe(
         'Model for Instruct. Applies to the next request in this session.'
@@ -1417,7 +1425,7 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(byClass('.agent-dialog-add', 'button').disabled).toBe(false);
     expect(dialogNote()).toBeNull();
     expect(applyAction().textContent).toBe('Save configuration');
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
     expect(instructionBox().getAttribute('title')).toBe(
         'The instruction this agent runs in this conversation.'
     );
@@ -1437,14 +1445,14 @@ it('restores a remembered session with its frozen team and server timings', asyn
     // R2: models are not part of the frozen team, so the dropdown stays usable on a
     // saved session and promises the next request in THIS chat — for every member,
     // which the T3 dropdown reaches one agent at a time.
-    expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
-    expect(byClass('.agent-model-select', 'select').title).toBe(
+    expect(viewedModelSelect().disabled).toBe(false);
+    expect(viewedModelSelect().title).toBe(
         'Model for Instruct. Applies to the next request in this session.'
     );
 
     selectConfigured('summarizer');
     expect(configuredAgent()).toBe('summarizer');
-    expect(byClass('.agent-model-select', 'select').title).toBe(
+    expect(viewedModelSelect().title).toBe(
         'Model for Summarizer. Applies to the next request in this session.'
     );
 
@@ -2503,7 +2511,7 @@ it('adds a picker agent, makes it the entry agent, and never duplicates a member
     //    keeps Rank A even though a conversation no longer starts there.
     selectConfigured('summarizer');
     expect(applyAction().textContent).toBe('Save configuration');
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 
     entryToggle().click();
     expect(applyAction().textContent).toBe('Save & set entry');
@@ -2544,8 +2552,8 @@ it('adds a picker agent, makes it the entry agent, and never duplicates a member
     expect(memberToggle().disabled).toBe(true);
     expect(memberToggle().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
     // The lock explanation PARAGRAPH is still gone (its reason lives on the locked control);
-    // the only note the panel prints here is the rank line, excluded by its own class.
-    expect(document.querySelector('.agent-dialog-field-note:not(.agent-dialog-rank-note)')).toBeNull();
+    // the panel prints no field note here at all.
+    expect(document.querySelector('.agent-dialog-field-note')).toBeNull();
 });
 
 it('views another agent configuration without moving the entry agent or PATCHing the team', async () => {
@@ -2599,7 +2607,7 @@ it('views another agent configuration without moving the entry agent or PATCHing
 
     // The model choice is a draft too. The one explicit action writes it, and R3: the
     // entry move the reader did NOT arm does not travel with it.
-    const select = byClass('.agent-model-select', 'select');
+    const select = viewedModelSelect();
     select.value = 'm2';
     select.dispatchEvent(new Event('change', { bubbles: true }));
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
@@ -2619,8 +2627,63 @@ it('views another agent configuration without moving the entry agent or PATCHing
     // The rebuild the PATCH triggers keeps the configuration being viewed (it is still
     // a member) and shows the saved model instead of yanking the reader elsewhere.
     expect(configuredAgent()).toBe('summarizer');
-    expect(byClass('.agent-model-select', 'select').value).toBe('m2');
+    expect(viewedModelSelect().value).toBe('m2');
     expect(agentRanks()).toEqual(['A', 'B']);
+});
+
+it('cycles a chip rank and saves the ladder it produces', async () => {
+    const base = descriptor({
+        agents: ['instruct', 'summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'A', summarizer: 'B' }
+    });
+    let current = base;
+    const calls = stubFetch((url, method, body) => {
+        if (url === '/api') return json(bootstrap({ presets: [base] }));
+        if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+
+        if (url === '/api/harnesses/instruct' && method === 'PATCH') {
+            const request = body as {
+                agents: string[];
+                entry: string;
+                ranks: Record<string, AgentRank>;
+            };
+            current = descriptor({
+                agents: request.agents,
+                entry: request.entry,
+                ranks: fillRanks(request.agents, request.ranks)
+            });
+            return json({ harness: current });
+        }
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    openAgents();
+    const badge = byClass('.agent-dialog-tab[data-agent="instruct"] .agent-dialog-agent-rank', 'button');
+    expect(badge.textContent).toBe('A');
+    expect(badge.disabled).toBe(false);
+
+    badge.click();
+    expect(
+        byClass('.agent-dialog-tab[data-agent="instruct"] .agent-dialog-agent-rank', 'button')
+            .textContent
+    ).toBe('B');
+    expect(applyAction().textContent).toBe('Save & set rank');
+
+    applyAction().click();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')[0]?.body).toEqual({
+        agents: ['instruct', 'summarizer'],
+        entry: 'instruct',
+        ranks: { instruct: 'B', summarizer: 'B' }
+    });
+    expect(agentRanks()).toEqual(['B', 'B']);
 });
 
 it('drops a removed member from the roster and offers it back through the add picker', async () => {
@@ -2690,7 +2753,7 @@ it('drops a removed member from the roster and offers it back through the add pi
 
     memberToggle().click();
     expect(agentEntries()).toEqual(['instruct']);
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 
     // The one surviving member is the entry agent: its team control is locked with the
     // reason ON the control, so the team can never be saved empty.
@@ -2698,8 +2761,8 @@ it('drops a removed member from the roster and offers it back through the add pi
     expect(memberToggle().disabled).toBe(true);
     expect(memberToggle().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
     // The lock explanation PARAGRAPH is still gone (its reason lives on the locked control);
-    // the only note the panel prints here is the rank line, excluded by its own class.
-    expect(document.querySelector('.agent-dialog-field-note:not(.agent-dialog-rank-note)')).toBeNull();
+    // the panel prints no field note here at all.
+    expect(document.querySelector('.agent-dialog-field-note')).toBeNull();
 });
 
 it('views a saved conversation’s team and saves a model draft through the session PATCH', async () => {
@@ -2768,11 +2831,11 @@ it('views a saved conversation’s team and saves a model draft through the sess
     // No team change was attempted, and the action cannot promote here.
     expect(patches).toEqual([]);
     expect(applyAction().textContent).toBe('Save configuration');
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 
     // The viewed agent's model is live (R2), but a selection is only a DRAFT: the
     // PATCH happens on the explicit action, and it never touches the frozen team.
-    const select = byClass('.agent-model-select', 'select');
+    const select = viewedModelSelect();
     expect(select.disabled).toBe(false);
     expect(select.value).toBe('');
 
@@ -2793,7 +2856,7 @@ it('views a saved conversation’s team and saves a model draft through the sess
     // The refresh keeps the viewed configuration and shows the saved model.
     expect(configuredAgent()).toBe('summarizer');
     expect(agentRanks()).toEqual(['A', 'B']);
-    expect(byClass('.agent-model-select', 'select').value).toBe('m2');
+    expect(viewedModelSelect().value).toBe('m2');
 });
 
 it('adds a member to a saved conversation through its own roster, never the harness template', async () => {
@@ -2901,10 +2964,11 @@ it('blocks removing an agent a conversation in the session runs, with the reason
         'This agent is in use by a conversation and cannot be removed.'
     );
 
-    // A press of a disabled control drafts nothing, so a save cannot be armed and no DELETE can
-    // race the conversation that owns the member.
+    // A press of a disabled control drafts nothing, so no DELETE can race the
+    // conversation that owns the member — and the action's own delta stays empty, so
+    // its press would only dismiss the dialog.
     byClass('.agent-dialog-remove', 'button').click();
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
 });
 
@@ -3249,7 +3313,7 @@ it('stops every task in the originating session while a run is in flight', async
     expect(instructionBox().disabled).toBe(true);
     // R2: the TEAM is locked mid-run, the MODEL is not — it edits the session's live
     // map for the next request and never cancels this stream.
-    const streamingSelect = byClass('.agent-model-select', 'select');
+    const streamingSelect = viewedModelSelect();
     expect(streamingSelect.disabled).toBe(false);
     expect(streamingSelect.title).toBe(
         'Model for Instruct. Applies to the next request in this session.'
@@ -3532,7 +3596,7 @@ it('queues a second task behind the active one and advances it automatically', a
     expect(document.querySelector('.composer .reset')).toBeNull();
     // R2: models stay editable while a queue runs.
     openAgents();
-    expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
+    expect(viewedModelSelect().disabled).toBe(false);
 
     // A completes; the server advances B without another submit.
     host = drain;
@@ -3713,9 +3777,9 @@ it('keeps a live model edit when the delayed 202 answer lands afterwards', async
     // session fallback is represented by option 0 (ui/agents.ts dedupe rule).
     openAgents();
     const shownModel = (): string | null =>
-        byClass('.agent-model-select', 'select').selectedOptions[0]?.textContent ?? null;
+        viewedModelSelect().selectedOptions[0]?.textContent ?? null;
 
-    const select = byClass('.agent-model-select', 'select');
+    const select = viewedModelSelect();
     expect(select.disabled).toBe(false);
     select.value = 'm2';
     select.dispatchEvent(new Event('change', { bubbles: true }));
@@ -4579,9 +4643,9 @@ it('deletes an inactive session on the first click, with no confirmation panel',
     openAgents();
     // T7b (R5/R6): deleting ANOTHER conversation changes nothing about this one — and this one's
     // own configuration is editable, because a saved conversation owns its team and prompts. The
-    // delete drafted nothing, so the save action is still asleep.
+    // delete drafted nothing, so the action's press would only dismiss the dialog.
     expect(instructionBox().disabled).toBe(false);
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
     // No session was created: a delete is not a submit.
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);
     expect(statusText()).toBe('idle');
@@ -4705,8 +4769,8 @@ it('deletes the running current session, stops watching and creates no replaceme
     expect(memberToggle().disabled).toBe(true);
     expect(memberToggle().title).toBe('The entry agent is always part of the team: every harness needs an entry point.');
     // The lock explanation PARAGRAPH is still gone (its reason lives on the locked control);
-    // the only note the panel prints here is the rank line, excluded by its own class.
-    expect(document.querySelector('.agent-dialog-field-note:not(.agent-dialog-rank-note)')).toBeNull();
+    // the panel prints no field note here at all.
+    expect(document.querySelector('.agent-dialog-field-note')).toBeNull();
 
     // The agent outside the team is reachable through `[+]` now, and its add is a live
     // draft the reader can still cancel.

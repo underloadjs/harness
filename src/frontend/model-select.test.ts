@@ -112,14 +112,21 @@ const openDeck = (): void => {
 
 const modelSelects = (): HTMLSelectElement[] => {
     openDeck();
-    return [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
+    // Every chip now carries its own model select; this helper reads the one on the
+    // agent the dialog is currently viewing, which is the select the old one-per-view
+    // tests name.
+    return [
+        ...document.querySelectorAll<HTMLSelectElement>(
+            '.agent-dialog-tab[aria-selected="true"] .agent-model-select'
+        )
+    ];
 };
 
 // Views another agent's configuration. Local only: it never sends a request.
 const selectConfigured = (name: string): void => {
     openDeck();
 
-    byClass(`.agent-dialog-tab[data-agent="${name}"]`, 'button').click();
+    byClass(`.agent-dialog-tab[data-agent="${name}"]`, 'div').click();
 };
 
 // R3: `[+]` is the only way an agent outside the roster gets a badge.
@@ -458,12 +465,12 @@ it('saves harness model changes against the stored map the dialog renders from',
     });
 
     // Both members are back on the fallback model, so the dialog restates the saved truth and
-    // has nothing pending: a second save of the same state is the one case that legitimately
-    // answers "Nothing changed."
+    // has nothing pending: the action stays pressable, and a press here would only dismiss
+    // the dialog rather than re-writing the same state.
     selectConfigured('instruct');
     expect(modelSelects()[0].value).toBe('');
     expect(optionTexts(modelSelects()[0])[0]).toBe('m1');
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 });
 
 it('names the server fallback when the stored settings model is blank', async () => {
@@ -544,10 +551,9 @@ it('shows a model-change error and keeps the last server-confirmed selection', a
         'That model is not available to this provider.'
     );
     // The stored configuration is untouched: the server's last answer still has no
-    // override, which is what the team list reports.
-    expect(
-        document.querySelector('.agent-dialog-agent[data-agent="instruct"] .agent-dialog-agent-model')?.textContent
-    ).toBe('m1');
+    // override. The chip keeps the refused DRAFT on screen (that is the draft layer's
+    // promise), so the server truth is asserted on the fixture it never wrote.
+    expect(current.agentModels).toBeUndefined();
 });
 
 // R3 (T4): the SAVING window must be observable while the PATCH is in flight. The
@@ -623,12 +629,13 @@ it('shows the saving state and diagnostic while a model PATCH is in flight', asy
         'agent configuration saved · applies to new sessions'
     );
     // T3: the dialog reports the same outcome in its own footer, and the drafts are
-    // cleared because the write was confirmed.
+    // cleared because the write was confirmed; the action stays pressable (a press
+    // now would only dismiss the dialog).
     expect(document.querySelector('.agent-dialog-error')?.textContent).toBe('');
     expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
         'agent configuration saved · applies to new sessions'
     );
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
 });
 
 it('clears the accessible status diagnostic when the state resets', async () => {
@@ -771,7 +778,7 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     // a nonmember never appears in it.
     expect(document.querySelector('.agent-dialog-note')).toBeNull();
     expect(applyAction().textContent).toBe('Save configuration');
-    expect(applyAction().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(false);
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
     const headerNewSession = byClass('.harness-title-row .new-session', 'button');
@@ -1003,15 +1010,14 @@ it('shows a session model-change error and keeps the last confirmed value', asyn
         'agent models: That model is not available to this session.'
     );
     // R2 (T3): the refused draft is KEPT so the reader can retry, and the dialog says
-    // why instead of closing. The SERVER's confirmed map is what the team list shows.
+    // why instead of closing. The frozen server map is untouched; the chip shows the
+    // draft because the dialog is still open on it.
     expect(modelSelects()[0].value).toBe('m3');
     expect(applyAction().disabled).toBe(false);
     expect(document.querySelector('.agent-dialog-error')?.textContent).toBe(
         'That model is not available to this session.'
     );
-    expect(
-        document.querySelector('.agent-dialog-agent[data-agent="instruct"] .agent-dialog-agent-model')?.textContent
-    ).toBe('m2');
+    expect(saved.agentModels).toEqual({ instruct: 'm2', summarizer: 'm1' });
     expect(calls).toContain('PATCH /api/sessions/s9');
     expect(
         calls.some((call) => call.startsWith('PATCH') && call.includes('/api/harnesses/'))

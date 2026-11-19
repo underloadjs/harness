@@ -1764,7 +1764,7 @@ const publishedCatalogue = (): string[] => {
     const values = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')].map(
         (select) => [...select.options].map((option) => option.value)
     );
-    byClass('.dialog-close', 'button').click();
+    byClass('.dialog-overlay', 'div').click();
 
     if (values.length === 0) throw new Error('no per-agent model dropdown was rendered');
 

@@ -455,8 +455,10 @@ beforeEach(() => {
 // the next case's `vi.resetModules()`, so an open dialog would keep consuming every later
 // `Tab` in this file — the same discipline `composer-agent-control.test.ts:142-151` follows.
 afterEach(async () => {
-    for (const button of document.querySelectorAll<HTMLButtonElement>('.dialog-close')) {
-        button.click();
+    // The agent dialog has no X any more, and an open dialog's Tab trap would consume
+    // every later test's Tab key. Dismiss through the backdrop, which every layer owns.
+    for (const overlay of document.querySelectorAll<HTMLElement>('.dialog-overlay')) {
+        overlay.click();
     }
     await flush(1);
     vi.unstubAllGlobals();

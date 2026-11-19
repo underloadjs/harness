@@ -277,7 +277,7 @@ it('keeps a legacy editable:false preset fully editable and never says read-only
     // drafts the membership, and saving from the entry agent adds without moving the entry.
     byClass('.agent-dialog-add', 'button').click();
     byClass('.agent-dialog-add-option[data-agent="summarizer"]', 'button').click();
-    byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').click();
+    byClass('.agent-dialog-tab[data-agent="instruct"]', 'div').click();
 
     byClass('.agent-dialog-apply', 'button').click();
     await flush();

@@ -202,9 +202,10 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-    // A leaked dialog overlay would own the next test's focus/Escape handling.
-    for (const button of document.querySelectorAll<HTMLButtonElement>('.dialog-close')) {
-        button.click();
+    // A leaked dialog overlay would own the next test's focus/Escape handling. The
+    // agent dialog has no X any more, so dismissal goes through its backdrop.
+    for (const overlay of document.querySelectorAll<HTMLElement>('.dialog-overlay')) {
+        overlay.click();
     }
     vi.unstubAllGlobals();
     // T38: the live case installs the stream double; it is released through the same module
@@ -341,11 +342,12 @@ it('opens the shared agent dialog from the single composer button', async () => 
     expect(instruction.disabled).toBe(false);
     expect(byClass('.agent-model-select', 'select').getAttribute('aria-label')).toBe('Model for Instruct');
 
-    // Nothing has been changed, so the action is disabled: it cannot claim a save or a
-    // promotion that the reader never asked for.
+    // Nothing has been changed, so the action carries no delta: it is pressable, and
+    // a press here would only dismiss the modal (it cannot claim a save or a
+    // promotion that the reader never asked for).
     const apply = byClass('.agent-dialog-apply', 'button');
     expect(apply.textContent).toBe('Save configuration');
-    expect(apply.disabled).toBe(true);
+    expect(apply.disabled).toBe(false);
 
     // R13: Escape dismisses the modal and focus returns to the composer button.
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
@@ -395,10 +397,10 @@ it('selects a different entry agent from the dialog and PATCHes the complete tea
     // moved, and the team is untouched. The panel's own control arms the entry move
     // the reader asked for, and the bottom-right action writes it in the same
     // complete-team PATCH the deck used.
-    byClass('.agent-dialog-tab[data-agent="research"]', 'button').click();
+    byClass('.agent-dialog-tab[data-agent="research"]', 'div').click();
     expect(patches).toEqual([]);
 
-    expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(false);
     expect(byClass('.agent-dialog-apply', 'button').textContent).toBe('Save configuration');
 
     // The entry move is a deliberate press, and the rebuild repaints the action's label
@@ -442,9 +444,10 @@ it('selects a different entry agent from the dialog and PATCHes the complete tea
         'Agent: Researcher. Open agent settings.'
     );
 
-    // R13: closing after the rebuild still returns focus to the LIVE button (the
-    // opener node itself may have been replaced by the chrome repaint).
-    byClass('.dialog-close', 'button').click();
+    // R13: dismissing after the rebuild still returns focus to the LIVE button (the
+    // opener node itself may have been replaced by the chrome repaint). The agent
+    // dialog's X is gone, so this is the backdrop path.
+    byClass('.dialog-overlay', 'div').click();
     expect(document.querySelector('.dialog')).toBeNull();
     expect(document.activeElement).toBe(byClass('.agent-control-button', 'button'));
 });
@@ -487,10 +490,14 @@ it('changes a model from the dialog and keeps the open dialog in sync without dr
 
     byClass('.agent-control-button', 'button').click();
 
-    // T3: the dialog reuses the EXISTING per-agent option rules (same labels/state),
-    // but shows one agent at a time through the dropdown instead of a select per card.
+    // T3: the dialog reuses the EXISTING per-agent option rules, and now every chip
+    // carries its own select so a model can be changed without viewing that agent first.
     const selects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
-    expect(selects.map((select) => select.getAttribute('aria-label'))).toEqual(['Model for Instruct']);
+    expect(selects.map((select) => select.getAttribute('aria-label'))).toEqual([
+        'Model for Instruct',
+        'Model for Researcher',
+        'Model for Coder'
+    ]);
 
     const instruct = byClass<HTMLSelectElement>(
         '.agent-model-select[aria-label="Model for Instruct"]',
@@ -530,7 +537,7 @@ it('changes a model from the dialog and keeps the open dialog in sync without dr
         'select'
     );
     expect(replaced.value).toBe('m3');
-    expect(document.activeElement).toBe(byClass('.agent-dialog-tab[data-agent="instruct"]', 'button'));
+    expect(document.activeElement).toBe(byClass('.agent-dialog-tab[data-agent="instruct"]', 'div'));
     expect(document.activeElement?.tagName).not.toBe('BODY');
 });
 
@@ -581,14 +588,14 @@ it('shows every agent instruction and guideline inside the dialog', async () => 
 
     // R3: the strip reaches every trusted agent the team selects — including one the
     // reader did not open the dialog for, whose guideline rules are part of ITS default prompt.
-    byClass('.agent-dialog-tab[data-agent="workspace"]', 'button').click();
+    byClass('.agent-dialog-tab[data-agent="workspace"]', 'div').click();
 
     expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe(
         'Write code.\n\nGuidelines:\n- Keep diffs small.'
     );
 
     // And the draft the reader typed for Instruct is still there when they go back.
-    byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').click();
+    byClass('.agent-dialog-tab[data-agent="instruct"]', 'div').click();
     expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe('Answer in one sentence.');
 });
 
@@ -659,14 +666,15 @@ it('keeps a saved conversation editable and states the scope a save writes', asy
     );
 
     // R5: the entry agent of a saved conversation is FIXED, so `Set as entry` carries that reason
-    // and the action can never promise a promotion this session cannot write.
+    // and the action can never promise a promotion this session cannot write; with no delta its
+    // press would only dismiss the dialog.
     expect(byClass('.agent-dialog-entry', 'button').disabled).toBe(true);
     expect(byClass('.agent-dialog-entry', 'button').title).toBe(
         'The entry agent is fixed for a saved conversation.'
     );
     const apply = byClass('.agent-dialog-apply', 'button');
     expect(apply.textContent).toBe('Save configuration');
-    expect(apply.disabled).toBe(true);
+    expect(apply.disabled).toBe(false);
 
     // R2: the model map is still live, and the strip reaches every member's configuration.
     expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
@@ -674,10 +682,10 @@ it('keeps a saved conversation editable and states the scope a save writes', asy
         'Model for Instruct. Applies to the next request in this session.'
     );
 
-    byClass('.agent-dialog-tab[data-agent="research"]', 'button').click();
-    expect(byClass('.agent-model-select', 'select').title).toBe(
-        'Model for Researcher. Applies to the next request in this session.'
-    );
+    byClass('.agent-dialog-tab[data-agent="research"]', 'div').click();
+    expect(
+        byClass('.agent-model-select[aria-label="Model for Researcher"]', 'select').title
+    ).toBe('Model for Researcher. Applies to the next request in this session.');
 });
 
 // R2 (T3): the whole point of the draft layer. Every dismissal path must discard the
@@ -718,19 +726,22 @@ it('discards every draft on close, overlay and Escape without a single request',
     await flush();
     await flush();
 
-    for (const dismiss of ['close', 'overlay', 'escape'] as const) {
+    for (const dismiss of ['overlay', 'escape'] as const) {
         byClass('.agent-control-button', 'button').click();
 
         // A draft on an agent that is NOT the entry agent: an instruction, a model, and an armed
         // entry move, i.e. one edit of every kind the dialog owns here (every trusted
         // agent is already on this team, so `[+]` has nothing to add).
-        byClass('.agent-dialog-tab[data-agent="research"]', 'button').click();
+        byClass('.agent-dialog-tab[data-agent="research"]', 'div').click();
 
         const box = byClass('.agent-dialog-instruction', 'textarea');
         box.value = 'Never sent.';
         box.dispatchEvent(new Event('input', { bubbles: true }));
 
-        const model = byClass('.agent-model-select', 'select');
+        const model = byClass(
+            '.agent-dialog-tab[data-agent="research"] .agent-model-select',
+            'select'
+        );
         model.value = 'm2';
         model.dispatchEvent(new Event('change', { bubbles: true }));
 
@@ -739,22 +750,26 @@ it('discards every draft on close, overlay and Escape without a single request',
         expect(patches).toEqual([]);
         expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(false);
 
-        if (dismiss === 'close') byClass('.dialog-close', 'button').click();
-        else if (dismiss === 'overlay') byClass('.dialog-overlay', 'div').click();
+        if (dismiss === 'overlay') byClass('.dialog-overlay', 'div').click();
         else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 
         expect(document.querySelector('.dialog')).toBeNull();
         // The dismissal itself wrote nothing.
         expect(patches).toEqual([]);
 
-        // Re-opening shows the SERVER's configuration, not the dropped draft.
+        // Re-opening shows the SERVER's configuration, not the dropped draft. The
+        // action is pressable as ever; its delta is empty, so a press would only
+        // dismiss the dialog again.
         byClass('.agent-control-button', 'button').click();
         expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('instruct');
         expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe('Answer directly.');
         expect(byClass('.agent-model-select', 'select').value).toBe('');
-        expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(true);
+        expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(false);
 
-        byClass('.dialog-close', 'button').click();
+        // The reopened state has no draft, so the action itself is the dismissal path:
+        // Save without a change behaves exactly like the backdrop/Escape above.
+        byClass('.agent-dialog-apply', 'button').click();
+        expect(document.querySelector('.dialog')).toBeNull();
         expect(patches).toEqual([]);
     }
 });

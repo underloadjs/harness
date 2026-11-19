@@ -118,10 +118,17 @@ it('imports the agent dialog stylesheet and keeps the single-writer action botto
     expect(rules).not.toContain('.agent-dialog .agent-summary {');
     expect(rules).not.toContain('.agent-dialog-instructions');
 
-    // R3: the roster strip is a full-width wrap of badges (the dropdown and the
-    // duplicate Team section are gone, and their rules must not come back).
-    expect(blockOf('.agent-dialog-tabs {', agentDialogRules)).toContain('width: 100%');
-    expect(blockOf('.agent-dialog-tabs {', agentDialogRules)).toContain('flex-wrap: wrap');
+    // R3: the roster strip is a full-width three-column grid of badges (the dropdown and
+    // the duplicate Team section are gone, and their rules must not come back). The
+    // equal `minmax(0, 1fr)` tracks are what makes the badges evenly spaced, and the
+    // phone rule collapses the grid to one badge per row.
+    const tabs = blockOf('.agent-dialog-tabs {', agentDialogRules);
+    expect(tabs).toContain('width: 100%');
+    expect(tabs).toContain('display: grid');
+    expect(tabs).toContain('grid-template-columns: repeat(3, minmax(0, 1fr))');
+    expect(blockOf('@media (max-width: 720px) {', agentDialogRules)).toContain(
+        'grid-template-columns: minmax(0, 1fr)'
+    );
     expect(agentDialogRules).not.toContain('.agent-dialog-agent-select {');
     expect(agentDialogRules).not.toContain('.agent-dialog-note {');
     expect(agentDialogRules).not.toContain('.agent-dialog-team-list {');
@@ -143,10 +150,11 @@ it('imports the agent dialog stylesheet and keeps the single-writer action botto
 
     // Footer: the note takes the remaining width and the action is pinned to the far
     // right, which is what makes "bottom right" the reading order rather than a guess.
+    // No rule sits above the action: the footer is separated by space, not a divider.
     const footer = blockOf('.agent-dialog-footer {', agentDialogRules);
     expect(footer).toContain('display: flex');
     expect(footer).toContain('justify-content: space-between');
-    expect(footer).toContain('border-top: 1px solid var(--border)');
+    expect(footer).not.toContain('border-top');
 
     // T5 REGRESSION (measured in real Chrome, both idle and refused states): the
     // refusal line always exists in the DOM and its `flex-basis: 100%` forces a wrap,
@@ -171,31 +179,45 @@ it('imports the agent dialog stylesheet and keeps the single-writer action botto
         'border-color: var(--accent)'
     );
 
-    // R1/R2 (T4): the chip's `entry` CAPTION is deleted — no rule, and no replacement
-    // `data-entry` chip styling either — and the rank moved out of the chip's text row
-    // into a pill that floats on its top-right corner. `position: relative` on the chip is
-    // what makes that possible: `.dialog`/`.dialog-body` are NOT positioned, so without a
-    // positioned containing block the pill would anchor to the fixed `.dialog-overlay`.
+    // R1/R2 (T4) + the 2026-11-20 quick controls: the chip's `entry` CAPTION is
+    // deleted, and the rank is the FIRST control rather than a floating corner pill.
+    // The rank badge is in flow, so the chip needs no positioned containing block for
+    // it; the model select sits at the right edge as the viewed member's list.
     expect(agentDialogRules).not.toContain('.agent-dialog-agent-entry {');
-    expect(blockOf('.agent-dialog-tab {', agentDialogRules)).toContain('position: relative');
+    expect(blockOf('.agent-dialog-tab {', agentDialogRules)).not.toContain('position: relative');
 
-    const rankPill = blockOf('.agent-dialog-tab .agent-dialog-agent-rank {', agentDialogRules);
-    // Out of flow, anchored to the chip's corner, and above every sibling (it is also the
-    // chip's LAST child in agent-dialog.ts, so DOM order agrees with the ring).
-    expect(rankPill).toContain('position: absolute');
-    expect(rankPill).toContain('top: -6px');
-    expect(rankPill).toContain('right: -6px');
-    expect(rankPill).toContain('z-index: 2');
-    // A fixed small centred square, so one letter always occupies the same slot whatever
-    // the chip's width, and the tokens are the sheet's own — `--bg-elevated` so the pill
-    // stays readable where it overhangs a neighbour, `--border` (NOT `--accent`, which this
-    // sheet reserves for selection and activity).
-    expect(rankPill).toContain('width: 16px');
-    expect(rankPill).toContain('height: 16px');
-    expect(rankPill).toContain('background: var(--bg-elevated)');
-    expect(rankPill).toContain('border: 1px solid var(--border)');
-    // Out of the pointer's way: the chip is the button, the pill is a caption.
-    expect(rankPill).toContain('pointer-events: none');
+    const rankBadge = blockOf('.agent-dialog-agent-rank {', agentDialogRules);
+    // In flow at the front, a real press target (the quick rank cycler), and above no
+    // sibling by z-index because there is nothing left out of flow. The 18px box is
+    // the shared square size for a one-letter badge.
+    expect(rankBadge).not.toContain('position: absolute');
+    expect(rankBadge).toContain('flex: 0 0 auto');
+    expect(rankBadge).toContain('min-width: 18px');
+    expect(rankBadge).toContain('height: 18px');
+    expect(rankBadge).toContain('background: var(--bg-elevated)');
+    expect(rankBadge).toContain('border: 1px solid var(--border)');
+    expect(rankBadge).toContain('cursor: pointer');
+    expect(rankBadge).not.toContain('pointer-events: none');
+
+    // The authority palette (2026-11-20): A gold, B silver, C copper, D white.
+    for (const [letter, colour] of [
+        ['A', '#f6c945'],
+        ['B', '#c8cfd8'],
+        ['C', '#d18555'],
+        ['D', '#f2f5f9']
+    ] as const) {
+        expect(
+            blockOf(`.agent-dialog-agent-rank[data-rank='${letter}'] {`, agentDialogRules)
+        ).toContain(`color: ${colour}`);
+    }
+
+    // The model is a fact at the chip's right edge; every chip's select is the actual
+    // list and takes the same slot, with no chevron and no visible frame.
+    expect(blockOf('.agent-dialog-agent-model {', agentDialogRules)).toContain('margin-left: auto');
+    const chipSelect = blockOf('.agent-dialog-tab .agent-model-select {', agentDialogRules);
+    expect(chipSelect).toContain('appearance: none');
+    expect(chipSelect).not.toContain('url(');
+    expect(chipSelect).toContain('background: transparent');
 });
 
 // Does a rule declare a `color:` property (as opposed to `border-color:` /
@@ -231,7 +253,7 @@ it('paints the agent identity tone on the composer label and the dialog badges (
     // selection/activity keep the accent border, so identity and state stay two facts.
     expect(blockOf('.agent-dialog-agent-name {', agentDialogRules)).toContain('color: var(--agent-color)');
     expect(blockOf('.agent-dialog-add-option {', agentDialogRules)).toContain('color: var(--agent-color)');
-    expect(blockOf('.agent-dialog-agent-rank,', agentDialogRules)).toContain('color: var(--muted)');
+    expect(blockOf('.agent-dialog-agent-rank {', agentDialogRules)).toContain('color: var(--muted)');
     expect(blockOf(".agent-dialog-tab[aria-selected='true'] {", agentDialogRules)).toContain(
         'border-color: var(--accent)'
     );
@@ -271,11 +293,12 @@ it('rounds every control with one shared token and keeps surfaces and circles on
     expect(blockOf('.agent-dialog-tab {', agentDialogRules)).toContain(
         'border-radius: var(--radius-sm)'
     );
-    // The rank corner pill (T4/R2) is the one shape in this sheet that COULD have taken the
-    // precedent's 999px circle (styles.css `.panel-new-pill`). It deliberately did not:
-    // taking the token keeps this guard total, so the ban below still covers every selector
-    // in the sheet — including any future one — instead of needing an exemption.
-    expect(blockOf('.agent-dialog-tab .agent-dialog-agent-rank {', agentDialogRules)).toContain(
+    // The rank badge (T4/R2 + the 2026-11-20 quick path) is the one shape in this sheet
+    // that COULD have taken the precedent's 999px circle (styles.css `.panel-new-pill`).
+    // It deliberately did not: taking the token keeps this guard total, so the ban below
+    // still covers every selector in the sheet — including any future one — instead of
+    // needing an exemption.
+    expect(blockOf('.agent-dialog-agent-rank {', agentDialogRules)).toContain(
         'border-radius: var(--radius-sm)'
     );
     expect(agentDialogRules).not.toContain('border-radius: 999px');

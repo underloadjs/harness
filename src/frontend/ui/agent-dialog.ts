@@ -3,25 +3,32 @@
 // PRODUCT RULE
 // ------------
 // ONE strip of clickable tabs lists the agents THIS conversation/harness actually has
-// — the team members, ENTRY agent first, exactly as the server reports them. Selecting a
-// tab shows THAT agent's configuration: ONE editable instruction box holding the FULL
-// effective instruction (R4: no read-only "preset" block and no revert control — the
-// box is the whole truth) and ONE model dropdown. Nothing else is listed: an agent the
-// team does not select has no configuration here yet, so it gets its own tab through
-// the `[+]` control instead — and in a session (`allowCustom`) the reader can also type
-// a brand-new agent name (R7) and get a tab the same way.
+// — the team members, ENTRY agent first, exactly as the server reports them. Each tab
+// is the compact configuration row: the rank badge at the front (click it to cycle
+// A -> B -> C -> D -> A), the agent name, and that agent's model select at the right
+// edge. Every chip's model select is live, so a model can be changed without viewing
+// that agent first. Selecting a tab shows the rest of THAT agent's configuration: ONE
+// editable instruction box holding the FULL effective instruction (R4: no read-only
+// "preset" block and no revert control — the box is the whole truth). Nothing else is
+// listed: an agent the team does not select has no configuration here yet, so it gets
+// its own tab through the header `[+]` control instead — and in a session
+// (`allowCustom`) the reader can also type a brand-new agent name (R7) and get a tab
+// the same way.
 //
 // Selecting a tab is a VIEW change: it never writes and changes neither the team nor
-// any rank. R20 replaced the single "make it the leader" press with TWO independent
-// controls inside the member's own panel — `Assign rank` (raise/lower THAT member,
-// which any number of members can share) and `Set as entry` (make THAT member the
-// agent a new conversation starts with). Reading a teammate's prompt therefore
-// cannot arm a rank change or move the entry role onto somebody else.
+// any rank. R20's two independent facts — rank (authority) and entry (routing) — are
+// touched only by their own controls: the chip's rank badge and the panel's
+// `Set as entry`. Reading a teammate's prompt therefore cannot arm a rank change or
+// move the entry role onto somebody else.
 //
-// The bottom-right action is the only thing that writes to the server. X / backdrop /
-// Escape / a programmatic `close()` therefore discard everything by construction —
-// nothing was ever sent. That is the whole purpose of the draft layer below:
-// selection, editing, adding and removing are LOCAL until the explicit action.
+// The bottom-right action is the only thing that writes to the server, and it is
+// ALWAYS pressable: a press that has a delta to write sends it, and a press with an
+// empty delta just dismisses the dialog (the same close path as the backdrop and
+// Escape, which discard everything by construction — nothing was ever sent). There is
+// no X: the header carries the `[+]` action where the close button used to be.
+// Backdrop / Escape / a programmatic `close()` behave exactly as before. That is the
+// whole purpose of the draft layer below: selection, editing, adding and removing are
+// LOCAL until the explicit action.
 //
 // DRAFTS
 // ------
@@ -77,7 +84,7 @@
 // HONEST RESTRICTIONS
 // -------------------
 // `editable` is the TEAM lock (an in-flight run, a session being created). It gates
-// `[+]`, the rank stepper, `Set as entry`, `Remove from team` and the instruction
+// `[+]`, the rank badges, `Set as entry`, `Remove from team` and the instruction
 // editor. Models keep their own flag inside `models` (a saved session edits its live
 // model map), so the dialog offers model editing exactly where the server does.
 //
@@ -96,9 +103,10 @@
 // actions because a tooltip on a disabled control is not reachable.
 //
 // R3 removed the lock EXPLANATION paragraph: the restriction is stated where it
-// bites — the footer's one short line says what Save can actually do here, and every
-// locked control carries the real reason (`hint` from main.ts) as its accessible
-// description. A disabled control that cannot say why is the failure mode.
+// bites — the footer's short line states a lock or an armed entry change and stays
+// empty otherwise (an idle editable dialog states nothing), and every locked control
+// carries the real reason (`hint` from main.ts) as its accessible description. A
+// disabled control that cannot say why is the failure mode.
 //
 // LIVE ACTIVITY WITHOUT LOSING FOCUS
 // ----------------------------------
@@ -127,9 +135,8 @@
 import type { AgentRank } from '../../types';
 import type { AgentDescriptor } from '../../server/protocol';
 // One source for rank wording, validation and stepping (R20) — see contract.ts.
-import { HIGHEST_RANK, LOWEST_RANK, isAgentRank, rankLabelOf, stepRank } from '../contract';
+import { AGENT_RANKS, isAgentRank, rankLabelOf } from '../contract';
 import {
-    UNKNOWN_MODEL_LABEL,
     agentDefaultInstructionOf,
     agentDetailsOf,
     createAgentModelSelect,
@@ -187,7 +194,7 @@ export type AgentDialogOptions = {
     // R20: the routing/seed agent for a new conversation. Independent of rank.
     entry: string;
     // R20: the rank configured per member (a member the map omits states none). The
-    // stepper paints from this and from its own draft, never from tab order.
+    // chip's rank badge paints from this and from its own draft, never from tab order.
     ranks: Readonly<Record<string, AgentRank>>;
     // The trusted agent library from GET /agents (or the boot fallback), with each
     // row's default-instruction text filled in by the identified profile read — see
@@ -213,7 +220,7 @@ export type AgentDialogOptions = {
     // fixed, so its shell passes false and the action can never offer a move the
     // session cannot perform. Defaults to true.
     canSetEntry?: boolean;
-    // R20: whether the rank stepper may be armed at all. A saved conversation runs the
+    // R20: whether the rank badge may be armed at all. A saved conversation runs the
     // ranks its harness template defines, so its shell passes false; a harness template
     // owns them. Defaults to true.
     canAssignRanks?: boolean;
@@ -297,6 +304,11 @@ type DialogState = {
     // activity WITHOUT a rebuild.
     root: HTMLElement;
     paint(focusKey?: string): void;
+    // Assigned by `openAgentDialog` once the modal handle exists: the apply press
+    // routes its empty-delta dismissal through this (the modal layer's own close,
+    // which fires the dismissal handler that drops the drafts). A no-op until then —
+    // a click cannot happen before the dialog is mounted.
+    dismiss(): void;
 };
 
 // Same neutral fallback as ui/agent-control.ts and ui/agents.ts `displayTitleOf`.
@@ -339,7 +351,7 @@ const allowsCustomAgent = (options: AgentDialogOptions): boolean => options.allo
 const maySetEntry = (options: AgentDialogOptions): boolean => options.canSetEntry !== false;
 
 // R20: a saved conversation inherits the ranks its harness template defines (the
-// roster route states no rank write for an existing member), so its stepper is inert.
+// roster route states no rank write for an existing member), so its badge is inert.
 const mayAssignRanks = (options: AgentDialogOptions): boolean => options.canAssignRanks !== false;
 
 // R6: an agent some conversation in this session already runs. Ids compare exactly,
@@ -435,6 +447,19 @@ const shownRankOf = (
     return isAgentRank(options.ranks[name]) ? options.ranks[name] : undefined;
 };
 
+// R20's quick rank control (2026-11-20): the badge is the rapid path, not a second
+// rank selector. A press walks the practical ladder A -> B -> C -> D and wraps to A,
+// so the common four-rank rosters need one click per step and no panel row. A member
+// with no stated rank starts at A (its first click assigns one); a rank outside this
+// practical band also re-enters at A rather than inventing an intermediate letter.
+const QUICK_RANK_CYCLE: readonly AgentRank[] = AGENT_RANKS.slice(0, 4);
+
+const nextQuickRankOf = (current: AgentRank | undefined): AgentRank => {
+    const at = current === undefined ? -1 : QUICK_RANK_CYCLE.indexOf(current);
+
+    return at < 0 ? (QUICK_RANK_CYCLE[0] ?? 'A') : (QUICK_RANK_CYCLE[(at + 1) % QUICK_RANK_CYCLE.length] ?? 'A');
+};
+
 // The entry change this dialog's action represents: the agent armed by `Set as entry`,
 // and only while the team is editable AND the scope can move the entry role at all
 // (R5/R6: a saved conversation's entry agent is fixed). `undefined` means "no move" —
@@ -463,9 +488,10 @@ const rankDeltasOf = (
 };
 
 // Is there anything worth sending? Computed from the DELTA the action would actually
-// produce (plus an armed entry change and any rank assignment), so "pending" can never
-// disagree with the request: a cancelled add or a re-armed entry change leaves an empty
-// delta and a DISABLED action, and a disabled button can never falsely claim a save.
+// produce (plus an armed entry change and any rank assignment), so the action's
+// tooltip can never promise a save the press would not make: a cancelled add or a
+// re-armed entry change leaves an empty delta, and an empty delta is a dismissal,
+// never a write.
 const changesPending = (options: AgentDialogOptions, state: DialogState): boolean => {
     if (entryTargetOf(options, state) !== undefined) return true;
     if (Object.keys(rankDeltasOf(options, state)).length > 0) return true;
@@ -544,8 +570,12 @@ const editDraft = (
 
 // The single line that states what this dialog can do right now. R3: it is the ONLY
 // explanation of a lock — the paragraph above the editors is gone, and a locked
-// control carries its own reason. R5: when a save IS possible the line says where it
-// lands, because "Saves" alone no longer answers that question in a conversation.
+// control carries its own reason. The line is STATE, never a standing description:
+// an idle editable dialog prints nothing here, and the line appears only while a
+// lock holds or an entry change is armed (after a save the element carries the
+// apply result instead). A rank assignment prints nothing: the action's own label
+// (`Save & set rank`) and the chip's badge already state that change, so a sentence
+// repeating it is noise under the form.
 const footerNoteOf = (options: AgentDialogOptions, state: DialogState): string => {
     if (!options.editable) {
         return options.models.editable
@@ -566,42 +596,31 @@ const footerNoteOf = (options: AgentDialogOptions, state: DialogState): string =
         )} the entry agent.`;
     }
 
-    // A rank assignment is a separate sentence: it names the member and the rank it
-    // moves to, because that is the whole effect (no other member is demoted).
-    const ranks = rankDeltasOf(options, state);
-    const rankKeys = Object.keys(ranks);
-
-    if (rankKeys.length > 0 && armedEntry === undefined) {
-        const [first] = rankKeys;
-        const rest = rankKeys.length > 1 ? ` (+${rankKeys.length - 1} more rank${rankKeys.length - 1 === 1 ? '' : 's'})` : '';
-
-        return `Saves ${isSessionScope(options) ? 'on this conversation' : 'this harness'} and sets ${memberTitleOf(
-            options,
-            state,
-            first
-        )} to ${rankLabelOf(ranks[first])}${rest}. Every other member keeps its rank.`;
-    }
-
-    return isSessionScope(options)
-        ? 'Saves on this conversation · only this session’s agents and instructions change.'
-        : 'Saves on this harness template · new sessions start with these agents and instructions.';
+    return '';
 };
 
 // Re-arm the action after a draft edit WITHOUT rebuilding the body: a rebuild on
-// every keystroke would drop the caret.
+// every keystroke would drop the caret. The action is never disabled for an empty
+// delta — an idle press dismisses the dialog — so only an in-flight write disables
+// it, and the tooltip is what states which outcome the next press has.
 const syncAction = (options: AgentDialogOptions, state: DialogState): void => {
     const apply = state.root.querySelector<HTMLButtonElement>('.agent-dialog-apply');
     if (apply === null) return;
 
-    const pending = changesPending(options, state);
-
-    apply.disabled = state.applying || !pending;
-    apply.title = state.applying
-        ? 'Saving…'
-        : pending
-          ? `Save this configuration${applySuffix(options, state)}. Closing the dialog saves nothing.`
-          : 'Nothing has changed yet.';
+    apply.disabled = state.applying;
+    apply.title = applyTitleOf(options, state);
 };
+
+// The apply button's tooltip: what the NEXT press does. With a delta it names the
+// write (and the cost of closing instead); with an empty delta it names the
+// dismissal, so an always-pressable button never reads as one that would save
+// nothing and do nothing.
+const applyTitleOf = (options: AgentDialogOptions, state: DialogState): string =>
+    state.applying
+        ? 'Saving…'
+        : changesPending(options, state)
+          ? `Save this configuration${applySuffix(options, state)}. Closing the dialog saves nothing.`
+          : 'Nothing to save · this closes the dialog.';
 
 // The clause the apply button's tooltip adds for what the draft also writes. ONE
 // writer, so the label above and the tooltip beside it cannot disagree, and R20's two
@@ -662,9 +681,11 @@ const selectMemberTab = (options: AgentDialogOptions, state: DialogState, member
     state.paint(`tab:${member}`);
 };
 
-// The `[+]` control and its accessible reason. Disabled rather than hidden when the
-// team is locked, so the affordance does not vanish on a saved conversation and the
-// tooltip states the real cause (`hint` from main.ts, never invented).
+// The `[+]` HEADER control and its accessible reason. It sits in the dialog's header
+// where the close button used to be, so the team's one add affordance is on the frame
+// rather than in the body. Disabled rather than hidden when the team is locked, so the
+// affordance does not vanish on a saved conversation and the tooltip states the real
+// cause (`hint` from main.ts, never invented).
 const createAddControl = (options: AgentDialogOptions, state: DialogState): HTMLElement => {
     const addable = addableOf(options, state);
     const add = el('button', 'agent-dialog-add', '+');
@@ -879,90 +900,73 @@ const isRemovalBlockedByThread = (
     isEntry: boolean
 ): boolean => options.editable && !isEntry && usedByThread(options, name);
 
-// The explicit rank control inside the selected agent's panel (R20). It assigns ONE
-// member's rank and nothing else: no other member moves, no member becomes "the"
-// leader, and any number of members may end up on the same letter. The two presses are
-// deliberately separate (rather than a single cycling button) because the reader must be
-// able to state which way a rank moves before pressing it.
-const createRankActions = (
+// R20's rank badge, now the QUICK control at the FRONT of the chip (2026-11-20).
+// It states one member's rank and cycles that member through A -> B -> C -> D -> A on
+// a click; it never selects a different tab and never becomes "the" leader. The badge
+// is deliberately a real button: the quick path has to work for the pointer AND for
+// the keyboard, and its accessible name states the exact step before it is taken.
+const createRankBadge = (
     options: AgentDialogOptions,
     state: DialogState,
     name: string,
     label: string
-): HTMLElement => {
-    const row = el('div', 'agent-dialog-rank');
+): HTMLButtonElement => {
     const current = shownRankOf(options, state, name);
-    // `data-rank` is the same hook the deck's tiles and the create form carry, so an
-    // inspector reads one member's rank the same way from any surface. Absent, not
-    // guessed, when neither the server nor a draft states one.
-    if (current !== undefined) row.dataset.rank = current;
+    const badge = el('button', 'agent-dialog-agent-rank');
+    badge.type = 'button';
+    badge.dataset.action = 'rank-cycle';
+    badge.dataset.agent = name;
+    if (current !== undefined) badge.dataset.rank = current;
 
-    row.append(el('p', 'agent-dialog-label agent-dialog-rank-label', rankLabelOf(current ?? HIGHEST_RANK)));
+    // `rank not stated` is shown as a dash rather than a guessed letter. It is still a
+    // press target: the first click assigns A, which is the only way an unranked added
+    // member can gain a rank now that the panel stepper is gone.
+    badge.textContent = current ?? '–';
 
-    const raise = el('button', 'agent-dialog-action agent-dialog-rank-raise', '−');
-    raise.type = 'button';
-    raise.dataset.action = 'rank-raise';
-    raise.dataset.agent = name;
-
-    const lower = el('button', 'agent-dialog-action agent-dialog-rank-lower', '+');
-    lower.type = 'button';
-    lower.dataset.action = 'rank-lower';
-    lower.dataset.agent = name;
-
-    const next = stepRank(current, -1);
-    const prev = stepRank(current, 1);
-    const atTop = current === HIGHEST_RANK;
-    const atBottom = current === LOWEST_RANK;
     const assignable = options.editable && mayAssignRanks(options);
+    const next = nextQuickRankOf(current);
 
-    // A press writes a DRAFT rank on this member only; the footer states what the
-    // action will save, and no PATCH happens until then (R3's transactional rule).
-    raise.setAttribute('aria-label', `Raise ${label} to ${rankLabelOf(next)}`);
-    lower.setAttribute('aria-label', `Lower ${label} to ${rankLabelOf(prev)}`);
-    raise.title = !options.editable
-        ? (options.hint ?? 'The agent team is locked here.')
-        : !assignable
-          ? // R20: a saved conversation runs the ranks its harness template defines, so
-            // the control has nothing to do here — and it says so instead of arming a
-            // draft that cannot be written.
-            'A saved conversation keeps the ranks its harness template defines.'
-          : atTop
-            ? `${rankLabelOf(HIGHEST_RANK)} is the highest rank.`
-            : `Move ${label} one step up in authority, to ${rankLabelOf(next)}. Only this agent changes.`;
-    lower.title = !options.editable
+    badge.setAttribute(
+        'aria-label',
+        current === undefined
+            ? `Set ${label} to ${rankLabelOf(next)}`
+            : `Change ${label} from ${rankLabelOf(current)} to ${rankLabelOf(next)}`
+    );
+    badge.title = !options.editable
         ? (options.hint ?? 'The agent team is locked here.')
         : !assignable
           ? 'A saved conversation keeps the ranks its harness template defines.'
-          : atBottom
-            ? `${rankLabelOf(LOWEST_RANK)} is the lowest rank.`
-            : `Move ${label} one step down in authority, to ${rankLabelOf(prev)}. Only this agent changes.`;
-    raise.disabled = !assignable || atTop;
-    lower.disabled = !assignable || atBottom;
+          : current === undefined
+            ? `No rank stated. Click to assign ${rankLabelOf(next)}.`
+            : `${rankLabelOf(current)} · click to cycle to ${rankLabelOf(next)}.`;
+    // Not the native `disabled` attribute: a disabled button swallows the click, and a
+    // rank badge that silently ignores a press is the bug this control fixes. It stays
+    // focusable and announces its state, and a press states the real reason when the
+    // scope cannot write ranks.
+    badge.setAttribute('aria-disabled', assignable ? 'false' : 'true');
 
-    // `focusKey` names the exact step that was pressed, so the rebuild puts the caret
-    // back on the control the reader is working with (a rank change repaints the panel).
-    const assign = (rank: AgentRank, focusKey: string): void => {
-        if (!assignable) return;
+    badge.addEventListener('click', (event) => {
+        event.stopPropagation();
+
+        if (!assignable) {
+            state.result = {
+                applied: false,
+                message: !options.editable
+                    ? (options.hint ?? 'The agent team is locked here.')
+                    : 'A saved conversation keeps the ranks its harness template defines; start a new session to change them.'
+            };
+            state.paint(`rank:${name}`);
+            return;
+        }
 
         editDraft(state, name, (draft) => {
-            draft.rank = rank;
+            draft.rank = next;
         });
         syncAction(options, state);
-        state.paint(focusKey);
-    };
-
-    raise.addEventListener('click', () => {
-        if (raise.disabled) return;
-        assign(next, 'action:rank-raise');
-    });
-    lower.addEventListener('click', () => {
-        if (lower.disabled) return;
-        assign(prev, 'action:rank-lower');
+        state.paint(`rank:${name}`);
     });
 
-    row.append(raise, lower);
-
-    return row;
+    return badge;
 };
 
 // The two explicit membership controls inside the selected agent's panel. R3: the
@@ -1096,9 +1100,8 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     const label = memberTitleOf(options, state, selected);
     const isMember = options.members.includes(selected);
     // R20: ENTRY is routing (which agent a new conversation starts with) and says
-    // nothing about authority. The rank of this member is a separate figure.
+    // nothing about authority.
     const isEntry = selected === options.entry;
-    const selectedRank = shownRankOf(options, state, selected);
     const isAdded = isDraftedAddition(options, state, selected);
     const draft = state.drafts.get(selected) ?? {};
 
@@ -1119,8 +1122,7 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
         const title = memberTitleOf(options, state, member);
         const active = member === selected;
 
-        const tab = el('button', 'agent-dialog-tab agent-dialog-agent');
-        tab.type = 'button';
+        const tab = el('div', 'agent-dialog-tab agent-dialog-agent');
         tab.setAttribute('role', 'tab');
         tab.id = `agent-dialog-tab-${member}`;
         tab.setAttribute('aria-selected', active ? 'true' : 'false');
@@ -1169,60 +1171,61 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
             tab.setAttribute('aria-busy', 'true');
         }
 
-        // The model line reads the same map the select is built from, so the strip and
-        // the editor can never disagree.
-        const model = options.models.models[member] ?? (options.models.fallbackModel?.trim() ?? '');
+        // The model line reads the same map the select is built from, so every chip
+        // states the model its agent would run. A draft model wins for THAT member, so
+        // switching tabs keeps every edit visible where it was made.
+        // The chip's text row (2026-11-20): `(A) Name        merge/ds4-flash`. The rank
+        // is the FIRST control, the name follows it, and the model sits at the right
+        // edge. EVERY chip carries the model select, so picking a model never requires
+        // viewing that agent first.
+        tab.append(createRankBadge(options, state, member, title));
+        tab.append(el('span', 'agent-dialog-agent-name', title));
 
-        // The chip's TEXT FLOW now holds two facts only: the identity name and the model
-        // string (R1/R2). Two things left this row:
-        //   - the `RANK A` caption — the letter floats instead, as the corner pill appended
-        //     below, which is what frees the chip's top-right corner;
-        //   - the `entry` caption (R1). It was a third word in a row that only ever had room
-        //     for two, and the fact it stated is still stated three times over: `data-entry`
-        //     above (the machine-readable half), the ` · entry agent` suffix in the accessible
-        //     name, and the detail panel's `Set as entry` / `Remove from team` pair
-        //     (`createMembershipActions`). No decision 2 replacement cue is added — styling
-        //     `data-entry` chips was explicitly out of scope.
-        // The model keeps `margin-left: auto` (`.agent-dialog-agent-model` in
-        // agent-dialog.css), so it still parks itself at the right edge of the row exactly
-        // as before.
-        tab.append(
-            el('span', 'agent-dialog-agent-name', title),
-            el('span', 'agent-dialog-agent-model', model.length > 0 ? model : UNKNOWN_MODEL_LABEL)
+        const memberDraft = state.drafts.get(member) ?? {};
+        const modelCell = el('span', 'agent-dialog-agent-model');
+        modelCell.append(
+            createAgentModelSelect(member, title, {
+                ...options.models,
+                models: {
+                    ...options.models.models,
+                    ...(memberDraft.model === undefined ? {} : { [member]: memberDraft.model })
+                },
+                onChange: (name: string, choice: string) => {
+                    editDraft(state, name, (entry) => {
+                        entry.model = choice;
+                    });
+                    syncAction(options, state);
+                }
+            })
         );
+        tab.append(modelCell);
 
-        // A drafted addition has no saved team entry yet, so its tab says so.
-        if (isDraftedAddition(options, state, member)) {
-            tab.append(el('span', 'agent-dialog-agent-state', 'new'));
-        }
+        tab.addEventListener('click', (event) => {
+            // The rank badge and the model select are their own controls. A press on
+            // either must not also move the view (the select would be rebuilt away
+            // mid-choice); every other point of the chip is the tab's select target.
+            const target = event.target;
+            if (
+                target instanceof Element &&
+                target.closest('.agent-dialog-agent-rank, .agent-dialog-agent-model') !== null
+            ) {
+                return;
+            }
 
-        // R2/R4: the rank letter is a floating pill in the chip's top-right corner (see
-        // `.agent-dialog-tab .agent-dialog-agent-rank` in agent-dialog.css for the geometry),
-        // so its text is the bare letter — `A`, not `Rank A`. The class name is unchanged on
-        // purpose for ONE reason: it is a pinned CSS contract — the `.agent-dialog-agent-rank,`
-        // caption block in ui/compact-control-style.test.ts slices that rule, so renaming this
-        // class would break that suite.
-        //
-        // It is NOT kept because a host reads it. The activity hook queries the CHIP, never the
-        // rank node inside it: ui/activity.ts:159-160 selects
-        // `.agent-tile[data-agent], .agent-control[data-agent], .agent-dialog-agent[data-agent]`,
-        // and `.agent-dialog-agent` is the class on `tab` (the `data-agent` it matches is set
-        // above). Nothing anywhere selects `.agent-dialog-agent-rank`.
-        //
-        // A member with NO stated rank gets NO pill at all rather than a placeholder glyph:
-        // inventing a mark would read as a rank. The fact is not lost — the chip's accessible
-        // name above still says `rank not stated`, `data-rank` stays absent, and the detail
-        // panel's rank heading and footnote state it in words (`createRankActions`).
-        //
-        // It is the LAST child because it is out of flow and must paint above every sibling
-        // (an overhang onto the chip's border and into the strip's 6px gap) without relying on
-        // a `z-index` race with the `[+]` control.
-        if (memberRank !== undefined) {
-            tab.append(el('span', 'agent-dialog-agent-rank', memberRank));
-        }
-
-        tab.addEventListener('click', () => {
             // A tab switch is a VIEW change: nothing is sent, no rank moves, no entry move.
+            selectMemberTab(options, state, member);
+        });
+
+        // A role="tab" div has no native Enter/Space activation, so it gets the same
+        // press a pointer has. Only the chip itself handles this: the rank badge and
+        // model select inside it keep their own keys.
+        tab.addEventListener('keydown', (event) => {
+            if (event.target !== tab) return;
+
+            const keyboard = event as KeyboardEvent;
+            if (keyboard.key !== 'Enter' && keyboard.key !== ' ') return;
+
+            keyboard.preventDefault();
             selectMemberTab(options, state, member);
         });
 
@@ -1230,11 +1233,21 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     }
 
     // Arrow keys move the selection inside the strip (automatic activation: switching
-    // a view has no side effect, so there is nothing to confirm with Enter).
+    // a view has no side effect, so there is nothing to confirm with Enter). A key
+    // press inside the rank badge or the model select belongs to THOSE controls: the
+    // strip must not swallow their arrows or activation keys.
     tabs.addEventListener('keydown', (event: Event) => {
         const keys = ['ArrowRight', 'ArrowLeft', 'Home', 'End'];
         const keyboard = event as KeyboardEvent;
         if (!keys.includes(keyboard.key)) return;
+
+        const target = event.target;
+        if (
+            target instanceof Element &&
+            target.closest('.agent-dialog-agent-rank, .agent-dialog-agent-model') !== null
+        ) {
+            return;
+        }
 
         const nodes = Array.from(tabs.querySelectorAll<HTMLElement>('.agent-dialog-tab'));
         if (nodes.length === 0) return;
@@ -1256,7 +1269,9 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
         selectMemberTab(options, state, moved);
     });
 
-    chooser.append(tabs, createAddControl(options, state));
+    // `[+]` is a HEADER action now (see `buildHeaderAction`): it sits exactly where
+    // the close button used to, and the strip below holds only the roster.
+    chooser.append(tabs);
 
     // A session's picker also opens when the catalogue is exhausted, because the
     // "New agent" form is still something to offer there (R7). A catalogue-only host has
@@ -1279,28 +1294,11 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     config.setAttribute('aria-labelledby', `agent-dialog-tab-${selected}`);
     config.dataset.agent = selected;
 
-    // Model -----------------------------------------------------------------
-    config.append(el('p', 'agent-dialog-label', 'Model'));
-
-    // `createAgentModelSelect` owns the option rules (resolved default first, the
-    // catalogue alphabetically, a stale id sorted in). The dialog replaces its PATCH
-    // callback with a DRAFT write — that substitution is the entire transactional
-    // difference from the old always-writing row.
-    const models: AgentModelSelect = {
-        ...options.models,
-        models: {
-            ...options.models.models,
-            ...(draft.model === undefined ? {} : { [selected]: draft.model })
-        },
-        onChange: (name: string, model: string) => {
-            editDraft(state, name, (entry) => {
-                entry.model = model;
-            });
-            syncAction(options, state);
-        }
-    };
-
-    config.append(createAgentModelSelect(selected, label, models));
+    // Model + rank ----------------------------------------------------------
+    // Both facts live in the chip above (2026-11-20): the rank badge is the quick
+    // cycler at the name's front, and the viewed member's model is the select at the
+    // chip's right edge. The config panel therefore starts with the instruction and
+    // keeps only the membership actions below it.
 
     // Instruction -----------------------------------------------------------
     // R4: exactly ONE instruction control, holding the FULL instruction the agent runs
@@ -1345,14 +1343,11 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     // Membership ------------------------------------------------------------
     // R3: no checkbox and no prose. `[+]` adds, this row removes.
     //
-    // R20 adds the two rank-era controls, each scoped to THIS member:
-    //   - the rank stepper assigns one letter to one member (nobody else moves, and
-    //     any number of members may end up on the same letter), and
-    //   - `Set as entry` moves the routing role, which is a separate fact from rank.
+    // R20's other rank-era control — the badge — lives at the front of the chip above;
+    // this row holds the membership pair, each scoped to THIS member: `Set as entry`
+    // moves the routing role, which is a separate fact from rank.
     // Conservative by construction: viewing a tab never changes the team, and the ENTRY
     // agent (the routing agent, whatever its rank) can never be removed.
-    config.append(createRankActions(options, state, selected, label));
-
     config.append(createMembershipActions(options, state, selected, label, isEntry, isMember));
 
     // R6: the thread reason repeated where it is visible. A disabled button's `title` is
@@ -1375,23 +1370,6 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
             el('p', 'agent-dialog-field-note', `${label} joins the team when you save · nothing is sent yet.`)
         );
     }
-
-    // R20: the rank a member holds is stated plainly, including when nothing states
-    // one, so the panel never implies a hierarchy the definition does not carry. A
-    // drafted change says so too, because nothing is sent until the action.
-    const rankDraft = state.drafts.get(selected)?.rank;
-
-    config.append(
-        el(
-            'p',
-            'agent-dialog-field-note agent-dialog-rank-note',
-            isAgentRank(rankDraft)
-                ? `${label} is set to ${rankLabelOf(rankDraft)} · ${rankDraft === options.ranks[selected] ? 'unchanged from the team' : 'not saved yet'}. Other members keep their own ranks.`
-                : selectedRank === undefined
-                  ? `${label} has no rank stated. Use the steps above to assign one; an agent with no rank has nothing to delegate from.`
-                  : `${label} holds ${rankLabelOf(selectedRank)}. Assigning a rank to another member does not change this one.`
-        )
-    );
 
     root.append(config);
 
@@ -1420,15 +1398,24 @@ const buildContent = (options: AgentDialogOptions, state: DialogState): HTMLElem
     // (an entry move, a rank assignment, or neither), so no wording ever claims a
     // promotion of a single lead agent.
     apply.textContent = applyLabelOf(options, state);
-    apply.disabled = state.applying || !changesPending(options, state);
-    apply.title = state.applying
-        ? 'Saving…'
-        : changesPending(options, state)
-          ? `Save this configuration${applySuffix(options, state)}. Closing the dialog saves nothing.`
-          : 'Nothing has changed yet.';
+    // The action is always pressable (only an in-flight write disables it): a press
+    // with a delta writes it, a press without one dismisses the dialog — the tooltip
+    // states which outcome the next press has.
+    apply.disabled = state.applying;
+    apply.title = applyTitleOf(options, state);
 
     apply.addEventListener('click', () => {
-        void submit(options, state);
+        if (state.applying) return;
+
+        if (changesPending(options, state)) {
+            void submit(options, state);
+            return;
+        }
+
+        // Nothing to write: the press dismisses the dialog through the same close
+        // path as the backdrop and Escape, which drops the drafts — an empty delta is
+        // exactly the case where dropping them loses nothing a save would have carried.
+        state.dismiss();
     });
 
     footer.append(note, error, apply);
@@ -1504,10 +1491,18 @@ const focusKeyOf = (root: HTMLElement): string | undefined => {
     const active = document.activeElement;
     if (!(active instanceof HTMLElement) || !root.contains(active)) return undefined;
 
+    if (active.classList.contains('agent-dialog-add')) return 'add';
+
+    // The chip's two quick controls are checked BEFORE the chip: both live inside the
+    // tab, and a rebuild must not hand their focus back to the whole badge.
+    const rank = active.closest<HTMLElement>('.agent-dialog-agent-rank');
+    if (rank !== null) return `rank:${rank.dataset.agent ?? ''}`;
+
+    const model = active.closest<HTMLSelectElement>('.agent-model-select');
+    if (model !== null) return `model:${model.getAttribute('aria-label') ?? ''}`;
+
     const tab = active.closest<HTMLElement>('.agent-dialog-tab');
     if (tab !== null) return `tab:${tab.dataset.agent ?? ''}`;
-
-    if (active.classList.contains('agent-dialog-add')) return 'add';
 
     const option = active.closest<HTMLElement>('.agent-dialog-add-option');
     if (option !== null) return `add:${option.dataset.agent ?? ''}`;
@@ -1531,9 +1526,6 @@ const focusKeyOf = (root: HTMLElement): string | undefined => {
     const apply = active.closest<HTMLButtonElement>('.agent-dialog-apply');
     if (apply !== null) return `apply:${apply.dataset.agent ?? ''}`;
 
-    const model = active.closest<HTMLSelectElement>('.agent-model-select');
-    if (model !== null) return `model:${model.getAttribute('aria-label') ?? ''}`;
-
     // R4: no `revert` and no read-only `preset` details any more — the instruction box
     // above is the only instruction control, so those keys can never be produced.
     return undefined;
@@ -1544,7 +1536,7 @@ const focusKeyOf = (root: HTMLElement): string | undefined => {
 // starts, and claiming it would be a lie); the reader is then handed the active tab,
 // which is the control that re-orients the whole form. The rule exists so a rebuild
 // can never drop focus onto <body> while the dialog is open — the case that happens
-// after a successful save, when the action becomes disabled again.
+// after a save or a removal, when the control that held focus may be gone.
 const targetOf = (root: HTMLElement, key: string): HTMLElement | null => {
     if (key === 'add' || key === 'add-first') {
         return root.querySelector<HTMLElement>('.agent-dialog-add');
@@ -1561,6 +1553,12 @@ const targetOf = (root: HTMLElement, key: string): HTMLElement | null => {
 
     if (kind === 'action') {
         return root.querySelector<HTMLElement>(`.agent-dialog-action[data-action="${rest}"]`);
+    }
+
+    if (kind === 'rank') {
+        return root.querySelector<HTMLElement>(
+            `.agent-dialog-agent-rank[data-agent="${rest}"]`
+        );
     }
 
     if (kind === 'tab') {
@@ -1649,7 +1647,7 @@ const focusByKey = (root: HTMLElement, key: string): void => {
 // `AgentDialogOptions.ranks` is required — the shell always passes the map it read from the card,
 // empty when the definition states no rank — and the dialog reads it on EVERY paint. Normalising it
 // once per options object (at open and on each `update`) means a caller that states no ranks still
-// gets an honest dialog: each rank readout says "rank not stated" instead of the body throwing on
+// gets an honest dialog: each rank badge says "rank not stated" instead of the body throwing on
 // `undefined[name]`. No rank is inferred — an unstated letter stays unstated.
 const optionsWithRanks = (options: AgentDialogOptions): AgentDialogOptions =>
     options.ranks === undefined ? { ...options, ranks: {} } : options;
@@ -1668,7 +1666,8 @@ export const openAgentDialog = (initial: AgentDialogOptions): AgentDialog => {
         applying: false,
         // Replaced by the first paint below.
         root: el('div', 'agent-dialog'),
-        paint: () => undefined
+        paint: () => undefined,
+        dismiss: () => undefined
     };
 
     let open = true;
@@ -1681,19 +1680,31 @@ export const openAgentDialog = (initial: AgentDialogOptions): AgentDialog => {
     // handle-clearing and focus-return logic.
     const onClose = initial.onClose;
 
-    // Rebuild the body in place. `focusKey` overrides the derived key only for a
-    // handler that knows which control it belongs to; otherwise the live focus is
-    // captured first, so an update never drops the reader on the close button.
+    // Rebuild the body and the header action in place. `focusKey` overrides the
+    // derived key only for a handler that knows which control it belongs to;
+    // otherwise the live focus is captured first, from the whole panel (the `[+]` now
+    // lives in the header), so an update never drops the reader on the backdrop.
     const paint = (focusKey?: string): void => {
-        const key = focusKey ?? focusKeyOf(state.root);
+        const scope = handle?.element ?? state.root;
+        const key = focusKey ?? focusKeyOf(scope);
         const content = buildContent(options, state);
 
         if (handle === undefined) return;
-        handle.update({ title: dialogTitle(options, state), content });
-        if (key !== undefined) focusByKey(content, key);
+        handle.update({
+            title: dialogTitle(options, state),
+            content,
+            headerAction: createAddControl(options, state)
+        });
+        if (key !== undefined) focusByKey(handle.element, key);
     };
 
     state.paint = paint;
+    // The apply press's dismissal path: the modal layer's own close, which fires the
+    // open-time dismissal handler (the drafts are dropped there). Reads the live
+    // `handle`, so it works from the very first click after mount.
+    state.dismiss = (): void => {
+        handle?.close();
+    };
 
     // `buildContent` seeds `state.root`, so activity and the action re-sync work from
     // the very first paint.
@@ -1702,6 +1713,11 @@ export const openAgentDialog = (initial: AgentDialogOptions): AgentDialog => {
     handle = openDialog({
         title: dialogTitle(options, state),
         content,
+        // R3 (2026-11-20): the header carries the `[+]` where the close X used to be.
+        // Dismissal is the backdrop, Escape, or the Save press with nothing to write —
+        // all three still drop the drafts through `onClose`.
+        headerAction: createAddControl(options, state),
+        showClose: false,
         onClose: () => {
             open = false;
             // Dismissal discards every draft: nothing was ever sent, so there is

@@ -305,7 +305,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-    for (const button of document.querySelectorAll<HTMLButtonElement>('.dialog-close')) button.click();
+    // A leaked modal owns the next test's Escape/focus handling. The agent dialog has
+    // no X any more, so dismissal goes through its backdrop.
+    for (const overlay of document.querySelectorAll<HTMLElement>('.dialog-overlay')) overlay.click();
     vi.unstubAllGlobals();
 });
 
@@ -340,7 +342,7 @@ describe('the configuration dialog reads what it edits', () => {
 
         // A second open asks again (the definition may have moved in another tab), and it is
         // still one request per open.
-        byClass('.dialog-close', 'button').click();
+        byClass('.dialog-overlay', 'div').click();
         openDialog();
         await flush();
         expect(server.harnessReads()).toHaveLength(2);
@@ -478,7 +480,7 @@ describe('the configuration dialog reads the default text it seeds', () => {
 
         // The catalogue agent with no tab is never asked for: the walk covers the members, and
         // nothing else has a panel to fill yet.
-        byClass('.dialog-close', 'button').click();
+        byClass('.dialog-overlay', 'div').click();
         openDialog();
         await flush();
 
@@ -506,7 +508,7 @@ describe('the configuration dialog reads the default text it seeds', () => {
         // say what the boot page said.
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Instruct');
         expect(
-            byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').getAttribute('aria-label')
+            byClass('.agent-dialog-tab[data-agent="instruct"]', 'div').getAttribute('aria-label')
         ).toBe('Configure Instruct · Rank A · entry agent');
         expect(
             byClass('.agent-dialog-tab[data-agent="instruct"] .agent-dialog-agent-name', 'span').textContent
@@ -577,7 +579,7 @@ describe('the configuration dialog reads the default text it seeds', () => {
         // not filled at all.
         expect(instructionBox().value).toBe(instructDefault);
 
-        byClass('.agent-dialog-tab[data-agent="summarizer"]', 'button').click();
+        byClass('.agent-dialog-tab[data-agent="summarizer"]', 'div').click();
         await flush();
 
         // The explicit selection asked again (the 404 poisoned nothing), and the answer is the
@@ -628,7 +630,7 @@ describe('the configuration dialog reads the default text it seeds', () => {
             byClass('.agent-dialog-tab[data-agent="archivist"] .agent-dialog-agent-name', 'span').textContent
         ).toBe('archivist');
 
-        byClass('.agent-dialog-tab[data-agent="archivist"]', 'button').click();
+        byClass('.agent-dialog-tab[data-agent="archivist"]', 'div').click();
         await flush();
 
         expect(server.agentDials()).toEqual([
@@ -683,8 +685,8 @@ describe('the configuration dialog reads the default text it seeds', () => {
         expect(document.querySelector('.agent-detail')).toBeNull();
 
         // Moving between two filled tabs is free, in both directions.
-        byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').click();
-        byClass('.agent-dialog-tab[data-agent="retriever"]', 'button').click();
+        byClass('.agent-dialog-tab[data-agent="instruct"]', 'div').click();
+        byClass('.agent-dialog-tab[data-agent="retriever"]', 'div').click();
         await flush();
 
         expect(server.agentDials()).toEqual([

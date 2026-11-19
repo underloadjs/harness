@@ -5,10 +5,10 @@
    `.button` primitives. ui/dialog.css owns the modal frame
    (`.dialog`, `.dialog-body` padding/scroll, the close button); this file styles
    ONLY the body content, which is why nothing here sets a width — the modal already
-   does, and the body scrolls. The one POSITIONING exception is the roster chip
-   (`.agent-dialog-tab`) plus its rank corner pill: a floating badge needs a
-   positioned containing block, and that block is the chip itself (see the rules
-   around `.agent-dialog-tab .agent-dialog-agent-rank` for why the overhang is safe).
+   does, and the body scrolls. The roster chip is the one exception: it is a flex
+   row that hosts the rank badge, the name and the model select, so the chip itself
+   is the positioning/layout context for its three facts (see the rules around
+   `.agent-dialog-tab`, `.agent-dialog-agent-rank` and `.agent-dialog-agent-model`).
 
    R3 layout, one column: the roster strip of clickable badges (the ONLY listing of
    the team — the dropdown and the duplicate "Team" section are gone), the viewed
@@ -38,34 +38,33 @@
     letter-spacing: 0.08em;
 }
 
-/* The roster strip. Badges wrap rather than scroll: a team is short, and a badge
-   that needs scrolling to see is a member nobody configures. `flex-wrap` plus the
-   strip's own full width is what keeps `[+]` on the row instead of floating. */
+/* The roster strip. A three-column grid, so the team reads as one evenly spaced list
+   instead of a ragged wrap: every badge gets the same column width, every row the same
+   gap, and a badge that needs scrolling to see never exists (the strip grows downward
+   and the body scrolls). The tracks are `minmax(0, 1fr)` so a long name/model pair
+   wraps INSIDE its badge instead of widening the grid past the dialog. A phone drops to
+   one column — the media query at the end of this sheet. */
 .agent-dialog-tabs {
-    display: flex;
-    flex-wrap: wrap;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     align-items: stretch;
     gap: 6px;
     width: 100%;
 }
 
-/* A badge is a real button so Enter/Space and a screen reader's button verb work
-   with no ARIA scripting; `role="tab"` (set in the TS) layers the tablist semantics
-   on top. Name + model stay inside it, so the strip still answers "who is on
-   this team and what do they run" — that is why the separate Team section died.
-
-   `position: relative` exists ONLY to be the containing block for the rank corner
-   pill (`.agent-dialog-tab .agent-dialog-agent-rank`, further down): `.dialog` and
-   `.dialog-body` are NOT positioned (ui/dialog.css:49, :207), so without it the pill
-   would anchor to the fixed `.dialog-overlay` and land in the viewport corner instead
-   of the chip's corner. It changes nothing else — the pill is out of flow, so the
-   chip's flex row lays out exactly as before. */
+/* A badge is a view target: `role="tab"` (set in the TS) supplies the tablist
+   semantics, a click anywhere outside its two quick controls selects it, and the
+   name + model stay inside it, so the strip still answers "who is on this team and
+   what do they run". The rank badge and the viewed agent's model select are CHILDREN
+   of the chip rather than the chip's siblings: the rank is at the name's front and
+   the model is at the right edge, which is the compact configuration row the panel
+   used to repeat. */
 /* Radius comes from `--radius-sm` (defined in styles.css `:root`): one control token shared
    by every pressable box in the app, so a tab, an input, a chip and the `.tool` chip all round
    the same. Surfaces keep `--radius`, and round badges/circular icon buttons keep 999px. This
    sheet is @imported into styles.css, so the token always resolves here. */
 .agent-dialog-tab {
-    position: relative;
+    min-width: 0;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -105,33 +104,78 @@
     border-style: dashed;
 }
 
-/* The model text inside a badge is a fact, not a label the reader acts on.
-   `margin-left: auto` parks it at the row's right edge — the reason the rank pill can
-   overhang the chip's top-right corner without touching it: the pill stops at the chip's
-   padding column (see the geometry note on
-   `.agent-dialog-tab .agent-dialog-agent-rank`), never reaching this text. */
+/* The model fact lives at the chip's right edge. Unselected chips print the resolved
+   id; the SELECTED chip puts a real select in the same slot (`.agent-model-select`
+   below), so choosing a model is always one press from the roster. `margin-left: auto`
+   parks whichever form is present at the right edge, and the max-width leaves the name
+   its share of a narrow three-column track. */
 .agent-dialog-agent-model {
+    display: inline-flex;
+    align-items: center;
     margin-left: auto;
+    max-width: 58%;
+    min-width: 0;
+    overflow: hidden;
     color: var(--muted);
     font-family: var(--mono);
     font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
-/* `[+]` sits at the end of the strip: it is the only way an agent outside the roster
-   gets a badge, and while the team is locked it stays visible but disabled with its
-   reason in `title` (never a silently missing affordance). */
+/* The model select inside a chip. It is deliberately minimal: the same muted mono
+   text the chip used to print, with no arrow and no visible frame until hover/focus.
+   `appearance: none` removes the native chevron; the whole label is still a select,
+   so the list opens from the text itself. Every chip carries one, which is why a model
+   can be changed without viewing that agent first. */
+.agent-dialog-tab .agent-model-select {
+    width: auto;
+    min-width: 0;
+    max-width: 100%;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.4;
+    cursor: pointer;
+    appearance: none;
+}
+
+.agent-dialog-tab .agent-model-select:hover:not(:disabled),
+.agent-dialog-tab .agent-model-select:focus {
+    border-color: var(--accent);
+    color: var(--text);
+    outline: none;
+}
+
+.agent-dialog-tab .agent-model-select:disabled {
+    opacity: 0.55;
+    cursor: default;
+}
+
+/* `[+]` is the dialog header's one action (2026-11-20), where the close X used to
+   sit. It keeps the same 28px footprint as the other dialog header controls, so the
+   title/action row reads as one bar. It stays visible but disabled with its reason
+   in `title` while the team is locked (never a silently missing affordance). */
 .agent-dialog-add {
+    display: inline-flex;
     flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
     align-self: flex-start;
-    min-width: 30px;
-    padding: 5px 10px;
+    width: 28px;
+    height: 28px;
+    padding: 0;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--muted);
     font-family: var(--mono);
-    font-size: 12px;
-    line-height: 1.3;
+    font-size: 14px;
+    line-height: 1;
     cursor: pointer;
 }
 
@@ -244,14 +288,6 @@
     background: var(--bg-elevated);
 }
 
-/* The model select reuses `.agent-model-select` (ui/agents.ts), which is styled for
-   the deck's compact card. Inside the configuration panel it is a normal full-width
-   field instead. */
-.agent-dialog-config .agent-model-select {
-    width: 100%;
-    max-width: 420px;
-}
-
 /* Instruction editor. `field-input` paints the frame; this only sets the reading
    shape, because the text is a multi-paragraph system prompt. */
 .agent-dialog-instruction {
@@ -318,40 +354,70 @@
     color: var(--accent);
 }
 
-/* The rank row (R20): the readout plus the two steppers on one line. `−` raises one
-   step of authority and `+` lowers one, and each one is a real button with its own
-   accessible name — deliberately not one cycling control, because the reader must be
-   able to state which way a rank moves before pressing it. The row carries `data-rank`
-   for an inspector, absent when no letter is stated. */
-.agent-dialog-rank {
-    display: flex;
-    flex-wrap: wrap;
+/* The rank badge (2026-11-20): the front of the chip, a real press target, and the
+   quick rank path. It shows the letter (or a dash when the member has no stated rank),
+   and a press cycles A -> B -> C -> D -> A. `aria-disabled` is used instead of the
+   native attribute so a scope that cannot write ranks still answers the press with its
+   reason; the disabled paint below mirrors that state. */
+.agent-dialog-agent-rank {
+    display: inline-flex;
+    flex: 0 0 auto;
     align-items: center;
-    gap: 6px;
-}
-
-/* The readout takes the row's remaining width so the two steppers stay together at the
-   end of the line instead of floating next to a short label. */
-.agent-dialog-rank-label {
-    flex: 1 1 auto;
-}
-
-.agent-dialog-rank-raise,
-.agent-dialog-rank-lower {
-    flex: none;
-    width: 26px;
-    padding: 4px 0;
-    text-align: center;
-    font-size: 12px;
+    justify-content: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 4px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0;
     line-height: 1;
+    text-transform: uppercase;
+    cursor: pointer;
 }
 
-/* The honest footnote (why a stepper is disabled, what an unsaved letter does). It
-   inherits the muted `.agent-dialog-field-note` tone on purpose and gets no colour of its
-   own here: it is an explanation, not a state — the state colours (`--accent` pending,
-   `--danger` refused) belong to the row's controls and the footer line. */
-.agent-dialog-rank-note {
-    flex: 1 1 100%;
+/* The rank palette (2026-11-20): A gold, B silver, C copper, D white. The letter and
+   its frame carry the colour so the badge stands out in the strip; the background gets
+   the same hue at a low alpha, keeping the chip's `--bg-elevated` surface readable.
+   This is a fact about AUTHORITY, deliberately separate from the agent's identity
+   tone (`.agent-dialog-agent-name`) and from the accent's selection/activity state. */
+.agent-dialog-agent-rank[data-rank='A'] {
+    border-color: #b8871f;
+    background: rgb(246 201 69 / 16%);
+    color: #f6c945;
+}
+
+.agent-dialog-agent-rank[data-rank='B'] {
+    border-color: #7e8794;
+    background: rgb(200 207 216 / 14%);
+    color: #c8cfd8;
+}
+
+.agent-dialog-agent-rank[data-rank='C'] {
+    border-color: #96552f;
+    background: rgb(209 133 85 / 16%);
+    color: #d18555;
+}
+
+.agent-dialog-agent-rank[data-rank='D'] {
+    border-color: #959eac;
+    background: rgb(242 245 249 / 12%);
+    color: #f2f5f9;
+}
+
+.agent-dialog-agent-rank:hover:not([aria-disabled='true']),
+.agent-dialog-agent-rank:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.agent-dialog-agent-rank[aria-disabled='true'] {
+    cursor: help;
+    opacity: 0.55;
 }
 
 /* The green `entry` caption the roster chip used to carry is GONE (R1) — this rule was
@@ -395,89 +461,10 @@
     color: var(--agent-color);
 }
 
-/* The two small mono captions a roster chip paints: the rank (R20) and the `new` state
-   of a drafted addition. They replace the old single `role` caption, which could not tell
-   authority and routing apart. Both stay mono-caps, both stay `--muted` — they are facts
-   ABOUT the agent, never the agent's identity tone (`.agent-dialog-agent-name` above).
-
-   The rank half is shared TYPOGRAPHY only; the letter itself is drawn as the floating
-   corner pill below, and the `entry` caption is gone (R1). The selector list keeps the
-   comma form on purpose: the CSS contract suite slices this block through
-   `.agent-dialog-agent-rank,` (compact-control-style.test.ts), and splitting it must not
-   change how `new` renders. */
-.agent-dialog-agent-rank,
-.agent-dialog-agent-state {
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-}
-
-/* R2: the rank letter is a PILL floating on the chip's top-right corner, not a word in
-   the chip's text row — which is what the `position: relative` on `.agent-dialog-tab`
-   exists for. Geometry and the two traps it has to answer:
-
-   - `top/right: -6px` + a 16px box puts the pill centred on the chip's corner, so it
-     reads as attached to THAT chip even in a wrapped multi-row strip. The offsets resolve
-     against the chip's PADDING box, so with the 1px border the pill spans x
-     [W-11, W+5] × y [-5, 11] in border-box coordinates (W = chip width): the padding column
-     sits at W-1, `right: -6px` puts the pill's RIGHT edge at W+5, and its 16px width puts the
-     LEFT edge at W-11. The overhang past the chip's OUTER edge (x = W) is therefore 5px, and
-     a sibling chip — the strip's `gap: 6px` starts the next one at W+6 — keeps 1px of
-     clearance, not 0. The chip's text is bounded by its CONTENT box (`padding: 6px 10px`),
-     whose right edge is W-11 and whose top is 7; W-11 is exactly the pill's left edge, so the
-     row's right-most in-flow item — the model string, or the `new` caption when a member is
-     drafted — has exactly 0 horizontal overlap with the pill: the boxes touch at x = W-11 and
-     nothing is covered. Nor is there a horizontal NEIGHBOUR to collide with: `[+]` is NOT on
-     the chip's row. `chooser.append(tabs, createAddControl(...))` (ui/agent-dialog.ts:1253)
-     puts it in the same `.agent-dialog-section` as the strip, and that section is
-     `flex-direction: column` with `gap: 8px` (`.agent-dialog-section`, top of this sheet), so
-     `[+]` sits 8px BELOW the strip — clear of the pill's 5px overhang and of its y band.
-   - Nothing clips the overhang. The ancestors are `.agent-dialog-tabs` (no `overflow`
-     in this sheet), `.agent-dialog` / `.agent-dialog-chooser` (also none), then
-     `.dialog-body` (`overflow: auto`, ui/dialog.css:207-216) inside `.dialog`
-     (`overflow: hidden`, ui/dialog.css:49-56). Both clip at their PADDING box, and the
-     strip is the first child of the body, which is padded `16px 18px` — so the 5px
-     overhang has 16px of clearance above and 18px at the right. (Had the strip been the
-     body's first row with no padding, this would need the inset fallback instead.)
-
-   Styling reuses existing tokens only, in the family of the floating `.panel-new-pill`
-   (styles.css:9704): `--bg-elevated` so the pill stays readable over the chip border and
-   over a neighbour it overlaps, `--border` (NOT `--accent`, which is reserved here for
-   selection and activity), `--muted` for the glyph, and `--radius-sm` for the frame —
-   deliberately the shared control token rather than the 999px circle the pill precedent
-   uses, because the CSS contract suite bans `border-radius: 999px` (and a one-off `7px`)
-   anywhere in this sheet, and taking the token keeps that guard total instead of needing an
-   exemption. `letter-spacing: 0` overrides the shared caption rule above: a single
-   centred glyph must not carry trailing tracking, and `text-transform: uppercase` is
-   re-declared (already inherited) so the letter stays typography-stable if that shared
-   rule is ever split. `z-index: 2` + being the chip's LAST child (ui/agent-dialog.ts)
-   keeps it above every sibling and above the `[+]`. */
-.agent-dialog-tab .agent-dialog-agent-rank {
-    position: absolute;
-    top: -6px;
-    right: -6px;
-    z-index: 2;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 16px;
-    height: 16px;
-    padding: 0;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    background: var(--bg-elevated);
-    box-shadow: 0 1px 3px rgb(0 0 0 / 35%);
-    letter-spacing: 0;
-    line-height: 1;
-    text-transform: uppercase;
-    pointer-events: none;
-}
-
 /* The footer. The action is the ONLY writer in this dialog, so it is the last thing
    on the bottom-right: what the reader reaches for after reading the note and the
-   refusal above it. */
+   refusal above it. No rule separates it from the configuration above — the space is
+   the separation, and the action's own fill is what marks it as the one writer. */
 .agent-dialog-footer {
     display: flex;
     flex-wrap: wrap;
@@ -486,7 +473,6 @@
     gap: 10px;
     margin-top: 4px;
     padding-top: 12px;
-    border-top: 1px solid var(--border);
 }
 
 .agent-dialog-footer-note {
@@ -527,4 +513,14 @@
 
 .agent-dialog-apply:disabled {
     cursor: default;
+}
+
+/* Phone / small view: one badge per row. The same grid collapsed to a single track, on
+   the same 720px breakpoint ui/dialog.css uses for the full-width phone panel, so the
+   strip changes step exactly where the dialog's own layout does. The 6px gap is
+   unchanged, so the badges keep one even rhythm. */
+@media (max-width: 720px) {
+    .agent-dialog-tabs {
+        grid-template-columns: minmax(0, 1fr);
+    }
 }
