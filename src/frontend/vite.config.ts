@@ -52,7 +52,7 @@ import { formatBuildStamp, formatHarnessUiLabel } from './build-label.ts';
 export { API_PROXY_KEY, DEFAULT_DEV_API, apiProxyRoutes, createApiProxy, createApiProxyRoutes } from './vite-proxy.ts';
 export type { ApiProxy } from './vite-proxy.ts';
 
-// Build identity for the topbar brand: "Harness UI v<package version>(<DDHHMM>)".
+// Build identity for the topbar brand: "Harness v<package version>(<DDHHMM>)".
 //
 // Composed HERE, once per build, because the label must name the artifact that
 // was produced: package.json's `version` (unavailable to the browser) plus the

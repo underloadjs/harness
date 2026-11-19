@@ -94,8 +94,10 @@
 // what the two NEWER controls may do at all, because the server's answer differs per
 // scope: `canSetEntry: false` (a saved conversation's ENTRY agent is fixed) disables
 // `Set as entry` and makes an armed entry change impossible, and `canAssignRanks:
-// false` (a saved conversation inherits the ranks its harness template defines; the
-// roster route states no rank write for an existing member) disables the stepper. The
+// false` (a STARTED saved conversation inherits the ranks its harness template defines;
+// the roster route states a rank only for a member the conversation adds) disables the
+// badge. A FRESH session — no host thread and no recorded turn — passes true, because
+// the server accepts a rank write until the conversation starts. The
 // action label is derived from the SAME flags, so it can never promise "Save & set
 // entry" somewhere that cannot set it. `threadAgents` names the agents a conversation
 // in this session already runs, and one of those cannot be removed (R6): its control
@@ -220,9 +222,10 @@ export type AgentDialogOptions = {
     // fixed, so its shell passes false and the action can never offer a move the
     // session cannot perform. Defaults to true.
     canSetEntry?: boolean;
-    // R20: whether the rank badge may be armed at all. A saved conversation runs the
+    // R20: whether the rank badge may be armed at all. A STARTED conversation runs the
     // ranks its harness template defines, so its shell passes false; a harness template
-    // owns them. Defaults to true.
+    // owns them, and a FRESH session can still change them until its first thread runs.
+    // Defaults to true.
     canAssignRanks?: boolean;
     // R6: agents a conversation in this session already runs. Each of those keeps its
     // tab but cannot be removed, and the control says why. Defaults to empty, so a

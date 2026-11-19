@@ -16986,6 +16986,27 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         syncDelegateDeclaration();
     };
 
+    // Change one registered member's AUTHORITY in place. Unlike remove + add, this keeps
+    // the brain, its default conversation, and every host thread exactly as they are —
+    // only the rank map moves. The map is live state (`rankOf`, `delegableNamesFor`, the
+    // per-turn projection), so the distinct-rank bounds and the installed `delegate`
+    // declaration are recomputed here exactly like the two roster writes above.
+    const setAgentRank = (name: string, rank: AgentRank): void => {
+        assertRosterIdle('change an agent rank');
+
+        const key = typeof name === 'string' ? name.trim() : '';
+
+        if (!Object.prototype.hasOwnProperty.call(agents, key)) {
+            throw new HarnessError(
+                `Agent "${key}" is not registered. Configured agents: ${Object.keys(agents).join(', ')}.`
+            );
+        }
+
+        rankByName.set(key, resolveRankValue(rank, `setAgentRank("${key}") rank`));
+        recomputeRankBounds();
+        syncDelegateDeclaration();
+    };
+
     // Replace the leading system block of one agent, leaving the conversation intact.
     const setAgentInstruction = (name: string, instruction: string): void => {
         assertRosterIdle('change an agent instruction');
@@ -17325,6 +17346,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // durability; the runtime only refuses to do it under a live run.
         addAgent,
         removeAgent,
+        setAgentRank,
         setAgentInstruction,
         // R3a persistence. `snapshot` never mutates; `restore` validates fully
         // and recompiles created-tool sources without executing them.

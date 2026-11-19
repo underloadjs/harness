@@ -1852,20 +1852,30 @@ export interface CreateSessionAgentRequest {
      * it is protected by MEMBERSHIP (a binding cannot detach it), not by a letter. An omitted or null value
      * asks for NO authority, and the binding is given the LOWEST letter of the scale - never "inherit", never a
      * guess. A value that is not one upper-case letter A-Z is 400 naming the letters the scale accepts; the
-     * retired `role` field is not accepted at all and lands in the unknown-field refusal. The rank is not
-     * patchable on the binding PATCH, which takes `model` and `instruction` only.
+     * retired `role` field is not accepted at all and lands in the unknown-field refusal. The rank is patchable
+     * on the binding PATCH only while the session has NOT started a conversation yet (see
+     * `UpdateSessionAgentRequest`).
      */
     rank?: AgentRank;
 }
 
 /**
  * An omitted property is no change; a string REPLACES the whole field; an explicit `null` clears the session
- * override and RESTORES the inherited binding. Identity, profile, tools, and the delegation graph are immutable
- * here. A model patch is accepted while the session runs; an instruction patch needs an idle session and
- * answers 409 while a live run or queued work exists.
+ * override and RESTORES the inherited binding. Identity, profile, and tools are immutable here. A model patch
+ * is accepted while the session runs; an instruction patch needs an idle session and answers 409 while a live
+ * run or queued work exists. A `rank` patch changes the authority map IN PLACE and is accepted only before the
+ * session's first thread starts - a saved conversation keeps the ranks its harness template defines and answers
+ * 409, because its delegation graph was built from that map.
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface UpdateSessionAgentRequest {
+    /**
+     * The member's new authority letter, written into this session's rank map. The brain, its default
+     * conversation and every host thread are untouched; the distinct-rank bounds and the `delegate` declaration
+     * follow the new map, so a later turn sees the changed authority. Refused with 409 once the session has a
+     * host thread or any turn at all.
+     */
+    rank?: AgentRank;
     /**
      * The model this member runs. Trimmed, non-empty, at most 200 characters, no control characters; a `null`
      * clears the session override and runs the model this session's settings carry. The value is applied to the

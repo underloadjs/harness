@@ -163,7 +163,7 @@ summary::-webkit-details-marker {
 }
 
 /* The brand is a real BUTTON (R2): on a phone it opens the harness drawer, so a
-   click on the visible "Harness UI" name is the dashboard-style menu trigger. These
+   click on the visible "Harness" name is the dashboard-style menu trigger. These
    resets keep it looking like the former text label on desktop/tablet, where the
    rails are permanent and the mobile drawer state is intentionally inert. */
 .brand {
@@ -178,11 +178,6 @@ summary::-webkit-details-marker {
     font: inherit;
     text-align: left;
     cursor: default;
-}
-
-.brand-mark {
-    color: var(--accent);
-    font-size: 17px;
 }
 
 .brand-name {
@@ -7506,7 +7501,7 @@ body.is-resizing-rail {
         outline-offset: 2px;
     }
 
-    /* R2: "Harness UI" (the brand button) is the human-readable drawer trigger on
+    /* R2: "Harness" (the brand button) is the human-readable drawer trigger on
        a phone. The desktop brand is inert, so the pointer affordance is phone-only. */
     .brand {
         cursor: pointer;

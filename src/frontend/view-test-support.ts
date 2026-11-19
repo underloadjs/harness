@@ -1279,6 +1279,9 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
         // the agent inherits again (../shared/harness-api.ts:1002-1011).
         instructions: Record<string, string>;
         models: Record<string, string>;
+        // R20: a rank re-stated on this session. The server accepts one only before the
+        // conversation starts; the double applies it to the binding row and the definition.
+        ranks: Record<string, AgentRank>;
     };
 
     const sessionAgentWrites = new Map<string, SessionAgentOverlay>();
@@ -1288,7 +1291,13 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
 
         if (known !== undefined) return known;
 
-        const created: SessionAgentOverlay = { added: [], removed: [], instructions: {}, models: {} };
+        const created: SessionAgentOverlay = {
+            added: [],
+            removed: [],
+            instructions: {},
+            models: {},
+            ranks: {}
+        };
         sessionAgentWrites.set(id, created);
 
         return created;
@@ -1368,8 +1377,9 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
             profile: added?.profile ?? name,
             // The rank this session RUNS this member at. A member the map omits reports the
             // LOWEST letter rather than no letter, because the binding field is a letter and
-            // an ungranted authority is the lowest authority (../shared/harness-api.ts).
-            rank: ranks[name] ?? LOWEST_RANK,
+            // an ungranted authority is the lowest authority (../shared/harness-api.ts). A
+            // rank patch this conversation made wins over the frozen map.
+            rank: overlay.ranks[name] ?? ranks[name] ?? LOWEST_RANK,
             origin: added !== undefined ? 'session' : 'definition',
             // The live brain's model first (this conversation's choice), then the creation
             // baseline, then the session settings model (`inherited_model`, the field that exists
@@ -1407,6 +1417,8 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
 
         if (input.instruction === null) delete overlay.instructions[agent];
         else if (typeof input.instruction === 'string') overlay.instructions[agent] = input.instruction;
+
+        if (input.rank !== undefined && isAgentRank(input.rank)) overlay.ranks[agent] = input.rank;
 
         if (input.model === null) delete overlay.models[agent];
         else if (typeof input.model === 'string' && input.model.trim().length > 0) {
@@ -2658,7 +2670,9 @@ export const withViewRoutes = (inner: StubHandler, options: ViewRouteOptions = {
                     // OUT of the map (no rank), which is what the shell renders as
                     // "rank not stated" — the double must not fill a letter in from position.
                     ranks: Object.fromEntries(
-                        Object.entries(ranksRaw(definition) ?? {}).filter(([name]) => members.includes(name))
+                        Object.entries({ ...(ranksRaw(definition) ?? {}), ...overlay.ranks }).filter(([name]) =>
+                            members.includes(name)
+                        )
                     ),
                     agents: members,
                     tools: definition.tools ?? [],

@@ -1,4 +1,4 @@
-// Build identity shown by the topbar brand: "Harness UI v2.3.0(081345)".
+// Build identity shown by the topbar brand: "Harness v2.3.0(081345)".
 //
 // WHY THIS IS COMPUTED AT BUILD TIME (src/frontend/vite.config.ts), NOT HERE:
 // the label names the ARTIFACT that was deployed. The package version lives in
@@ -34,6 +34,6 @@ export const formatBuildStamp = (date: Date): string => {
     return `${day}${hour}${minute}`;
 };
 
-/** The label shape: `Harness UI v<package version>(<build stamp>)`. */
+/** The label shape: `Harness v<package version>(<build stamp>)`. */
 export const formatHarnessUiLabel = (version: string, stamp: string): string =>
-    `Harness UI v${version}(${stamp})`;
+    `Harness v${version}(${stamp})`;

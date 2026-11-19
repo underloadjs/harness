@@ -5,8 +5,8 @@
 
 // Composed at BUILD time by src/frontend/vite.config.ts (`define`) from
 // package.json's version and the build machine's clock, e.g.
-// "Harness UI v2.3.0(081345)". Nobody assigns it: it is a literal substitution.
+// "Harness v2.3.0(081345)". Nobody assigns it: it is a literal substitution.
 //
 // `undefined` under vitest, whose config does not define it, so main.ts falls
-// back to the bare "Harness UI" name there. See src/frontend/build-label.ts.
+// back to the bare "Harness" name there. See src/frontend/build-label.ts.
 declare const __HARNESS_UI_LABEL__: string | undefined;

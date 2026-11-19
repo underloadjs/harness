@@ -245,6 +245,9 @@ import type { ContextBlock, TurnSection } from '../shared/turn-display';
 // (src/core/thread.ts). `src/server/sessions.ts:216` imports this same pair, so the API layer and
 // the store cannot drift onto two different transcript validators or two spellings of that id.
 import { readHarnessMessages, THREAD_AGENT_PREFIX } from '../core';
+// The rank vocabulary is the one authority scale: the PATCH edge names the same letters the
+// store validator accepts, so a client never has to hold two spellings.
+import { AGENT_RANKS } from '../types';
 // T5 (R2/R3): the plugin settings store's status-carrying failure (404 unknown plugin, 400
 // unknown key / mistyped / out-of-range value). The store itself is reached through
 // `store.pluginSettings` (the PROCESS/TEMPLATE scope) and `requireSession(id).plugins` (R4's
@@ -3901,12 +3904,24 @@ export const createHarnessApi = ({
         const agentId = ctx.params.agent_id;
         const body = requireObjectBody<UpdateSessionAgentRequest>(await ctx.body());
 
-        requireKnownFields(body, ['model', 'instruction']);
+        requireKnownFields(body, ['model', 'instruction', 'rank']);
 
         if (findAgentBinding(record, agentId) === undefined) throw missing('agent', agentId, record.id);
 
-        if (body.model === undefined && body.instruction === undefined) {
+        if (body.model === undefined && body.instruction === undefined && body.rank === undefined) {
             throw new HttpError(400, 'A patch must change at least one field.');
+        }
+
+        // B3 R14/R15: one validator for the binding rank, at the HTTP edge for the same
+        // reason POST validates it here — an invalid body answers 400 before any store
+        // gate can turn it into a 409 about a busy or started session.
+        const rank = body.rank === undefined ? undefined : validateBindingRank(body.rank);
+
+        if (body.rank !== undefined && rank === undefined) {
+            throw new HttpError(
+                400,
+                `An agent rank must be one letter of the authority scale, ${AGENT_RANKS.join(', ')}.`
+            );
         }
 
         // T27: a session-level INSTRUCTION override is now backed by the runtime
@@ -3921,28 +3936,48 @@ export const createHarnessApi = ({
         // the team a restart resolves — it retunes a seed inside the roster the record already
         // carries — so the contract keeps this write (and the session-level `agent_models` patch)
         // available on every template, including a scripted or injected one.
-        if (body.instruction !== undefined) {
-            if (body.instruction !== null && typeof body.instruction !== 'string') {
-                throw new HttpError(400, '"instruction" must be a string or null.');
-            }
+        if (body.instruction !== undefined && body.instruction !== null && typeof body.instruction !== 'string') {
+            throw new HttpError(400, '"instruction" must be a string or null.');
+        }
 
+        const fields: string[] = [];
+
+        // RANK comes first, before the other fields, so a rank the session cannot take (it has
+        // already started a conversation) refuses the whole patch before any override is
+        // written. The rank is the one binding field that is only writable before the session's
+        // first thread — the store owns that rule and states it as a 409.
+        //
+        // Unlike a model/instruction override, a rank change rewrites the team a restart
+        // resolves, so it takes the same durable-roster gate as bind/detach: a scripted or
+        // injected template cannot honour the saved map, and answering 200 would be a lie the
+        // next boot takes back.
+        if (rank !== undefined) {
+            assertDurableRoster(record, 'change an agent rank');
+
+            await store.setSessionAgentRank(record.id, agentId, rank);
+            fields.push('rank');
+        }
+
+        if (body.instruction !== undefined) {
             await store.setSessionAgentInstruction(
                 record.id,
                 agentId,
                 body.instruction === null ? null : body.instruction
             );
+
+            fields.push('instruction');
         }
 
         if (body.model === undefined) {
-            // Instruction-only patch: the revisions and the receipt below are the same, and the
-            // model half is genuinely unchanged.
+            // No model half: the revisions and the receipt below are the same, and the model
+            // field is genuinely unchanged.
             const revision = events.bumpRevision('session_agents', record.id);
 
             events.bumpRevision('session', record.id);
             publish('agent.registry_updated', [
                 { resource: 'session_agents', id: record.id },
                 { resource: 'session', id: record.id }
-            ], { agent_id: agentId, fields: ['instruction'] });
+            ], { agent_id: agentId, fields });
 
             const updated = findAgentBinding(store.liveSession(record.id), agentId);
 
@@ -3955,13 +3990,15 @@ export const createHarnessApi = ({
 
         await store.setAgentModels(record.id, merged);
 
+        fields.push('model');
+
         const revision = events.bumpRevision('session_agents', record.id);
 
         events.bumpRevision('session', record.id);
         publish('agent.registry_updated', [
             { resource: 'session_agents', id: record.id },
             { resource: 'session', id: record.id }
-        ], { agent_id: agentId });
+        ], { agent_id: agentId, fields });
 
         const updated = findAgentBinding(store.liveSession(record.id), agentId);
 

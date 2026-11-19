@@ -2628,7 +2628,7 @@ const app = document.querySelector<HTMLDivElement>('#app');
 if (app === null) throw new Error('The harness UI needs an #app element.');
 
 const topbar = el('header', 'topbar');
-// R2: the visible "Harness UI" title is the phone drawer trigger. It is a real
+// R2: the visible "Harness" title is the phone drawer trigger. It is a real
 // button (not a click handler on a div) so it is keyboard reachable and exposes
 // `aria-controls`/`aria-expanded` for the harness listing. `syncBrandTrigger` below
 // adds those disclosure semantics ONLY on phones; above 860px the rails are always
@@ -2636,17 +2636,15 @@ const topbar = el('header', 'topbar');
 // no misleading `aria-expanded=false`). Its visual styling is unchanged.
 const brand = el('button', 'brand');
 brand.type = 'button';
-const brandMark = el('span', 'brand-mark', '◍');
-brandMark.setAttribute('aria-hidden', 'true');
-// Build identity ("Harness UI v2.3.0(081345)"): version from package.json plus
+// Build identity ("Harness v2.3.0(081345)"): version from package.json plus
 // the build stamp (day, hour, minute), both inlined at build time by
 // src/frontend/vite.config.ts.
 // The bare name is the fallback for a host that does not define the constant
 // (the UI's vitest config), so tests and any non-Vite bundle keep a valid label.
 // See src/frontend/build-label.ts.
 const harnessUiLabel =
-    typeof __HARNESS_UI_LABEL__ === 'string' ? __HARNESS_UI_LABEL__ : 'Harness UI';
-brand.append(brandMark, el('span', 'brand-name', harnessUiLabel));
+    typeof __HARNESS_UI_LABEL__ === 'string' ? __HARNESS_UI_LABEL__ : 'Harness';
+brand.append(el('span', 'brand-name', harnessUiLabel));
 
 // The status pill is the app's single live region, and it is APP-SCOPED: it
 // announces startup/readiness and app/config failures to screen readers and shows
@@ -2745,7 +2743,7 @@ statusButton.append(statusPill);
 
 // The right cluster keeps the live status pill alone at the top-right on every width.
 // There is NO rail control in the topbar (T3/R1+R3): the harness listing is opened by
-// the "Harness UI" brand button and the scratch board by the floating `.scratch-fab`
+// the "Harness" brand button and the scratch board by the floating `.scratch-fab`
 // below.
 //
 // RELOCATION (this change): the two catalogue toggles used to be this cluster's last two
@@ -2799,7 +2797,7 @@ leftRail.id = 'rail-left';
 leftRail.setAttribute('aria-label', 'Harnesses');
 const harnessHead = el('div', 'rail-head');
 // R4: the "Harnesses" title IS the drawer toggle. It opens and closes the SAME left
-// sidebar as the "Harness UI" brand, so the small-screen `×` control is gone: one
+// sidebar as the "Harness" brand, so the small-screen `×` control is gone: one
 // labelled heading does the job the glyph did, and the drawer no longer needs a
 // second, easily-missed target. The `<h2>` stays (the rail keeps its accessible
 // section heading and the existing `.rail-title` styling); the BUTTON inside it is the
@@ -5814,7 +5812,7 @@ scratchFab.addEventListener('click', () => {
     setRailOpen(openRail === 'right' ? undefined : 'right', scratchFab);
 });
 
-// R2: clicking the "Harness UI" brand opens the harness DRAWER on sm/mobile. It is
+// R2: clicking the "Harness" brand opens the harness DRAWER on sm/mobile. It is
 // a toggle, so a second click closes it. `syncBrandTrigger` natively disables the
 // button above 860px; the media guard here is the second line of defence against a
 // programmatic click while a resize transition is in flight.
@@ -7551,17 +7549,25 @@ type AgentView = {
     //   - `canSetEntry` is false for a saved conversation: its ENTRY agent is fixed
     //     server-side (the entry agent is the member no session write can detach), so
     //     the control must not arm a move that cannot be written.
-    //   - `canAssignRanks` is false for a saved conversation for the same reason on the
-    //     rank side: the roster route states no rank write for an EXISTING member, so a
-    //     session runs the ranks its harness template defines. An agent this conversation
-    //     ADDS does carry a rank in its create, which is why the dialog's add flow keeps
-    //     the drafted rank (see `applySessionConfiguration`).
+    //   - `canAssignRanks` is false for a STARTED saved conversation for the same reason
+    //     on the rank side: its delegation graph was built from the ranks its harness
+    //     template defines. A FRESH session — no host thread, no recorded turn — passes
+    //     true, because the server accepts a rank write until the conversation starts.
+    //     An agent this conversation ADDS does carry a rank in its create, which is why
+    //     the dialog's add flow keeps the drafted rank (see `applySessionConfiguration`).
     //   - `threadAgents` names the agents a conversation in this session already runs
     //     (R6); each keeps its tab but cannot be removed.
     scope: 'session' | 'harness';
     allowCustom: boolean;
     canSetEntry: boolean;
+    // A session earns this the moment it has no host thread and no recorded turn: it is
+    // still the fresh conversation `+ New session` created, so the server accepts a rank
+    // patch for it. A started conversation keeps the ranks its template defines.
     canAssignRanks: boolean;
+    // The same fact, kept separately because the WRITE path needs it: `canAssignRanks`
+    // also covers a harness template (no session at all), while `fresh` is specifically
+    // "a session that has not started anything".
+    fresh: boolean;
     threadAgents: string[];
     // The model a no-override choice resolves to (rendered as an id, never
     // "inherit"); '' means "not known", which the select states honestly.
@@ -7574,6 +7580,12 @@ const agentViewOf = (instance: Instance): AgentView => {
     const display = instance.frozen ?? instance.descriptor;
     const members = membersOf(display);
     const locked = instance.sessionId !== undefined;
+    // A session with no host thread and no recorded turn is the empty record `+ New session`
+    // created — the one window where its rank map can still be re-stated. `threads` is the
+    // discovery roster (host conversations only), and `records` is the turn summaries this
+    // instance has applied; either one means the conversation has started and its ranks are
+    // the frozen template's for good.
+    const fresh = locked && instance.threads.length === 0 && instance.records.size === 0;
     // T7b (R5/R6): a saved conversation is no longer locked for TEAM/instruction edits — it
     // owns its own roster, models and prompts through `POST/PATCH/DELETE
     // /sessions/{id}/agents...`, and a save there never touches the harness template. Only an
@@ -7700,7 +7712,8 @@ const agentViewOf = (instance: Instance): AgentView => {
         // can detach).
         allowCustom: locked,
         canSetEntry: !locked,
-        canAssignRanks: !locked,
+        canAssignRanks: !locked || fresh,
+        fresh,
         threadAgents,
         hint
     };
@@ -8778,7 +8791,12 @@ const applySessionConfiguration = async (
     const additions = changes.add.filter((name) => !existing.includes(name));
     const prompts = Object.entries(changes.instructions);
     const drafted = Object.entries(changes.models);
-    const teamWork = removals.length > 0 || additions.length > 0 || prompts.length > 0;
+    const rankEntries = Object.entries(changes.ranks ?? {});
+    const existingRankWork = rankEntries.filter(
+        ([name]) => existing.includes(name) && !additions.includes(name)
+    );
+    const teamWork =
+        removals.length > 0 || additions.length > 0 || prompts.length > 0 || rankEntries.length > 0;
     // Only a roster write moves the member set; a prompt or model save re-reads nothing but the
     // text it just wrote (the model PATCH answer is already the newest authority for its field).
     const rosterMoved = removals.length > 0 || additions.length > 0;
@@ -8791,14 +8809,14 @@ const applySessionConfiguration = async (
         return { applied: false, message: 'The entry agent is fixed for a saved conversation.' };
     }
 
-    // R20: a saved conversation runs the RANKS its harness template defines. The roster
-    // route states a rank only for a member this conversation ADDS, so a rank draft on
-    // an existing member has no route to land on and is refused with the reason, rather
-    // than silently dropped on the floor.
-    const rankEntries = Object.entries(changes.ranks ?? {});
-    const existingRankWork = rankEntries.filter(([name]) => existing.includes(name) && !additions.includes(name));
-
-    if (existingRankWork.length > 0) {
+    // R20: a STARTED conversation runs the ranks its harness template defines — the
+    // roster route states a rank only for a member this conversation ADDS. A FRESH
+    // session (the empty record `+ New session` created) has no history yet, so the
+    // server accepts a rank patch for its existing members; that is exactly the window
+    // this dialog is in when `view.fresh` is true. A stale or foreign caller that tries
+    // to restate an existing member's rank on a started session is refused with the
+    // reason rather than silently dropped.
+    if (existingRankWork.length > 0 && !view.fresh) {
         return {
             applied: false,
             message: 'A saved conversation keeps the ranks its harness template defines; start a new session to change them.'
@@ -8860,10 +8878,17 @@ const applySessionConfiguration = async (
             });
         }
 
-        // 3. The roster the writes produced, BEFORE anything is addressed by member name.
-        if (rosterMoved) await refreshSessionRoster(instance, sessionId);
+        // 3. Ranks for members that were ALREADY on this team. Only a fresh session can reach
+        //    this branch, so the server accepts the write; an addition carries its own rank in
+        //    the create above, and an existing member has no other route to a new letter.
+        for (const [name, rank] of existingRankWork) {
+            await updateSessionAgent(sessionId, name, { rank });
+        }
 
-        // 4. Prompts for the members that were ALREADY on this team (an added member's text
+        // 4. The roster the writes produced, BEFORE anything is addressed by member name.
+        if (rosterMoved || existingRankWork.length > 0) await refreshSessionRoster(instance, sessionId);
+
+        // 5. Prompts for the members that were ALREADY on this team (an added member's text
         //    travelled with its create, so restating it here would be a second write of the
         //    same bytes).
         for (const [name, text] of prompts) {
@@ -8876,7 +8901,7 @@ const applySessionConfiguration = async (
             });
         }
 
-        // 5. Models, built from the REFRESHED roster so a member added one request ago is on the
+        // 6. Models, built from the REFRESHED roster so a member added one request ago is on the
         //    list its key belongs to and a removed one is off it (`modelsForMembers` filters to
         //    the final set because the PATCH replaces the whole field).
         if (drafted.length > 0) {
@@ -8924,7 +8949,7 @@ const applySessionConfiguration = async (
             return result;
         }
 
-        // 6. No model write: this function owns the refresh and the honest status line.
+        // 7. No model write: this function owns the refresh and the honest status line.
         await refreshSessionConfiguration(instance, sessionId);
         setStatus('idle', saved);
 
@@ -8934,9 +8959,9 @@ const applySessionConfiguration = async (
 
         setStatus('error', `${label}: ${message}`);
 
-        // Written, then re-read: steps 1-4 may have applied part of the draft, and the roster on
-        // screen is a claim about the server, not about what this browser wanted.
-        if (rosterMoved) await refreshSessionRoster(instance, sessionId);
+        // Written, then re-read: the steps above may have applied part of the draft, and the
+        // roster on screen is a claim about the server, not about what this browser wanted.
+        if (rosterMoved || existingRankWork.length > 0) await refreshSessionRoster(instance, sessionId);
         await refreshSessionConfiguration(instance, sessionId);
 
         return { applied: false, message };

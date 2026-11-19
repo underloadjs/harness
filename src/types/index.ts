@@ -5628,6 +5628,14 @@ export type Harness = {
     //     Committed history in OTHER agents is never rewritten: a
     //     delegated answer already copied into the caller's transcript stays.
     removeAgent: (name: string) => void;
+    //   - `setAgentRank(name, rank)` — replace one registered member's AUTHORITY in
+    //     place, without rebuilding its brain or touching any conversation. The rank
+    //     map is live state (`rankOf`, `delegableNamesFor`, the per-turn projection), so
+    //     this recomputes the distinct-rank bounds and re-syncs the installed
+    //     `delegate` declaration exactly like `addAgent`/`removeAgent`. Throws for an
+    //     unknown agent, a bad rank letter, or while any run is in flight — the same
+    //     structural gate the other roster writes use.
+    setAgentRank: (name: string, rank: AgentRank) => void;
     //   - `setAgentInstruction(name, instruction)` — replace the agent's leading system
     //     block IN PLACE with one system message, and reseed its `instructions` baseline
     //     so a later `reset()` returns to the new prompt. The number of messages replaced

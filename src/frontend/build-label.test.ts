@@ -1,4 +1,4 @@
-// The topbar brand label ("Harness UI v2.3.0(081345)") is composed at build time
+// The topbar brand label ("Harness v2.3.0(081345)") is composed at build time
 // by src/frontend/vite.config.ts from package.json's version and the build
 // machine's clock (DDHHMM). These tests pin the two pure pieces, constructing
 // Dates from local fields so they never depend on the machine's zone or on when
@@ -30,6 +30,6 @@ describe('formatBuildStamp', () => {
 
 describe('formatHarnessUiLabel', () => {
     it('renders the version and build stamp in the brand label shape', () => {
-        expect(formatHarnessUiLabel('2.3.0', '081345')).toBe('Harness UI v2.3.0(081345)');
+        expect(formatHarnessUiLabel('2.3.0', '081345')).toBe('Harness v2.3.0(081345)');
     });
 });

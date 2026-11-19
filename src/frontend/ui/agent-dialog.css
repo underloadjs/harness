@@ -41,9 +41,9 @@
 /* The roster strip. A three-column grid, so the team reads as one evenly spaced list
    instead of a ragged wrap: every badge gets the same column width, every row the same
    gap, and a badge that needs scrolling to see never exists (the strip grows downward
-   and the body scrolls). The tracks are `minmax(0, 1fr)` so a long name/model pair
-   wraps INSIDE its badge instead of widening the grid past the dialog. A phone drops to
-   one column — the media query at the end of this sheet. */
+   and the body scrolls). The tracks are `minmax(0, 1fr)` so a long name is truncated
+   INSIDE its badge instead of widening the grid past the dialog. A phone drops to one
+   column — the media query at the end of this sheet. */
 .agent-dialog-tabs {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -66,7 +66,12 @@
 .agent-dialog-tab {
     min-width: 0;
     display: flex;
-    flex-wrap: wrap;
+    /* ONE row at every width (2026-11-20): the rank, name and model are three facts
+       about the same agent, so the select must sit BESIDE the name rather than
+       wrapping to a second line and leaving the badge half empty. A name too long for
+       the track is ellipsized (`.agent-dialog-agent-name`), never allowed to push the
+       select onto its own row. */
+    flex-wrap: nowrap;
     align-items: center;
     gap: 8px;
     padding: 6px 10px;
@@ -108,10 +113,12 @@
    id; the SELECTED chip puts a real select in the same slot (`.agent-model-select`
    below), so choosing a model is always one press from the roster. `margin-left: auto`
    parks whichever form is present at the right edge, and the max-width leaves the name
-   its share of a narrow three-column track. */
+   its share of a narrow three-column track. The chip never wraps (see
+   `.agent-dialog-tab`): when both facts cannot fit, the name ellipsizes instead. */
 .agent-dialog-agent-model {
     display: inline-flex;
     align-items: center;
+    flex: 0 1 auto;
     margin-left: auto;
     max-width: 58%;
     min-width: 0;
@@ -127,11 +134,15 @@
    text the chip used to print, with no arrow and no visible frame until hover/focus.
    `appearance: none` removes the native chevron; the whole label is still a select,
    so the list opens from the text itself. Every chip carries one, which is why a model
-   can be changed without viewing that agent first. */
+   can be changed without viewing that agent first. `field-sizing: content` is what
+   keeps it INLINE: the control hugs the selected id instead of reserving the width of
+   the widest catalogue option, so a short model never squeezes the agent's name out of
+   the chip (and the truncated name, if any, is the honest trade — see above). */
 .agent-dialog-tab .agent-model-select {
     width: auto;
     min-width: 0;
     max-width: 100%;
+    field-sizing: content;
     padding: 0;
     border: 1px solid transparent;
     border-radius: var(--radius-sm);
@@ -456,9 +467,17 @@
    `--accent` stays reserved for selection (`[aria-selected='true']`) and activity
    (`[data-activity='active']`) — identity colour and state colour are two different
    facts and must stay readable as such. The role/model captions stay `--muted`: they
-   are facts about the agent, not the agent. */
+   are facts about the agent, not the agent.
+   The name is also the shrinkable path that keeps the chip a single row: `min-width: 0`
+   lets a long name give way to the model select, and the ellipsis keeps the truncation
+   visible rather than silently clipping the identity. */
 .agent-dialog-agent-name {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
     color: var(--agent-color);
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 /* The footer. The action is the ONLY writer in this dialog, so it is the last thing

@@ -24,7 +24,10 @@
 //   6. R7 — a session may invent an agent the catalogue never described: its own name, model and
 //      instruction, durable as `preset.customAgents` and rebuilt byte-identically by the second
 //      process, with `instruction_source: "session"` on every read and the base text as the
-//      honest undo of a `null` instruction patch.
+//      honest undo of a `null` instruction patch;
+//   7. R20 — a FRESH session (no host thread, no turn) can re-state an existing member's rank,
+//      and the same write answers 409 once a thread exists. That is the window `+ New session`
+//      opens eagerly, and the one the frontend's rank badge offers.
 //
 // Cross-references:
 //   - ../harness.ts              — addAgent / removeAgent / setAgentInstruction and their gate
@@ -271,6 +274,87 @@ describe('session agent bindings', () => {
         expect(
             (await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: BINDING })).status
         ).toBe(409);
+    });
+
+    // R20 / the fresh-session window: `+ New session` creates an EMPTY record eagerly, so the
+    // frontend still lets the reader re-state its ranks until the first thread exists. This is
+    // the server half of that rule — the same PATCH, the same persisted map, and the exact 409
+    // once a host thread exists.
+    it('changes a rank on a fresh session and refuses it once a thread exists', async () => {
+        const { api, store } = openInMemory();
+        const sessionId = await createSession(api);
+
+        const ranked = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, { rank: 'C' })
+        );
+
+        expect(ranked.status).toBe(200);
+        expect(ranked.body.agent.rank).toBe('C');
+
+        // The live roster, the frozen definition AND the runtime all read the new letter, so a
+        // restart and the delegation graph can never disagree about the team.
+        const roster = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(roster.body.agents.find((row: Record<string, any>) => row.agent_id === 'instruct').rank).toBe('C');
+
+        const definition = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/definition`));
+
+        expect(definition.body.definition.ranks).toEqual({ instruct: 'C' });
+        expect(store.liveSession(sessionId).harness.ranks).toEqual({ instruct: 'C' });
+        expect(store.liveSession(sessionId).preset.ranks).toEqual({ instruct: 'C' });
+
+        // A host thread is the line: the conversation has started, so the rank map is the one
+        // its delegation graph was built from and the write is refused with the same sentence
+        // the dialog shows.
+        const thread = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/threads`, { agent: 'instruct' })
+        );
+
+        expect(thread.status).toBe(201);
+
+        const refused = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, { rank: 'D' })
+        );
+
+        expect(refused.status).toBe(409);
+        expect(refused.body.error.message).toBe(
+            'A saved conversation keeps the ranks its harness template defines; start a new session to change them.'
+        );
+
+        // Nothing moved: the roster still reads the letter the fresh window wrote.
+        const after = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(after.body.agents.find((row: Record<string, any>) => row.agent_id === 'instruct').rank).toBe('C');
+    });
+
+    it('persists a fresh session rank change across a restart', async () => {
+        const root = tempRoot('fresh-rank');
+        const persistence = new HarnessPersistence(root);
+        const registry = createHarnessRegistry([narrowPreset()]);
+        const store = new SessionStore(SETTINGS, registry, undefined, { persistence });
+        const api = createHarnessApi({ store, defaults: API_DEFAULTS, registry });
+
+        const sessionId = await createSession(api);
+
+        expect(
+            (await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, { rank: 'C' })).status
+        ).toBe(200);
+
+        // The durable preset and definition copies carry the new letter before the answer, which
+        // is what a second process rebuilds its harness from.
+        const stored = readDocument(root).sessions[0];
+
+        expect(stored.preset.ranks).toEqual({ instruct: 'C' });
+        expect(stored.definition.ranks).toEqual({ instruct: 'C' });
+
+        const reopened = openOnDisk(root);
+
+        expect(reopened.restoreProblems).toEqual([]);
+
+        const roster = jsonOf(await call(reopened.api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(roster.body.agents.find((row: Record<string, any>) => row.agent_id === 'instruct').rank).toBe('C');
+        expect(reopened.store.liveSession(sessionId).harness.ranks).toEqual({ instruct: 'C' });
     });
 
     it('keeps a binding out of every other session of the same store', async () => {

@@ -122,6 +122,11 @@ const instructionBox = (): HTMLTextAreaElement => {
     return byClass('.agent-dialog-instruction', 'textarea');
 };
 
+const rankBadge = (agent: string): HTMLButtonElement => {
+    openDialog();
+    return byClass(`.agent-dialog-tab[data-agent="${agent}"] .agent-dialog-agent-rank`, 'button');
+};
+
 const applyAction = (): HTMLButtonElement => {
     openDialog();
     return byClass('.agent-dialog-apply', 'button');
@@ -612,6 +617,84 @@ it('saves an instruction on a saved conversation on the session agent, never on 
     // draft it held in flight.
     expect(instructionBox().value).toBe('Answer in one sentence.');
     expect(applyAction().disabled).toBe(false);
+});
+
+it('changes a rank on a fresh conversation and writes it to the session agent', async () => {
+    // `+ New session` creates the record EAGERLY, so the card is bound before the first thread.
+    // This is the window the dialog names: with no thread and no turn the rank badge is a real
+    // control, and its save goes to THIS conversation's member — never to the template.
+    const frozen = descriptor();
+    const server = stubSession(frozen);
+
+    localStorage.setItem(SESSION_KEY, 's9');
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    const badge = rankBadge('instruct');
+
+    expect(badge.getAttribute('aria-disabled')).toBe('false');
+    expect(badge.textContent).toBe('A');
+
+    badge.click();
+    expect(rankBadge('instruct').textContent).toBe('B');
+    expect(rankBadge('instruct').getAttribute('aria-label')).toBe('Change Instruct from Rank B to Rank C');
+    expect(applyAction().textContent).toBe('Save & set rank');
+
+    applyAction().click();
+    await flush();
+    await flush();
+    await flush();
+
+    // ONE write, the rank on the existing member; the template is untouched.
+    expect(dials(server, 'PATCH', '/sessions/s9/agents/instruct')).toEqual([
+        {
+            url: '/v1/harness/sessions/s9/agents/instruct',
+            method: 'PATCH',
+            body: { rank: 'B' }
+        }
+    ]);
+    expect(dials(server, 'PATCH', '/harnesses/instruct')).toEqual([]);
+
+    // The definition read after the save carries the new letter, so the badge paints it back.
+    expect(rankBadge('instruct').textContent).toBe('B');
+    expect(rankBadge('instruct').getAttribute('aria-disabled')).toBe('false');
+});
+
+it('keeps a rank locked once the conversation has a thread', async () => {
+    // The other half of the same rule: a host thread means the delegation graph was built from
+    // the frozen map. The badge states why and sends nothing.
+    const frozen = descriptor();
+    const started = snapshot({
+        id: 's9',
+        status: 'idle',
+        model: 'm1',
+        agentModels: { instruct: 'm2', summarizer: 'm1' },
+        harnessDefinition: frozen,
+        threads: [{ id: 'thread-1', agent: 'instruct', origin: 'host', status: 'idle', sequence: 1 }]
+    } as SessionSnapshot);
+    const server = stubSession(frozen, { session: started });
+
+    localStorage.setItem(SESSION_KEY, 's9');
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    const badge = rankBadge('instruct');
+
+    expect(badge.getAttribute('aria-disabled')).toBe('true');
+    expect(badge.textContent).toBe('A');
+
+    badge.click();
+    await flush();
+
+    expect(byClass('.agent-dialog-error', 'p').textContent).toBe(
+        'A saved conversation keeps the ranks its harness template defines; start a new session to change them.'
+    );
+    expect(dials(server, 'PATCH', '/sessions/s9/agents/instruct')).toEqual([]);
+    expect(rankBadge('instruct').textContent).toBe('A');
 });
 
 it('sends null for a cleared instruction so the conversation restores its default', async () => {

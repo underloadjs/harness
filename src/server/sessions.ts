@@ -7702,6 +7702,80 @@ export class SessionStore {
     }
 
     /**
+     * Change one member's rank in a session that has NOT started a conversation yet
+     * (`PATCH /sessions/{id}/agents/{agent_id}` with `rank`).
+     *
+     * WHY THIS IS RESTRICTED TO AN UNSTARTED SESSION: a saved conversation runs the rank
+     * map its harness template gave it, because that map is the authority the delegation
+     * graph and every later turn were built from. A session with no host thread and no
+     * turns has no such history, so re-stating its ranks is safe — and it is exactly the
+     * window the frontend names when it says "start a new session to change them". Once a
+     * conversation has started, the refusal is the server's own honest answer rather than
+     * a write that silently changes what an existing turn's team was authorized to do.
+     *
+     * The runtime call (`harness.setAgentRank`) changes ONLY the rank map: the brain, its
+     * default conversation and every host thread stay untouched. The durable preset and
+     * the frozen definition copies are rewritten by `applyBindingMaps`, so a restart
+     * resolves the same ladder.
+     */
+    async setSessionAgentRank(id: string, agentId: string, rank: AgentRank): Promise<SessionSnapshot> {
+        const session = this.require(id);
+
+        this.assertBindingIdle(session, 'change an agent rank in a session');
+
+        const agent = typeof agentId === 'string' ? agentId.trim() : '';
+
+        if (!session.definition.agents.includes(agent)) {
+            throw new SessionError(404, `Agent "${agent}" is not a member of session "${id}".`);
+        }
+
+        const resolved = validateBindingRank(rank);
+
+        if (resolved === undefined) {
+            throw new SessionError(
+                400,
+                `An agent rank must be one letter of the authority scale, ${AGENT_RANKS.join(', ')}.`
+            );
+        }
+
+        // A host thread is the independent conversation the reader started; its presence
+        // is the moment this stops being a fresh session. Turns are checked too (a thread
+        // that was soft-deleted still leaves history behind).
+        const started =
+            session.turns.length > 0 || session.harness.threads().some((thread) => thread.origin === 'host');
+
+        if (started) {
+            throw new SessionError(
+                409,
+                'A saved conversation keeps the ranks its harness template defines; start a new session to change them.'
+            );
+        }
+
+        const previous = this.captureBindingState(session);
+
+        try {
+            session.harness.setAgentRank(agent, resolved);
+        } catch (error) {
+            throw new SessionError(409, messageOf(error));
+        }
+
+        this.applyBindingMaps(session, agent, { rank: resolved });
+
+        session.updatedAt = Date.now();
+
+        try {
+            session.core = session.harness.snapshot();
+            await this.persistOrThrow();
+        } catch (error) {
+            this.rollbackBindingState(session, previous);
+
+            throw error;
+        }
+
+        return this.snapshot(session);
+    }
+
+    /**
      * Re-read the live harness into `session.core` and commit the document (T27).
      *
      * WHY THIS EXISTS: a REST tool write (enable/disable/remove/replace an installed revision)

@@ -1,5 +1,5 @@
 // R1/R2/R4 (plus T3/R3 and T8): phone rails start collapsed, the harness listing opens as a
-// drawer from the "Harness UI" brand, the drawer's own "Harnesses" heading is the toggle that
+// drawer from the "Harness" brand, the drawer's own "Harnesses" heading is the toggle that
 // closes it again, and the SCRATCH board opens from a floating action button above the
 // composer. T8: the scratch board opens in the SAME left-hand sidebar slot as the harness
 // drawer — the phone has ONE sidebar, and pressing either trigger swaps what is in it.
@@ -16,7 +16,7 @@
 //     scratch board (no close-then-open, no intermediate state), and the brand does the same
 //     in reverse. In jsdom a click is delivered regardless of stacking, so the CSS stacking
 //     that makes the FAB pressable above the backdrop is pinned as a stylesheet fact;
-//   - R2/R4: the brand is a real button whose accessible name is "Harness UI"; clicking it
+//   - R2/R4: the brand is a real button whose accessible name is "Harness"; clicking it
 //     opens the harness listing as an off-canvas sidebar, and the sidebar's "Harnesses"
 //     heading is a disclosure toggle for the same rail (focus lands on it);
 //   - R3: above 860px the permanently visible rail means the brand must NOT be a tabbable
@@ -398,12 +398,10 @@ it('opens the harness sidebar from the brand and closes it from the Harnesses ti
     expect(brand.tagName).toBe('BUTTON');
     expect(brand.type).toBe('button');
     expect(brand.disabled).toBe(false);
-    expect(brand.textContent).toBe('◍Harness UI');
+    expect(brand.textContent).toBe('Harness');
     expect(brand.getAttribute('aria-controls')).toBe('rail-left');
     expect(brand.getAttribute('aria-expanded')).toBe('false');
     expect(brand.title).toBe('Show or hide harnesses');
-    // The decorative mark is not part of the accessible name.
-    expect(brand.querySelector('.brand-mark')?.getAttribute('aria-hidden')).toBe('true');
 
     // R4: the drawer's dismissal control IS the "Harnesses" heading. It opens and closes
     // the same sidebar as the brand, so the small `×` control is gone: no `.rail-close`
@@ -477,7 +475,7 @@ it('keeps the desktop brand a non-disclosure and restores affordances across res
     expect(brand.hasAttribute('aria-controls')).toBe(false);
     expect(brand.hasAttribute('aria-expanded')).toBe(false);
     expect(brand.title).toBe('');
-    expect(brand.textContent).toBe('◍Harness UI');
+    expect(brand.textContent).toBe('Harness');
 
     // R4: the harness title obeys the same platform rule. On desktop it is a plain
     // heading (disabled, no disclosure ARIA), because a permanently visible rail has no
