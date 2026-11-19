@@ -11548,8 +11548,8 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
 
         save = el('button', 'button primary plugin-setting-save', 'Save');
         save.type = 'button';
-        // NEVER disabled. The press is always live and a press with nothing changed sends
-        // nothing (see the empty-patch guard below); the `saving` flag in the handler is
+        // NEVER disabled. The press is always live and a press with nothing changed dismisses
+        // the layer (see the empty-patch guard below); the `saving` flag in the handler is
         // what keeps a double click from writing the same patch twice, so the control has
         // no honest reason to grey itself out.
         actions.append(save);
@@ -11650,8 +11650,15 @@ const openPluginDialog = (plugin: PluginSummary, trigger?: HTMLElement): void =>
                 // empty settings patch (`400` — "A plugin settings patch must change at
                 // least one setting", ../server/plugins.ts:545-553), and sending every
                 // field anyway would pin each untouched default as an explicit stored
-                // override. A no-change press is therefore a silent no-op.
-                if (Object.keys(patch).length === 0) return;
+                // override. A no-change press therefore DISMISSES the layer — the same
+                // close path as the backdrop and Escape, and the same rule the agent/tool
+                // configuration dialogs follow: an empty delta closes, never a silent dead
+                // press and never an invented "Saved".
+                if (Object.keys(patch).length === 0) {
+                    handle?.close();
+
+                    return;
+                }
 
                 saving = true;
                 note('Saving…', false);

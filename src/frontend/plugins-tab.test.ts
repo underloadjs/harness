@@ -34,8 +34,9 @@
 //       (changed keys only), the answer is merged into the cache, the row's settings line
 //       moves with it, and reopening shows 150000 with no extra read;
 //     - the Save control is NEVER disabled (first frame, mid-write, after a save, after a
-//       refusal) and sits flush RIGHT in its own row; a press with nothing changed is a
-//       silent no-op, because the server refuses an empty settings patch with a 400
+//       refusal) and sits flush RIGHT in its own row; a press with nothing changed dismisses
+//       the layer through the same close path as the backdrop and Escape (no write, no
+//       invented success line), because the server refuses an empty settings patch with a 400
 //       (../server/plugins.ts) and sending every field anyway would pin each untouched
 //       default as an explicit stored override;
 //     - a refusal shows the server's message verbatim, keeps the typed value, and re-arms
@@ -1919,7 +1920,7 @@ it('opens the Context Compaction dialog with the declared hooks and a numeric li
     expect(byClass('.plugin-setting-hint', 'p').textContent).toBe(compactionRow().settings[0]?.description);
 
     // The write control is always live: it exists, it is ENABLED on the first frame, and a
-    // press with nothing changed sends nothing (pinned by its own test below).
+    // press with nothing changed dismisses the layer (pinned by its own test below).
     expect(byClass('.plugin-setting-save', 'button').textContent).toBe('Save');
     expect(byClass('.plugin-setting-save', 'button').disabled).toBe(false);
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('');
@@ -2006,19 +2007,23 @@ it('saves only the changed key, repaints from the server row, and reopens with t
     expect(pluginCountReads(dialed)).toBe(1);
 });
 
-it('keeps Save pressable and sends nothing when no setting changed', async () => {
-    // The control is never disabled, so "there is nothing to write" has to be a no-op in the
-    // handler rather than a greyed-out button. Two reasons the no-op is the right shape: the
+it('keeps Save pressable and dismisses the layer when no setting changed', async () => {
+    // The control is never disabled, so "there is nothing to write" is handled INSIDE the
+    // handler rather than by a greyed-out button. Two reasons the press must not write: the
     // server REFUSES an empty settings patch (`400` — "A plugin settings patch must change at
     // least one setting", ../server/plugins.ts:545-553), and sending EVERY field instead
-    // would pin each untouched default as an explicit stored override.
+    // would pin each untouched default as an explicit stored override. With nothing to write
+    // the press therefore acts like any other dismissal — the same close path as the backdrop
+    // and Escape — instead of a dead press that leaves the layer sitting there.
     const { calls, dialed } = stub();
 
     await boot();
     openPlugins();
     await flush();
 
-    pluginInfo('context-compaction').click();
+    const info = pluginInfo('context-compaction');
+
+    info.click();
 
     const save = byClass('.plugin-setting-save', 'button');
 
@@ -2028,19 +2033,24 @@ it('keeps Save pressable and sends nothing when no setting changed', async () =>
     await flush();
 
     // Nothing changed, so nothing left the browser: no write, no second catalogue read, and
-    // no invented success line — the status stays empty because nothing happened.
+    // no invented success line — and the layer is gone, focus is back on the mark that opened
+    // it, and the catalogue's open-state marker is reset.
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
     expect(dialed.filter((line) => line.startsWith('PATCH'))).toEqual([]);
     expect(pluginCountReads(dialed)).toBe(1);
-    expect(byClass('.plugin-setting-status', 'p').textContent).toBe('');
-    expect(save.disabled).toBe(false);
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.activeElement).toBe(info);
+    expect(info.getAttribute('aria-expanded')).toBe('false');
+    expect(info.hasAttribute('data-open')).toBe(false);
 
     // The very same control writes the moment a figure differs from the server's.
+    info.click();
+
     const input = byClass('.plugin-setting-input[data-setting="contextLimit"]', 'input');
 
     input.value = '120000';
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    save.click();
+    byClass('.plugin-setting-save', 'button').click();
     await flush();
     await flush();
 
@@ -2048,7 +2058,7 @@ it('keeps Save pressable and sends nothing when no setting changed', async () =>
         { url: '/api/sessions/s1/plugins/context-compaction', method: 'PATCH', body: { settings: { contextLimit: 120000 } } }
     ]);
     expect(byClass('.plugin-setting-status', 'p').textContent).toBe('Saved');
-    expect(save.disabled).toBe(false);
+    expect(byClass('.plugin-setting-save', 'button').disabled).toBe(false);
     expect(pluginCountReads(dialed)).toBe(1);
 });
 
