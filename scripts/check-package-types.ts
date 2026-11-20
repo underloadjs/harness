@@ -249,7 +249,7 @@ const testSources = sourceFiles.filter(
 );
 if (testSources.length > 0) fail(`test sources leaked into "files": ${testSources.slice(0, 5).join(', ')}`);
 
-const generatedSources = sourceFiles.filter((file) => file.startsWith(`${EDITABLE_SOURCE_ROOT}/frontend/dist/`));
+const generatedSources = sourceFiles.filter((file) => file.startsWith(`${EDITABLE_SOURCE_ROOT}/dist/`));
 if (generatedSources.length > 0) fail(`generated browser output leaked into "files": ${generatedSources.slice(0, 5).join(', ')}`);
 
 // The headline source-only rule, over the PACKED tree: the payload is TypeScript
@@ -457,13 +457,10 @@ const nodeConsumer = consumer(
     `import { agent, harness, tool, openAICompatible, MAX_EXTRA_BODY_BYTES, PROVIDER_REQUEST_BODY_CODE, STRUCTURED_OUTPUT_INVALID_CODE, STRUCTURED_SCHEMA_INVALID_CODE, estimateContextTokens, CONTEXT_OVERFLOW_CODE } from '@underload/harness';
 import { startHarnessServer } from '@underload/harness/server';
 import { LOOPBACK_HOSTNAMES, isLoopbackHostname } from '@underload/harness/shared';
-import { API_ROOT, loadBootstrap } from '@underload/harness/frontend';
 
-// The Node root exposes BOTH surfaces: server APIs and the reusable client.
+// The Node root exposes the library, shared helpers and the server API.
 export const serverKind: string = typeof startHarnessServer;
 export const loopback: boolean = isLoopbackHostname('localhost') && LOOPBACK_HOSTNAMES.size > 0;
-export const clientRoot: string = API_ROOT;
-export const bootstrap = loadBootstrap();
 export const factories = { agent, harness, tool };
 
 // issue 0001: the request-body extension, the response format and the structured
@@ -506,13 +503,13 @@ const browserConsumer = consumer(
         compilerOptions: { ...baseOptions, module: 'ESNext', moduleResolution: 'Bundler', customConditions: ['browser'] },
         include: ['index.ts']
     },
-    `import { agent, createTurnBoard, loadBootstrap, estimateContextTokens, CONTEXT_OVERFLOW_CODE } from '@underload/harness';
+    `import { agent, estimateContextTokens, CONTEXT_OVERFLOW_CODE } from '@underload/harness';
 // @ts-expect-error - the "browser" condition must resolve src/browser.ts, which
 // deliberately has no Node server surface. If this import ever type-checks, the
 // condition mapping regressed and a browser bundle could reach node:http types.
 import { startHarnessServer } from '@underload/harness';
 
-export const client = { agent, createTurnBoard, loadBootstrap };
+export const client = { agent, estimateContextTokens };
 
 // issue 0001: a browser host configures the request body exactly like a Node host,
 // so the new provider fields and the structured-agent setting must resolve from the

@@ -56,9 +56,9 @@ const createFixture = () => {
         'src/tools/deep/b.ts',
         'src/tools/deep/b.spec.tsx',
         'src/server/workers/worker-boot.mjs',
-        'src/frontend/dist/index.html',
-        'src/frontend/node_modules/cache.ts',
-        'src/frontend/.vite/cache.ts',
+        'src/generated/dist/index.html',
+        'src/generated/node_modules/cache.ts',
+        'src/generated/.vite/cache.ts',
         'src/snapshots/__snapshots__/a.ts',
         'README.md'
     ]) {
@@ -73,7 +73,7 @@ const createFixture = () => {
             '!src/**/*.spec.ts',
             '!src/**/*.spec.tsx',
             '!src/**/__snapshots__/**',
-            '!src/frontend/dist/**',
+            '!src/**/dist/**',
             '!src/**/node_modules/**',
             '!src/**/.vite/**'
         ]
@@ -87,8 +87,8 @@ describe('publishedFiles / isPublished / copyPublishedPackage', () => {
         const { root, manifest } = createFixture();
 
         // The published payload is the source tree alone (the real manifest has no
-        // `dist` root either); the app build output under `src/frontend/dist` is
-        // negated, and the one permitted `.mjs` ships with the source.
+        // `dist` root either); any build output nested under `src/` is negated, and
+        // the one permitted `.mjs` ships with the source.
         expect(publishedFiles({ root, manifest })).toEqual([
             'src/index.ts',
             'src/server/workers/worker-boot.mjs',
@@ -105,7 +105,7 @@ describe('publishedFiles / isPublished / copyPublishedPackage', () => {
         expect(isPublished('src/server/workers/worker-boot.mjs', { root, manifest })).toBe(true);
         expect(isPublished('src/tools/a.test.ts', { root, manifest })).toBe(false);
         expect(isPublished('src/tools/deep/b.spec.tsx', { root, manifest })).toBe(false);
-        expect(isPublished('src/frontend/dist/index.html', { root, manifest })).toBe(false);
+        expect(isPublished('src/generated/dist/index.html', { root, manifest })).toBe(false);
         // A build root that no longer exists is not inside `files`: this is the
         // assertion that fails the moment a `dist/` artifact re-enters the manifest.
         expect(isPublished('./dist/index.mjs', { root, manifest })).toBe(false);
@@ -143,8 +143,8 @@ describe('publishedFiles / isPublished / copyPublishedPackage', () => {
             'src/tools/a.ts',
             'src/tools/deep/b.ts'
         ]);
-        // The negated `!src/frontend/dist/**` root must not be materialised at all.
-        expect(existsSync(path.join(targetRoot, 'src/frontend/dist/index.html'))).toBe(false);
+        // The negated `!src/**/dist/**` rule must not be materialised at all.
+        expect(existsSync(path.join(targetRoot, 'src/generated/dist/index.html'))).toBe(false);
     });
 });
 

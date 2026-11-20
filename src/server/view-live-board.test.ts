@@ -37,9 +37,9 @@ import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';
 import { SessionStore } from './sessions';
 import type { SessionView } from './protocol';
-import { createTurnBoard } from '../frontend/ui/turns';
-import type { TurnBoard } from '../frontend/ui/turns';
-import { sessionThreadsOf } from '../frontend/ui/threads';
+import { createTurnBoard } from '@loadscript/harness/frontend/ui/turns';
+import type { TurnBoard } from '@loadscript/harness/frontend/ui/turns';
+import { sessionThreadsOf } from '@loadscript/harness/frontend/ui/threads';
 
 const DEFAULTS: RunnerSettings = {
     baseURL: 'http://scripted.invalid/v1',

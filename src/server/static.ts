@@ -1,9 +1,8 @@
-// Static file serving for the built UI.
+// Static file serving for a built UI.
 //
-// `yarn build:frontend` emits `src/frontend/dist`; `startHarnessServer` mounts it
-// here so one standalone process serves both the API and the UI. (The
-// @underload/service gateway serves the API only.) Hashed
-// assets get an immutable cache; the entry document never does.
+// A host supplies its own build directory through `startHarnessServer({ staticRoot })`
+// (for example the `@loadscript/harness` app build). Hashed assets get an immutable
+// cache; the entry document never does.
 
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';

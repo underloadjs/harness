@@ -54,7 +54,7 @@
 // Run: yarn vitest run src/server/turn-projector-abandoned-card.test.ts   (cwd packages/underload/harness)
 
 import { describe, expect, it } from 'vitest';
-import { elapsedBetween, formatDuration } from '../frontend/ui/time';
+import { elapsedBetween, formatDuration } from '@loadscript/harness/frontend/ui/time';
 import type { HarnessEvent } from '../harness';
 import type { DisplayProjectContext, TurnDisplayOp, TurnRecordStatus, TurnSection } from '../shared/turn-display';
 import type { SessionTurn } from './protocol';

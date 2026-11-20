@@ -29,7 +29,6 @@ import type { HarnessHandler } from './handler';
 // The mount constant is the REST owner's single source of truth (./api.ts); the stream path is
 // derived from it rather than repeated here, so the two can never disagree.
 import { STANDALONE_MOUNT } from './api';
-import { packagePath } from './package-root';
 import type { RunnerSettings } from './harnesses/types';
 import type { HarnessIndex } from './protocol';
 import { SessionStore } from './sessions';
@@ -318,15 +317,12 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
         events
     });
 
-    // Default static root: the UI application build inside the package. Resolved
-    // through ./package-root.ts rather than `new URL('../frontend/dist', ...)` so the
-    // value is identical in the source tree (src/server -> src/frontend/dist) and in
-    // the bundle (dist/<chunk> -> src/frontend/dist), and so Vite never treats the
-    // path as an asset to inline.
+    // Static root: the deployable UI build is owned by `@loadscript/harness`, so
+    // this server no longer carries a default. `null` disables static serving
+    // (used by tests); a host that wants one process to serve both the API and a
+    // UI passes the built directory explicitly.
     const staticRoot =
-        options.staticRoot === null
-            ? undefined
-            : (options.staticRoot ?? packagePath('src', 'frontend', 'dist'));
+        options.staticRoot === null ? undefined : options.staticRoot;
     const serveStatic = staticRoot === undefined ? undefined : createStaticHandler(staticRoot);
 
     const server = http.createServer((request, response) => {

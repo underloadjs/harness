@@ -1,5 +1,10 @@
 # @underload/harness
 
+> The reusable browser client and its app build moved to
+> [`@loadscript/harness`](../loadscript/harness): the UI sources that used to live
+> under `src/frontend` are no longer part of this package. The library and the
+> server API stay here.
+
 A plugin-first CLI agent harness. One call builds a callable writer that runs the
 tool loop for you.
 
@@ -11,15 +16,12 @@ yarn add @underload/harness
 
 The harness core has no runtime dependencies of its own, and Node 18+ is enough
 (`fetch` is the default transport). What the package DOES declare in `dependencies` is
-exactly what its published sources import: `dotenv` (the Node entries' `.env` loader),
-`typescript` (the tool-source compiler, `src/core/tool-source.ts`), and `dompurify`,
-`marked` and `highlight.js` (the browser markdown renderer,
-`src/frontend/ui/markdown.ts`). Because the package ships source rather than a bundle,
-"only the browser uses it" cannot make a package dev-only: an installed host that imports
-`./frontend` really resolves those three. `vite` is a `peerDependency` (`^8`) for the
-deployable app surface (`build:frontend` / `dev:frontend`, and the module runner the
-worker entries load through). Nothing is inlined — every dependency stays the dependency's
-own published artifact (see [npm Publishing](#npm-publishing)).
+exactly what its published sources import: `dotenv` (the Node entries' `.env` loader)
+and `typescript` (the tool-source compiler, `src/core/tool-source.ts`). The browser
+markdown renderer (`dompurify`, `marked`, `highlight.js`) moved with the client to
+`@loadscript/harness`. `vite` is a `peerDependency` (`^8`) for the module runner the
+worker entries load through. Nothing is inlined — every dependency stays the
+dependency's own published artifact (see [npm Publishing](#npm-publishing)).
 
 ## Usage
 
@@ -293,28 +295,15 @@ src/server/
   config.ts             provider defaults + mergeSettings credential rule
   protocol.ts           client/server wire types (turns, queue, stream items)
   package-root.ts       package root discovered by walking to package.json (build-layout free)
-  static.ts             src/frontend/dist serving
+  static.ts             optional static serving for a host-supplied UI build
   cli/                  argv parsing, one-shot + interactive rendering
   harnesses/            presets and harness-level tools shared by CLI and server
   endpoint/harness/     the route modules @underload/service discovers
-src/frontend/
-  index.ts              the reusable client: api + contract + ui panels
-                        -> @underload/harness/frontend
-  main.ts               the app shell (imports styles.css, mounts the DOM on load)
-  api.ts                root resolution (query/saved URL/injected/build/Pages chain,
-                        defaulting to /v1/harness) + the REST reads and writes
-  stream.ts             the realtime client: the `harness.v1` WebSocket at
-                        /v1/harness/stream (subscribe, resume, resync)
-  deployment.ts         the local/LAN gateway chain a GitHub Pages host probes
-  contract.ts           wire validation/presentation helpers
-  ui/                   turns, agents, create form, markdown, panels, tools, tokens,
-                        action-request (owner question card)
-  extensions/           the shell's panel registry: context + runtime, the records
-                        client/wake/dom helpers, and the two live panels
-                        (harness.tasks, harness.records — see the scratch-board section)
-  styles.css            the app stylesheet
-  index.html            the app entry document
 
+The browser client that used to sit under `src/frontend/` (index/main/api/
+stream/deployment/contract/ui/extensions/styles.css/index.html) now lives in
+`@loadscript/harness`.
+```
 docs/                   the package documents (index: docs/README.md): the plugin
                         authoring guide (plugins.md), the runtime-tools
                         integration doc, and the issue + task logs
@@ -341,18 +330,16 @@ Imports resolve by environment as well as by name, so a browser never loads a
 
 | Specifier | Resolves to | Contains |
 |---|---|---|
-| `@underload/harness` (node/import) | `src/index.ts` | library + shared + server + client |
-| `@underload/harness` (browser) | `src/browser.ts` | library + shared + client |
+| `@underload/harness` (node/import) | `src/index.ts` | library + shared + server |
+| `@underload/harness` (browser) | `src/browser.ts` | library + shared |
 | `@underload/harness/server` | `src/server/index.ts` | server API only |
 | `@underload/harness/worker` | `src/server/workers/lane-worker.ts` | the lane-worker ENTRY a `Worker` is spawned with (`threadExecution: 'worker'`) — not an API surface |
 | `@underload/harness/io-worker` | `src/server/workers/io-worker.ts` | the IO-worker ENTRY (`HARNESS_IO_EXECUTION=worker`) — same shape, durability arm |
-| `@underload/harness/frontend` | `src/frontend/index.ts` | browser client only |
 | `@underload/harness/shared` | `src/shared/index.ts` | origin/loopback helpers |
 
 Importing any of them is inert: no listener is bound (call `startHarnessServer`
-for that, or let `@underload/service` host `/v1/harness`), and the client entry
-applies no CSS and creates no element — the shell (`main.ts`) is deliberately not
-exported.
+for that, or let `@underload/service` host `/v1/harness`). The browser client is
+`@loadscript/harness`.
 
 ### TypeScript consumers
 
@@ -378,9 +365,8 @@ Types follow the same environment split as the runtime:
 
 | Consumer | Resolves | Compiler needs |
 |---|---|---|
-| Node | `src/index.ts` (library + shared + server + client) | `lib` with `DOM` (client signatures) and `types: ["node"]` (server API) |
-| Browser (`customConditions: ["browser"]`) | `src/browser.ts` (library + shared + client) | `lib` with `DOM`; `types: ["vite/client"]` |
-| `@underload/harness/frontend` | `src/frontend/index.ts` | `lib` with `DOM`; `types: ["vite/client"]` |
+| Node | `src/index.ts` (library + shared + server) | `types: ["node"]` (server API) |
+| Browser (`customConditions: ["browser"]`) | `src/browser.ts` (library + shared) | `lib` with `DOM` |
 | `@underload/harness/server` | `src/server/index.ts` | `types: ["node"]` |
 
 Type-checking source instead of a trimmed declaration surface costs two settings, both

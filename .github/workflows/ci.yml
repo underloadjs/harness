@@ -1,21 +1,8 @@
-# Typecheck, test, and build the package and the harness app, then publish the
-# built UI (src/frontend/dist) to GitHub Pages on pushes to main.
+# Typecheck, test, and generate the package manifests.
 #
-# The normal host remains the @underload/service gateway (`yarn start-service`),
-# which discovers the harness endpoint modules; the UI is a separate Vite launch
-# (`yarn dev:frontend`) and the optional standalone API launcher is
-# `yarn dev:server`. This workflow verifies that the library, the server tests,
-# the UI tests, and the client bundle all compile, and additionally deploys the
-# static UI bundle to Pages (https://underloadjs.github.io/harness/).
-#
-# One-time repo setting (required once, not per-deploy):
-#   Settings → Pages → Build and deployment → Source: "GitHub Actions"
-#
-# The deployed UI is only the client: Pages serves no API, so the bundle resolves
-# its server at runtime from the compiled local/LAN chain
-# (src/frontend/deployment.ts) and the service's Origin gate admits this
-# https://*.github.io page (src/shared/origin.ts `isPagesOrigin`). README
-# “GitHub Pages” documents the mixed-content limit of the LAN entry.
+# The deployable UI build and its Pages deployment moved to
+# `@loadscript/harness` together with the client sources. The optional
+# standalone API launcher is `yarn dev:server`.
 
 name: CI
 
@@ -27,13 +14,6 @@ on:
 
 permissions:
     contents: read
-    pages: write
-    id-token: write
-
-# One deploy at a time; new pushes cancel in-flight deploys
-concurrency:
-    group: pages
-    cancel-in-progress: true
 
 jobs:
     build:
@@ -57,54 +37,8 @@ jobs:
             - name: Test
               run: npm test
 
-            # The UI suite is a separate vitest config (jsdom, src/frontend/), so
-            # the package's default `test` script cannot cover it.
-            - name: Test UI
-              run: npm run test:frontend
-
             # `build` regenerates the two GENERATED catalogues (harness-tools.manifest.json
             # + the plugin manifest). The package publishes `src/*.ts`, so there is no
             # library bundle to build here.
             - name: Generate catalogues
               run: npm run build
-
-            - name: Build UI
-              run: npm run build:frontend
-              # Pages serves this repo under the /harness/ project path, so the
-              # bundle's asset URLs must be prefixed (src/frontend/vite.config.ts
-              # reads PLAYGROUND_BASE for exactly this). Default '/' would 404
-              # every asset at https://underloadjs.github.io/harness/.
-              #
-              # VITE_HARNESS_API is deliberately NOT set: this host serves the
-              # bundle and no API, so the client resolves the local/LAN gateway
-              # chain at runtime instead (src/frontend/deployment.ts) — localhost
-              # first, then the standard LAN host. Pinning one absolute root here
-              # would freeze every visitor onto that single machine.
-              env:
-                  PLAYGROUND_BASE: harness
-
-            - name: Configure Pages
-              if: github.event_name != 'pull_request'
-              uses: actions/configure-pages@v5
-
-            - name: Upload Pages artifact
-              if: github.event_name != 'pull_request'
-              uses: actions/upload-pages-artifact@v3
-              with:
-                  # The UI app build is the only bundle here: the package publishes its
-                  # `src/*.ts` sources and has no root build output at all, so this is
-                  # also the one artifact with an `index.html` for Pages to serve.
-                  path: src/frontend/dist
-
-    deploy:
-        # PRs only verify the build; pushes to main (and manual runs) publish.
-        if: github.event_name != 'pull_request'
-        runs-on: ubuntu-latest
-        needs: build
-        environment:
-            name: github-pages
-            url: ${{ steps.deployment.outputs.page_url }}
-        steps:
-            - name: Deploy to GitHub Pages
-              id: deployment
-              uses: actions/deploy-pages@v4

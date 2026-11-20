@@ -40,7 +40,7 @@ import type { DisplayNoticeNode, DisplayProjectContext } from '../shared/turn-di
 // The fixed consumer contract: the frontend's own classifier, which is what decides the
 // `data-provider` attribute and the label span of a compiled notice. DOM-free, so it runs
 // under this config's `node` environment.
-import { providerFailureOf } from '../frontend/provider-diagnostics';
+import { providerFailureOf } from '@loadscript/harness/frontend/provider-diagnostics';
 import type { SessionTurn } from './protocol';
 import { createTurnProjector, projectTurn, refoldTurn, providerRetryNoticeText } from './turn-projector';
 

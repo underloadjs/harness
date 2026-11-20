@@ -16,7 +16,7 @@
 //   - ./api-views.test.ts         — the wire privacy rules on top of it
 
 import { describe, expect, it } from 'vitest';
-import { elapsedBetween } from '../frontend/ui/time';
+import { elapsedBetween } from '@loadscript/harness/frontend/ui/time';
 import type { HarnessEvent } from '../harness';
 import { DISPLAY_ARGS_PREVIEW_CHARS, DISPLAY_PANELS_PER_STEP, DISPLAY_PREVIEW_CHARS } from '../shared/turn-display';
 import type {

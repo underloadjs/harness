@@ -27,13 +27,33 @@
             "types": "./src/server/workers/io-worker.ts",
             "default": "./src/server/workers/io-worker.ts"
         },
-        "./frontend": {
-            "types": "./src/frontend/index.ts",
-            "default": "./src/frontend/index.ts"
-        },
         "./shared": {
             "types": "./src/shared/index.ts",
             "default": "./src/shared/index.ts"
+        },
+        "./shared/harness-api": {
+            "types": "./src/shared/harness-api.ts",
+            "default": "./src/shared/harness-api.ts"
+        },
+        "./shared/harness-stream": {
+            "types": "./src/shared/harness-stream.ts",
+            "default": "./src/shared/harness-stream.ts"
+        },
+        "./shared/turn-display": {
+            "types": "./src/shared/turn-display.ts",
+            "default": "./src/shared/turn-display.ts"
+        },
+        "./shared/run-identity": {
+            "types": "./src/shared/run-identity.ts",
+            "default": "./src/shared/run-identity.ts"
+        },
+        "./server/turn-projector": {
+            "types": "./src/server/turn-projector.ts",
+            "default": "./src/server/turn-projector.ts"
+        },
+        "./types": {
+            "types": "./src/types/index.ts",
+            "default": "./src/types/index.ts"
         },
         "./package.json": "./package.json"
     },
@@ -44,7 +64,6 @@
         "!src/**/*.spec.ts",
         "!src/**/*.spec.tsx",
         "!src/**/__snapshots__/**",
-        "!src/frontend/dist/**",
         "!src/**/node_modules/**",
         "!src/**/.vite/**"
     ],
@@ -66,15 +85,11 @@
     },
     "scripts": {
         "build": "npm run tools:manifest && npm run plugins:manifest",
-        "build:frontend": "vite build --config src/frontend/vite.config.ts",
         "cli": "vite-node src/server/cli/index.ts",
-        "dev:frontend": "vite --config src/frontend/vite.config.ts",
         "dev:server": "vite-node src/server/dev.ts",
-        "preview:frontend": "vite preview --config src/frontend/vite.config.ts",
         "prepublishOnly": "npm run typecheck && npm run test && npm run build && npm run test:package:files && npm run test:package && npm run test:package:runtime && npm run test:package:tools",
         "test": "npm run tools:manifest:check && npm run plugins:manifest:check && vitest run",
         "test:contract": "vitest run scripts/generate-harness-contract.test.ts",
-        "test:frontend": "vitest run --config src/frontend/vitest.config.ts",
         "test:package": "vite-node scripts/check-package-types.ts",
         "test:package:files": "vitest run scripts/package-files.test.ts",
         "test:package:runtime": "vite-node scripts/check-package-runtime.ts",
@@ -90,6 +105,7 @@
     "author": "NQQT",
     "license": "ISC",
     "devDependencies": {
+        "@loadscript/harness": "*",
         "@types/node": "^25.9.1",
         "jsdom": "^29.0.2",
         "vite": "^8.0.8",
@@ -98,10 +114,7 @@
         "yaml": "^2.9.1"
     },
     "dependencies": {
-        "dompurify": "^3.4.15",
         "dotenv": "^17.4.2",
-        "highlight.js": "11.12.0",
-        "marked": "^18.0.12",
         "typescript": "^6.0.0"
     },
     "peerDependencies": {

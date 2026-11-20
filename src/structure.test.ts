@@ -1,8 +1,8 @@
 // Structure + import-safety contract for the R1/R2 layout.
 //
 // What this file pins (all deterministic, all read from the source tree):
-//   1. the application tree lives under src/ (frontend + server + shared) and the
-//      old top-level folders are gone;
+//   1. the application tree lives under src/ (server + shared) and the moved UI
+//      tree is gone;
 //   2. package.json resolves SOURCE FIRST for every consumer, dev or installed:
 //      `main`/`module`/`types` are `./src/index.ts`, and EVERY target of EVERY
 //      published subpath (the `types` conditions and the `default` runtime
@@ -11,9 +11,8 @@
 //      target: the package is published as source, so an installed host loads the
 //      same file a workspace run edits. `dist/` is therefore not a resolution target
 //      at all — items 8-9 below are the proofs;
-//   3. the frontend and server launches are separate — `dev:frontend` is Vite
-//      only, `dev:server` is the explicit standalone API, and the @underload/service
-//      gateway still owns the normal listener (imports bind nothing);
+//   3. the standalone server launch is separate from the UI app, which now lives in
+//      `@loadscript/harness`;
 //   4. each root entry composes the layers it is allowed to reach (Node root:
 //      library + shared + server + client; browser root: library + shared +
 //      client, never the server tree);
@@ -35,11 +34,11 @@
 //   - ../scripts/check-package-types.ts — the published-SOURCE check that enforces the
 //     same rule for a real consumer install (every subpath needs a `./src/*.ts`
 //     runtime target, nothing may point at `dist/`, and no built artifact may ship)
-//   - ../src/frontend/vite.config.ts — the ONE Vite config left in the package: the
-//     frontend app build (`build:frontend`). The root `vite.config.ts` retired with the
-//     library bundles, and the `retired build layer` block below pins its absence.
-//   - ./server/service-start.test.ts — the end-to-end proof that the real service
-//     gateway serves /v1/harness from the moved endpoint folder
+//   - ../src/structure.test.ts — the in-repo mirror of the same manifest rules (no dist);
+//     the moved client's own structure lives with `@loadscript/harness`
+//   - ../scripts/check-package-types.ts — the published-SOURCE check that enforces the
+//     same rule for a real consumer install (every subpath needs a `./src/*.ts`
+//     runtime target, nothing may point at `dist/`, and no built artifact may ship)
 //
 // Node environment ON PURPOSE: every assertion here reads the source tree through
 // `fileURLToPath(import.meta.url)` (./openai.ts, package.json, the tsconfigs). Under the
@@ -201,8 +200,13 @@ const PUBLISHED_SPECIFIERS = [
     { subpath: './server', specifier: '@underload/harness/server', source: './src/server/index.ts' },
     { subpath: './worker', specifier: '@underload/harness/worker', source: './src/server/workers/lane-worker.ts' },
     { subpath: './io-worker', specifier: '@underload/harness/io-worker', source: './src/server/workers/io-worker.ts' },
-    { subpath: './frontend', specifier: '@underload/harness/frontend', source: './src/frontend/index.ts' },
-    { subpath: './shared', specifier: '@underload/harness/shared', source: './src/shared/index.ts' }
+    { subpath: './shared', specifier: '@underload/harness/shared', source: './src/shared/index.ts' },
+    { subpath: './shared/harness-api', specifier: '@underload/harness/shared/harness-api', source: './src/shared/harness-api.ts' },
+    { subpath: './shared/harness-stream', specifier: '@underload/harness/shared/harness-stream', source: './src/shared/harness-stream.ts' },
+    { subpath: './shared/turn-display', specifier: '@underload/harness/shared/turn-display', source: './src/shared/turn-display.ts' },
+    { subpath: './shared/run-identity', specifier: '@underload/harness/shared/run-identity', source: './src/shared/run-identity.ts' },
+    { subpath: './server/turn-projector', specifier: '@underload/harness/server/turn-projector', source: './src/server/turn-projector.ts' },
+    { subpath: './types', specifier: '@underload/harness/types', source: './src/types/index.ts' }
 ] as const;
 
 describe('package layout', () => {
@@ -224,7 +228,6 @@ describe('package layout', () => {
         expect(folders).toEqual([
             'agents',
             'core',
-            'frontend',
             'plugin',
             // R2/R3/R4: the auto-discovered built-in plugins. `src/plugins` is the
             // scanned folder (one `*.plugin.ts` per plugin); `src/plugin` stays the
@@ -243,8 +246,6 @@ describe('package layout', () => {
             'src/index.ts',
             'src/browser.ts',
             'src/server/index.ts',
-            'src/frontend/index.ts',
-            'src/frontend/main.ts',
             'src/shared/index.ts',
             'src/harness.ts'
         ]) {
@@ -294,15 +295,35 @@ describe('package layout', () => {
                 types: './src/server/workers/io-worker.ts',
                 default: './src/server/workers/io-worker.ts'
             },
-            // ./frontend needs no nested `browser` group: its single entry is already
-            // browser-safe, so the top-level pair answers every environment.
-            './frontend': {
-                types: './src/frontend/index.ts',
-                default: './src/frontend/index.ts'
-            },
+            // The reusable browser client moved to `@loadscript/harness`; this
+            // package no longer publishes a `./frontend` entry.
             './shared': {
                 types: './src/shared/index.ts',
                 default: './src/shared/index.ts'
+            },
+            './shared/harness-api': {
+                types: './src/shared/harness-api.ts',
+                default: './src/shared/harness-api.ts'
+            },
+            './shared/harness-stream': {
+                types: './src/shared/harness-stream.ts',
+                default: './src/shared/harness-stream.ts'
+            },
+            './shared/turn-display': {
+                types: './src/shared/turn-display.ts',
+                default: './src/shared/turn-display.ts'
+            },
+            './shared/run-identity': {
+                types: './src/shared/run-identity.ts',
+                default: './src/shared/run-identity.ts'
+            },
+            './server/turn-projector': {
+                types: './src/server/turn-projector.ts',
+                default: './src/server/turn-projector.ts'
+            },
+            './types': {
+                types: './src/types/index.ts',
+                default: './src/types/index.ts'
             },
             './package.json': './package.json'
         });
@@ -322,8 +343,13 @@ describe('package layout', () => {
             './server',
             './worker',
             './io-worker',
-            './frontend',
-            './shared'
+            './shared',
+            './shared/harness-api',
+            './shared/harness-stream',
+            './shared/turn-display',
+            './shared/run-identity',
+            './server/turn-projector',
+            './types'
         ]);
 
         // Issue 0002 published the standalone tool-source compile on the ROOT and
@@ -352,17 +378,17 @@ describe('package layout', () => {
             '!src/**/*.spec.ts',
             '!src/**/*.spec.tsx',
             '!src/**/__snapshots__/**',
-            '!src/frontend/dist/**',
             '!src/**/node_modules/**',
             '!src/**/.vite/**'
         ]);
 
         // Rows come from the module-level walk shared with the resolution tests.
         const published = exportTargets.filter(({ subpath }) => subpath !== './package.json');
-        // 14 = root 4 (browser.types/default + types/default) + ./server 2 + ./worker 2
+        // 24 = root 4 (browser.types/default + types/default) + ./server 2 + ./worker 2
         // (T5 lane-worker executable) + ./io-worker 2 (D4 IO-worker executable) +
-        // ./frontend 2 + ./shared 2.
-        expect(published.length).toBe(14);
+        // ./shared 2 + the four shared contract files 8 + ./server/turn-projector 2 +
+        // ./types 2.
+        expect(published.length).toBe(24);
 
         // Family 1 — `types`: the same `.ts` entries the runtime loads, so a consumer's
         // editor reads the source of truth instead of a generated `.d.ts` that can be
@@ -374,12 +400,17 @@ describe('package layout', () => {
             './src/server/index.ts',
             './src/server/workers/lane-worker.ts',
             './src/server/workers/io-worker.ts',
-            './src/frontend/index.ts',
-            './src/shared/index.ts'
+            './src/shared/index.ts',
+            './src/shared/harness-api.ts',
+            './src/shared/harness-stream.ts',
+            './src/shared/turn-display.ts',
+            './src/shared/run-identity.ts',
+            './src/server/turn-projector.ts',
+            './src/types/index.ts'
         ]);
 
         // Family 2 — every remaining condition is a RUNTIME target (`default`, plus the
-        // one nested under the root `browser` group). Same seven entries; the pair for
+        // one nested under the root `browser` group). Same twelve entries; the pair for
         // each subpath is one file, never a bundle.
         const runtimeTargets = published.filter(({ condition }) => !isTypesCondition(condition));
         expect(runtimeTargets.map(({ target }) => target)).toEqual([
@@ -388,8 +419,13 @@ describe('package layout', () => {
             './src/server/index.ts',
             './src/server/workers/lane-worker.ts',
             './src/server/workers/io-worker.ts',
-            './src/frontend/index.ts',
-            './src/shared/index.ts'
+            './src/shared/index.ts',
+            './src/shared/harness-api.ts',
+            './src/shared/harness-stream.ts',
+            './src/shared/turn-display.ts',
+            './src/shared/run-identity.ts',
+            './src/server/turn-projector.ts',
+            './src/types/index.ts'
         ]);
 
         // Every declared target must exist on disk — a typo here is a 404 for the
@@ -398,10 +434,10 @@ describe('package layout', () => {
             expect(fs.existsSync(path.join(PACKAGE_ROOT, target))).toBe(true);
         }
 
-        // Exact per-family counts, 7 types + 7 runtime = 14. The prefix/extension rule
+        // Exact per-family counts, 12 types + 12 runtime = 24. The prefix/extension rule
         // (every target is `./src/*.ts`) is already pinned by the two full-list
         // assertions above.
-        expect([typeTargets.length, runtimeTargets.length]).toEqual([7, 7]);
+        expect([typeTargets.length, runtimeTargets.length]).toEqual([12, 12]);
     });
 
     it('resolves every published specifier to source, never to dist, for a dev/test host', async () => {
@@ -464,13 +500,18 @@ describe('package layout', () => {
         // jumps and the executed module identical.
         const paths = readConfig('tsconfig.json').compilerOptions.paths as Record<string, string[]>;
 
-        // Exact key set: the six published specifiers, no stale alias left behind.
+        // Exact key set: the published specifiers, no stale alias left behind.
         expect(Object.keys(paths).sort()).toEqual([
             '@underload/harness',
-            '@underload/harness/frontend',
             '@underload/harness/io-worker',
             '@underload/harness/server',
+            '@underload/harness/server/turn-projector',
             '@underload/harness/shared',
+            '@underload/harness/shared/harness-api',
+            '@underload/harness/shared/harness-stream',
+            '@underload/harness/shared/run-identity',
+            '@underload/harness/shared/turn-display',
+            '@underload/harness/types',
             '@underload/harness/worker'
         ]);
 
@@ -482,8 +523,13 @@ describe('package layout', () => {
             './server': ['./src/server/index.ts'],
             './worker': ['./src/server/workers/lane-worker.ts'],
             './io-worker': ['./src/server/workers/io-worker.ts'],
-            './frontend': ['./src/frontend/index.ts'],
-            './shared': ['./src/shared/index.ts']
+            './shared': ['./src/shared/index.ts'],
+            './shared/harness-api': ['./src/shared/harness-api.ts'],
+            './shared/harness-stream': ['./src/shared/harness-stream.ts'],
+            './shared/turn-display': ['./src/shared/turn-display.ts'],
+            './shared/run-identity': ['./src/shared/run-identity.ts'],
+            './server/turn-projector': ['./src/server/turn-projector.ts'],
+            './types': ['./src/types/index.ts']
         });
 
         for (const { subpath, specifier, source } of PUBLISHED_SPECIFIERS) {
@@ -498,36 +544,28 @@ describe('package layout', () => {
         }
 
         // The nested `browser` declaration is the other half of the mirror: the
-        // browser-safe root, never the Node server surface. Only the root needs it —
-        // ./frontend's single entry is already browser-safe.
+        // browser-safe root, never the Node server surface. Only the root needs it.
         const browserRuntime = exportTargets
             .filter(({ condition }) => condition.endsWith('browser.default'))
             .map(({ subpath, target }) => `${subpath} -> ${target}`);
         expect(browserRuntime).toEqual(['. -> ./src/browser.ts']);
     });
 
-    it('splits the frontend and server launches without starting one from the other', () => {
-        // R1/R2: `dev:frontend` is Vite ONLY (no in-process API); the optional
-        // `dev:server` is the standalone Node API (no Vite, no UI). Normal hosting
-        // remains the @underload/service gateway (`yarn start-service` at the repo
-        // root), which discovers the endpoint modules on its own.
-        //
-        // The list is asserted as "required scripts exist, forbidden aliases do not"
-        // rather than an exact key set: build/release scripts are extended by other
-        // workstreams and the invariant is about launch separation, not count.
-        for (const script of ['build', 'cli', 'dev:frontend', 'dev:server', 'test', 'test:frontend', 'test:package', 'typecheck']) {
-            expect(typeof manifest.scripts[script]).toBe('string');
-        }
+    it('keeps the standalone server launch separate from the UI app', () => {
+        // The UI build and dev server live in `@loadscript/harness` now; this
+        // package only ships the optional standalone Node API launcher.
+        expect(typeof manifest.scripts['dev:server']).toBe('string');
+        expect(typeof manifest.scripts['cli']).toBe('string');
+        expect(manifest.scripts['dev:server']).toBe('vite-node src/server/dev.ts');
+        expect(manifest.scripts['dev:server']).not.toMatch(/--config|src\/frontend/);
+
         for (const forbidden of ['start', 'serve', 'server']) {
             expect(manifest.scripts[forbidden]).toBeUndefined();
         }
-
-        // Exact commands: the frontend script is the Vite dev server, the server
-        // script is the standalone launcher. Neither may reference the other layer.
-        expect(manifest.scripts['dev:frontend']).toBe('vite --config src/frontend/vite.config.ts');
-        expect(manifest.scripts['dev:server']).toBe('vite-node src/server/dev.ts');
-        expect(manifest.scripts['dev:frontend']).not.toMatch(/vite-node|src\/server/);
-        expect(manifest.scripts['dev:server']).not.toMatch(/--config|src\/frontend/);
+        // The UI launch scripts moved with the UI.
+        for (const moved of ['build:frontend', 'dev:frontend', 'preview:frontend', 'test:frontend']) {
+            expect(manifest.scripts[moved]).toBeUndefined();
+        }
 
         // No script runs the deleted combined launcher or the CLI's explicit
         // `--serve` opt-in: those are typed by a user, never a package script.
@@ -538,18 +576,18 @@ describe('package layout', () => {
         }
     });
 
-    it('keeps CI on the current frontend scripts and startup wording', () => {
-        // The workflow is a second consumer of package.json. It used to name the
-        // removed playground scripts, so assert both the current commands and that
-        // every `npm run <script>` in the workflow resolves to a real script.
+    it('keeps CI off the moved UI scripts', () => {
+        // The workflow is a second consumer of package.json. The UI build/test
+        // steps moved to `@loadscript/harness`, so this workflow must not name
+        // scripts this manifest no longer has.
         const workflow = readText('.github/workflows/ci.yml');
 
-        expect(workflow).toContain('run: npm run test:frontend');
-        expect(workflow).toContain('run: npm run build:frontend');
+        for (const moved of ['test:frontend', 'build:frontend']) {
+            expect(workflow).not.toContain(`run: npm run ${moved}`);
+        }
 
         // Retired launch/build names must not survive in the workflow or its
-        // comments: the startup split is Vite-only frontend + explicit standalone
-        // server, with @underload/service as the normal host.
+        // comments.
         for (const retired of [
             'test:playground',
             'build:playground',
@@ -567,112 +605,22 @@ describe('package layout', () => {
         }
     });
 
-    it('proxies the canonical /v1/harness root (REST and the stream upgrade) at the running service', async () => {
-        // R1 + T14: the browser dials the SAME path it uses in production - `/v1/harness/...` -
-        // because `/api` is gone from the contract (src/shared/harness-api.ts:39
-        // `HARNESS_API_ROOT`, mirrored by `API_ROOT` in src/frontend/api.ts). Both Vite modes
-        // therefore forward the canonical path to the service mount on :5000 with an IDENTITY
-        // rewrite, and `ws: true` carries the realtime upgrade (`GET /v1/harness/stream`) to that
-        // same host/port. No UI launch needs an embedded API.
-        //
-        // A page-level `?apiRoot=` or build-time `VITE_HARNESS_API` still overrides the fallback
-        // at runtime (src/frontend/api.ts `resolveApiRoot`); this pins only the default.
-        //
-        // HARNESS_DEV_API is read at config-module load. Clear it for this import so the
-        // assertion is independent of the shell that runs the suite.
-        const previous = process.env.HARNESS_DEV_API;
-        delete process.env.HARNESS_DEV_API;
-
-        try {
-            const config = (await import('./frontend/vite.config')).default as any;
-            // The proxy key is anchored to the API mount and Vite treats a leading `^` as a RegExp,
-            // so it matches exactly `/v1/harness` and `/v1/harness/...` - never an unrelated source
-            // module or page route, which would blank the UI when the upstream is down. Pin the
-            // exact key at both launch seams.
-            const proxyKey = '^/v1/harness(?:/|$)';
-            expect(Object.keys(config.server.proxy)).toEqual([proxyKey]);
-            expect(Object.keys(config.preview.proxy)).toEqual([proxyKey]);
-
-            const devProxy = config.server.proxy[proxyKey];
-            const previewProxy = config.preview.proxy[proxyKey];
-
-            // One object for both modes: dev and preview can never drift.
-            expect(devProxy).toBe(previewProxy);
-            expect(devProxy.target).toBe('http://127.0.0.1:5000');
-            expect(devProxy.changeOrigin).toBe(true);
-
-            // Same host for both planes: the HTTP upgrade is proxied too, so the socket dials the
-            // page origin like every REST call. Without `ws` the REST reads work and the realtime
-            // plane silently 404s at Vite (./vite-proxy.ts:90-93).
-            expect(devProxy.ws).toBe(true);
-
-            // The service gate requires Origin host === request Host; the proxy stamps the target
-            // origin so a LAN page keeps working without widening that gate.
-            expect(devProxy.headers).toEqual({ origin: 'http://127.0.0.1:5000' });
-
-            // Identity rewrite: canonical path in, the same path out - including the stream path
-            // and a query string (a page size or cursor must survive the proxy).
-            expect(devProxy.rewrite('/v1/harness')).toBe('/v1/harness');
-            expect(devProxy.rewrite('/v1/harness/stream')).toBe('/v1/harness/stream');
-            expect(devProxy.rewrite('/v1/harness/sessions/s-1/events?limit=25')).toBe(
-                '/v1/harness/sessions/s-1/events?limit=25'
-            );
-        } finally {
-            if (previous === undefined) delete process.env.HARNESS_DEV_API;
-            else process.env.HARNESS_DEV_API = previous;
-        }
-    });
-
-    it('can point the same proxy at the separate standalone launcher', async () => {
-        // R2 + T14: `yarn dev:server` publishes the SAME canonical root on :5181
-        // (`STANDALONE_MOUNT === HARNESS_API_ROOT`, ./server/api.ts:270-274), so pointing
-        // HARNESS_DEV_API at the standalone launcher is an identity rewrite exactly like the
-        // service mount. The helper still swaps the prefix for a host that publishes the API
-        // somewhere else - the only case where the browser's canonical path and the upstream path
-        // differ - which is what keeps `?apiRoot=`-style deployments working.
-        const { createApiProxy, DEFAULT_DEV_API } = await import('./frontend/vite.config');
-        const standalone = createApiProxy('http://127.0.0.1:5181/v1/harness');
-
-        expect(DEFAULT_DEV_API).toBe('http://127.0.0.1:5000/v1/harness');
-        expect(standalone.target).toBe('http://127.0.0.1:5181');
-        expect(standalone.changeOrigin).toBe(true);
-        expect(standalone.ws).toBe(true);
-        expect(standalone.headers).toEqual({ origin: 'http://127.0.0.1:5181' });
-        expect(standalone.rewrite('/v1/harness')).toBe('/v1/harness');
-        expect(standalone.rewrite('/v1/harness/sessions/s-1/events')).toBe('/v1/harness/sessions/s-1/events');
-
-        // A trailing slash on the mount is normalized (no `//` in the URL).
-        const trailing = createApiProxy('http://127.0.0.1:5000/v1/harness/');
-        expect(trailing.rewrite('/v1/harness/health')).toBe('/v1/harness/health');
-
-        // A non-canonical upstream swaps only the mount, and the stream upgrade follows it.
-        const custom = createApiProxy('http://127.0.0.1:5181/api');
-        expect(custom.rewrite('/v1/harness/stream')).toBe('/api/stream');
-        expect(custom.rewrite('/v1/harness')).toBe('/api');
-    });
-
     it('keeps both dev launchers out of every imported surface', () => {
         // R1/R2: the old frontend launcher (which called startHarnessServer) is
         // gone, and the standalone launcher is an executable entry, not a barrel
         // member. Importing the package therefore cannot reach either listener.
-        expect(fs.existsSync(path.join(PACKAGE_ROOT, 'src/frontend/dev.ts'))).toBe(false);
+        expect(fs.existsSync(path.join(PACKAGE_ROOT, 'src/frontend'))).toBe(false);
 
         for (const barrel of [
             'src/index.ts',
             'src/browser.ts',
-            'src/server/index.ts',
-            'src/frontend/index.ts'
+            'src/server/index.ts'
         ]) {
             expect(readText(barrel)).not.toContain("'./dev'");
         }
 
-        // Vite config is UI-only: no server import, no launcher call.
-        const viteConfig = readText('src/frontend/vite.config.ts');
-        expect(viteConfig).not.toContain('startHarnessServer');
-        expect(viteConfig).not.toContain("'../server");
-
         // The standalone launcher starts the Node server only; it must not import
-        // Vite or touch the frontend tree.
+        // Vite or touch a UI tree.
         const serverDev = readText('src/server/dev.ts');
         expect(serverDev).not.toContain("from 'vite'");
         expect(serverDev).not.toContain("from '../frontend");
@@ -707,11 +655,10 @@ describe('package layout', () => {
         );
         // `build` refreshes the two GENERATED manifests and nothing else. The package is
         // published as TypeScript source, so there is no library bundle and no declaration
-        // emit to run before publish; `build:frontend` is the only Vite build left, and it
-        // builds the deployable UI through its own config (pinned next).
+        // emit to run before publish. The deployable UI build moved to `@loadscript/harness`.
         expect(manifest.scripts['build']).toBe('npm run tools:manifest && npm run plugins:manifest');
         expect(manifest.scripts['build']).not.toContain('vite build');
-        expect(manifest.scripts['build:frontend']).toBe('vite build --config src/frontend/vite.config.ts');
+        expect(manifest.scripts['build:frontend']).toBeUndefined();
         expect(manifest.scripts['typecheck']).toBe(
             'npm run tools:manifest:check && npm run plugins:manifest:check && tsc --noEmit'
         );
@@ -764,23 +711,19 @@ describe('package layout', () => {
 });
 
 describe('entry composition', () => {
-    it('Node root = library + shared + server + client', () => {
-        // The Node root includes the browser client because every module in
-        // src/frontend/index.ts is import-safe without a DOM (no stylesheet, no
-        // module-scope element creation).
+    it('Node root = library + shared + server', () => {
+        // The reusable browser client moved to `@loadscript/harness`.
         expect(starExports(readText('src/index.ts'))).toEqual([
             './harness',
             './shared',
-            './server',
-            './frontend'
+            './server'
         ]);
     });
 
-    it('browser root = library + shared + client, never the server tree', () => {
+    it('browser root = library + shared, never the server tree', () => {
         expect(starExports(readText('src/browser.ts'))).toEqual([
             './harness',
-            './shared',
-            './frontend'
+            './shared'
         ]);
     });
 
@@ -809,39 +752,6 @@ describe('entry composition', () => {
         expect(exported).not.toContain('./browser');
     });
 
-    it('client barrel exports the reusable modules but not the app shell', () => {
-        expect(starExports(readText('src/frontend/index.ts'))).toEqual([
-            './api',
-            './contract',
-            './extensions',
-            './ui/activity',
-            './ui/agents',
-            './ui/create-harness',
-            './ui/dialog',
-            './ui/file-links',
-            './ui/file-preview',
-            './ui/markdown',
-            './ui/model-order',
-            './ui/panels',
-            './ui/preview',
-            './ui/time',
-            './ui/tokens',
-            './ui/tools',
-            './ui/turns'
-        ]);
-
-        const client = readText('src/frontend/index.ts');
-        // `main.ts` boots the DOM and imports the stylesheet: it must stay out.
-        expect(client).not.toContain("'./main'");
-        expect(client).not.toContain('.css');
-    });
-
-    it('the app shell owns the stylesheet so no barrel import applies CSS', () => {
-        expect(readText('src/frontend/main.ts')).toContain("import './styles.css';");
-        // The client graph never reaches a Node built-in (browser-safe).
-        expect(readText('src/frontend/api.ts')).not.toContain("from 'node:");
-        expect(readText('src/frontend/contract.ts')).not.toContain("from 'node:");
-    });
 });
 
 describe('import safety', () => {
@@ -1030,11 +940,8 @@ describe('import safety', () => {
         // (../server/harnesses/fixture-presets.test-support.ts).
         expect(root.FIXTURE_PRESETS).toBeUndefined();
         expect(root.ALL_PRESET_TEMPLATES).toBeUndefined();
-        // Client (import-safe under Node; no DOM work at module scope). The browser's
-        // fallback root is the canonical mount, not the retired `/api`.
-        expect(root.API_ROOT).toBe('/v1/harness');
-        expect(typeof root.createTurnBoard).toBe('function');
-        expect(typeof root.loadBootstrap).toBe('function');
+        // The browser client is no longer part of this root; `@loadscript/harness`
+        // owns it.
 
         httpCreateServer.mockRestore();
         netCreateServer.mockRestore();
@@ -1078,12 +985,10 @@ describe('retired build layer', () => {
             expect(fs.existsSync(path.join(PACKAGE_ROOT, retired))).toBe(false);
         }
 
-        // Nothing consumes the retired root config either: `build:frontend` and
-        // `dev:frontend` load src/frontend/vite.config.ts (pinned next), and the worker
-        // runner starts Vite with `configFile: false`
+        // Nothing consumes the retired root config either: the worker runner
+        // starts Vite with `configFile: false`
         // (./server/workers/worker-runner.ts:78).
-        expect(fs.existsSync(path.join(PACKAGE_ROOT, 'src/frontend/vite.config.ts'))).toBe(true);
-        expect(manifest.scripts['build:frontend']).toBe('vite build --config src/frontend/vite.config.ts');
+        expect(fs.existsSync(path.join(PACKAGE_ROOT, 'src/frontend'))).toBe(false);
     });
 
     it('keeps the one TypeScript config no-emit', () => {
@@ -1120,26 +1025,15 @@ describe('retired build layer', () => {
         expect(PERMITTED_BUILD_ARTIFACT).toBe('src/server/workers/worker-boot.mjs');
         expect(packed).toContain(PERMITTED_BUILD_ARTIFACT);
 
-        // Exact non-`.ts` inventory: the bootstrap plus the deployable UI assets and the
-        // OpenAPI document. `src/frontend/dist/**` (the `build:frontend` output) is
-        // excluded from `files` by name, so it can never masquerade as published source.
+        // Exact non-`.ts` inventory: the worker bootstrap plus the OpenAPI
+        // document. The UI assets moved to `@loadscript/harness`.
         expect(packed.filter((file: string) => !file.endsWith('.ts'))).toEqual([
-            'src/frontend/index.html',
-            'src/frontend/styles.css',
-            'src/frontend/ui/agent-dialog.css',
-            'src/frontend/ui/dialog.css',
             'src/server/harness.swagger.yaml',
             'src/server/workers/worker-boot.mjs'
         ]);
 
-        // Hand-written AMBIENT declarations, not emit: a consumer needs them to
-        // type-check the published source (`import.meta.env`, and the
-        // highlight.js/lib/core subpath its own `exports` map leaves untyped). An
-        // emitted twin (`foo.d.ts` beside `foo.ts`) is what the checkers reject, and
-        // this exact list is the pin that no declaration emit lands in `src/`.
-        expect(packed.filter((file: string) => file.endsWith('.d.ts'))).toEqual([
-            'src/frontend/ui/highlight-core.d.ts',
-            'src/frontend/vite-env.d.ts'
-        ]);
+        // No hand-written ambient declarations remain in this package (the two
+        // that existed belonged to the moved client).
+        expect(packed.filter((file: string) => file.endsWith('.d.ts'))).toEqual([]);
     });
 });

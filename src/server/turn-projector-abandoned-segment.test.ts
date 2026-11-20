@@ -59,8 +59,8 @@
 // Run: yarn vitest run src/server/turn-projector-abandoned-segment.test.ts   (cwd packages/underload/harness)
 
 import { describe, expect, it } from 'vitest';
-import { elapsedBetween, formatDuration } from '../frontend/ui/time';
-import { contextBarOf, contextBlockDurationOf, contextSegmentTitleOf } from '../frontend/view-context';
+import { elapsedBetween, formatDuration } from '@loadscript/harness/frontend/ui/time';
+import { contextBarOf, contextBlockDurationOf, contextSegmentTitleOf } from '@loadscript/harness/frontend/view-context';
 import type { HarnessEvent } from '../harness';
 import type {
     ContextBlock,
