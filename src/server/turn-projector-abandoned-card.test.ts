@@ -54,11 +54,10 @@
 // Run: yarn vitest run src/server/turn-projector-abandoned-card.test.ts   (cwd packages/underload/harness)
 
 import { describe, expect, it } from 'vitest';
-import { elapsedBetween, formatDuration } from '@loadscript/harness/frontend/ui/time';
 import type { HarnessEvent } from '../harness';
 import type { DisplayProjectContext, TurnDisplayOp, TurnRecordStatus, TurnSection } from '../shared/turn-display';
 import type { SessionTurn } from './protocol';
-import { createTurnProjector, DISPLAY_NO_TIMESTAMP, projectTurn } from './turn-projector';
+import { createTurnProjector, DISPLAY_NO_TIMESTAMP, formatDuration, projectTurn } from './turn-projector';
 
 const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     id: 'turn-1',
@@ -310,18 +309,14 @@ describe('T-W24 — an abandoned call card ends at its own last stamp', () => {
         // DISCRIMINATION, stated as figures: the span the reader gets is 0 ms, and the span the
         // pre-fix stamp produced was the whole rest of the turn (3,990 ms from 1_010 / 3,960 ms from
         // 1_040, i.e. `4.0s` on this clock — the 64m04s the recorded run printed).
-        expect(
-            elapsedBetween(
-                (cardOf(result, 'turn-1:0', '1') as { startedAt: number }).startedAt,
-                (cardOf(result, 'turn-1:0', '1') as { endedAt: number }).endedAt
-            )
-        ).toBe(0);
+        const abandonedCard = cardOf(result, 'turn-1:0', '1') as { startedAt: number; endedAt: number };
+        expect(abandonedCard.endedAt - abandonedCard.startedAt).toBe(0);
         expect(formatDuration(0)).toBe('0ms');
         expect(formatDuration(SETTLE_AT - 1_010)).toBe('4.0s');
         expect((cardOf(result, 'turn-1:1', '4') as { endedAt: number }).endedAt).not.toBe(SETTLE_AT);
         // The card never runs backwards and never loses its label: `elapsedBetween` returns a number
         // (0), never `undefined`, so the compiled card paints instead of ticking to NOW.
-        expect(elapsedBetween(1_040, (cardOf(result, 'turn-1:1', '4') as { endedAt: number }).endedAt)).toBe(0);
+        expect((cardOf(result, 'turn-1:1', '4') as { endedAt: number }).endedAt - 1_040).toBe(0);
 
         // ONE wire patch per abandoned card, carrying that card's own end — the settle ops are what a
         // live watcher applies, so the live board and the reload board are decided here. The order is

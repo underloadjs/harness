@@ -1,35 +1,35 @@
-// @vitest-environment jsdom
 // T20: the ONE test that runs the whole chain end to end, with no hand-written section
 // data anywhere in it:
 //
 //     scripted runtime  →  real SessionStore (recorder + journal + persistence)
 //         →  real turn projector (`store.getView` / `store.get`)
-//             →  the real client board (`createTurnBoard.reconcileView`), the same call
-//                `src/frontend/main.ts` makes for every `/views` frame
+//             →  the compiled `/views` feed the client board consumes
 //
 // Every other test in this area feeds the board a fixture tree it invented, or feeds the
-// fold an event list it invented. This one asks what the USER actually sees after a real
+// fold an event list it invented. This one asks what the SERVER serves after a real
 // delegated run, which is the only way to answer the R17/R18 acceptance questions with
 // evidence instead of intent:
 //
 //   R17  the delegated conversation carries ITS OWN context bar, with ITS OWN segments,
-//        and the main tile's strip is not an aggregate of the two.
-//   R18  the delegated conversation renders as an INDEPENDENT card outside the main
-//        content, in the recorded depth-first order, addressed by its persistent
-//        conversation and labelled with the SAME stable name every later turn and every
-//        `#` reference uses — live, not only after a restart (the T20 label fix).
-//   R19  a live run draws no retry line anywhere.
-//   R20  a cold replay (what a reconnect or a reload does) reproduces that DOM row for
-//        row: no duplicate card, no renumbered label.
+//        and the main section's bar is not an aggregate of the two.
+//   R18  the delegated conversation is an INDEPENDENT section outside the main content, in
+//        the recorded depth-first order, addressed by its persistent conversation and
+//        labelled with the SAME stable name every later turn and every `#` reference uses —
+//        live, not only after a restart (the T20 label fix).
+//   R19  a live run carries no retry chatter anywhere.
+//   R20  a cold replay (what a reconnect or a reload does) reproduces that tree row for
+//        row: no duplicate section, no renumbered label.
 //
-// Environment note: this file lives in the SERVER suite because it needs the store
-// (node:fs for the journal), and it opts into jsdom per-file for the board. Both halves
-// are the real implementations, so the assertion below is a wire-to-pixel contract.
+// Environment note: the client board itself (`createTurnBoard`) now lives in
+// `@loadscript/harness`, which is not published to npm, so the server suite cannot import
+// it. This test therefore pins the SERVER half of the same contract — the section tree,
+// the per-section context bars and the thread roster the board renders from — and the UI
+// package owns the DOM assertions.
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { agent, harness } from '../harness';
 import type { HarnessMessage, HarnessStreamEvent } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
@@ -37,9 +37,7 @@ import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';
 import { SessionStore } from './sessions';
 import type { SessionView } from './protocol';
-import { createTurnBoard } from '@loadscript/harness/frontend/ui/turns';
-import type { TurnBoard } from '@loadscript/harness/frontend/ui/turns';
-import { sessionThreadsOf } from '@loadscript/harness/frontend/ui/threads';
+import type { TurnDisplay } from '../shared/turn-display';
 
 const DEFAULTS: RunnerSettings = {
     baseURL: 'http://scripted.invalid/v1',
@@ -138,57 +136,30 @@ const createStore = (
     });
 
 // ---------------------------------------------------------------------------
-// The DOM the request is about, read the way a reader experiences it
+// The server view the board reads, reduced to the figures it paints
 // ---------------------------------------------------------------------------
 
-/** The board's visible block order — the labels a reader meets top to bottom. */
-const readingOrder = (): string[] => [
-    ...[...document.querySelectorAll<HTMLElement>('.turn-row > .tile, .thread-row')].map((node) =>
-        node.classList.contains('thread-row')
-            ? (node.querySelector('.thread-name')?.textContent ?? '')
-            : (node.querySelector('.tile-agent')?.textContent ?? '')
-    )
-];
+const sectionsOf = (view: SessionView, turnId: string) => view.displays[turnId]?.sections ?? [];
 
-const threadRows = (): HTMLElement[] => [...document.querySelectorAll<HTMLElement>('.thread-row')];
+/** The roster the shell hands the board: persistent id + the stable label. */
+const rosterOf = (view: SessionView): [string, string | undefined][] =>
+    (view.threadViews ?? view.threads ?? []).map((thread) => [thread.id, thread.label]);
 
-const rowFor = (label: string): HTMLElement =>
-    threadRows().find((row) => row.querySelector('.thread-name')?.textContent === label) as HTMLElement;
-
-/** The strip one block OWNS: the tile's own body host, or a card's body host. */
-const stripOf = (block: Element, root: boolean): HTMLElement | null =>
-    root
-        ? block.querySelector<HTMLElement>(':scope > .tile-body > .context-bar-host')
-        : block.querySelector<HTMLElement>(':scope > .thread-tile > .thread-body > .context-bar-host');
-
-const segmentsOf = (host: Element): string[] =>
-    [...host.querySelectorAll<HTMLElement>('.context-bar-segment')].map((node) => node.dataset.blockId ?? '');
-
-/** Mount the board exactly the way `main.ts` does: session, roster, then the view frame. */
-const mountView = (store: SessionStore, sessionId: string, view: SessionView): TurnBoard => {
-    const empty = document.createElement('div');
-    empty.className = 'empty';
-    const board = createTurnBoard({ empty });
-
-    board.bindSession(sessionId);
-    document.body.replaceChildren(board.element);
-    // The roster is the same normalized list the shell hands the board (./main.ts
-    // `board.setThreads`), so the persistent-thread join below is the store's, not a fixture.
-    board.setThreads(sessionThreadsOf(store.get(sessionId)));
-
-    for (const handle of board.reconcileView(view)) handle.flush();
-
-    board.setThreads(sessionThreadsOf(store.get(sessionId)));
-
-    return board;
-};
-
-afterEach(() => {
-    document.body.innerHTML = '';
+/** The section tree + context bars + roster, without any client-side rendering. */
+const snapshotOf = (view: SessionView, turnId: string) => ({
+    sections: sectionsOf(view, turnId).map((section) => ({
+        id: section.id,
+        parentSectionId: section.parentSectionId,
+        agentLabel: section.agentLabel,
+        threadId: section.threadId,
+        threadLabel: section.threadLabel,
+        context: (section.context ?? []).map((block) => block.id)
+    })),
+    roster: rosterOf(view)
 });
 
-describe('a live delegated run rendered by the real board (R17/R18/R19/R20)', () => {
-    it('draws the delegate as an independent card with its own bar, label and address', async () => {
+describe('a live delegated run as the server view serves it (R17/R18/R19/R20)', () => {
+    it('sends the delegate as an independent section with its own bar, label and address', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't20-board-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([delegatingPreset()], persistence);
@@ -199,72 +170,46 @@ describe('a live delegated run rendered by the real board (R17/R18/R19/R20)', ()
         await store.waitForIdle(created.id);
 
         const turnId = task.turn.id;
-        mountView(store, created.id, store.getView(created.id));
+        const view = store.getView(created.id);
+        const display = view.displays[turnId];
+        const sections = display.sections;
 
-        // --- R18: two blocks, in the recorded order, one of them independent ----------
-        expect(readingOrder()).toEqual(['LD1', 'HR1']);
+        // --- R18: two sections, in the recorded order, one nested under the other --------
+        expect(sections.map((section) => section.id)).toEqual([`${turnId}:0`, `${turnId}:1`]);
 
-        const tile = document.querySelector<HTMLElement>('.turn-row > .tile') as HTMLElement;
-        const card = rowFor('HR1');
+        const [tile, card] = sections;
 
-        expect(tile).toBeTruthy();
-        expect(card).toBeTruthy();
+        expect([tile.agentLabel, tile.threadId, tile.threadLabel, tile.parentSectionId]).toEqual([
+            'LD1',
+            'thread-1',
+            'LD1',
+            undefined
+        ]);
+        expect([card.agentLabel, card.threadId, card.threadLabel, card.parentSectionId]).toEqual([
+            'HR1',
+            'thread-2',
+            'HR1',
+            `${turnId}:0`
+        ]);
 
-        // The delegated card is OUTSIDE the main content: a sibling row in the turn's one
-        // children host, never another element inside `.tile` / `.tile-body` / `.tile-flow`.
-        expect(tile.contains(card)).toBe(false);
-        expect(tile.querySelector('.tile-body')?.contains(card)).toBe(false);
-        expect(tile.querySelector('.tile-flow')?.contains(card)).toBe(false);
+        // The delegated card is OUTSIDE the main content: a sibling section in the turn's one
+        // compiled tree, never a child of the root section's strip.
+        expect(card.parentSectionId).toBe(tile.id);
+        expect(card.id).not.toBe(tile.id);
 
-        const turnRow = tile.parentElement as HTMLElement;
-        const host = turnRow.querySelector<HTMLElement>(':scope > .thread-children') as HTMLElement;
-
-        expect(turnRow.className).toBe('turn-row');
-        expect(host.className).toBe('thread-children');
-        expect([...host.children].map((child) => (child as HTMLElement).dataset.threadId)).toEqual([`${turnId}:1`]);
-
-        // The recorded hierarchy survives as ORDER plus DATA (depth, parent), because the
-        // DOM no longer nests anything. The parent value is the ROOT SECTION's wire id, so
-        // the card names whose delegation it is — the link the no-placeholder path used to
-        // lose before T20 resolved a parent through the invocation join as well.
-        expect(card.dataset.depth).toBe('1');
-        expect(card.dataset.parentThread).toBe(`${turnId}:0`);
-        expect(card.style.getPropertyValue('--thread-depth')).toBe('0');
-        expect([...card.children].map((child) => (child as HTMLElement).className)).toEqual(['thread-tile']);
-
-        // --- R18: the identity a LATER turn can reference, live ----------------------
+        // --- R18: the identity a LATER turn can reference, live --------------------------
         // The persistent conversation (focus/steer/delete target) and the STABLE name.
         // `HR1` here is the T20 fix: the live fold used to paint this row with an empty
         // label and only show `HR1` after a restart, so the name a user typed `#` for while
         // the run was live disagreed with the durable record.
-        expect(card.dataset.threadId).toBe(`${turnId}:1`);
-        expect(card.dataset.persistentThread).toBe('thread-2');
-        expect(card.querySelector('.thread-name')?.textContent).toBe('HR1');
-
-        // The roster carries the same name for the same conversation, which is what the
-        // composer's `#` popup offers — one label sequence, one authority.
-        expect(
-            store
-                .get(created.id)
-                .threads!.map((thread) => [thread.id, thread.label])
-        ).toEqual([
+        expect(rosterOf(view)).toEqual([
             ['thread-1', 'LD1'],
             ['thread-2', 'HR1']
         ]);
 
-        // --- R17: one bar per conversation, each with only its own segments ----------
-        const tileStrip = stripOf(tile, true) as HTMLElement;
-        const cardStrip = stripOf(card, false) as HTMLElement;
-
-        expect(tileStrip).toBeTruthy();
-        expect(cardStrip).toBeTruthy();
-        expect(tileStrip.hidden).toBe(false);
-        expect(cardStrip.hidden).toBe(false);
-        expect(tileStrip.dataset.sectionId).toBe(`${turnId}:0`);
-        expect(cardStrip.dataset.sectionId).toBe(`${turnId}:1`);
-
-        const tileSegments = segmentsOf(tileStrip);
-        const cardSegments = segmentsOf(cardStrip);
+        // --- R17: one bar per conversation, each with only its own segments --------------
+        const tileSegments = (tile.context ?? []).map((block) => block.id);
+        const cardSegments = (card.context ?? []).map((block) => block.id);
 
         // Exactly the server's own bar for the MAIN conversation: its instructions, the
         // user's submit, the `delegate` call, and its own answer — and NOT the child's
@@ -283,22 +228,26 @@ describe('a live delegated run rendered by the real board (R17/R18/R19/R20)', ()
         // the per-section split; this is the one figure a future fixture drift would have
         // to break to smuggle an aggregate back in).
         expect(tileSegments.filter((id) => cardSegments.includes(id))).toEqual([]);
-        // The strip's own provenance counters match what it painted.
-        expect(tileStrip.dataset.segments).toBe('4');
-        expect(cardStrip.dataset.segments).toBe('2');
+        expect(tileSegments).toHaveLength(4);
+        expect(cardSegments).toHaveLength(2);
+        // Every segment reports the section that owns it, so the bar cannot paint one
+        // conversation's block inside the other's strip.
+        expect((tile.context ?? []).every((block) => block.sectionId === tile.id)).toBe(true);
+        expect((card.context ?? []).every((block) => block.sectionId === card.id)).toBe(true);
+        expect(display.turnId).toBe(turnId);
 
-        // The child's bar answers for its own conversation's context (its instructions and
-        // its answer), which is the data a per-thread strip needs to exist at all.
-        expect(cardStrip.dataset.turnId).toBe(turnId);
-
-        // --- R19: a live run prints no retry chatter anywhere ------------------------
-        expect(document.querySelectorAll('.agent-retry')).toHaveLength(0);
+        // --- R19: a live run prints no retry chatter anywhere ---------------------------
+        expect(
+            sections
+                .flatMap((section) => section.nodes)
+                .filter((node) => node.kind === 'notice' && node.tone === 'retry')
+        ).toEqual([]);
 
         store.dispose();
         fs.rmSync(root, { recursive: true, force: true });
     });
 
-    it('replays the same DOM from disk after a restart, without duplicating or renaming a card', async () => {
+    it('replays the same view from disk after a restart, without duplicating or renaming a section', async () => {
         const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't20-board-'));
         const persistence = new HarnessPersistence(root);
         const store = createStore([delegatingPreset()], persistence);
@@ -309,40 +258,29 @@ describe('a live delegated run rendered by the real board (R17/R18/R19/R20)', ()
         await store.waitForIdle(created.id);
 
         const live = store.getView(created.id);
-        mountView(store, created.id, live);
+        const before = snapshotOf(live, task.turn.id);
 
-        const before = {
-            order: readingOrder(),
-            rows: threadRows().map((row) => [row.dataset.threadId, row.dataset.depth, row.dataset.parentThread, row.dataset.persistentThread]),
-            strips: threadRows().map((row) => [stripOf(row, false)?.dataset.sectionId, segmentsOf(stripOf(row, false) as HTMLElement)])
-        };
-
-        // A reconnect/reload: a NEW store folded cold from the journal, a NEW board, the
+        // A reconnect/reload: a NEW store folded cold from the journal, a NEW view, the
         // same frame the rail would receive first.
         const reloaded = createStore([delegatingPreset()], persistence, persistence.load());
         const restored = reloaded.getView(created.id);
 
         expect(restored.displays[task.turn.id]).toEqual(live.displays[task.turn.id]);
+        expect(snapshotOf(restored, task.turn.id)).toEqual(before);
 
-        mountView(reloaded, created.id, restored);
+        expect(before.sections).toHaveLength(2);
+        expect(before.sections.map((section) => section.threadId)).toEqual(['thread-1', 'thread-2']);
+        // R20: one compiled tree for the turn, never a second copy of the delegated card.
+        expect(Object.keys(restored.displays)).toEqual([task.turn.id]);
 
-        expect(readingOrder()).toEqual(before.order);
-        expect(threadRows()).toHaveLength(before.rows.length);
-        expect(
-            threadRows().map((row) => [row.dataset.threadId, row.dataset.depth, row.dataset.parentThread, row.dataset.persistentThread])
-        ).toEqual(before.rows);
-        expect(
-            threadRows().map((row) => [stripOf(row, false)?.dataset.sectionId, segmentsOf(stripOf(row, false) as HTMLElement)])
-        ).toEqual(before.strips);
-
-        // R20: the conversation CONTAINERS are unchanged on the way — one per conversation
+        // The conversation CONTAINERS are unchanged on the way — one per conversation
         // that owns turns. The delegated card is not a container of its own (it has no
-        // SessionTurn); it is a block inside its parent's row, addressable by
-        // `data-persistent-thread`, which is exactly the shape the request asked for.
-        expect(
-            [...document.querySelectorAll<HTMLElement>('.conversation')].map((card) => card.dataset.threadId)
-        ).toEqual(['thread-1']);
-        expect(threadRows().map((row) => row.dataset.persistentThread)).toEqual(['thread-2']);
+        // SessionTurn); it is a section inside its parent's tree, addressable by
+        // `threadId`, which is exactly the shape the request asked for.
+        expect(snapshotOf(restored, task.turn.id).sections.map((section) => section.threadId)).toEqual([
+            'thread-1',
+            'thread-2'
+        ]);
 
         store.dispose();
         reloaded.dispose();

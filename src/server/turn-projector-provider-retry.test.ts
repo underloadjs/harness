@@ -14,7 +14,8 @@
 //        `.agent-notice[data-tone=error][data-provider=<class>]` with `<class>` as the
 //        label span, and it recovers that class from the node TEXT via `providerFailureOf`
 //        (../frontend/provider-diagnostics.ts:222-238). The class is therefore asserted
-//        against the real frontend function, not against a paraphrase.
+//        with a local mirror of that message fallback (the UI package is not published,
+//        so the server suite cannot import it).
 //   AC2  an UNCLASSIFIED retry (`provider` absent) projects the byte-identical node
 //        sequence it had before this handler existed — asserted against the pre-change op
 //        arrays copied from the T16/R16a block in ./turn-projector.test.ts:767-776.
@@ -37,12 +38,17 @@
 import { describe, expect, it } from 'vitest';
 import type { HarnessEvent } from '../harness';
 import type { DisplayNoticeNode, DisplayProjectContext } from '../shared/turn-display';
-// The fixed consumer contract: the frontend's own classifier, which is what decides the
-// `data-provider` attribute and the label span of a compiled notice. DOM-free, so it runs
-// under this config's `node` environment.
-import { providerFailureOf } from '@loadscript/harness/frontend/provider-diagnostics';
 import type { SessionTurn } from './protocol';
 import { createTurnProjector, projectTurn, refoldTurn, providerRetryNoticeText } from './turn-projector';
+
+// Local mirror of the frontend's `providerFailureOf` message fallback (the class is read from
+// the notice text). The UI package is not published, so the server suite cannot import it; the
+// server sentence is what this suite pins, and the UI package owns its classifier tests.
+const providerLabelOf = (message: string): string | undefined => {
+    if (message.includes('provider-timeout')) return 'provider-timeout';
+    if (message.includes('provider-connection')) return 'provider-connection';
+    return undefined;
+};
 
 const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     id: 'turn-1',
@@ -206,20 +212,20 @@ describe('a provider-classified retry mints a compiled notice (T13, AC1)', () =>
 
         // The class is what the frontend recovers FROM THE TEXT (../frontend/ui/turns.ts:7858
         // calls `providerFailureOf({ message: node.text })`), and its `label` becomes both
-        // `data-provider` and the `.agent-notice-label` span. Asserted against the real
-        // function, so the server sentence and the frontend classifier cannot drift.
-        expect(providerFailureOf({ message: notice.text })?.label).toBe('provider-connection');
+        // `data-provider` and the `.agent-notice-label` span. Asserted with the local mirror,
+        // so the server sentence still carries the token that classifier keys on.
+        expect(providerLabelOf(notice.text)).toBe('provider-connection');
 
         // A provider-classified timeout is labelled with ITS class — the sentence names it.
         const timedOut = fold(providerLadder().slice(0, 5));
         const timeoutNotice = noticesOf(timedOut.display())[1];
 
         expect(timeoutNotice.text).toBe(TIMEOUT_LINE);
-        expect(providerFailureOf({ message: timeoutNotice.text })?.label).toBe('provider-timeout');
+        expect(providerLabelOf(timeoutNotice.text)).toBe('provider-timeout');
 
         // And the class token is load-bearing, not decoration: strip it and the same
         // sentence is no longer a provider line, which is why the server states it.
-        expect(providerFailureOf({ message: 'attempt 6 of 11 failed \u00b7 retrying in 32.0s \u00b7 ECONNREFUSED' })).toBeUndefined();
+        expect(providerLabelOf('attempt 6 of 11 failed \u00b7 retrying in 32.0s \u00b7 ECONNREFUSED')).toBeUndefined();
     });
 
     it('keeps the turn running: no error state and no turn-level error detail', () => {

@@ -16,7 +16,6 @@
 //   - ./api-views.test.ts         — the wire privacy rules on top of it
 
 import { describe, expect, it } from 'vitest';
-import { elapsedBetween } from '@loadscript/harness/frontend/ui/time';
 import type { HarnessEvent } from '../harness';
 import { DISPLAY_ARGS_PREVIEW_CHARS, DISPLAY_PANELS_PER_STEP, DISPLAY_PREVIEW_CHARS } from '../shared/turn-display';
 import type {
@@ -504,7 +503,7 @@ describe('section timing (R9)', () => {
         expect([sections[1].startedAt, sections[1].endedAt]).toEqual([1_020, 1_030]);
         expect(sections[1].state).toBe('cancelled');
         // The label the reader now gets: 10 ms of real run, not the 4.0s the pre-fix span printed.
-        expect(elapsedBetween(sections[1].startedAt, sections[1].endedAt)).toBe(10);
+        expect((sections[1].endedAt ?? 0) - (sections[1].startedAt ?? 0)).toBe(10);
         expect(formatDuration(1_030 - 1_020)).toBe('10ms');
         expect(formatDuration(5_000 - 1_020)).toBe('4.0s');
 

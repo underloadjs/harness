@@ -56,10 +56,9 @@
 // Run: yarn vitest run src/server/turn-projector-settle-interrupted.test.ts  (cwd packages/underload/harness)
 
 import { describe, expect, it } from 'vitest';
-import { formatDuration, elapsedBetween } from '@loadscript/harness/frontend/ui/time';
 import type { HarnessEvent } from '../harness';
 import type { DisplayProjectContext, TurnDisplayOp, TurnRecordStatus, TurnSection } from '../shared/turn-display';
-import { createTurnProjector, projectTurn } from './turn-projector';
+import { createTurnProjector, formatDuration, projectTurn } from './turn-projector';
 import type { SessionTurn } from './protocol';
 
 // `entry` is routing only (which flow is the turn's ROOT one); the rank every row reports comes
@@ -287,7 +286,7 @@ describe('T-W23 — a force-closed section reports its own last activity, and th
         expect(killed.endedAt).toBe(1_040);
         // The exact figure the row prints through ../frontend/ui/time.ts, and the figure it printed
         // before (a 3,980 ms span the run never lived).
-        expect(formatDuration(elapsedBetween(killed.startedAt, killed.endedAt) ?? -1)).toBe('20ms');
+        expect(formatDuration((killed.endedAt ?? 0) - (killed.startedAt ?? 0))).toBe('20ms');
         expect(formatDuration(SETTLE_AT - (killed.startedAt ?? 0))).toBe('4.0s');
         // STATE = cut off, not success.
         expect(killed.state).toBe('cancelled');
@@ -331,7 +330,7 @@ describe('T-W23 — a force-closed section reports its own last activity, and th
         expect(answered.state).toBe('done');
         expect(answered.startedAt).toBe(1_060);
         expect(answered.endedAt).toBe(1_080);
-        expect(formatDuration(elapsedBetween(answered.startedAt, answered.endedAt) ?? -1)).toBe('20ms');
+        expect(formatDuration((answered.endedAt ?? 0) - (answered.startedAt ?? 0))).toBe('20ms');
         expect(faceOf(answered)).toEqual(FACE_BEFORE['turn-1:2']);
 
         // A row that FAILED with its own `error` frame is equally untouched: the failure stamped
@@ -461,7 +460,7 @@ describe('T-W23 — a force-closed section reports its own last activity, and th
 
         expect(killed.startedAt).toBe(1_040);
         expect(killed.endedAt).toBe(1_040);
-        expect(formatDuration(elapsedBetween(killed.startedAt, killed.endedAt) ?? -1)).toBe('0ms');
+        expect(formatDuration((killed.endedAt ?? 0) - (killed.startedAt ?? 0))).toBe('0ms');
         expect(killed.state).toBe('cancelled');
     });
 
