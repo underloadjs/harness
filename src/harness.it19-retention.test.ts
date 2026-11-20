@@ -1516,7 +1516,7 @@ const createStore = (presets: HarnessPreset[], persistence?: HarnessPersistence)
 
 // Repo-root `Temp/` (root AGENTS.md): a crashed run leaves an inspectable document instead of a
 // directory in the OS temp nobody can find. Same resolution ./server/thread-stop-reference.test.ts:220 uses.
-const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
+const PACKAGE_ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TEMP_ROOT = path.join(path.resolve(PACKAGE_ROOT, '../../..'), 'Temp');
 const roots: string[] = [];
 

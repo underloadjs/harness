@@ -297,6 +297,19 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 // Entry copies and projections
 // ---------------------------------------------------------------------------
 //
+// A declared field key is DATA, so it must become an OWN property even when the key
+// is `__proto__` (a plain assignment would hit the inherited setter and vanish). One
+// helper for every object the engine builds keyed by a field name: patches, additions,
+// projections and restored entries.
+const setOwn = (target: Record<string, unknown>, key: string, value: unknown): void => {
+    Object.defineProperty(target, key, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true
+    });
+};
+
 // Copy on the way out, ALWAYS. A caller or a model-visible result must never hold a
 // reference into the live store, or `result.entries[0].completed = true` in a UI
 // would mutate session state behind the tool's back. A `strings` field is copied too.
@@ -326,7 +339,7 @@ const copyEntry = (
         // body", which is a different fact from "this page does not show bodies".
         if (value === undefined) continue;
 
-        copy[field.key] = Array.isArray(value) ? [...(value as unknown[])] : value;
+        setOwn(copy, field.key, Array.isArray(value) ? [...(value as unknown[])] : value);
     }
 
     copy.rev = entry.rev;
@@ -371,9 +384,11 @@ const countsOf = (
 
         if (count === true) {
             // An enum: one count per declared value, in the declared order, so a
-            // caller can compare count objects without sorting keys.
+            // caller can compare count objects without sorting keys. `total` is the
+            // record count and is never a facet, even when a value is named "total".
             for (const value of field.values ?? []) {
-                counts[value] = items.filter((item) => item[field.key] === value).length;
+                if (value === 'total') continue;
+                setOwn(counts, value, items.filter((item) => item[field.key] === value).length);
             }
 
             continue;
@@ -381,9 +396,11 @@ const countsOf = (
 
         const matching = items.filter((item) => item[field.key] === true).length;
 
-        counts[count.key] = matching;
+        if (count.key !== 'total') setOwn(counts, count.key, matching);
 
-        if (count.complement !== undefined) counts[count.complement] = items.length - matching;
+        if (count.complement !== undefined && count.complement !== 'total') {
+            setOwn(counts, count.complement, items.length - matching);
+        }
     }
 
     return counts;
@@ -1667,7 +1684,7 @@ const readEntryInput = (
             );
         }
 
-        patch[key] = normalizeFieldValue(label, spec, value[key]);
+        setOwn(patch, key, normalizeFieldValue(label, spec, value[key]));
     }
 
     if (id === undefined) {
@@ -2204,7 +2221,7 @@ const readStoredEntry = (
     const ordered: Record<string, unknown> = { id: entry.id };
 
     for (const field of definition.fields) {
-        if (entry[field.key] !== undefined) ordered[field.key] = entry[field.key];
+        if (entry[field.key] !== undefined) setOwn(ordered, field.key, entry[field.key]);
     }
 
     ordered.rev = entry.rev;
@@ -2609,7 +2626,10 @@ export const createRecordEngine = (): RecordEngine => {
             collectionsRev,
             affectedCollections,
             // Detached, so a listener that keeps or mutates the list cannot disturb the feed.
-            changes: changes.map((change) => ({ ...change })),
+            changes: changes.map((change) => ({
+                ...change,
+                ...(change.fields === undefined ? {} : { fields: [...change.fields] })
+            })),
             reason
         };
 
@@ -3177,6 +3197,13 @@ export const createRecordEngine = (): RecordEngine => {
                 result.entries = readIds(state, plan.lookups);
             }
 
+            // An `ids` read names its records EXHAUSTIVELY; the collection page `project`
+            // measured (with its budget cut and its nextOffset) describes a different
+            // read and would tell the caller to keep paging records it already holds.
+            if (plan.lookups.length > 0) {
+                result.page = { offset: 0, limit, hasMore: false };
+            }
+
             return result;
         }
 
@@ -3272,7 +3299,7 @@ export const createRecordEngine = (): RecordEngine => {
             entry.rev += 1;
 
             for (const [key, value] of written) {
-                entry[key] = Array.isArray(value) ? [...value] : value;
+                setOwn(entry, key, Array.isArray(value) ? [...value] : value);
             }
 
             writeAttribution(entry);
@@ -3319,7 +3346,7 @@ export const createRecordEngine = (): RecordEngine => {
 
                 if (value === undefined) continue;
 
-                entry[spec.key] = Array.isArray(value) ? [...value] : value;
+                setOwn(entry, spec.key, Array.isArray(value) ? [...value] : value);
             }
 
             writeAttribution(entry);
@@ -4158,7 +4185,10 @@ export const createRecordEngine = (): RecordEngine => {
                 storeRev,
                 collectionsRev,
                 collections: listed,
-                changes: storeFeed.map((change) => ({ ...change }))
+                changes: storeFeed.map((change) => ({
+                    ...change,
+                    ...(change.fields === undefined ? {} : { fields: [...change.fields] })
+                }))
             };
         },
 
@@ -4177,7 +4207,12 @@ export const createRecordEngine = (): RecordEngine => {
         // widens its own return type with `RecordStoreWindow` so the field is REQUIRED on
         // what `changesSince()` hands back, never an optional a caller has to re-narrow.
         changesSince: (since: number): RecordStoreDelta & RecordStoreWindow => {
-            const changes = storeFeed.filter((change) => change.seq > since).map((change) => ({ ...change }));
+            const changes = storeFeed
+                .filter((change) => change.seq > since)
+                .map((change) => ({
+                    ...change,
+                    ...(change.fields === undefined ? {} : { fields: [...change.fields] })
+                }));
 
             // THE RESET RULE, in the three cases that exist:
             //   - `since > storeRev`: the store rewound under this watermark (a `reset()`
@@ -4234,7 +4269,7 @@ export const createRecordEngine = (): RecordEngine => {
 
             for (const [name, state] of collections) {
                 section[name] = {
-                    definition: state.definition,
+                    definition: cloneDefinition(state.definition),
                     items: state.items.map((item) =>
                         // A snapshot carries EVERY declared field, `getOnly` included: a
                         // resumed session must not lose chapter bodies.

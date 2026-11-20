@@ -25,7 +25,7 @@ const add = async (engine: Eng, collection: string, entries: unknown[]) =>
     run(engine, 'records', { collection, entries, limit: 1 });
 
 const define = async (engine: Eng, definition: Record<string, unknown>) =>
-    run(engine, 'records', { define });
+    run(engine, 'records', { define: definition });
 
 describe('stress: define / dispatch short-circuits', () => {
     it('D3: `define` beside a write silently DISCARDS the write', async () => {
@@ -284,17 +284,18 @@ describe('stress: field-key shape', () => {
             ]
         });
 
-        // A required field the add never supplied, yet the add succeeded.
-        const added = await add(engine, 'proto', [{ ok: 'yes' }]);
-        expect(added.entry.__proto__).toBeDefined();
+        // A computed key is required here: `{ __proto__: 'value' }` in an object
+        // literal sets no own property, so it could never exercise the engine.
+        const added = await add(engine, 'proto', [{ ok: 'yes', ['__proto__']: 'first' }]);
+        expect(added.entry['__proto__']).toBe('first');
 
         const patched = await run(engine, 'records', {
             collection: 'proto',
-            entries: [{ id: added.entry.id, ok: 'y2', __proto__: 'set' }],
+            entries: [{ id: added.entry.id, ok: 'y2', ['__proto__']: 'set' }],
             expects: [{ id: added.entry.id, rev: 1 }],
             limit: 1
         });
-        expect(patched.entry.__proto__).toBe('set');
+        expect(patched.entry['__proto__']).toBe('set');
     });
 
     it('D53b: an enum facet value named `__proto__` silently vanishes from counts', async () => {
@@ -403,8 +404,18 @@ describe('stress: change feed floor', () => {
     it('D-: a trimmed window reports the floor and a stale since is refused', async () => {
         const engine = createRecordEngine();
 
-        for (let index = 0; index < 250; index += 1) {
-            await run(engine, 'tasks', { tasks: [{ text: `task ${index}` }] });
+        // 250 events without exceeding the 200-record cap: 200 adds, then 50 updates.
+        const created = await run(engine, 'tasks', {
+            tasks: Array.from({ length: 200 }, (_, index) => ({ text: `task ${index}` }))
+        });
+        const ids = created.addedIds as string[];
+
+        for (let index = 0; index < 50; index += 1) {
+            await run(engine, 'tasks', {
+                tasks: [{ id: ids[index], completed: true }],
+                expects: [{ id: ids[index], rev: 1 }],
+                limit: 1
+            });
         }
 
         const read = await run(engine, 'tasks', { limit: 1 });
