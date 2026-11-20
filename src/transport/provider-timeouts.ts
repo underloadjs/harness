@@ -136,7 +136,7 @@ export type ProviderTimeoutPhase = 'response-head' | 'first-token' | 'stream-chu
 
 // A diagnosed connection failure: the errno when the platform named one, plus the
 // deepest useful message from the cause chain (`connect ECONNREFUSED
-// 127.0.0.1:6660`) so the frame quotes what the OS actually reported.
+// 127.0.0.1:8800`) so the frame quotes what the OS actually reported.
 export type ProviderConnectionFailure = {
     errno?: string;
     detail: string;
@@ -245,7 +245,7 @@ const fieldOf = (variable: string): string =>
 // but a baseURL that embedded a credential (or a token in `?key=`) must not have it
 // echoed back by an error that the UI renders. `host` keeps the port so the message
 // can name what was dialled; `port` is the EFFECTIVE port (an explicit port wins,
-// otherwise the scheme's default) because "which port is it using, 5500 or 6660?"
+// otherwise the scheme's default) because "which port is it using, 5500 or 8800?"
 // is exactly the question this failure answers.
 export const providerURLOf = (raw: string): { url: string; host: string; port?: number } => {
     try {
@@ -316,7 +316,7 @@ const ERRNO_IN_MESSAGE = /E(?:CONNREFUSED|NOTFOUND|AI_AGAIN|NETUNREACH|HOSTUNREA
 // Walk a fetch failure's cause graph and return the connection failure it describes,
 // or `undefined` for anything that is not one. `fetch` wraps the socket error, so the
 // useful half is usually TWO levels down (`TypeError: fetch failed` ->
-// `Error: connect ECONNREFUSED 127.0.0.1:6660`), and Happy Eyeballs stacks wrap the
+// `Error: connect ECONNREFUSED 127.0.0.1:8800`), and Happy Eyeballs stacks wrap the
 // real causes in an `AggregateError` under `errors`. Traversal is cycle-guarded and
 // depth-capped because a thrown value may be hostile, and classification must never
 // throw.
@@ -944,7 +944,7 @@ export const providerTimeoutMessage = (input: {
     );
 };
 
-// A connection frame. This is the answer to "is it using 5500 or 6660?": the message
+// A connection frame. This is the answer to "is it using 5500 or 8800?": the message
 // states the dialled host:port and the configured endpoint, quotes what the OS
 // reported, and says what to check. The historical frame hid all of that behind
 // "Request to <url> failed: fetch failed", because undici's real reason is on the

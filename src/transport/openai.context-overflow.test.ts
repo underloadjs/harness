@@ -3,7 +3,7 @@
 //
 // THE REPORTED DEFECT (2026-11-17). A run against the local gateway died with
 //   `ERROR provider-transit: attempt 1..11 of 11 failed · retrying in Xs · Upstream stream
-//    terminated · http://localhost:6660/providers/private/v1/chat/completions`
+//    terminated · http://localhost:8800/providers/private/v1/chat/completions`
 // — eleven attempts at the SAME bytes, ~3 minutes of backoff, and the compaction turn
 // failed the same way. Two facts made it unfixable at the time:
 //   1. the gateway commits `200 OK` + `text/event-stream` BEFORE it generates
@@ -50,8 +50,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { CONTEXT_OVERFLOW_CODE, agent, openAICompatible, providerWireFailureOf } from '@underload/harness';
 import type { AgentStreamEvent, HarnessStreamEvent } from '@underload/harness';
 
-const BASE_URL = 'http://localhost:6660/providers/private/v1';
-const CHAT_URL = 'http://localhost:6660/providers/private/v1/chat/completions';
+const BASE_URL = 'http://localhost:8800/providers/private/v1';
+const CHAT_URL = 'http://localhost:8800/providers/private/v1/chat/completions';
 
 const request = {
     model: 'local/basalt',
@@ -143,7 +143,7 @@ describe('in-stream context overflow (the reported failure)', () => {
         // matcher this frame was `provider-rejected` (also terminal, but with no
         // actionable name and nothing for compaction to switch on).
         const event = await transportFrame({
-            message: `upstream localhost:6660/v1/chat/completions returned HTTP 400 before the first chunk: ${PROVIDER_LINE}`,
+            message: `upstream localhost:8800/v1/chat/completions returned HTTP 400 before the first chunk: ${PROVIDER_LINE}`,
             type: 'stream_error',
             code: 'upstream_status',
             status: 400,
@@ -155,9 +155,9 @@ describe('in-stream context overflow (the reported failure)', () => {
             code: 'context-overflow',
             message: overflowWireMessage(
                 ' (HTTP 400)',
-                quotedProvider(`upstream localhost:6660/v1/chat/completions returned HTTP 400 before the first chunk: ${PROVIDER_LINE}`)
+                quotedProvider(`upstream localhost:8800/v1/chat/completions returned HTTP 400 before the first chunk: ${PROVIDER_LINE}`)
             ),
-            details: { errorClass: 'context-overflow', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'context-overflow', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -181,7 +181,7 @@ describe('in-stream context overflow (the reported failure)', () => {
                 ' (HTTP 413)',
                 quotedProvider('upstream /v1/chat/completions returned HTTP 413 before the first chunk')
             ),
-            details: { errorClass: 'context-overflow', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'context-overflow', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -195,7 +195,7 @@ describe('in-stream context overflow (the reported failure)', () => {
             type: 'error',
             code: 'context-overflow',
             message: overflowWireMessage('', quotedProvider(PROVIDER_LINE)),
-            details: { errorClass: 'context-overflow', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'context-overflow', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -224,7 +224,7 @@ describe('in-stream context overflow (the reported failure)', () => {
                 type: 'error',
                 code: 'context-overflow',
                 message: overflowWireMessage('', quotedProvider(wording)),
-                details: { errorClass: 'context-overflow', url: CHAT_URL, port: 6660 }
+                details: { errorClass: 'context-overflow', url: CHAT_URL, port: 8800 }
             });
         }
     });
@@ -276,7 +276,7 @@ describe('in-stream failures that are NOT context overflows', () => {
         expect(event).toEqual({
             type: 'error',
             message: GATEWAY_UNKNOWN_LINE,
-            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -300,7 +300,7 @@ describe('in-stream failures that are NOT context overflows', () => {
                 'The upstream refused this request itself, so re-sending the same bytes would be refused ' +
                 'again. The provider blamed `max_tokens`. The provider said: "Invalid value for max_tokens: ' +
                 'expected integer"',
-            details: { errorClass: 'provider-rejected', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'provider-rejected', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -320,7 +320,7 @@ describe('in-stream failures that are NOT context overflows', () => {
             expect(event).toEqual({
                 type: 'error',
                 message: `upstream returned HTTP ${status}: ${PROVIDER_LINE}`,
-                details: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+                details: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
             });
         }
     });
@@ -427,7 +427,7 @@ describe('the retry ladder an overflow is kept out of (core/agent.ts)', () => {
                 maxAttempts: 2,
                 delayMs: 1,
                 error: { message: GATEWAY_UNKNOWN_LINE },
-                provider: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+                provider: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
             },
             { type: 'error', error: { message: GATEWAY_UNKNOWN_LINE } }
         ]);

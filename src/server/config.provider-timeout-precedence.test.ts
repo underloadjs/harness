@@ -40,7 +40,7 @@ import { providerOf } from './harnesses/toolbox';
 import { mergeSettings, SettingsError } from './config';
 import type { RunnerSettings } from './harnesses/types';
 
-const BASE_URL = 'http://localhost:6660/providers/private/v1';
+const BASE_URL = 'http://localhost:8800/providers/private/v1';
 
 const SERVER_DEFAULTS: RunnerSettings = { baseURL: BASE_URL, apiKey: 'server-key', model: 'local/basalt' };
 

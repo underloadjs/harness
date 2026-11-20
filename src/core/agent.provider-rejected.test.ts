@@ -25,7 +25,7 @@ const rejected = (status: number, detail: string): HarnessStreamEvent => ({
     type: 'error',
     code: 'provider-rejected',
     message:
-        `provider-rejected: the provider answered http://localhost:6660/providers/private/v1/chat/completions ` +
+        `provider-rejected: the provider answered http://localhost:8800/providers/private/v1/chat/completions ` +
         `with HTTP ${status} and refused the request, so re-sending the same bytes would be refused again — ` +
         `this turn failed after one attempt instead of waiting out the retry ladder. The provider said: "${detail}"`
 });

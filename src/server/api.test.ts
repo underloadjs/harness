@@ -1190,7 +1190,7 @@ describe('service origin gate', () => {
 
         // Loopback is allowed by design (dev UI), even on another port; a LAN origin is not.
         const sameHostDifferentPort = await callHandler(runtime, 'GET', MOUNT, {
-            headers: { origin: 'http://127.0.0.1:6660', host: '127.0.0.1:5000' }
+            headers: { origin: 'http://127.0.0.1:8800', host: '127.0.0.1:5000' }
         });
         expect(sameHostDifferentPort.status).toBe(200);
 

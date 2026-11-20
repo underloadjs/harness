@@ -426,7 +426,7 @@ describe('agent', () => {
             agent({
                 name: 'writer',
                 model: 'm',
-                provider: { baseURL: 'http://localhost:6660/providers/private/v1' }
+                provider: { baseURL: 'http://localhost:8800/providers/private/v1' }
             })
         ).not.toThrow();
     });
@@ -1158,7 +1158,7 @@ describe('agent context window floor (issue 0004)', () => {
         const overflowByClass: HarnessStreamEvent = {
             type: 'error',
             message: 'the prompt is too large for this model',
-            details: { errorClass: CONTEXT_OVERFLOW_CODE, url: 'http://localhost:6660/v1/chat/completions' }
+            details: { errorClass: CONTEXT_OVERFLOW_CODE, url: 'http://localhost:8800/v1/chat/completions' }
         };
 
         const { stream, calls } = scriptedStream([[overflowByClass], OK_FRAMES]);

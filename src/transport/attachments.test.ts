@@ -255,7 +255,7 @@ describe('openAICompatible attachments', () => {
         const fetchMock = stubFetch();
 
         const events = await collect(
-            streamFor('http://localhost:6660/providers/private/v1')({
+            streamFor('http://localhost:8800/providers/private/v1')({
                 model: 'm',
                 messages: [{ role: 'user', content: '[Video 1]', attachments: [video()] }]
             })

@@ -77,7 +77,7 @@ describe('openAICompatible', () => {
         const fetchMock = stubFetch(['data: [DONE]\n\n']);
 
         const stream = openAICompatible({
-            baseURL: 'http://localhost:6660/providers/private/v1/',
+            baseURL: 'http://localhost:8800/providers/private/v1/',
             apiKey: 'secret',
             headers: { 'x-extra': 'yes' },
             sampling: { temperature: 0.7, top_p: 0.9 }
@@ -88,7 +88,7 @@ describe('openAICompatible', () => {
         expect(fetchMock).toHaveBeenCalledTimes(1);
         const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
 
-        expect(url).toBe('http://localhost:6660/providers/private/v1/chat/completions');
+        expect(url).toBe('http://localhost:8800/providers/private/v1/chat/completions');
         expect(init.method).toBe('POST');
         expect(init.headers).toMatchObject({
             'content-type': 'application/json',

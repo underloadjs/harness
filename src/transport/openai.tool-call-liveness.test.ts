@@ -78,8 +78,8 @@ import {
 } from '@underload/harness';
 import type { HarnessMessage, HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '@underload/harness';
 
-const BASE_URL = 'http://localhost:6660/providers/private/v1';
-const CHAT_URL = 'http://localhost:6660/providers/private/v1/chat/completions';
+const BASE_URL = 'http://localhost:8800/providers/private/v1';
+const CHAT_URL = 'http://localhost:8800/providers/private/v1/chat/completions';
 
 const request = {
     model: 'local/basalt',
@@ -498,7 +498,7 @@ describe('tool-call argument generation: visibility and liveness (probe P2)', ()
             {
                 type: 'error',
                 message: 'The model stream ended before reporting a completion.',
-                details: { errorClass: PROVIDER_TRANSIT_CLASS, url: CHAT_URL, port: 6660 }
+                details: { errorClass: PROVIDER_TRANSIT_CLASS, url: CHAT_URL, port: 8800 }
             }
         ]);
     });
@@ -519,7 +519,7 @@ describe('tool-call argument generation: visibility and liveness (probe P2)', ()
             {
                 type: 'error',
                 message: 'The model stream ended before reporting a completion.',
-                details: { errorClass: PROVIDER_TRANSIT_CLASS, url: CHAT_URL, port: 6660 }
+                details: { errorClass: PROVIDER_TRANSIT_CLASS, url: CHAT_URL, port: 8800 }
             }
         ]);
     });
@@ -730,7 +730,7 @@ describe('tool-call argument generation: visibility and liveness (probe P2)', ()
         expect(stall.value).toMatchObject({
             type: 'error',
             code: PROVIDER_TIMEOUT_CODE,
-            details: { errorClass: PROVIDER_TIMEOUT_CODE, url: CHAT_URL, port: 6660, phase: 'stream-chunk', timeoutMs: 120_000 }
+            details: { errorClass: PROVIDER_TIMEOUT_CODE, url: CHAT_URL, port: 8800, phase: 'stream-chunk', timeoutMs: 120_000 }
         });
     });
 
@@ -768,7 +768,7 @@ describe('tool-call argument generation: visibility and liveness (probe P2)', ()
             details: { phase: 'stream-chunk', timeoutMs: 120_000, errorClass: PROVIDER_TIMEOUT_CODE }
         });
         expect((stall.value as Extract<HarnessStreamEvent, { type: 'error' }>).message).toContain(
-            'delivered 1 body chunk(s) from localhost:6660 and then went silent for 120 seconds'
+            'delivered 1 body chunk(s) from localhost:8800 and then went silent for 120 seconds'
         );
 
         // And the frame is the START of a retry sequence, not the end of the run:

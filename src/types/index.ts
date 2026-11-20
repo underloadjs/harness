@@ -622,7 +622,7 @@ export type HarnessTransportOptions = {
 // `stream` is supplied to the agent.
 export type HarnessProviderConfiguration = {
     // Base URL without the /chat/completions suffix, e.g.
-    // 'http://localhost:6660/providers/private/v1'.
+    // 'http://localhost:8800/providers/private/v1'.
     baseURL: string;
     // A static key, or a getter so rotating credentials stay live per request.
     apiKey?: string | (() => string);

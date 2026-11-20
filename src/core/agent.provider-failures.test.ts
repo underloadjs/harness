@@ -39,14 +39,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent } from '@underload/harness';
 import type { AgentStreamEvent, HarnessStream, HarnessStreamEvent } from '@underload/harness';
 
-const CHAT_URL = 'http://localhost:6660/providers/private/v1/chat/completions';
+const CHAT_URL = 'http://localhost:8800/providers/private/v1/chat/completions';
 
 const TIMEOUT_MESSAGE =
-    'provider-timeout: the provider accepted the TCP connection at localhost:6660 but sent no response for 2 seconds.';
+    'provider-timeout: the provider accepted the TCP connection at localhost:8800 but sent no response for 2 seconds.';
 
 const CONNECTION_MESSAGE =
-    'provider-connection: nothing answered on localhost:6660 — the request was dialled to ' +
-    'http://localhost:6660/providers/private/v1/chat/completions. ECONNREFUSED (connect ECONNREFUSED 127.0.0.1:6660).';
+    'provider-connection: nothing answered on localhost:8800 — the request was dialled to ' +
+    'http://localhost:8800/providers/private/v1/chat/completions. ECONNREFUSED (connect ECONNREFUSED 127.0.0.1:8800).';
 
 const TIMEOUT_FRAME: HarnessStreamEvent = {
     type: 'error',
@@ -55,7 +55,7 @@ const TIMEOUT_FRAME: HarnessStreamEvent = {
     details: {
         errorClass: 'provider-timeout',
         url: CHAT_URL,
-        port: 6660,
+        port: 8800,
         phase: 'response-head',
         timeoutMs: 2_000
     }
@@ -65,7 +65,7 @@ const CONNECTION_FRAME: HarnessStreamEvent = {
     type: 'error',
     code: 'provider-connection',
     message: CONNECTION_MESSAGE,
-    details: { errorClass: 'provider-connection', url: CHAT_URL, port: 6660, errno: 'ECONNREFUSED' }
+    details: { errorClass: 'provider-connection', url: CHAT_URL, port: 8800, errno: 'ECONNREFUSED' }
 };
 
 // The frame `transport/openai.ts` yields for the gateway's in-stream `aborted` code: a
@@ -75,9 +75,9 @@ const ABORTED_FRAME: HarnessStreamEvent = {
     code: 'provider-aborted',
     message:
         'provider-aborted: the provider reported a failure on the stream from ' +
-        'http://localhost:6660/providers/private/v1. The request was cancelled before it completed, ' +
+        'http://localhost:8800/providers/private/v1. The request was cancelled before it completed, ' +
         'so it is not re-sent.',
-    details: { errorClass: 'provider-aborted', url: CHAT_URL, port: 6660 }
+    details: { errorClass: 'provider-aborted', url: CHAT_URL, port: 8800 }
 };
 
 const OVERFLOW_FRAME: HarnessStreamEvent = {
@@ -98,7 +98,7 @@ const AUTH_FRAME: HarnessStreamEvent = { type: 'error', message: 'HTTP 401: nope
 const TRANSIT_FRAME: HarnessStreamEvent = {
     type: 'error',
     message: 'Upstream stream terminated',
-    details: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+    details: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
 };
 
 // A transport that fails the SAME way on every attempt, counting the requests, so a
@@ -183,7 +183,7 @@ const build = (stream: HarnessStream, retry?: { maxRetries?: number; baseDelayMs
 const TIMEOUT_DIAGNOSTICS = {
     errorClass: 'provider-timeout',
     url: CHAT_URL,
-    port: 6660,
+    port: 8800,
     phase: 'response-head',
     timeoutMs: 2_000
 };
@@ -206,7 +206,7 @@ describe('provider failure retry policy (T6)', () => {
                 maxAttempts: 3,
                 delayMs: 250,
                 error: { message: CONNECTION_MESSAGE, code: 'provider-connection' },
-                provider: { errorClass: 'provider-connection', url: CHAT_URL, port: 6660, errno: 'ECONNREFUSED' }
+                provider: { errorClass: 'provider-connection', url: CHAT_URL, port: 8800, errno: 'ECONNREFUSED' }
             },
             {
                 type: 'retry',
@@ -214,7 +214,7 @@ describe('provider failure retry policy (T6)', () => {
                 maxAttempts: 3,
                 delayMs: 500,
                 error: { message: CONNECTION_MESSAGE, code: 'provider-connection' },
-                provider: { errorClass: 'provider-connection', url: CHAT_URL, port: 6660, errno: 'ECONNREFUSED' }
+                provider: { errorClass: 'provider-connection', url: CHAT_URL, port: 8800, errno: 'ECONNREFUSED' }
             },
             { type: 'error', error: { message: CONNECTION_MESSAGE, code: 'provider-connection' } }
         ]);
@@ -449,7 +449,7 @@ describe('provider failure retry policy (T6)', () => {
                 maxAttempts: 3,
                 delayMs: 1,
                 error: { message: 'Upstream stream terminated' },
-                provider: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+                provider: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
             },
             {
                 type: 'retry',
@@ -457,7 +457,7 @@ describe('provider failure retry policy (T6)', () => {
                 maxAttempts: 3,
                 delayMs: 2,
                 error: { message: 'Upstream stream terminated' },
-                provider: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+                provider: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
             },
             // No `code` on the terminal record: the class is in the diagnostics block,
             // and inventing a code here would promise a retry policy this class does not

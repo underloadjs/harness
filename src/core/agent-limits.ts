@@ -111,7 +111,7 @@ export const DELEGATE_MAX_TURNS_MAX = 64;
 // the user watched a spinner for 1+2+4+...+512 = 1023 s (~17.05 min) before an error
 // named the endpoint. A dial that reached nobody is a CONFIGURATION condition, not a
 // transient one: a minute of patience is proportionate, eight minutes of backoff is
-// not, and the answer the user needs is "nothing is listening on 6660".
+// not, and the answer the user needs is "nothing is listening on 8800".
 //
 // (2026-11-17) That 1023 s figure is now HISTORY for EVERY class, not just the dead
 // dial: the transient ladder's waits are capped by `RETRY_MAX_DELAY_MS` below, so the

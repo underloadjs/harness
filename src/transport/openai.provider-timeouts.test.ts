@@ -9,7 +9,7 @@
 //     stream was flowing (AC1);
 //   - a refused connection / failed name resolution is CLASSIFIED (`provider-
 //     connection`) and the frame names the dialled host:port, which is the answer to
-//     "is it dialling 5500 or 6660?" (AC2);
+//     "is it dialling 5500 or 8800?" (AC2);
 //   - a TIME-fixable 4xx/5xx keeps the byte-for-byte historical frame: no code, no
 //     details (AC3). T8 deliberately moved only the DETERMINISTIC refusals
 //     (400/401/403/404) into their own class — see ./openai.provider-rejected.test.ts;
@@ -38,8 +38,8 @@ import {
 } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent } from '@underload/harness';
 
-const BASE_URL = 'http://localhost:6660/providers/private/v1';
-const CHAT_URL = 'http://localhost:6660/providers/private/v1/chat/completions';
+const BASE_URL = 'http://localhost:8800/providers/private/v1';
+const CHAT_URL = 'http://localhost:8800/providers/private/v1/chat/completions';
 
 const request = {
     model: 'local/basalt',
@@ -117,7 +117,7 @@ const collectAll = async (
 // The three documented sentences, spelled out so the operator-facing wording is a
 // pinned contract (a UI renders them verbatim).
 const headMessage = (seconds: number, variable: string): string =>
-    `provider-timeout: the provider accepted the TCP connection at localhost:6660 but sent no response for ${seconds} seconds. ` +
+    `provider-timeout: the provider accepted the TCP connection at localhost:8800 but sent no response for ${seconds} seconds. ` +
     'Nothing ended the wait earlier, so the turn is now failed instead of running forever. The request was sent, ' +
     `so it may still be running on the provider. Raise \`${variable}\` (or set it to 0 to disable the bound) if ` +
     'this endpoint legitimately needs longer.';
@@ -157,7 +157,7 @@ describe('provider time bounds (T6)', () => {
                 details: {
                     errorClass: PROVIDER_TIMEOUT_CODE,
                     url: CHAT_URL,
-                    port: 6660,
+                    port: 8800,
                     phase: 'response-head',
                     timeoutMs: 2_000
                 }
@@ -192,14 +192,14 @@ describe('provider time bounds (T6)', () => {
             details: {
                 errorClass: PROVIDER_TIMEOUT_CODE,
                 url: CHAT_URL,
-                port: 6660,
+                port: 8800,
                 phase: 'first-token',
                 timeoutMs: 3_000
             }
         });
 
         expect(String((first.value as Extract<HarnessStreamEvent, { type: 'error' }>).message)).toContain(
-            'provider-timeout: the provider opened the stream from localhost:6660 but sent no token for 3 seconds'
+            'provider-timeout: the provider opened the stream from localhost:8800 but sent no token for 3 seconds'
         );
         expect(await attempt.pending()).toEqual({ done: true, value: undefined });
     });
@@ -234,21 +234,21 @@ describe('provider time bounds (T6)', () => {
             details: {
                 errorClass: PROVIDER_TIMEOUT_CODE,
                 url: CHAT_URL,
-                port: 6660,
+                port: 8800,
                 phase: 'stream-chunk',
                 timeoutMs: 2_000
             }
         });
 
         const message = String((stall.value as Extract<HarnessStreamEvent, { type: 'error' }>).message);
-        expect(message).toContain('delivered 1 body chunk(s) from localhost:6660 and then went silent for 2 seconds');
+        expect(message).toContain('delivered 1 body chunk(s) from localhost:8800 and then went silent for 2 seconds');
         expect(message).toContain('whatever arrived is a partial answer and is discarded');
         expect(await attempt.pending()).toEqual({ done: true, value: undefined });
     });
 
     it('classifies a refused connection and names the dialled host and port', async () => {
         const refused = Object.assign(new TypeError('fetch failed'), {
-            cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:6660'), { code: 'ECONNREFUSED' })
+            cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8800'), { code: 'ECONNREFUSED' })
         });
 
         vi.stubGlobal(
@@ -268,15 +268,15 @@ describe('provider time bounds (T6)', () => {
             type: 'error',
             code: PROVIDER_CONNECTION_CODE,
             message:
-                'provider-connection: nothing answered on localhost:6660 — the request was dialled to ' +
-                'http://localhost:6660/providers/private/v1/chat/completions. ECONNREFUSED (connect ECONNREFUSED ' +
-                '127.0.0.1:6660). Check that the provider is running on that port and that the configured base URL ' +
+                'provider-connection: nothing answered on localhost:8800 — the request was dialled to ' +
+                'http://localhost:8800/providers/private/v1/chat/completions. ECONNREFUSED (connect ECONNREFUSED ' +
+                '127.0.0.1:8800). Check that the provider is running on that port and that the configured base URL ' +
                 'is the one you meant. Set the per-session base URL (Endpoint & model) to the endpoint ' +
                 'that is actually up; `HARNESS_BASE_URL` counts only when the session has no stored address.',
             details: {
                 errorClass: PROVIDER_CONNECTION_CODE,
                 url: CHAT_URL,
-                port: 6660,
+                port: 8800,
                 errno: 'ECONNREFUSED'
             }
         });
@@ -306,11 +306,11 @@ describe('provider time bounds (T6)', () => {
         expect(collected[0]).toMatchObject({
             type: 'error',
             code: PROVIDER_CONNECTION_CODE,
-            details: { errorClass: PROVIDER_CONNECTION_CODE, url: CHAT_URL, port: 6660, errno: 'EAI_AGAIN' }
+            details: { errorClass: PROVIDER_CONNECTION_CODE, url: CHAT_URL, port: 8800, errno: 'EAI_AGAIN' }
         });
 
         const message = String((collected[0] as Extract<HarnessStreamEvent, { type: 'error' }>).message);
-        expect(message).toContain('nothing answered on localhost:6660');
+        expect(message).toContain('nothing answered on localhost:8800');
         expect(message).toContain('EAI_AGAIN');
     });
 

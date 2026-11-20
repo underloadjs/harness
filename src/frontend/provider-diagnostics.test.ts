@@ -30,7 +30,7 @@ const STUCK_URL = 'http://localhost:5500/providers/private/v1';
 describe('the effective provider target (AC1)', () => {
     it('names host:port from the session endpoint, explicit port included', () => {
         expect(providerHostOf(STUCK_URL)).toBe('localhost:5500');
-        expect(providerHostOf('http://127.0.0.1:6660/providers/private/v1')).toBe('127.0.0.1:6660');
+        expect(providerHostOf('http://127.0.0.1:8800/providers/private/v1')).toBe('127.0.0.1:8800');
     });
 
     it('fills the scheme default for a URL that parses but states no port', () => {

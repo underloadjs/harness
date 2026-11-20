@@ -39,7 +39,7 @@ import { toErrorInfo } from '../util';
 // does not depend on sampling or agent configuration.
 export type ModelListConfiguration = {
     // Base URL without the /models suffix, e.g.
-    // 'http://localhost:6660/providers/private/v1'. Trailing slashes are ignored.
+    // 'http://localhost:8800/providers/private/v1'. Trailing slashes are ignored.
     baseURL: string;
     // A static key, or a getter so rotating credentials stay live per request.
     apiKey?: string | (() => string);

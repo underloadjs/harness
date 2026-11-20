@@ -534,7 +534,7 @@ it('opens the settings in a dialog titled Endpoint & model with every control', 
     expect(inputs.map((input) => input.type)).toEqual(['text', 'password']);
     expect(inputs.map((input) => input.value)).toEqual(['http://provider/v1', '']);
     expect(inputs.map((input) => input.placeholder)).toEqual([
-        'http://localhost:6660/providers/private/v1',
+        'http://localhost:8800/providers/private/v1',
         'optional'
     ]);
     expect(inputs.map((input) => [input.spellcheck, input.autocomplete])).toEqual([
@@ -2098,13 +2098,13 @@ it('publishes the server-default catalogue on boot even when the dialog is alrea
 
     // The layer really is inside the bootstrap window: the field still names the module-load
     // endpoint, so the server defaults have not landed (and have not been re-synced) yet.
-    expect(baseURL.value).toBe('http://localhost:6660/providers/private/v1');
+    expect(baseURL.value).toBe('http://localhost:8800/providers/private/v1');
 
     // The defaults land, the draft is left alone, and boot dials the endpoint it just learned.
     await advance(500);
     await loaded;
     expect(localStorage.getItem(SETTINGS_KEY)).toBe(storedSettings('http://provider/v1', '', 'm1'));
-    expect(baseURL.value).toBe('http://localhost:6660/providers/private/v1');
+    expect(baseURL.value).toBe('http://localhost:8800/providers/private/v1');
 
     // Boot's remaining work is a promise chain rather than a timer, so the clock is stepped until
     // the composer's agent control exists instead of guessing how many hops it needs.
@@ -2122,7 +2122,7 @@ it('publishes the server-default catalogue on boot even when the dialog is alrea
         modelCalls(calls).map(
             (call) => (call.body as { settings: { base_url: string } }).settings.base_url
         )
-    ).toEqual(['http://localhost:6660/providers/private/v1', 'http://provider/v1']);
+    ).toEqual(['http://localhost:8800/providers/private/v1', 'http://provider/v1']);
 
     closeWithEscape();
 
@@ -2351,7 +2351,7 @@ it('leaves what the reader is typing when the bootstrap lands with the dialog op
 
     // The proof the layer really is INSIDE the bootstrap window: the field still names the
     // module-load default, i.e. the server defaults have not landed (and not been re-synced) yet.
-    expect(baseURL.value).toBe('http://localhost:6660/providers/private/v1');
+    expect(baseURL.value).toBe('http://localhost:8800/providers/private/v1');
 
     baseURL.value = 'http://typed-during-boot/v1';
     baseURL.dispatchEvent(new Event('input', { bubbles: true }));

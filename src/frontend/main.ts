@@ -522,7 +522,7 @@ const resolveFileForPreview: FilePreviewResolver = async (name) => {
 const STORAGE_KEY = 'underload-harness-app:settings';
 
 const DEFAULT_SETTINGS: RunnerSettings = {
-    baseURL: 'http://localhost:6660/providers/private/v1',
+    baseURL: 'http://localhost:8800/providers/private/v1',
     apiKey: '',
     // The local basalt model: the id the gateway above serves for it, and the model
     // every preset agent shows in the deck when it has no per-agent override.
@@ -3587,7 +3587,7 @@ endpointBody.append(
     // Terse state line: the root THIS load dials. A deployment question ("is this page
     // talking to /v1/harness or /api?") stays answerable without devtools.
     serverRootLive,
-    field('Base URL', 'baseURL', 'text', 'http://localhost:6660/providers/private/v1'),
+    field('Base URL', 'baseURL', 'text', 'http://localhost:8800/providers/private/v1'),
     // (T9/AC4) The bounds that address belongs to, immediately under it.
     providerTimeoutsLine,
     field('API key', 'apiKey', 'password', 'optional'),

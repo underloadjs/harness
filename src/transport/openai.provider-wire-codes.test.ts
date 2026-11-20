@@ -47,8 +47,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openAICompatible, providerWireFailureOf } from '@underload/harness';
 import type { HarnessStreamEvent } from '@underload/harness';
 
-const BASE_URL = 'http://localhost:6660/providers/private/v1';
-const CHAT_URL = 'http://localhost:6660/providers/private/v1/chat/completions';
+const BASE_URL = 'http://localhost:8800/providers/private/v1';
+const CHAT_URL = 'http://localhost:8800/providers/private/v1/chat/completions';
 
 const request = {
     model: 'local/basalt',
@@ -116,7 +116,7 @@ describe('gateway in-stream error codes (transport classification)', () => {
             details: {
                 errorClass: 'provider-timeout',
                 url: CHAT_URL,
-                port: 6660,
+                port: 8800,
                 phase: 'stream-chunk'
             }
         });
@@ -124,7 +124,7 @@ describe('gateway in-stream error codes (transport classification)', () => {
 
     it('maps wire `connection` to provider-connection and keeps the errno', async () => {
         const event = await transportFrame({
-            message: 'connect ECONNREFUSED 127.0.0.1:6660',
+            message: 'connect ECONNREFUSED 127.0.0.1:8800',
             type: 'upstream_error',
             code: 'connection',
             status: undefined,
@@ -138,11 +138,11 @@ describe('gateway in-stream error codes (transport classification)', () => {
             message:
                 'provider-connection: the provider reported a failure on the stream from ' +
                 `${CHAT_URL}. Nothing answered the dial on the provider side, so this attempt is re-sent on ` +
-                'the short connection ladder. The provider said: "connect ECONNREFUSED 127.0.0.1:6660"',
+                'the short connection ladder. The provider said: "connect ECONNREFUSED 127.0.0.1:8800"',
             details: {
                 errorClass: 'provider-connection',
                 url: CHAT_URL,
-                port: 6660,
+                port: 8800,
                 errno: 'ECONNREFUSED'
             }
         });
@@ -163,7 +163,7 @@ describe('gateway in-stream error codes (transport classification)', () => {
                 'provider-aborted: the provider reported a failure on the stream from ' +
                 `${CHAT_URL}. The request was cancelled before it completed, so it is not re-sent. ` +
                 'The provider said: "Upstream stream aborted by client"',
-            details: { errorClass: 'provider-aborted', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'provider-aborted', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -183,7 +183,7 @@ describe('gateway in-stream error codes (transport classification)', () => {
                 `provider-rejected: the provider reported a failure on the stream from ${CHAT_URL} (HTTP 401). ` +
                 'The upstream refused this request itself, so re-sending the same bytes would be refused again. ' +
                 'The provider blamed `api_key`. The provider said: "Invalid API key"',
-            details: { errorClass: 'provider-rejected', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'provider-rejected', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -203,7 +203,7 @@ describe('gateway in-stream error codes (transport classification)', () => {
         expect(event).toEqual({
             type: 'error',
             message: 'Upstream gateway timeout',
-            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -218,7 +218,7 @@ describe('gateway in-stream error codes (transport classification)', () => {
         expect(event).toEqual({
             type: 'error',
             message: 'Upstream chunk failed to decode',
-            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -235,7 +235,7 @@ describe('gateway in-stream error codes (transport classification)', () => {
         expect(event).toEqual({
             type: 'error',
             message: 'Upstream stream terminated',
-            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
         });
     });
 
@@ -250,7 +250,7 @@ describe('gateway in-stream error codes (transport classification)', () => {
         expect(event).toEqual({
             type: 'error',
             message: 'Upstream stream terminated',
-            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+            details: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
         });
     });
 });

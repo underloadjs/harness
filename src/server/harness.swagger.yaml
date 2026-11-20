@@ -376,7 +376,7 @@ paths:
                 summary: Point future sessions at another gateway without sending a key
                 value:
                   settings:
-                    base_url: http://localhost:6660/providers/private/v1
+                    base_url: http://localhost:8800/providers/private/v1
                     model: merge/ds4-flash
               drop-key:
                 summary: Remove the configured server key

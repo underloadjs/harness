@@ -27,7 +27,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openAICompatible } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent } from '@underload/harness';
 
-const BASE_URL = 'http://localhost:6660/providers/private/v1';
+const BASE_URL = 'http://localhost:8800/providers/private/v1';
 
 const request = {
     model: 'local/basalt',

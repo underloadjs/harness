@@ -4709,7 +4709,7 @@ describe('context-compaction summarize flow (T9)', () => {
             "This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens";
         const refusalFrame = {
             error: {
-                message: `upstream localhost:6660/v1/chat/completions returned HTTP 400 before the first chunk: ${providerLine}`,
+                message: `upstream localhost:8800/v1/chat/completions returned HTTP 400 before the first chunk: ${providerLine}`,
                 type: 'stream_error',
                 code: 'upstream_status',
                 status: 400,
@@ -4802,7 +4802,7 @@ describe('context-compaction summarize flow (T9)', () => {
                     // window is declared anywhere, so the buffer and the first-rung pre-shrink
                     // have nothing to bind to (see the operator gap in the memo above).
                     model: 'local/basalt',
-                    stream: openAICompatible({ baseURL: 'http://localhost:6660/providers/private/v1' })
+                    stream: openAICompatible({ baseURL: 'http://localhost:8800/providers/private/v1' })
                 })
             },
             pluginSettings: summarizeSettings(),

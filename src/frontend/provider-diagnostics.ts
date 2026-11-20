@@ -2,7 +2,7 @@
 //
 // WHY THIS MODULE EXISTS. A stuck run used to say nothing the reader could act on: the
 // tile read `task failed: Request to http://localhost:5500/providers/private/v1/… failed:
-// fetch failed`, and the reader had no idea whether the UI was dialling 5500 or 6660, nor
+// fetch failed`, and the reader had no idea whether the UI was dialling 5500 or 8800, nor
 // that a retry ladder was spending ~17 more minutes before giving up. Three facts answer
 // that, and they are exactly the three the transport (T6) now emits and the contract
 // already reports: the DIALLED target, the retry ladder, and the failure class.

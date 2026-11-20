@@ -43,7 +43,7 @@ import type { HarnessEvent, HarnessStream, HarnessStreamEvent } from '@underload
 // one module registry per test file.
 import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
 
-const CHAT_URL = 'http://localhost:6660/providers/private/v1/chat/completions';
+const CHAT_URL = 'http://localhost:8800/providers/private/v1/chat/completions';
 
 // The reported failure, as the transport publishes it: 526 chunks arrived, then the
 // gateway sat on its 120 s chunk bound. Before 2026-11-17 this frame arrived CODELESS
@@ -53,14 +53,14 @@ const TIMEOUT_FRAME: HarnessStreamEvent = {
     type: 'error',
     code: 'provider-timeout',
     message:
-        'provider-timeout: the provider delivered 526 body chunk(s) from localhost:6660 and then went ' +
+        'provider-timeout: the provider delivered 526 body chunk(s) from localhost:8800 and then went ' +
         'silent for 120 seconds. Nothing ended the wait earlier, so the turn is now failed instead of ' +
-        'running forever. The stream from http://localhost:6660/providers/private/v1/chat/completions is ' +
+        'running forever. The stream from http://localhost:8800/providers/private/v1/chat/completions is ' +
         'unfinished, so whatever arrived is a partial answer and is discarded.',
     details: {
         errorClass: 'provider-timeout',
         url: CHAT_URL,
-        port: 6660,
+        port: 8800,
         phase: 'stream-chunk',
         timeoutMs: 120_000
     }
@@ -70,8 +70,8 @@ const TIMEOUT_FRAME: HarnessStreamEvent = {
 const CONNECTION_FRAME: HarnessStreamEvent = {
     type: 'error',
     code: 'provider-connection',
-    message: 'provider-connection: nothing answered on localhost:6660.',
-    details: { errorClass: 'provider-connection', url: CHAT_URL, port: 6660, errno: 'ECONNREFUSED' }
+    message: 'provider-connection: nothing answered on localhost:8800.',
+    details: { errorClass: 'provider-connection', url: CHAT_URL, port: 8800, errno: 'ECONNREFUSED' }
 };
 
 // A gateway error frame with an unknown/absent code, and a body that closed mid-answer,
@@ -79,7 +79,7 @@ const CONNECTION_FRAME: HarnessStreamEvent = {
 const TRANSIT_FRAME: HarnessStreamEvent = {
     type: 'error',
     message: 'Upstream stream terminated',
-    details: { errorClass: 'provider-transit', url: CHAT_URL, port: 6660 }
+    details: { errorClass: 'provider-transit', url: CHAT_URL, port: 8800 }
 };
 
 // A provider answer that is NOT a network death: an HTTP 5xx body. Codeless AND without
@@ -177,7 +177,7 @@ describe('run stop reason for a network failure (Contract D)', () => {
                 provider: {
                     errorClass: 'provider-timeout',
                     url: CHAT_URL,
-                    port: 6660,
+                    port: 8800,
                     phase: 'stream-chunk',
                     timeoutMs: 120_000
                 }

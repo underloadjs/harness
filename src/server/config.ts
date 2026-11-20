@@ -269,7 +269,7 @@ export class ServerRuntimeError extends Error {
     }
 }
 
-const DEFAULT_BASE_URL = 'http://localhost:6660/providers/private/v1';
+const DEFAULT_BASE_URL = 'http://localhost:8800/providers/private/v1';
 // The local basalt model, which is the id the private provider at DEFAULT_BASE_URL
 // actually serves for it (its /models catalogue lists `local/basalt`; a hosted
 // `merge/ds4-flash` request costs money and a `localhost/basalt` request 404s).

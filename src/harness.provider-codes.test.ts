@@ -51,17 +51,17 @@ import {
 } from '@underload/harness';
 import type { HarnessEvent, HarnessStream, HarnessStreamEvent } from '@underload/harness';
 
-const CHAT_URL = 'http://localhost:6660/providers/private/v1/chat/completions';
+const CHAT_URL = 'http://localhost:8800/providers/private/v1/chat/completions';
 
 // The exact frame texts the transport produces (transport/provider-timeouts.ts). They
 // are pinned verbatim here because AC1 is about the CODE travelling with them, and a
 // message that silently changed would otherwise hide in a code-only assertion.
 const TIMEOUT_MESSAGE =
-    'provider-timeout: the provider accepted the TCP connection at localhost:6660 but sent no response for 300 seconds.';
+    'provider-timeout: the provider accepted the TCP connection at localhost:8800 but sent no response for 300 seconds.';
 
 const CONNECTION_MESSAGE =
-    'provider-connection: nothing answered on localhost:6660 — the request was dialled to ' +
-    `${CHAT_URL}. ECONNREFUSED (connect ECONNREFUSED 127.0.0.1:6660).`;
+    'provider-connection: nothing answered on localhost:8800 — the request was dialled to ' +
+    `${CHAT_URL}. ECONNREFUSED (connect ECONNREFUSED 127.0.0.1:8800).`;
 
 const CODELESS_MESSAGE = 'HTTP 418: I am a teapot';
 
@@ -72,7 +72,7 @@ const TIMEOUT_FRAME: HarnessStreamEvent = {
     details: {
         errorClass: PROVIDER_TIMEOUT_CODE,
         url: CHAT_URL,
-        port: 6660,
+        port: 8800,
         phase: 'response-head',
         timeoutMs: 300_000
     }
@@ -82,7 +82,7 @@ const CONNECTION_FRAME: HarnessStreamEvent = {
     type: 'error',
     code: PROVIDER_CONNECTION_CODE,
     message: CONNECTION_MESSAGE,
-    details: { errorClass: PROVIDER_CONNECTION_CODE, url: CHAT_URL, port: 6660, errno: 'ECONNREFUSED' }
+    details: { errorClass: PROVIDER_CONNECTION_CODE, url: CHAT_URL, port: 8800, errno: 'ECONNREFUSED' }
 };
 
 // A frame with no machine code at all: the shape every unclassified provider failure has
@@ -193,7 +193,7 @@ describe('run-level provider failures keep their machine code (T8, AC1)', () => 
                         provider: {
                             errorClass: PROVIDER_TIMEOUT_CODE,
                             url: CHAT_URL,
-                            port: 6660,
+                            port: 8800,
                             phase: 'response-head',
                             timeoutMs: 300_000
                         }
@@ -247,7 +247,7 @@ describe('run-level provider failures keep their machine code (T8, AC1)', () => 
                     provider: {
                         errorClass: PROVIDER_CONNECTION_CODE,
                         url: CHAT_URL,
-                        port: 6660,
+                        port: 8800,
                         errno: 'ECONNREFUSED'
                     }
                 }
@@ -335,7 +335,7 @@ describe('run-level provider failures keep their machine code (T8, AC1)', () => 
                 message:
                     'provider-rejected: the provider answered with HTTP 401 and refused the request, so ' +
                     're-sending the same bytes would be refused again.',
-                details: { errorClass: PROVIDER_REJECTED_CODE, url: CHAT_URL, port: 6660 }
+                details: { errorClass: PROVIDER_REJECTED_CODE, url: CHAT_URL, port: 8800 }
             },
             attempts
         );
@@ -354,7 +354,7 @@ describe('run-level provider failures keep their machine code (T8, AC1)', () => 
                         'provider-rejected: the provider answered with HTTP 401 and refused the request, so ' +
                         're-sending the same bytes would be refused again.',
                     code: PROVIDER_REJECTED_CODE,
-                    provider: { errorClass: PROVIDER_REJECTED_CODE, url: CHAT_URL, port: 6660 }
+                    provider: { errorClass: PROVIDER_REJECTED_CODE, url: CHAT_URL, port: 8800 }
                 }
             }
         ]);

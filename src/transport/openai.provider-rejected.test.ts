@@ -21,8 +21,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PROVIDER_REJECTED_CODE, openAICompatible } from '@underload/harness';
 import type { HarnessStreamEvent } from '@underload/harness';
 
-const BASE_URL = 'http://localhost:6660/providers/private/v1';
-const CHAT_URL = 'http://localhost:6660/providers/private/v1/chat/completions';
+const BASE_URL = 'http://localhost:8800/providers/private/v1';
+const CHAT_URL = 'http://localhost:8800/providers/private/v1/chat/completions';
 
 const request = {
     model: 'local/basalt',
