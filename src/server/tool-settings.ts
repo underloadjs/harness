@@ -72,7 +72,7 @@
 // name that was switched off when its lane was created, and a name switched off while the
 // lane was already running reaches it when the lane is next created (an idle reclaim, a new
 // conversation, an authority rebuild) - the documented lane semantics, the same ones
-// `PATCH /v1/harness/plugins/{plugin_id}` states (../harness.swagger.yaml, that PATCH).
+// `PATCH /v1/harness/plugins/{plugin_id}` states (../harness-server.swagger.yaml, that PATCH).
 // Discovery is NOT delayed even in that window: a lane's `toolRequest` is routed to the
 // authority (../workers/lane-authority.ts), which answers against the canonical harness and
 // therefore against this live provider.

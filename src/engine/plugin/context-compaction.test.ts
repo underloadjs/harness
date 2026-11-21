@@ -833,7 +833,7 @@ describe('context-compaction metadata', () => {
         expect(metadata.systemPrompt).toBe(COMPACTION_INSTRUCTION);
 
         // The contract's cap, pinned in-repo: `PluginSummary.system_prompt` declares
-        // `maxLength: 2000` (src/server/harness.swagger.yaml), and nothing enforces that at
+        // `maxLength: 2000` (src/harness-server.swagger.yaml), and nothing enforces that at
         // runtime — src/server/api.ts `pluginRowOf` spreads the declared value out as-is — so
         // the budget is asserted here instead. The identity above covers both copies with this
         // one check. The shipped prompt is 1714 characters and 21 lines (the OpenCode checkpoint

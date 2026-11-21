@@ -217,7 +217,7 @@ export type LaneBlueprint = {
     // lane-creation value uses (`record`, `settings`, `apiKey`, `memoryKeys` above), and
     // it matches the documented lane semantics: an already-running lane keeps the state it
     // was built with and "picks the new value up the next time its lane is created"
-    // (../harness.swagger.yaml, `PATCH /v1/harness/plugins/{plugin_id}`), while a NEW lane
+    // (../../harness-server.swagger.yaml, `PATCH /v1/harness/plugins/{plugin_id}`), while a NEW lane
     // - an idle reclaim, a new conversation, an authority rebuild - states the CURRENT set.
     //
     // A disabled name is never UNREGISTERED here: the provider only hides it from a
@@ -264,7 +264,7 @@ export type LaneBlueprint = {
     //
     // A SNAPSHOT, with the same documented consequence as `disabledTools`: a lane that is
     // already running keeps the values it was built with, and "picks the new value up the
-    // next time its lane is created" (../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id} - the wording this
+    // next time its lane is created" (../../harness-server.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id} - the wording this
     // field is what makes true for worker lanes).
     //
     // ADDITIVE and OPTIONAL, same tolerance rule as above: `undefined` or `{}` ("no plugin

@@ -32,7 +32,7 @@
 // T39 UPDATE (./api-regressions.test.ts owns the repaired behaviour, asserted through REST): the
 // per-conversation backlog IS projected — `queueRowsOf`/`pendingCountOf` (./api-reads.ts:166-173 and
 // :655-683) fold every lane queue into one global FIFO ordering, and `TaskReceipt.queue_position` is
-// that ordering's 1-based ordinal (contract `minimum: 1`, ./harness.swagger.yaml:5001-5005). A cancel
+// that ordering's 1-based ordinal (contract `minimum: 1`, ../harness-server.swagger.yaml:5001-5005). A cancel
 // whose `all` is not a boolean answers 400 again, before anything is cancelled. One finding below is
 // still store behaviour and stays asserted as-observed: a session-level cancel stops EVERY active
 // conversation run while its receipt names a single `active_turn_id`.
@@ -989,7 +989,7 @@ describe('queue HTTP contract', () => {
         // which folds every lane backlog), and by the time the receipt is built this submit's own
         // conversation has already promoted it out of the backlog — it is running, so it has no slot.
         // A submit that genuinely waits DOES get the slot, as the 1-based ordinal the contract
-        // specifies (./harness.swagger.yaml:5001-5005): see ./api-regressions.test.ts.
+        // specifies (../harness-server.swagger.yaml:5001-5005): see ./api-regressions.test.ts.
         expect(second.status).toBe('queued');
         expect(second).not.toHaveProperty('queue_position');
 

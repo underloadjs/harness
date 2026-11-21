@@ -11,7 +11,7 @@
 //      with it (src/server/api.ts:4600-4662);
 //   2. a property's `description` renders as a JSDoc block at the property's own column, the prose
 //      the shipped contract used to carry only as hand edits (e.g. TurnBlockWriteReceipt.included,
-//      spec src/server/harness.swagger.yaml:8458-8470).
+//      spec src/harness-server.swagger.yaml:8458-8470).
 //
 // The renderer is imported, not re-implemented here, and importing it has no side effect on the
 // shipped files: the write/exit pass only runs when the module is the process entry
@@ -51,7 +51,7 @@ const VITE_NODE_CLI = require.resolve('vite-node/cli');
  * 1. `anyOf` of `required`-only members + sibling `properties`
  * ------------------------------------------------------------------------- */
 
-// The exact shape of `PatchTurnBlockRequest` (src/server/harness.swagger.yaml:8415-8440): a
+// The exact shape of `PatchTurnBlockRequest` (src/harness-server.swagger.yaml:8415-8440): a
 // `type: object` with the real field map, an `anyOf` pair naming nothing but `required`, and
 // `additionalProperties: false`.
 const patchShapedSchema = {
@@ -240,7 +240,7 @@ describe('the type/constraint split the fold depends on', () => {
 
 describe('the shipped body the two rules exist for', () => {
     it('renders the shipped PatchTurnBlockRequest with both axes instead of unknown', () => {
-        // The real spec schema (src/server/harness.swagger.yaml:8415-8440), not a fixture: its `anyOf`
+        // The real spec schema (src/harness-server.swagger.yaml:8415-8440), not a fixture: its `anyOf`
         // pair carries nothing but `required`, so its declaration must carry the field map. Only the
         // CODE lines are asserted here (the prose lines are the spec's, and the `--check` guard below
         // pins them byte-for-byte against the shipped file), stripped the same way the emitter's own

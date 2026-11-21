@@ -1,6 +1,6 @@
 // T13: the one paging helper every paginated canonical route shares.
 //
-// WHY (spec `components.parameters.Limit` / `.Cursor`, src/server/harness.swagger.yaml:2887):
+// WHY (spec `components.parameters.Limit` / `.Cursor`, src/harness-server.swagger.yaml:2887):
 //   - the SAME default (25) and maximum (100) apply to every paginated route, so one
 //     clamp is the contract, not a per-route invention (`HARNESS_PAGE_LIMIT` is the
 //     generated constant the client also uses);

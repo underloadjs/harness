@@ -33,7 +33,7 @@
 //
 // W26 (2026-11-17) adds the WIRE half of the same three scenarios. D1-D3 read the store's own view
 // (`store.get()` / the persisted document); what a CLIENT reads is the roster PAGE
-// (`./api-reads.ts` `threadRowOf` → `./harness.swagger.yaml` `ThreadSummary`), and W22 had published
+// (`./api-reads.ts` `threadRowOf` → `../harness-server.swagger.yaml` `ThreadSummary`), and W22 had published
 // `epoch` there while the row still carried no invocation id — a process token with nothing beside it.
 // W26 put `invocation_id`/`invocation_ids` on the row, so the pair is now checkable on the wire:
 //   D4 — after a restart, a post-restart row carries `epoch` BESIDE its `invocation_id`, and the two

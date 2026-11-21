@@ -1935,7 +1935,7 @@ describe('an injected registry', () => {
 describe('per-agent identity colors', () => {
     // One table, three layers. The library pattern (src/core/agent.ts
     // `AGENT_COLOR_PATTERN`), the registry pattern (registry.ts, same file) and the HTTP
-    // contract (`harness.swagger.yaml` `agent_colors.pattern`) must agree on exactly this
+    // contract (`harness-server.swagger.yaml` `agent_colors.pattern`) must agree on exactly this
     // set, or a stored color could be one a UI cannot paint.
     const HEX_ACCEPTED = ['#abc', '#abcd', '#aabbcc', '#aabbccdd', '#ABC', '#4ADE80'];
     const HEX_REJECTED = [

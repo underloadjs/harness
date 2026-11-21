@@ -258,7 +258,7 @@ describe('harness stream contract', () => {
             sustained_stall_ms: 10000,
             ack_timeout_ms: 5000,
             // Pinned to `x-websocket.limits.revision_records_per_state` in
-            // src/server/harness.swagger.yaml, which equals the `StreamResourceKind` count —
+            // src/harness-server.swagger.yaml, which equals the `StreamResourceKind` count —
             // the assertion under this one is the machine check that the two cannot drift.
             revision_records_per_state: 21,
         });
@@ -302,7 +302,7 @@ describe('harness stream contract', () => {
             'thread.removed',
             'transcript.updated',
             // T4: the record store's wake-up kind. Its place in this array is the yaml's
-            // `WsUpdateKind.enum` order (src/server/harness.swagger.yaml), and it sits with
+            // `WsUpdateKind.enum` order (src/harness-server.swagger.yaml), and it sits with
             // the other session-scoped identity kinds, right after the transcript.
             'records.updated',
             'tool.registry_updated',
@@ -694,7 +694,7 @@ describe('harness contract type wiring (compile time)', () => {
     // HAND-MAINTAINED BLOCKS (C1 follow-up): two regenerations of this file collapsed
     // `PatchTurnBlockRequest` to `unknown | unknown` and stripped the property doc blocks of
     // `TurnBlockWriteReceipt`, because the spec's `anyOf` members
-    // (src/server/harness.swagger.yaml:8417-8419) carry only `required` with no `properties`,
+    // (src/harness-server.swagger.yaml:8417-8419) carry only `required` with no `properties`,
     // which the renderer turns into `unknown` (scripts/generate-harness-contract.mjs:141-142
     // and :183). `unknown` accepts ANY value, so plain assignability cannot see the collapse —
     // hence `keyof` and indexed-access probes: both are errors on `unknown`, so the collapse

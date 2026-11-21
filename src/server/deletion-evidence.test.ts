@@ -12,7 +12,7 @@
 //
 // WHAT FIXES IT (option (b), chosen over forwarding the row): the deletion fact travels as its OWN
 // field beside the roster — `SessionSnapshot.inactiveThreads` / `SessionView.inactiveThreads`
-// (./protocol.ts) and the REST `SessionResource.inactive_thread_ids` (./harness.swagger.yaml,
+// (./protocol.ts) and the REST `SessionResource.inactive_thread_ids` (../harness-server.swagger.yaml,
 // generated into ./shared/harness-api.ts, emitted by ./api-reads.ts `sessionResourceOf`). Forwarding
 // the row instead would have widened every gate built on the roster (`defaultThreadId`, the roster
 // "names it" checks, `thread_count`), which is why the roster keeps meaning "the conversations this

@@ -219,7 +219,7 @@ const INSTRUCTION_TEXT_PATTERN = /^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007
 // Accepted per-agent identity COLOR (R2): a CSS hex color, 3/4/6/8 digits, either
 // case. This is deliberately the SAME expression the library validates at agent
 // construction (src/core/agent.ts `AGENT_COLOR_PATTERN`) and the same expression the
-// HTTP contract publishes (`harness.swagger.yaml` `agent_colors.pattern`): a color the
+// HTTP contract publishes (`harness-server.swagger.yaml` `agent_colors.pattern`): a color the
 // edge accepts is always one `agent()` accepts and a UI can always paint. The
 // duplication is only about the ERROR, not the rule — here a rejection must be a 400
 // that names the offending agent, while `agent()` names the agent it was configuring.

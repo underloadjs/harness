@@ -230,7 +230,7 @@ describe('subscribe registration', () => {
         });
 
         // The cap IS `revision_records_per_state` (21 — one record per `StreamResourceKind`,
-        // src/server/harness.swagger.yaml `x-websocket.limits`), so a 25-record host baseline
+        // src/harness-server.swagger.yaml `x-websocket.limits`), so a 25-record host baseline
         // must be truncated to exactly that many, in the host's order.
         expect(outcome.status === 'ok' && outcome.state.revisions.length).toBe(21);
         expect(outcome.status === 'ok' && outcome.state.revisions[0]).toEqual({ resource: 'config', id: null, revision: 0, epoch: EPOCH });

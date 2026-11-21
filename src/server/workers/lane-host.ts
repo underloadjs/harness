@@ -89,7 +89,7 @@ export type LaneTarget = { kind: 'thread'; threadId: string } | { kind: 'root'; 
 // below, and the worker turns each back into the provider its harness is built with
 // (./lane-worker-loop.ts `laneToolSettingsProvider` / `lanePluginSettingsProvider`). They are
 // therefore LANE-CREATION snapshots, not live reads - the documented lane semantics for every
-// value that crosses here (../harness.swagger.yaml, the plugin-settings PATCH).
+// value that crosses here (../../harness-server.swagger.yaml, the plugin-settings PATCH).
 //
 // `withheldTools` (R5b) joins the same list with ONE difference worth naming, because it is the
 // field that proves the difference is not a rule of the mechanism: the deployment deny list and

@@ -23,7 +23,7 @@ rows from `ContextBlock.lane` and owns no lane arithmetic either.
 
 The Rust port (`packages/typecrate/harness`) mirrors both halves this feature touches: the
 contract (`src/contract.rs`, generated-equivalent of `src/shared/harness-api.ts` and
-`harness.swagger.yaml`) and the display fold (`src/projector.rs`, the port of
+`harness-server.swagger.yaml`) and the display fold (`src/projector.rs`, the port of
 `src/server/turn-projector.ts`). Neither has the field yet.
 
 ## Gap
@@ -82,7 +82,7 @@ generated field is not permission to drop the key.
 
 | Fact | Where |
 |---|---|
-| Published field: `ContextBlock.lane`, integer, `minimum: 0`, absent ⇒ lane 0, mint-assigned and immutable (not a patch key) | `src/server/harness.swagger.yaml:8122`, generated into `src/shared/harness-api.ts:3320` (inside `ContextBlock`, `:3299`) and `src/shared/turn-display.ts:491` |
+| Published field: `ContextBlock.lane`, integer, `minimum: 0`, absent ⇒ lane 0, mint-assigned and immutable (not a patch key) | `src/harness-server.swagger.yaml:8122`, generated into `src/shared/harness-api.ts:3320` (inside `ContextBlock`, `:3299`) and `src/shared/turn-display.ts:491` |
 | The TypeScript fold's rule: an event-driven segment takes the event's lane, a non-event segment (`system` / `prompt` / `steer`) takes the turn's starting lane, `0` is never written, and a `context:set` patch never carries a lane | `src/server/turn-projector.ts:1409-1449` (`laneOfEvent` / `laneOfTurn` / `laneFieldsOf`), mints at `:1564`, `:1588`, `:1662`, `:2163`, `:2219`, `:2313`, `:2490`, `:2603` |
 | The stamp is written by the recorder at record time, read live per event | `src/server/sessions.ts:2745` (`contextLaneOf`, its rule comment `:2718-2744`), `:7924-7936` (model-run recorder: the rule at `:7924-7933`, the live read at `:7934`, the write at `:7936`), `:6978-6985` (command recorder, one rule for both) |
 | Durable per-conversation lane, with its strict snapshot whitelist and normalization (`0` never persisted) | `src/types/index.ts:2608` `HarnessThreadRecord` with `contextLane` at `:2647`, `:3067` `HarnessThreadSnapshot` with `contextLane` at `:3080`, `src/core/snapshot.ts` `readThreads` (`contextLane` in the key list + non-negative-integer read at `:758-763`, labelled `snapshot.threads` at `:950`, refusal sentences in `src/core/snapshot-validation.ts:90`/`:98`), `src/harness.ts:5781` (`setThreadContextLane`) |
@@ -149,7 +149,7 @@ vendored at `packages/typecrate/harness/tests/fixtures/lane-compaction/`.
   `packages/typecrate/harness/src/contract.rs:3029-3059` (was `:2728`; the first pass of this
   update moved it to `:3018-3048`, which is also wrong — `:3018` is `TurnDisplayResponse`, and
   the `ContextBlock` doc comment starts at `:3022`, so the struct body is `:3029-3059`).
-- **Re-verified exact, no edit needed**: swagger `src/server/harness.swagger.yaml:8122`
+- **Re-verified exact, no edit needed**: swagger `src/harness-server.swagger.yaml:8122`
   (`lane:` / `type: integer` / `minimum: 0`), the generated `lane?: number` at
   `src/shared/harness-api.ts:2116` and `src/shared/turn-display.ts:491`, the fold rule at
   `src/server/turn-projector.ts:1409-1449` (`laneOfEvent` `:1435-1439`, `laneOfTurn` `:1441`,

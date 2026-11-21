@@ -3373,7 +3373,7 @@ export class SessionStore {
     // `worker_threads`. Reading it at THIS moment is what makes the deny list a lane-creation
     // snapshot: a lane that is already running keeps the set it was built with, and a newly
     // created one states the operator's current value, exactly the documented semantics of
-    // `PATCH /v1/harness/plugins/{plugin_id}` (../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}) and of every
+    // `PATCH /v1/harness/plugins/{plugin_id}` (../harness-server.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}) and of every
     // other field below. `disabled()` is the store's sorted snapshot of the SAME names the
     // durable document carries (its `snapshot()`), just unwrapped for the wire.
     //

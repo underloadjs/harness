@@ -2,7 +2,7 @@
 // opaque cursor codec, and the client-frame validator the conversation runs FIRST.
 //
 // Contract role: `src/shared/harness-stream.ts` is GENERATED from
-// `src/server/harness.swagger.yaml` and carries only types plus the constant maps. This file
+// `src/harness-server.swagger.yaml` and carries only types plus the constant maps. This file
 // is the hand-written runtime half of the same vocabulary: everything the conversation must
 // decide per frame, in the exact order the spec's `x-websocket.validation_precedence` states:
 //
@@ -21,7 +21,7 @@
 // Cross-references:
 //   - ../../shared/harness-stream.ts — generated frame types + `HARNESS_WS_STREAM_LIMITS`
 //   - ../../shared/harness-api.ts    — `HARNESS_WS_SUBPROTOCOL`, `HARNESS_ROUTES` (link builder)
-//   - src/server/harness.swagger.yaml lines 2326-2571 — the `x-websocket` extension this file implements
+//   - src/harness-server.swagger.yaml lines 2326-2571 — the `x-websocket` extension this file implements
 //   - ./broker.ts ./connection.ts ./transport.ts ./mount.ts — the consumers of every table below
 //
 // No `@presource/*` import: `@underload/harness` ships with zero presource dependencies (see

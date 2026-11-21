@@ -29,7 +29,7 @@
 // provider rendering exists on the compiled plane (../frontend/ui/turns.ts:7858). A new
 // `provider` tone would be a wire change: `DisplayNode.tone` is a CLOSED enum of the six
 // documented tones (../shared/harness-api.ts:3378, generated from
-// ./harness.swagger.yaml), so it is not available without a contract edit.
+// ../harness-server.swagger.yaml), so it is not available without a contract edit.
 //
 // Run: yarn vitest run src/server/turn-projector-provider-retry.test.ts   (cwd packages/underload/harness)
 // Frontend regression for the consumer side:

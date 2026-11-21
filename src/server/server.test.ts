@@ -14,7 +14,7 @@ import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-suppo
 // the old root would fail the moment the contract root moved — which is exactly what happened.
 import { STANDALONE_MOUNT } from './api';
 // T18: every path, status, and payload below is stated the way the GENERATED contract states it
-// (`src/shared/harness-api.ts`, produced from src/server/harness.swagger.yaml). That is deliberate:
+// (`src/shared/harness-api.ts`, produced from src/harness-server.swagger.yaml). That is deliberate:
 // a network test that re-derives a path from the implementation cannot catch a route that moved,
 // and the legacy spellings this file used (`/messages`, `/presets`, a streamed submit) are exactly
 // the things the target contract removed.

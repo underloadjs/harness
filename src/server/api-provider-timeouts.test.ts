@@ -14,7 +14,7 @@
 //
 // Cross-references:
 //   - ./api.ts                          — the option, the mapping, `configDocument`
-//   - ./harness.swagger.yaml            — the spec the generated DTO comes from
+//   - ../harness-server.swagger.yaml            — the spec the generated DTO comes from
 //   - ../shared/harness-api.ts          — `GlobalConfigDocument.providerTimeouts`
 //   - ./config.ts                       — `loadProviderTimeoutConfiguration`
 //

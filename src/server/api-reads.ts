@@ -475,7 +475,7 @@ export const createdToolNames = (record: SessionRecord): string[] =>
  * (spec: the display subtree keeps camelCase) except the task text, which becomes the bounded
  * `promptPreview` + exact `promptChars` pair — for the row's own `prompt` AND for every
  * `steers[i]` entry (spec: `TurnSummary` and `DisplaySteerSummary` are both closed objects with
- * that pair, ./harness.swagger.yaml:6108 / :6075).
+ * that pair, ../harness-server.swagger.yaml:6108 / :6075).
  */
 export const turnRowOf = (projector: TurnProjector, turnId: string): WireTurnSummary => {
     const row = projector.summary() as unknown as Record<string, unknown>;
@@ -502,7 +502,7 @@ export const turnRowOf = (projector: TurnProjector, turnId: string): WireTurnSum
 /**
  * One steer entry of the projector's row -> the WIRE `DisplaySteerSummary`.
  *
- * The contract (../shared/harness-api.ts:1718-1726, from ./harness.swagger.yaml:6075-6107) is a
+ * The contract (../shared/harness-api.ts:1718-1726, from ../harness-server.swagger.yaml:6075-6107) is a
  * CLOSED object whose text field is `promptPreview` beside the EXACT `promptChars`; it requires
  * `[at, promptPreview, promptChars]` and sends nothing outside that set. The projector instead
  * keeps the submit's verbatim text under `prompt` (./turn-projector.ts:2794-2808, whose member
@@ -745,7 +745,7 @@ export const threadRowOf = (
             : { invocation_id: thread.invocationId }),
         ...(invocationIds.length === 0 ? {} : { invocation_ids: invocationIds }),
         // W22 (2026-11-17) — the conversation's RUN discriminator, on the host/UI roster plane
-        // (`./harness.swagger.yaml` `ThreadSummary.epoch`). Emitted under exactly ONE condition: the runtime
+        // (`../harness-server.swagger.yaml` `ThreadSummary.epoch`). Emitted under exactly ONE condition: the runtime
         // record pairs an invocation id with the process that minted it (`../types/index.ts`
         // `HarnessThreadRecord.epoch`, which travels with `invocationId` and never ahead of it). A
         // conversation that never ran, and every conversation restored from a document written before the

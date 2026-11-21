@@ -418,7 +418,7 @@ describe('GET /v1/harness/plugins', () => {
             title: 'Context Compaction',
             description: COMPACTION.description,
             // The prompt the details panel shows, projected to the contract's snake_case
-            // spelling (../server/harness.swagger.yaml `PluginSummary.system_prompt`).
+            // spelling (../harness-server.swagger.yaml `PluginSummary.system_prompt`).
             // The other two rows declare no prompt and emit no such key: async-ping's
             // key-set assertion above and context-trimmer's own deep-equal below are what
             // pin that absence, so adding the field cannot widen the other rows.

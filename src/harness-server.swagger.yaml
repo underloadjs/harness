@@ -8,9 +8,9 @@
 #   src/server/config.ts     - provider defaults, credential rule, runtime configuration
 #   src/server/harnesses/    - harness definition registry (create/patch/delete, built-in tombstones)
 #   src/server/journal.ts    - durable event record, (turnId, index) locator
-#   src/server/turn-projector.ts, src/shared/turn-display.ts - display projection + addressed ops
-#   src/core/command.ts, src/core/command-builtins.ts        - slash-command grammar and built-ins
-#   src/types/index.ts       - harness domain types (events, messages, tools, threads, commands)
+#   src/server/turn-projector.ts, src/engine/shared/turn-display.ts - display projection + addressed ops
+#   src/engine/core/command.ts, src/engine/core/command-builtins.ts        - slash-command grammar and built-ins
+#   src/engine/types/index.ts       - harness domain types (events, messages, tools, threads, commands)
 # ---------------------------------------------------------------------------
 openapi: 3.0.3
 info:
@@ -3082,7 +3082,7 @@ paths:
       description: >-
         The ONE write the segment dialog makes: it switches this segment's transcript entry into, or out of, the
         requests that follow, on either of two axes. `included` is the segment's OWN prompt axis and is the HTTP
-        face of the shipped `turn.before setIncluded` control (src/harness.ts `setIncluded`): the target is the
+        face of the shipped `turn.before setIncluded` control (src/engine/harness.ts `setIncluded`): the target is the
         ONE transcript ENTRY behind the segment — per entry, with NO cascade. Provider tool-call pairing still
         holds without one, because the projection answers every emitted `tool_calls[]` slot: an excluded request
         entry lets its results ride as an ownerless `tool` message, and a withheld result comes back as a synthetic
@@ -3090,7 +3090,7 @@ paths:
         segment's thinking, because that is what rides in the prompt for a thinking window, and it is the figure
         `GET` on this path publishes as `included` — the write mirrors the read. `reasoningIncluded` names the
         THINKING axis explicitly (trimmer uplift T7): the per-entry flag `turn.before setReasoningIncluded` writes
-        (src/harness.ts `setReasoningIncluded`), which withholds ONE assistant entry's thinking from its projection
+        (src/engine/harness.ts `setReasoningIncluded`), which withholds ONE assistant entry's thinking from its projection
         copy while the entry itself keeps travelling, with NO unit cascade. At least one field is required. A
         segment whose requested axis names no live entry — no live call id behind a call, no single assistant entry
         carrying this EXACT recorded thinking behind a thinking window, or no single assistant entry whose `content`
@@ -4606,7 +4606,7 @@ components:
                 belongs to, reporting the shipped `has_api_key` - it never means "no key". An omitted
                 property leaves the key untouched. The stored value is never echoed back.
     # ---------------------------------------------------------------------
-    # THE RANK LETTER (R1) - the kernel's `AgentRank` (src/types/index.ts) spelled on the
+    # THE RANK LETTER (R1) - the kernel's `AgentRank` (src/engine/types/index.ts) spelled on the
     # wire. One UPPER-CASE letter, `A` the HIGHEST authority and `Z` the lowest. A rank is
     # AUTHORITY, not a singleton: a definition may hand the same letter to any number of
     # members, and several members may hold `A`. There is no `role` axis anywhere in this
@@ -5169,7 +5169,7 @@ components:
     # and the effective values an operator has set.
     #
     # WHY `settings` AND `values` TRAVEL TOGETHER. A plugin's descriptor list is
-    # authored in the plugin file itself (`src/plugins/*.plugin.ts`, projected into
+    # authored in the plugin file itself (`src/engine/plugins/*.plugin.ts`, projected into
     # the generated manifest), so the server cannot restate it; `values` is the
     # resolution of those same keys against the stored overrides. Shipping both in
     # one row is what lets the Plugins pane render an editable form in a single
@@ -6523,7 +6523,7 @@ components:
               description: >-
                 THE UNREGISTER AXIS, and nothing else: true for a name this conversation may not
                 DELETE, because it is harness-owned - the figure is the kernel's own `toolManage
-                remove` rule (`src/harness.ts` refuses a name whose REGISTERED
+                remove` rule (`src/engine/harness.ts` refuses a name whose REGISTERED
                 `visibility` is `core`), read from the same live registry map the delete route
                 asks. Consequences, stated exactly: a protected entry refuses DELETE with 403 and
                 accepts a source PATCH (replacing an implementation is a different privilege from
@@ -7560,7 +7560,7 @@ components:
       description: >-
         One registered slash command, projected for a composer: the registry key, the line a client inserts,
         the one-line summary, and the argument template. Names are validated by the shared parser
-        (`src/core/command.ts`), so an invocation is always `/`-safe and lowercase.
+        (`src/engine/core/command.ts`), so an invocation is always `/`-safe and lowercase.
       required: [name, invocation, description]
       additionalProperties: false
       properties:
@@ -7699,7 +7699,7 @@ components:
         # unpairable: `src/frontend/view-shell.ts` `getRawSession` builds the transcript dialog's roster rows from
         # THIS page, so an export read carried a process with no invocation id beside it and the
         # invocation -> conversation join could still not key a contested id. These two fields close that gap.
-        # Values are BARE invocation ids, never the composite `id\0epoch` (`src/shared/run-identity.ts`; the strip
+        # Values are BARE invocation ids, never the composite `id\0epoch` (`src/engine/shared/run-identity.ts`; the strip
         # is `invocationIdOfRunKey`, applied by `src/server/api-reads.ts`), and BOTH keys are omitted when the
         # conversation recorded nothing, so a conversation that never ran projects exactly as it did before.
         invocation_id:
@@ -7729,7 +7729,7 @@ components:
           items:
             type: string
         # W22 (2026-11-17) — the host/UI roster plane gains the run discriminator the store already
-        # records (`src/types/index.ts` `HarnessThreadRecord.epoch`). Additive and optional: a
+        # records (`src/engine/types/index.ts` `HarnessThreadRecord.epoch`). Additive and optional: a
         # conversation with no recorded epoch emits NO key, so every roster row of every document
         # written before this field projects byte-identically.
         epoch:
@@ -8750,7 +8750,7 @@ components:
         away at the block detail route. The display and block routes transport the projector's record VERBATIM
         (./api.ts `getSessionTurnDisplay` and `getSessionTurnBlock` cast, never restate, `projector.display()` and
         `store.blockDetail()`), so these property names ARE the projector's field names
-        (src/shared/turn-display.ts `ContextBlock`): `name`, never a renamed `label`, is what the server sends.
+        (src/engine/shared/turn-display.ts `ContextBlock`): `name`, never a renamed `label`, is what the server sends.
         No time figure, no span, and no `inPrompt` verdict is dropped by this record either, because every one of
         them is a figure the durable record already holds and a client may not re-derive.
       required: [kind, id, turnId, sectionId, chars]
@@ -8779,7 +8779,7 @@ components:
             projection. ABSENT means lane 0, the default lane, so a producer that says nothing is lane 0 and a
             client never synthesizes another number. Assigned at MINT time by the `context:add` that creates the
             block and IMMUTABLE afterwards, so it is not a key of `ContextBlockPatch` (the shared whitelist in
-            src/shared/turn-display.ts `ContextBlockPatch` is the authority): a block that would change lanes is a
+            src/engine/shared/turn-display.ts `ContextBlockPatch` is the authority): a block that would change lanes is a
             `context:remove` + `context:add` pair, exactly like an identity-field change. The NUMBER is opaque
             here - the server decides what mints a new lane, a renderer only groups rows by it.
         name:
@@ -8878,7 +8878,7 @@ components:
             this same path writes it. A client never derives it.
 
             ONE FIELD NAME, TWO HONEST GRANULARITIES, and they differ in exactly ONE case (the in-repo model
-            src/shared/turn-display.ts `ContextBlock.included` is the authority and states the same rule; this
+            src/engine/shared/turn-display.ts `ContextBlock.included` is the authority and states the same rule; this
             schema is its verbatim wire alias). The BLOCK DETAIL read (./api.ts `getSessionTurnBlock`) answers the
             ENTRY this segment resolves to, per entry — that is the verdict the dialog's chip switches, and the
             one `PATCH` on this path writes. The DISPLAY read (./api.ts `getSessionTurnDisplay`, which stamps the
@@ -9135,12 +9135,12 @@ components:
           description: >-
             The segment's OWN prompt axis, resolved through the join that can name this segment's entry. For a
             `tool` segment it addresses the ONE transcript ENTRY behind that segment — never the unit around it.
-            `false` stores the flag core keeps only as a literal `false` (src/core/agent.ts `withIncluded`),
+            `false` stores the flag core keeps only as a literal `false` (src/engine/core/agent.ts `withIncluded`),
             `true` removes it, which is how a reader switches a segment back on, and NOTHING fans out to a
             sibling: a policy that wants a whole exchange out of the requests writes each entry it names.
             Provider pairing survives without a cascade because the projection answers every emitted
             `tool_calls[]` slot — a withheld request entry lets its results ride as an ownerless `tool` message,
-            and a withheld result is replaced in the request by a synthetic `withheld` tool message (src/harness.ts
+            and a withheld result is replaced in the request by a synthetic `withheld` tool message (src/engine/harness.ts
             `projectTranscript`). For a `reasoning` segment the same field addresses that entry's THINKING,
             because thinking is what rides in the prompt for a thinking window — it is the same figure this path's
             `GET` publishes as `included`, so the write mirrors the read.
@@ -9148,7 +9148,7 @@ components:
           type: boolean
           description: >-
             The THINKING axis, named explicitly (trimmer uplift T7): the per-entry `reasoningIncluded` flag core's
-            `turn.before setReasoningIncluded` writes (src/harness.ts `setReasoningIncluded`). It withholds ONE
+            `turn.before setReasoningIncluded` writes (src/engine/harness.ts `setReasoningIncluded`). It withholds ONE
             assistant entry's thinking from its projection copy while the entry itself keeps travelling, and there
             is NO unit cascade, because thinking belongs to exactly one entry. It resolves through the thought join
             only, so it is writable on a `reasoning` segment and refused 409 on any other kind, whose recorded bytes
@@ -9276,7 +9276,7 @@ components:
     HarnessEventType:
       type: string
       description: >-
-        Recorded event kinds, the authoritative list of `HarnessEvent` in `src/types/index.ts`: `start` opens a
+        Recorded event kinds, the authoritative list of `HarnessEvent` in `src/engine/types/index.ts`: `start` opens a
         run with its agent and model; `text` and `reasoning` are deltas; `tool_call` is the requested call and
         `tool_result` its answer; `usage` is per-request accounting, emitted for EVERY model request including
         tool rounds, so usage events rather than `done` are the complete cost record; `done` is the committed
@@ -9585,7 +9585,7 @@ components:
                 it is what a `turn.before` policy uses to name the same turn in a later round (`setIncluded(id, ...)).
                 For a turn that requested tools the id addresses THIS request entry only: `setIncluded(id, …)` switches
                 that one entry, and the results answering these calls carry ids of their own
-                (src/harness.ts `insertToolMessage`) to be addressed separately.
+                (src/engine/harness.ts `insertToolMessage`) to be addressed separately.
             included:
               type: boolean
               description: >-
@@ -9595,7 +9595,7 @@ components:
                 an answered call whose RESULT is switched off keeps its slot with a request-only `withheld`
                 placeholder, and an unanswered one keeps its `pending` placeholder, so a partial `tool_calls` block
                 is still a valid provider request without moving any sibling flag
-                (src/harness.ts `projectTranscript`, src/types/index.ts:217-222).
+                (src/engine/harness.ts `projectTranscript`, src/engine/types/index.ts:217-222).
             reasoningIncluded:
               type: boolean
               description: >-
@@ -9606,7 +9606,7 @@ components:
                 RESOLVED OUT OF THE PROJECTION: a flagged entry is still emitted in the request, at the same
                 position with the same `content` and `toolCalls`, but its projection copy omits `reasoning`
                 entirely and no request object carries the flag key, so the transport needs no new field. Written
-                by `turn.before setReasoningIncluded` (src/harness.ts) and by `PATCH` on a `reasoning` context
+                by `turn.before setReasoningIncluded` (src/engine/harness.ts) and by `PATCH` on a `reasoning` context
                 segment; canonical state, snapshots, branches and forks DO carry it, so the decision survives a
                 restart. Assistant-only, and never cascaded: thinking belongs to exactly one entry.
         - type: object
@@ -9661,7 +9661,7 @@ components:
                 it is what a `turn.before` policy uses to name the same turn in a later round (`setIncluded(id, ...)).
                 The result of a call block carries its own id too, so a policy may address an answered call FROM the
                 result side — and `setIncluded` then switches that result entry alone, never its owning request or its
-                sibling results (src/harness.ts `insertToolMessage`, src/types/index.ts:311-314).
+                sibling results (src/engine/harness.ts `insertToolMessage`, src/engine/types/index.ts:311-314).
             included:
               type: boolean
               description: >-
@@ -9669,7 +9669,7 @@ components:
                 nothing else. Its owning request keeps travelling unless it carries its own flag, and an emitted call
                 whose answer is switched off keeps its slot with a request-only `withheld` tool message, so the
                 provider never sees a `tool_calls` block with a missing answer — pairing holds without any fan-out to
-                siblings (src/harness.ts `projectTranscript`, src/types/index.ts:304-310).
+                siblings (src/engine/harness.ts `projectTranscript`, src/engine/types/index.ts:304-310).
     HarnessEvent:
       type: object
       description: >-

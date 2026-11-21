@@ -1321,7 +1321,7 @@ export type SubmitTaskResult = {
 // Response of POST /sessions/:id/threads/:threadId/cancel (R6 stop-one), the STORE's
 // answer (./sessions.ts `cancelThread`) — not the REST receipt. The wire body is the
 // generated 6-field `CancelThreadResult` (../shared/harness-api.ts, built from
-// ./harness.swagger.yaml): this pair plus `thread_id`, `session_id`, the post-stop
+// ../harness-server.swagger.yaml): this pair plus `thread_id`, `session_id`, the post-stop
 // `status`, `dropped_queued_tasks`, and `revision`.
 //
 // `cancelled` is honest about what this call TERMINATED: true when it aborted a live

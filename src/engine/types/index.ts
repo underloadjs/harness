@@ -3853,7 +3853,7 @@ export type HarnessThreadRecord = {
     // true of the TYPE: `../server/sessions.ts` `threadRoster` spreads the record, so the token reached the
     // roster JSON undeclared. The host/UI roster plane now DECLARES it — `SessionThread.epoch` /
     // `SessionThreadView.epoch` (../server/protocol.ts) and `ThreadSummary.epoch`
-    // (../server/harness.swagger.yaml -> ../shared/harness-api.ts) — because the client transcript join
+    // (../../harness-server.swagger.yaml -> ../shared/harness-api.ts) — because the client transcript join
     // (../frontend/ui/thread-transcript.ts) cannot resolve a contested recycled invocation id between two
     // otherwise-identical claimants without it (W19's residual, pinned as F3 and D2).
     //
@@ -5829,7 +5829,7 @@ export type HarnessPluginMetadata = {
     // literal, NOT a reference to that plugin's own prompt constant: the constant is
     // declared after `metadata`, so a reference would read a temporal dead zone, and a
     // test pins the two copies byte-exact. The wire spelling is snake_case
-    // (`system_prompt`, src/server/harness.swagger.yaml `PluginSummary`); this internal
+    // (`system_prompt`, src/harness-server.swagger.yaml `PluginSummary`); this internal
     // name stays camelCase like every other field here (src/server/api.ts `pluginRowOf`
     // is the one place that maps the two).
     systemPrompt?: string;

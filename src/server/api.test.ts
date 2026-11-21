@@ -1,6 +1,6 @@
 ﻿// The transport-neutral canonical API, reached through the @underload/service adapter.
 //
-// T34: rewritten against the FINAL target contract (harness.swagger.yaml + the generated
+// T34: rewritten against the FINAL target contract (harness-server.swagger.yaml + the generated
 // ../shared/harness-api.ts routes), NOT against the old bootstrap/SSE surface. Nothing here
 // asks the server for a compatibility alias: `/api`, `/presets`, `/tools/bootstrap`,
 // `POST /sessions/:id/messages` and the SSE submit are pinned as GONE (404/400), which is the
@@ -889,7 +889,7 @@ describe('canonical root and provider document', () => {
 // Issue 0005 (C): `POST /sessions` may START with a transcript instead of an empty one, so a
 // client that already holds the conversation does not have to replay it through the transcript
 // PUT after the session exists. THE semantics this pins (./api.ts postSession, and the JSDoc on
-// `CreateSessionRequest.messages` in ./harness.swagger.yaml):
+// `CreateSessionRequest.messages` in ../harness-server.swagger.yaml):
 //   - the seed is validated BEFORE anything is created, so a bad row is a 400 and no session;
 //   - it is a whole-document REPLACE of the entry agent's default conversation (`agent:<entry>`),
 //     which is why a seed with no `system` row drops the profile prompt (see `role_counts` below);

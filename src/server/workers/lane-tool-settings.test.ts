@@ -76,7 +76,7 @@
 //   - ../harnesses/presets.ts         the demo factory's two forwards
 //   - ../../harness.ts                `isToolGloballyDisabled`, `requestToolsFor`
 //   - ../../plugin/host.ts, plugin/hooks.ts the `enabled` gate a plugin provider answers
-//   - ../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id} the lane-creation wording these fields implement
+//   - ../../harness-server.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id} the lane-creation wording these fields implement
 
 // The deepest level this feature can be pinned at, on REAL `node:worker_threads` lanes:
 // a live turn whose provider request is captured on the WIRE by a loopback stub provider.
@@ -196,7 +196,7 @@ describe('R3 lane propagation: the blueprint carries the deny list at lane creat
         // The value the FIRST lane was built with is untouched: a live lane keeps the state it
         // was created with, and picks the new value up when its lane is next created - the
         // documented semantics of every value that crosses here
-        // (../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}, `PATCH /v1/harness/plugins/{plugin_id}`).
+        // (../../harness-server.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}, `PATCH /v1/harness/plugins/{plugin_id}`).
         expect(created.disabledTools).toEqual([]);
         // A lane created after the write states the operator's current value.
         expect(next.disabledTools).toEqual(['timeNow']);

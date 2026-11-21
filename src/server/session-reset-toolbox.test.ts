@@ -51,7 +51,7 @@
 //                                      when it hands the persisted set to `setActiveTools`
 //   - ../types/index.ts              — `HarnessConfiguration.enableAllTools`,
 //                                      `Harness.enableAllSwitchableTools`
-//   - ./harness.swagger.yaml         — `SessionToolSummary.enabled` (the promise's wording)
+//   - ../harness-server.swagger.yaml         — `SessionToolSummary.enabled` (the promise's wording)
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';

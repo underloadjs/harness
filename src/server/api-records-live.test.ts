@@ -34,7 +34,7 @@
 //                                   the `StoreStreamSignal` variant it emits
 //   - ../core/records.ts          — the feed and the reset rule (pinned in
 //                                   ../core/records.store-events.test.ts)
-//   - ./harness.swagger.yaml      — `/v1/harness/sessions/{session_id}/records`, `RecordsSnapshot
+//   - ../harness-server.swagger.yaml      — `/v1/harness/sessions/{session_id}/records`, `RecordsSnapshot
 //                                   Response`, `RecordsDeltaResponse`, `WsUpdateRecords`
 //   - ./api-live-events.test.ts   — the hub/broker/bridge fixture this reuses
 

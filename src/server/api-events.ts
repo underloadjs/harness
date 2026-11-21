@@ -3,7 +3,7 @@
 //
 // WHY THIS MODULE EXISTS
 // ----------------------
-// The target contract (src/server/harness.swagger.yaml, mirrored by
+// The target contract (src/harness-server.swagger.yaml, mirrored by
 // src/shared/harness-api.ts + src/shared/harness-stream.ts) states every collection page,
 // every resource read, and every stream frame with a revision counter that is only
 // comparable WITHIN one server epoch. Both transport owners need the exact same numbers:

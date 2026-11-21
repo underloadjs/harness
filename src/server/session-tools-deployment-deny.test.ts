@@ -1,7 +1,7 @@
 // F2-1 — the deployment-wide tool deny × the SESSION toolbox rows.
 //
 // WHY THIS FILE EXISTS: the published contract (`SessionToolSummary.enabled`,
-// ../shared/harness-api.ts, generated from ./harness.swagger.yaml) promised that a session this
+// ../shared/harness-api.ts, generated from ../harness-server.swagger.yaml) promised that a session this
 // server created NEW answers `true` for "every row that is switchable at all". A name the
 // OPERATOR has switched off deployment-wide (`PATCH /v1/harness/tools/{tool_id}`) is still
 // switchable by this session, so the promise was read as falsified: after denying `shell`, a
@@ -37,7 +37,7 @@
 //   - ./api-reads.ts                 — `sessionToolRowsOf` (`enabled`/`protected`/`origin`)
 //   - ./api.ts                       — `patchTool` (the global route), `setSessionToolEnabled`
 //   - ./tool-settings.ts             — the deployment deny list behind both routes
-//   - ./harness.swagger.yaml         — the prose this file is the behaviour half of
+//   - ../harness-server.swagger.yaml         — the prose this file is the behaviour half of
 //   - ./session-reset-toolbox.test.ts — the same seed scope on the reset path (F2-2)
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';

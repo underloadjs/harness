@@ -1,7 +1,7 @@
 // T4 (data plane) — the stream tables the `records.updated` kind depends on.
 //
 // WHY THIS FILE EXISTS. `./protocol.ts` is the hand-written mirror of the contract's
-// `x-websocket` extension in ../harness.swagger.yaml: three tables (which kinds a scope
+// `x-websocket` extension in ../../harness-server.swagger.yaml: three tables (which kinds a scope
 // publishes, which counters a subscription bootstraps against, which counters one kind
 // moves) plus the two link builders that tell a client WHERE to re-read. The rest of the
 // stream suite tests the broker's behavior; nothing pinned the tables themselves, and the
@@ -20,7 +20,7 @@
 //   - ./protocol.ts                   — the tables under test
 //   - ./mount.ts                      — `hubResourceId` (the hub's id for a resource kind)
 //   - ../api-events.ts                — `resourceBaselineLink` (the link a resync hands out)
-//   - ../harness.swagger.yaml         — `WsUpdateKind`, `StreamResourceKind`,
+//   - ../../harness-server.swagger.yaml         — `WsUpdateKind`, `StreamResourceKind`,
 //                                       `subscription_scopes[].publishes`, `x-websocket.limits`
 
 import { describe, expect, it } from 'vitest';
@@ -39,7 +39,7 @@ import { HARNESS_STREAM_RESOURCE_KINDS, HARNESS_WS_STREAM_LIMITS, HARNESS_WS_UPD
 describe('the records scope tables', () => {
     it('publishes records.updated to the session scope, at the contract position', () => {
         // Verbatim from `x-websocket.subscription_scopes[scope=session].publishes`
-        // (../harness.swagger.yaml:3013). Order matters here because this array IS the answer a
+        // (../../harness-server.swagger.yaml:3013). Order matters here because this array IS the answer a
         // `subscription_state` frame carries in `publishes`.
         expect(HARNESS_WS_SCOPE_PUBLISHES.session).toEqual([
             'session.updated',

@@ -17,7 +17,7 @@
 //      record (no epoch anywhere) still folds into the merged row it folded into before;
 //   4. the epoch never rides the WIRE: it is projector row state
 //      (`SectionRecord.epoch`), so no `TurnDisplayOp`, no `TurnSection`, and no `TurnSummary`
-//      carries the key — which is why ../shared/harness-api.ts and ./harness.swagger.yaml did
+//      carries the key — which is why ../shared/harness-api.ts and ../harness-server.swagger.yaml did
 //      not move.
 //
 // Scratch lives in the repo-root Temp/ (root AGENTS.md), never the OS temp dir.
@@ -231,7 +231,7 @@ describe('the epoch survives the trip to disk and back (T-W8)', () => {
         // The ops a running turn streams, the compiled tree every read serves, and the summary
         // row are the whole display contract. `SectionRecord.epoch` is projector row state, so
         // the key appears in NONE of them — which is why the generated REST contract
-        // (../shared/harness-api.ts, ./harness.swagger.yaml) and the browser's `HarnessThread`
+        // (../shared/harness-api.ts, ../harness-server.swagger.yaml) and the browser's `HarnessThread`
         // alias did not have to move.
         const folded = foldEvents(RESTARTED_CHILD);
         const wire = JSON.stringify({

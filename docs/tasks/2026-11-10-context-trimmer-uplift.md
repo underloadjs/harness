@@ -672,7 +672,7 @@ this is the largest single task.)
   carry it without breaking its "no flag key on a request" posture
   (`src/harness.ts:6561-6569` — decide and document whether the thought flag rides on the request
   object or is resolved out of it, and make `turn.before`'s `currentMessages()` agree);
-  `harness.swagger.yaml` and the client contract must publish it; and the control's doc comment
+  `harness-server.swagger.yaml` and the client contract must publish it; and the control's doc comment
   must state the storage rule the same way `setIncluded`'s does.
 - **Option B — `edit(entry, {reasoning: ''})`.** Cheaper, no new field, and **destructive**:
   the transcript stops carrying the thinking a reader was shown, which contradicts "nothing is

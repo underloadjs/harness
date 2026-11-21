@@ -1481,7 +1481,7 @@ export const nestedRunHandshakeLimitations = (refusedTools: readonly string[]): 
 // a limit: a lane kept declaring and launching tools the operator had switched off. Carrying
 // the SET at lane creation gives a new lane the CURRENT value (an idle reclaim, a new
 // conversation, an authority rebuild) while a live lane keeps the value it was built with,
-// which is exactly the documented lane semantics (../harness.swagger.yaml, the
+// which is exactly the documented lane semantics (../../harness-server.swagger.yaml, the
 // plugin-settings PATCH: a lane "picks the new value up the next time its lane is created").
 //
 // WHY `undefined` FOR AN EMPTY LIST: `harness()` keeps a fast path for "no provider wired"
@@ -1505,7 +1505,7 @@ export const nestedRunHandshakeLimitations = (refusedTools: readonly string[]): 
 // VALUES at lane creation (../sessions.ts `blueprintFor`) and rebuilding the provider here is
 // what makes a replica answer the operator's switches instead of the library's declared
 // defaults; a live lane keeps the state it was created with and the next lane sees the edit,
-// the documented semantics (../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}).
+// the documented semantics (../../harness-server.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}).
 //
 // `undefined` for an absent/empty snapshot is the deliberate fast path: the preset factories
 // spread these members only when present (../harnesses/toolbox.ts), so a deployment that never
@@ -1715,7 +1715,7 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
             // (../harnesses/toolbox.ts). A lane therefore honours every name switched off when
             // the lane was created, and picks up a later edit when it is next created - the
             // documented lane semantics, the same ones the plugin-settings PATCH states
-            // (../harness.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}). Discovery is not even delayed by that window:
+            // (../../harness-server.swagger.yaml, PATCH /v1/harness/plugins/{plugin_id}). Discovery is not even delayed by that window:
             // a lane's `toolRequest` is routed to the authority (../lane-authority.ts), which
             // answers against the canonical harness and so against the LIVE provider.
             ...(toolSettings === undefined ? {} : { toolSettings }),

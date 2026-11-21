@@ -106,7 +106,7 @@
 //     applies again. Same `null`-means-reset rule as `PATCH /config` (./api.ts `patchConfig`).
 //   - an unknown key is refused with the declared set named, rather than stored and then
 //     ignored forever - the contract's "a client is never left believing it changed
-//     something" rule (src/server/harness.swagger.yaml `components.responses.BadRequest`).
+//     something" rule (src/harness-server.swagger.yaml `components.responses.BadRequest`).
 //
 // WORKER MODE (the provider cannot cross; the VALUES can)
 // -------------------------------------------------------

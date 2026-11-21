@@ -126,7 +126,7 @@ Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harn
 > ONCE PER SIZE STEP (its latch re-arms on Rule 3's own 5% margin and `reported: true` marks the
 > turn that printed), and the ServiceInfo / `tool_result_bytes` prose that called the cap
 > window-scaled now says what it is — a FIXED byte count — regenerated into
-> `src/shared/harness-api.ts` from `src/server/harness.swagger.yaml`. Plus the fourth door of the
+> `src/shared/harness-api.ts` from `src/harness-server.swagger.yaml`. Plus the fourth door of the
 > DOOR SHAPE rule below: a compaction note also used to cross the delegation door through the
 > STREAMING lane (`isCompactionAnswerStream`, a position test on a content-free placeholder turn,
 > makes an abort mid-summary fall through to `lastSubstantiveText`). Pinned in
@@ -147,7 +147,7 @@ Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harn
 > segments end at the call's own last frame from ONE shared computation, the root row stays the
 > turn's), with the measured before/after figures read off the recorded run's own folds; every value
 > was re-derived at source from `src/server/api-reads.ts` (`threadRowOf`, `rosterInvocationIdsOf`,
-> `uniqueInvocationIds`, `MAX_ROSTER_INVOCATIONS`), `src/server/harness.swagger.yaml`,
+> `uniqueInvocationIds`, `MAX_ROSTER_INVOCATIONS`), `src/harness-server.swagger.yaml`,
 > `src/shared/harness-api.ts`, `src/shared/harness-stream.ts`, `src/shared/run-identity.ts`,
 > `src/server/protocol.ts`, `src/server/turn-projector.ts` (`interruptedStateOf`,
 > `interruptedEndedAtOf`, `abandonedEndedAtOf`, `settle`), `src/server/journal.ts`,
@@ -722,7 +722,7 @@ src/browser.ts          browser root: library + shared + client
 src/shared/
   index.ts              the /shared barrel (isomorphic code only — safe in either runtime)
   origin.ts             loopback/same-origin rules (inbound gate + outbound gate)
-  harness-api.ts        GENERATED from src/server/harness.swagger.yaml — the canonical REST
+  harness-api.ts        GENERATED from src/harness-server.swagger.yaml — the canonical REST
                         contract types (scripts/generate-harness-contract.ts)
   harness-stream.ts     GENERATED from the same spec — the update-stream wire vocabulary
   attachments.ts        the SINGLE attachment gate shared by composer, route, run, snapshot
@@ -5182,7 +5182,7 @@ The answer is ONE new informational event kind and ONE new display field, not a 
   (`src/harness.ts:13452-13478`). A frame after `completed` is dropped like a late text delta.
 - **Contract.** `progress` joined the CLOSED event-kind list
   (`src/shared/harness-stream.ts:130-146`) and the generated swagger / API types
-  (`src/server/harness.swagger.yaml:9241, 9257, 9687-9709`;
+  (`src/harness-server.swagger.yaml:9241, 9257, 9687-9709`;
   `src/shared/harness-api.ts:3956, 4057-4068`) — all three are generator output
   (`scripts/generate-harness-contract.ts`), never hand-edited.
 - **Counters, never text.** `toolCallSlots` is `pending.size` — a slot exists exactly when the
@@ -6209,7 +6209,7 @@ resumed conversation under a dead child's id. Root runs are unchanged: they stil
   that is true only of the TURN planes. The same process token IS published on the CONVERSATION
   planes, beside the run ids it discriminates — `SessionThread.epoch` (`src/server/protocol.ts:610`),
   `SessionThreadView.epoch` (`:719`, the compact row the browser renders) and `epoch` on
-  `ThreadSummary` (`src/server/harness.swagger.yaml:7544-7595` → `src/shared/harness-api.ts:2821`),
+  `ThreadSummary` (`src/harness-server.swagger.yaml:7544-7595` → `src/shared/harness-api.ts:2821`),
   which is also what a `thread.upsert` frame carries because the live row is the same producer
   (`WsUpdateThreadUpsert.thread: ThreadSummary`, `src/shared/harness-stream.ts:766`). The token is
   BARE there too, and the model-facing `threadList` page still strips it. See "THE ROSTER ROW
@@ -7268,7 +7268,7 @@ table.
 |---|---|
 | `GET /v1/harness/health` | Liveness and session count (`{ ok, sessions, epoch }`, `src/server/api.ts:1675-1680`) |
 | `GET /v1/harness/harnesses` | Harness definitions, **paged** (`q` matches name/title/description); every entry is an editable application copy and `editable` is always `true`. CORRECTED IN PLACE 2026-11-11: this row also used to promise "provider defaults, and `agents`" in the same answer — defaults are `GET /config` now and the registry is `GET /agents`, each its own bounded page |
-| `POST /v1/harness/harnesses` | `{ name, title?, description?, agents, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }` (`agents` is the ONLY roster field, in declaration order, and is REQUIRED beside `name`; `entry` defaults to its first name and `ranks` may cover fewer members than the roster. CORRECTED IN PLACE 2026-11-11: these fields are snake_case on the wire, not the old camelCase `agentModels`/`agentInstructions`, `src/shared/harness-api.ts:643-652`; CORRECTED AGAIN 2026-11-18: `primary`/`subagents` are gone from the contract — the row is `entry` + `ranks`, and `AgentRank` is the 26-letter enum at `src/server/harness.swagger.yaml:4587-4593`) |
+| `POST /v1/harness/harnesses` | `{ name, title?, description?, agents, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }` (`agents` is the ONLY roster field, in declaration order, and is REQUIRED beside `name`; `entry` defaults to its first name and `ranks` may cover fewer members than the roster. CORRECTED IN PLACE 2026-11-11: these fields are snake_case on the wire, not the old camelCase `agentModels`/`agentInstructions`, `src/shared/harness-api.ts:643-652`; CORRECTED AGAIN 2026-11-18: `primary`/`subagents` are gone from the contract — the row is `entry` + `ranks`, and `AgentRank` is the 26-letter enum at `src/harness-server.swagger.yaml:4587-4593`) |
 | `PATCH /v1/harness/harnesses/:name` | `{ title?, description?, agents?, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `{ harness }`; every template is patchable, `entry` re-targets routing ALONE (an omitted `entry` keeps the current one while it stays a member and otherwise falls back to the new roster's first agent), `ranks` REPLACES the authority map (`{}` clears every rank, an omitted map keeps the ranks of the surviving members), and each other map field REPLACES the map it names |
 | `GET /v1/harness/harnesses/:name` | `200 { harness }` — one definition with the IDENTIFIED read's own projection, `agent_instructions` included when the card overrides any; the paged listing omits that map, so the configuration dialog reads the single card it opens. A legacy NAME alias (`writer` → `instruct`) resolves to its target; unknown is `404` |
 | `DELETE /v1/harness/harnesses/:name` | `200 { deleted: true, harness_name, tombstoned, restored_by_restart: false }`; `404` unknown name or repeat delete (name aliases are not deletable identities); `409` while a live or restored session belongs to that exact canonical harness — the message names the count, nothing is removed, and no session is cascaded, so each owned session must be deleted individually (`DELETE /v1/harness/sessions/:id`; there is deliberately no bulk delete) before the retry answers `200`. Removes a user harness or a shipped built-in; a built-in's name is persisted in the database's additive `deleted` list so a restart keeps it removed. A session still keeps the frozen definition it captured, which is exactly why the route refuses while any remain: a conversation must never outlive its harness card as an orphan the UI cannot reach. **T6:** after the registry write succeeds, the route also removes every knowledge article ATTRIBUTED to this canonical harness (`KnowledgeArticle.harness`) from the shared base and awaits the store's flush before the `200`; other harnesses' articles, unowned/legacy rows and Storyline records survive, and the base is never reset. The two stores are not transactional: a cleanup/flush failure after the committed harness delete answers `500` naming the partial outcome (the harness is gone; a repeat DELETE is `404` and does not retry the cleanup) |
@@ -7810,7 +7810,7 @@ Retired SSE frames (history only — these routes answer `404` now):
     row (`interruptedEndedAtOf`, `:804-812` — written by `apply` at `:3514` from frame stamps only,
     never a wall-clock read), and state is `'cancelled'` where the turn settled `done`
     (`interruptedStateOf`, `:794-795`). `'cancelled'` is an EXISTING vocabulary value
-    (`src/shared/turn-display.ts:195`), so the wire enum (`src/server/harness.swagger.yaml:8298`),
+    (`src/shared/turn-display.ts:195`), so the wire enum (`src/harness-server.swagger.yaml:8298`),
     the client's terminal-state sets (`src/frontend/view-state.ts:907`, `:962-963`, `:975-976`) and
     the detail's settled test (`src/frontend/view-detail.ts:261-263`) are all unchanged — nothing to
     migrate on restore. The alternatives were rejected on the record: `'done'` is the
@@ -7894,7 +7894,7 @@ publishes — `invocation_id`, `invocation_ids` and `epoch`. It used to publish 
 row was id-free by the R1 compact-roster decision, and W22 published only the PROCESS, which left
 the token unpairable exactly where the join needs it.
 
-- **The wire shape** is `ThreadSummary` (`src/server/harness.swagger.yaml:7544-7595` → the
+- **The wire shape** is `ThreadSummary` (`src/harness-server.swagger.yaml:7544-7595` → the
   generated `src/shared/harness-api.ts:2793` `invocation_id`, `:2805` `invocation_ids`
   (`maxItems: 64`), `:2821` `epoch`). All three are OPTIONAL and their values are **BARE** —
   never `id\0epoch`. The store's persisted join is keyed by the RUN (`src/shared/run-identity.ts`),

@@ -1,7 +1,7 @@
 // The canonical harness HTTP API (T13).
 //
 // ONE transport-neutral dispatcher owns the whole REST surface named by the target
-// contract: `src/server/harness.swagger.yaml`, mirrored verbatim by
+// contract: `src/harness-server.swagger.yaml`, mirrored verbatim by
 // `src/shared/harness-api.ts` (deep import - the shared barrel collides). It knows nothing
 // about Node's IncomingMessage, Hono's Context, or a WebSocket writer; the adapters
 // (./handler.ts, ./service.ts, ./endpoint/**) supply a request object and send what comes
@@ -2956,7 +2956,7 @@ export const createHarnessApi = ({
             // every other row keeps the exact key set it had before this field existed
             // (src/server/plugins-api.test.ts pins the shipped catalogue's key sets). This one
             // DOES rename on the way out — `metadata.systemPrompt` (internal camelCase,
-            // ../types/index.ts) -> `system_prompt` (wire snake_case, ../server/harness.swagger.yaml
+            // ../types/index.ts) -> `system_prompt` (wire snake_case, ../harness-server.swagger.yaml
             // `PluginSummary`) — the same mapping every other REST key here makes.
             ...(metadata.systemPrompt === undefined ? {} : { system_prompt: metadata.systemPrompt }),
             ...(metadata.version === undefined ? {} : { version: metadata.version }),
@@ -3590,9 +3590,9 @@ export const createHarnessApi = ({
         sessionRevision: number
     ): TaskReceipt => {
         // T39 (regression): the contract's `TaskReceipt.queue_position` is an ORDINAL with
-        // `minimum: 1` (./harness.swagger.yaml:5001-5005 — "equal to `GET .../queue`'s
+        // `minimum: 1` (../harness-server.swagger.yaml:5001-5005 — "equal to `GET .../queue`'s
         // ordering"), while `QueuedTask.position` is the 0-based array slot of the same ordering
-        // (./harness.swagger.yaml:5101-5104). Deriving the receipt figure straight from
+        // (../harness-server.swagger.yaml:5101-5104). Deriving the receipt figure straight from
         // `row.position` therefore reported the FIRST queued task as slot `0`, which the contract
         // forbids and which read as "no place in line". `findIndex` over the same projection keeps
         // the two figures consistent: receipt N == queue page row N-1.
@@ -4837,7 +4837,7 @@ export const createHarnessApi = ({
         // out of `createdToolRecords`, it does not gate the captured revision. So the row reports
         // `source_available: true`, the guard finds a revision, and the removal runs: that is the
         // 200 ../api-session-tool-writes.test.ts pins, and it is what the DELETE description in
-        // ./harness.swagger.yaml already states (`toolCancel` is deletable).
+        // ../harness-server.swagger.yaml already states (`toolCancel` is deletable).
         //
         // WHERE THE 400 IS THE REAL ANSWER: a build with no source compiler — the aliased browser
         // graph, where `supportsToolCompilation === false` — installs the same baseline from a
@@ -5240,7 +5240,7 @@ export const createHarnessApi = ({
         // T12 contract sync: the wire pair is now the GENERATED shape itself — the spec
         // documents `cancelled` as an honest boolean and `status` as the conversation's
         // post-stop status (`CancelThreadResult`, ../shared/harness-api.ts:1613 from
-        // ./harness.swagger.yaml:6748), so no widening cast or dropped annotation is needed
+        // ../harness-server.swagger.yaml:6748), so no widening cast or dropped annotation is needed
         // here. The literals `true`/`"stopped"` were the answer this route used to hardcode.
         const result: CancelThreadResult = {
             cancelled: stopped.cancelled,

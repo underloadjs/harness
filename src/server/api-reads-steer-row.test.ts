@@ -4,7 +4,7 @@
 // WHY THIS FILE EXISTS
 // --------------------
 // The contract models `TurnSummary.steers[i]` as the CLOSED object `DisplaySteerSummary`
-// (../shared/harness-api.ts:1718-1726, generated from ./harness.swagger.yaml:6075-6107):
+// (../shared/harness-api.ts:1718-1726, generated from ../harness-server.swagger.yaml:6075-6107):
 // `required: [at, promptPreview, promptChars]` and `additionalProperties: false`. The projector's
 // row instead carries the submit's verbatim text under `prompt` (./turn-projector.ts:2794-2808,
 // typed by the INTERNAL render model ../shared/turn-display.ts:281-296 `DisplaySteerSummary`).

@@ -189,7 +189,7 @@ const normalizeInstructions = (instruction: string | string[] | undefined): stri
 // case. Nothing else: a named color (`red`), an `rgb()`/`hsl()` function, or an
 // emoji is a different rendering contract per host, while a hex literal is paintable
 // by every host and is what the server echoes on `HarnessDescriptor.agentColors` and
-// constrains in the HTTP contract (`harness.swagger.yaml` `agent_colors.pattern`).
+// constrains in the HTTP contract (`harness-server.swagger.yaml` `agent_colors.pattern`).
 //
 // MIRRORING: the registry keeps its own copy of this expression
 // (src/server/harnesses/registry.ts `AGENT_COLOR_PATTERN`) only so its rejection can

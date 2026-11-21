@@ -111,7 +111,7 @@ tells you nothing, and the context bar's number moves with no explanation.
   (`src/frontend/main.ts:1709-1714`). The flag IS visible in the transcript
   dialog — a `<pre>` of the server's recorded messages
   (`src/frontend/ui/thread-transcript.ts:31-33`) — and IS published for all four variants in
-  `src/server/harness.swagger.yaml` (`:8785`, `:8815`, `:8847`, `:8917`). **Prefer the transcript
+  `src/harness-server.swagger.yaml` (`:8785`, `:8815`, `:8847`, `:8917`). **Prefer the transcript
   read over a new event field:** the
   document is the authority, and an event would have to be replayed to reconstruct state.
 - **T7.2 — transcript metadata: the excluded count and the estimated tokens saved**, surfaced

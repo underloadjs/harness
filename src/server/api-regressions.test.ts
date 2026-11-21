@@ -20,7 +20,7 @@
 //      RUNNING conversation, which cannot be steered — ./sessions.ts:6380-6384) appears on
 //      `GET .../queue` in FIFO order, is counted by `session.queue_depth`, is named by
 //      `POST .../cancel {all:true}`'s `dropped_queued_tasks`, and `TaskReceipt.queue_position`
-//      is the contract's 1-based ordinal (./harness.swagger.yaml:5001-5005) of that ordering.
+//      is the contract's 1-based ordinal (../harness-server.swagger.yaml:5001-5005) of that ordering.
 //      Concurrent plain-thread submit is NOT changed by any of this: an unfocused submit still
 //      opens its own conversation and runs immediately (./queue.test.ts pins that).
 //   D. tool registration states what it did to a PRIOR registration. The create path hardcoded
@@ -394,7 +394,7 @@ describe('the lane backlog is a first-class queue: visible, FIFO, counted, and c
         const two = await submitTask(call, id, { input: 'clip-b', thread_id: first.thread_id, attachments: [clip(2)] });
 
         // RECEIPT: both are queued, and each names its slot in the queue page's ordering. The
-        // contract makes this figure 1-based (`minimum: 1`, ./harness.swagger.yaml:5001-5005), so
+        // contract makes this figure 1-based (`minimum: 1`, ../harness-server.swagger.yaml:5001-5005), so
         // the first waiting task is `1`, not `0`.
         expect(one.status).toBe('queued');
         expect(two.status).toBe('queued');
@@ -405,7 +405,7 @@ describe('the lane backlog is a first-class queue: visible, FIFO, counted, and c
         expect(String(one.turn_id)).toMatch(UUID_PATTERN);
 
         // THE QUEUE PAGE: the lane backlog IS the backlog. `position` is the 0-based slot of the
-        // same ordering (./harness.swagger.yaml:5101-5104), so page row N-1 == receipt N.
+        // same ordering (../harness-server.swagger.yaml:5101-5104), so page row N-1 == receipt N.
         const page = await readOk<{ items: Record<string, unknown>[]; limit: number; next_cursor: string | null; total?: number }>(
             call,
             'GET',

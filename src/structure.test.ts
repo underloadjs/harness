@@ -1032,7 +1032,7 @@ describe('retired build layer', () => {
         // Exact non-`.ts` inventory: the worker bootstrap plus the OpenAPI
         // document. The UI assets moved to `@loadscript/harness`.
         expect(packed.filter((file: string) => !file.endsWith('.ts'))).toEqual([
-            'src/server/harness.swagger.yaml',
+            'src/harness-server.swagger.yaml',
             'src/server/workers/worker-boot.mjs'
         ]);
 
