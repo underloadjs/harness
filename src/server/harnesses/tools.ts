@@ -61,11 +61,11 @@
 //   - ../package-root.ts  — PACKAGE_ROOT (folder paths are absolute)
 
 import path from 'node:path';
-import { normalizeTags, prepareToolCandidate, TOOL_SOURCE_ROOTS, discoverToolMetadata } from '../../core';
-import type { DiscoveredTool } from '../../core';
+import { normalizeTags, prepareToolCandidate, TOOL_SOURCE_ROOTS, discoverToolMetadata } from '../../engine/core';
+import type { DiscoveredTool } from '../../engine/core';
 // `Tool` is the public contract and lives in the type module, not in `core` (which
 // re-exports only its own shapes).
-import type { Tool } from '../../types';
+import type { Tool } from '../../engine/types';
 import { packagePath } from '../package-root';
 
 // The dedicated server tools directory, package-relative. Its two subfolders are the

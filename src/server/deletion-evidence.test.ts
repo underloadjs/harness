@@ -40,7 +40,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';

@@ -12,7 +12,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { HARNESS_RUNTIME_EPOCH, createHarnessEventHub, resourceKeyOf } from '../api-events';
-import type { WsServerMessage } from '../../shared/harness-stream';
+import type { WsServerMessage } from '../../engine/shared/harness-stream';
 import { createStreamBroker } from './broker';
 import { bridgeEventHub, createHarnessStreamMount, hubResourceId, hubStreamSources } from './mount';
 import { HARNESS_WS_STREAM_PATH, encodeStreamCursor } from './protocol';

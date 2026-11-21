@@ -14,7 +14,7 @@
 //
 // Run: yarn vitest run src/server/cli/render.test.ts   (cwd packages/underload/harness)
 
-import type { HarnessAssistantMessage, HarnessEvent } from '../../harness';
+import type { HarnessAssistantMessage, HarnessEvent } from '../../engine/harness';
 import { createRenderer } from './render';
 import type { RenderOptions } from './render';
 

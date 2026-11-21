@@ -25,8 +25,8 @@
 //   - ../handler.ts — GET /api/tools, POST /api/tools/:name
 //   - ../cli/index.ts      — `--tools` and `/tools`
 
-import { presetTools } from '../../harness';
-import type { Tool } from '../../harness';
+import { presetTools } from '../../engine/harness';
+import type { Tool } from '../../engine/harness';
 import { harnessTools } from './tools';
 import { presets, PRESET_MAX_ITERATIONS } from './presets';
 // Value import for the local findPreset() below. The barrel also re-exports the
@@ -148,8 +148,8 @@ export {
     agentProfile,
     agentProfiles,
     isAgentProfileName
-} from '../../agents';
-export type { AgentProfile } from '../../agents';
+} from '../../engine/agents';
+export type { AgentProfile } from '../../engine/agents';
 
 // One catalogue built for one host. `entries` is the display order (grouped, and
 // stable so a UI never has to sort); `tools` holds only executable definitions;

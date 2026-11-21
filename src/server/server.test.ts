@@ -18,7 +18,7 @@ import { STANDALONE_MOUNT } from './api';
 // a network test that re-derives a path from the implementation cannot catch a route that moved,
 // and the legacy spellings this file used (`/messages`, `/presets`, a streamed submit) are exactly
 // the things the target contract removed.
-import { HARNESS_ROUTES } from '../shared/harness-api';
+import { HARNESS_ROUTES } from '../engine/shared/harness-api';
 import type {
     DeleteHarnessResult,
     GlobalConfigDocument,
@@ -34,7 +34,7 @@ import type {
     TurnResource,
     TurnResponse,
     TurnSummaryPage
-} from '../shared/harness-api';
+} from '../engine/shared/harness-api';
 // The runtime config error type is re-exported by the server barrel; asserting the
 // class (not just the message) is what proves a bad deployment value is a
 // DEPLOYMENT error rather than a client 400.

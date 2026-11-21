@@ -17,19 +17,19 @@ import type {
     HarnessUsage,
     ToolMediaDescriptor,
     ToolUiPanel
-} from '../harness';
+} from '../engine/harness';
 import type { RunnerSettings } from './harnesses/types';
-import type { AgentResultReference } from '../shared/agent-results';
+import type { AgentResultReference } from '../engine/shared/agent-results';
 // THE RANK VOCABULARY (R1) — the ONE A–Z letter type the kernel publishes
 // (./types/index.ts), reused here verbatim rather than re-declared, so the wire can
 // never drift from what the kernel accepts. `import type` only: the emitted file has
 // no runtime dependency, which this module must keep (a browser imports it).
-import type { AgentRank } from '../types';
+import type { AgentRank } from '../engine/types';
 // The display contract is imported (not just re-exported) because the view
 // envelopes below embed its shapes. `import type` only: this file stays free of any
 // runtime dependency, and `../shared/turn-display.ts` never imports this file back,
 // so the dependency direction is one-way with no cycle at any level.
-import type { TurnBlockDetail, TurnDisplay, TurnDisplayOp, TurnStepDetail, TurnSummary } from '../shared/turn-display';
+import type { TurnBlockDetail, TurnDisplay, TurnDisplayOp, TurnStepDetail, TurnSummary } from '../engine/shared/turn-display';
 
 export type {
     HarnessActionAnswer,
@@ -52,9 +52,9 @@ export type {
     ToolMediaDescriptor,
     ToolUiBlock,
     ToolUiPanel
-} from '../harness';
+} from '../engine/harness';
 export type { RunnerSettings } from './harnesses/types';
-export type { AgentResultReference, AgentResultBlock, AgentResultStatus } from '../shared/agent-results';
+export type { AgentResultReference, AgentResultBlock, AgentResultStatus } from '../engine/shared/agent-results';
 // THE LIVE SESSION RECORD, re-exported for consumers that name the store's read model rather than
 // a wire envelope (`./sessions.ts:958` — `export type SessionRecord = Session`, the alias
 // ./api-reads.ts already imports). TYPE-ONLY on purpose: `export type { … } from` is erased, so
@@ -110,7 +110,7 @@ export type {
     TurnSectionPatch,
     TurnStepDetail,
     TurnSummary
-} from '../shared/turn-display';
+} from '../engine/shared/turn-display';
 
 export type SessionStatus = 'idle' | 'running' | 'error';
 
@@ -726,7 +726,7 @@ export type SessionThread = {
 // `./server/*` at runtime. This file stays the published surface — every existing importer
 // (`./api-reads.ts`, `./sessions.ts`, `./turn-projector.ts`, the tests) resolves these names from
 // here and nothing changed for them.
-export { INVOCATION_RUN_KEY_SEPARATOR, invocationIdOfRunKey, invocationRunKeyOf } from '../shared/run-identity';
+export { INVOCATION_RUN_KEY_SEPARATOR, invocationIdOfRunKey, invocationRunKeyOf } from '../engine/shared/run-identity';
 
 // A conversation as the COMPACT surface sees it (R1). The field set is exactly
 // `SessionThread` minus `messages`, plus a bounded transcript signal: the roster's

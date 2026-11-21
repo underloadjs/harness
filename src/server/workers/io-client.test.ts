@@ -49,7 +49,7 @@ import type { HarnessDatabase } from '../persistence';
 // prove a plain `HarnessPersistence.load()` can read them, so their hand-built cores used to
 // carry an arbitrary `version: 1`; that number is now part of the read contract, and pinning
 // the constant keeps this file honest the day the kernel bumps the snapshot.
-import { HARNESS_SNAPSHOT_VERSION } from '../../core/snapshot';
+import { HARNESS_SNAPSHOT_VERSION } from '../../engine/core/snapshot';
 import {
     HarnessIoError,
     IO_WORKER_PACKAGE_SPECIFIER,

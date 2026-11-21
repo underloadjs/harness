@@ -44,7 +44,7 @@ import type { ServerRuntimeConfiguration } from '../config';
 // (../../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped onto every run identity the runtime
 // mints). The value is random by design, so the lane's epoch is pinned by shape + inequality, not
 // by a literal.
-import { HARNESS_PROCESS_EPOCH } from '../../core/agent-limits';
+import { HARNESS_PROCESS_EPOCH } from '../../engine/core/agent-limits';
 import type { LaneAuthority } from './lane-authority';
 import type { SessionSnapshot, SessionTurn } from '../protocol';
 import { SessionStore } from '../sessions';

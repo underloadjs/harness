@@ -127,7 +127,7 @@
 //   - ./registry.ts     — restore policy, aliases, validation
 //   - ../api.ts         — descriptors resolved from this metadata
 
-import type { AgentRank } from '../../types';
+import type { AgentRank } from '../../engine/types';
 import type { HarnessPreset } from './types';
 import { PRESET_MAX_ITERATIONS, SHARED_TOOL_NAMES, createProfiledHarness } from './toolbox';
 

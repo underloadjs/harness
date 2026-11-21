@@ -22,7 +22,7 @@
 import { describe, expect, it, beforeEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { agentProfile, agentProfiles } from '../../agents';
+import { agentProfile, agentProfiles } from '../../engine/agents';
 import {
     AgentStateError,
     attachDefaultAgentState,

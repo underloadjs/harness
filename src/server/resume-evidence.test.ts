@@ -28,15 +28,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 // T-W8: every recorded `thread` payload now carries the minting process's epoch
 // (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity mints in
 // ../harness.ts). These assertions are WHOLE payloads, so the key has to be named; the
 // value is exact because every frame here was recorded IN THIS PROCESS, and vitest gives
 // one module registry per test file — one epoch for the whole file.
-import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
-import type { HarnessStreamEvent } from '../harness';
-import { HarnessError } from '../util/errors';
+import { HARNESS_PROCESS_EPOCH } from '../engine/core/agent-limits';
+import type { HarnessStreamEvent } from '../engine/harness';
+import { HarnessError } from '../engine/util/errors';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { DEFAULT_RUNTIME_CONFIGURATION } from './config';

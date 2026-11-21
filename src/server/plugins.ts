@@ -143,14 +143,14 @@
 //                                    and the session-scoped `GET/PATCH
 //                                    /sessions/{session_id}/plugins/{plugin_id}` pair
 
-import { createPluginSettingsView } from '../plugin/settings';
-import { BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
+import { createPluginSettingsView } from '../engine/plugin/settings';
+import { BUILTIN_PLUGIN_DESCRIPTORS } from '../engine/plugin/manifest';
 import type {
     HarnessPluginMetadata,
     HarnessPluginSettingDescriptor,
     HarnessPluginSettingsProvider,
     HarnessPluginSettingType
-} from '../types';
+} from '../engine/types';
 import type { HarnessPluginSettingsRecord } from './persistence';
 
 // The value space of a declared setting. `default` is required on the descriptor, so an

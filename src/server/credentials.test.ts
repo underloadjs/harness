@@ -36,7 +36,7 @@ import type {
     TurnEventPage,
     TurnResource,
     TurnResponse
-} from '../shared/harness-api';
+} from '../engine/shared/harness-api';
 
 const SERVER_KEY = 'server-secret';
 const MODEL = 'credential-test-model';

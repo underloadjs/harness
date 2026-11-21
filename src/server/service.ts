@@ -94,7 +94,7 @@
 
 import { bodyLimitFor, SERVICE_MOUNT } from './api';
 import type { HarnessApi, HarnessApiEmit, HarnessApiStream } from './api';
-import { isLoopbackHostname, isPagesOrigin } from '../shared/origin';
+import { isLoopbackHostname, isPagesOrigin } from '../engine/shared/origin';
 import type { HarnessRuntime } from './runtime';
 import { getHarnessRuntime, prepareHarnessKnowledge } from './runtime';
 // R-boot: the ONE boot configuration contract the direct listener also consumes. The

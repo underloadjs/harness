@@ -15,7 +15,7 @@
 
 // `core` is the harness-internal live helper entry (see ./timeNow.tool.ts): the
 // source compiler treats it as framework, not as a second editable tool copy.
-import { tool } from '../../../core';
+import { tool } from '../../../engine/core';
 
 // Demo-tool bounds. These are validation limits, not knobs: the demo tools exist
 // to be predictable examples. `metadata` below repeats the same numbers as

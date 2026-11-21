@@ -16,7 +16,7 @@ import net from 'node:net';
 import { createHash } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { HARNESS_WS_SUBPROTOCOL } from '../../shared/harness-api';
+import { HARNESS_WS_SUBPROTOCOL } from '../../engine/shared/harness-api';
 import { createHarnessStreamMount, type HarnessStreamMount } from './mount';
 import { HARNESS_WS_STREAM_PATH } from './protocol';
 

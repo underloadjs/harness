@@ -21,7 +21,7 @@
 //   - ./transport.ts    — the `HarnessSocket` whose queue this module paces
 //   - swagger 2465-2488 — heartbeat and backpressure rules implemented verbatim below
 
-import { HARNESS_WS_SUBPROTOCOL } from '../../shared/harness-api';
+import { HARNESS_WS_SUBPROTOCOL } from '../../engine/shared/harness-api';
 import type {
     WsClientMessage,
     WsProtocolError,
@@ -30,7 +30,7 @@ import type {
     WsSubscribe,
     WsSubscriptionFilters,
     WsSubscriptionScope
-} from '../../shared/harness-stream';
+} from '../../engine/shared/harness-stream';
 import { HARNESS_WS_CLOSE_CODES, parseClientFrame, streamFrameBytes, type StreamFailure } from './protocol';
 import type { HarnessStreamBroker, StreamDelivery, StreamEvent, StreamSessionHandle, StreamSubscribeRequest } from './broker';
 import { WEBSOCKET_STATE, type HarnessSocket } from './transport';

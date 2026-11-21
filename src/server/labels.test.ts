@@ -28,8 +28,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
-import type { HarnessStreamEvent } from '../harness';
+import { agent, harness } from '../engine/harness';
+import type { HarnessStreamEvent } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';
@@ -42,8 +42,8 @@ import type { SessionSnapshot } from './protocol';
 // SAME helper the recorder writes with instead of re-typing the separator, and the epoch half is
 // the real per-process value the runtime stamped (../core/agent-limits `HARNESS_PROCESS_EPOCH`).
 import { invocationIdOfRunKey, invocationRunKeyOf } from './protocol';
-import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
-import { listAgentResultBlocks } from '../shared/agent-results';
+import { HARNESS_PROCESS_EPOCH } from '../engine/core/agent-limits';
+import { listAgentResultBlocks } from '../engine/shared/agent-results';
 
 const SETTINGS: RunnerSettings = {
     baseURL: 'http://scripted.invalid/v1',

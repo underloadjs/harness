@@ -21,20 +21,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness, tool } from '../harness';
+import { agent, harness, tool } from '../engine/harness';
 import type {
     HarnessMessage,
     HarnessProgress,
     HarnessSnapshot,
     HarnessStream,
     HarnessStreamEvent
-} from '../harness';
-import type { TaskChange, TaskItem, TaskResult } from '../types';
+} from '../engine/harness';
+import type { TaskChange, TaskItem, TaskResult } from '../engine/types';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry, presets } from './harnesses';
 import { createWebSearchCatalogueEntry, createToolCatalogue } from './harnesses';
 import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
-import { AGENT_PROFILES, agentInstruction } from '../agents';
+import { AGENT_PROFILES, agentInstruction } from '../engine/agents';
 import { SessionStore } from './sessions';
 import {
     HARNESS_DATABASE_VERSION,

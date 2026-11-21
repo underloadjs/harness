@@ -59,11 +59,11 @@ import type {
     HarnessPluginSettingsProvider,
     HarnessToolSettingsProvider,
     ToolContext
-} from '../../types';
+} from '../../engine/types';
 // B6: the generated built-in plugin entries are the only plugin set a worker can
 // reconstruct (their `setup` functions live in this checkout). `lanePluginSetOf` below
 // maps the blueprint's names back onto THESE objects.
-import { BUILTIN_PLUGINS } from '../../plugin';
+import { BUILTIN_PLUGINS } from '../../engine/plugin';
 import type { HarnessPluginSettingsRecord } from '../persistence';
 import type { HarnessPreset, HarnessToolboxDefaults } from '../harnesses/types';
 import { presetFromRecord } from '../harnesses';

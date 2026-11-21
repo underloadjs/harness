@@ -123,7 +123,7 @@ import {
     HARNESS_REVISION_HEADER,
     HARNESS_SERVICE_CAPABILITIES,
     HARNESS_SERVICE_LIMITS
-} from '../shared/harness-api';
+} from '../engine/shared/harness-api';
 import type {
     AgentProfileResponse,
     AgentSummaryPage,
@@ -200,16 +200,16 @@ import type {
     UpdateSessionRequest,
     UpdateThreadTranscriptRequest,
     UsageByThread
-} from '../shared/harness-api';
-import type { StreamResourceKind, WsUpdateKind } from '../shared/harness-stream';
-import type { HarnessAttachment, HarnessMessage } from '../harness';
+} from '../engine/shared/harness-api';
+import type { StreamResourceKind, WsUpdateKind } from '../engine/shared/harness-stream';
+import type { HarnessAttachment, HarnessMessage } from '../engine/harness';
 // T5 (R2/R3): the plugin catalogue types (domain models, re-exported by the library root) and
 // the status-carrying error the settings store throws at the write edge.
-import type { HarnessPluginMetadata, HarnessPluginSettingDescriptor } from '../harness';
-import { unwrapToolResult, toolMediaDescriptors, boundToolResult, resolveToolParameters } from '../harness';
-import { isInstanceOf, toErrorInfo } from '../util';
-import { listModels, ModelListError } from '../transport/models';
-import type { ModelListConfiguration } from '../transport/models';
+import type { HarnessPluginMetadata, HarnessPluginSettingDescriptor } from '../engine/harness';
+import { unwrapToolResult, toolMediaDescriptors, boundToolResult, resolveToolParameters } from '../engine/harness';
+import { isInstanceOf, toErrorInfo } from '../engine/util';
+import { listModels, ModelListError } from '../engine/transport/models';
+import type { ModelListConfiguration } from '../engine/transport/models';
 import type { RunnerSettings } from './harnesses/types';
 import { createToolCatalogue, createCoreToolEntries, createHarnessRegistry, describeHarness } from './harnesses';
 import type { CatalogueEntry, HarnessPreset, HarnessRegistry, ToolCatalogue } from './harnesses';
@@ -233,21 +233,21 @@ import { HarnessRegistryError } from './harnesses/registry';
 import { AgentStateError } from './harnesses/agent-state';
 import type { AgentProfilePatch } from './harnesses/agent-state';
 import { writeHarnessAgentRecords } from './persistence';
-import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
+import { MAX_SUBMIT_BODY_BYTES } from '../engine/shared/attachments';
 import { SessionError, SessionStore, recordedStreamText, validateAttachmentsForSubmit, validateBindingRank } from './sessions';
 import type { EnqueuedTask, SessionRecord, ThreadLaneInfo } from './sessions';
 // R7 (T4b): the display-route inclusion stamp writes the bar's own field, so it is typed with the
 // bar's own model (the fold's output type, which is what `projector.display()` returns).
-import type { ContextBlock, TurnSection } from '../shared/turn-display';
+import type { ContextBlock, TurnSection } from '../engine/shared/turn-display';
 // Issue 0005 (C): the seed on `POST /sessions` is validated by the ONE transcript reader the
 // runtime and snapshot restore already enforce (`readHarnessMessages`, src/core/snapshot.ts), and
 // it lands in the entry agent's DEFAULT conversation, whose id prefix is `THREAD_AGENT_PREFIX`
 // (src/core/thread.ts). `src/server/sessions.ts:216` imports this same pair, so the API layer and
 // the store cannot drift onto two different transcript validators or two spellings of that id.
-import { readHarnessMessages, THREAD_AGENT_PREFIX } from '../core';
+import { readHarnessMessages, THREAD_AGENT_PREFIX } from '../engine/core';
 // The rank vocabulary is the one authority scale: the PATCH edge names the same letters the
 // store validator accepts, so a client never has to hold two spellings.
-import { AGENT_RANKS } from '../types';
+import { AGENT_RANKS } from '../engine/types';
 // T5 (R2/R3): the plugin settings store's status-carrying failure (404 unknown plugin, 400
 // unknown key / mistyped / out-of-range value). The store itself is reached through
 // `store.pluginSettings` (the PROCESS/TEMPLATE scope) and `requireSession(id).plugins` (R4's
@@ -1325,7 +1325,7 @@ export const createHarnessApi = ({
         transcriptSignalOf(id, revision, liveThreadMessages(record, id), record.invalidThreads.has(id));
 
     /** A conversation's messages, or empty when the harness has no such conversation (a stale unreadable record). */
-    const liveThreadMessages = (record: SessionRecord, id: string): import('../harness').HarnessMessage[] => {
+    const liveThreadMessages = (record: SessionRecord, id: string): import('../engine/harness').HarnessMessage[] => {
         if (record.invalidThreads.has(id)) return [];
 
         try {
@@ -1654,7 +1654,7 @@ export const createHarnessApi = ({
     };
 
     /** The messages of one conversation, or the empty list for an unreadable transcript. */
-    const transcriptMessagesOf = (record: SessionRecord, threadId: string): import('../harness').HarnessMessage[] => {
+    const transcriptMessagesOf = (record: SessionRecord, threadId: string): import('../engine/harness').HarnessMessage[] => {
         if (record.invalidThreads.has(threadId)) return [];
 
         try {
@@ -5283,7 +5283,7 @@ export const createHarnessApi = ({
 
         // The cursor addresses recorded POSITIONS, so a role filter must not renumber the
         // collection: `total` stays the whole transcript's entry count.
-        const rows: import('../harness').HarnessMessage[] = [];
+        const rows: import('../engine/harness').HarnessMessage[] = [];
         let served = 0;
         let collected = 0;
 

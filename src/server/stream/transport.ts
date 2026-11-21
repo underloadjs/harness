@@ -31,7 +31,7 @@
 import { createHash } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
-import { HARNESS_WS_STREAM_LIMITS } from '../../shared/harness-stream';
+import { HARNESS_WS_STREAM_LIMITS } from '../../engine/shared/harness-stream';
 import { HARNESS_WS_CLOSE_CODES } from './protocol';
 
 /** RFC 6455 §5.2 opcodes, restricted to the subset this conversation accepts. */

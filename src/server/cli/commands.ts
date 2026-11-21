@@ -42,8 +42,8 @@
 //   - ./options.ts               — the same "extract pure logic from index.ts" precedent
 //   - ../harnesses/types.ts      — HarnessPreset, the catalogue type `presets` holds
 
-import { formatCommandHelp, parseCommandLine } from '../../harness';
-import type { Harness, HarnessCommandResult } from '../../harness';
+import { formatCommandHelp, parseCommandLine } from '../../engine/harness';
+import type { Harness, HarnessCommandResult } from '../../engine/harness';
 import type { HarnessPreset } from '../harnesses/types';
 
 // Everything the dispatcher touches in the outside world, injected so the REPL

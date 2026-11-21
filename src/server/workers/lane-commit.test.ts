@@ -25,7 +25,7 @@ import {
     PROFILES_COLLECTION,
     TASKS_COLLECTION,
     readRecordsStoreState
-} from '../../core';
+} from '../../engine/core';
 import {
     DEFAULT_BOUNDS,
     applyMutationGroup,

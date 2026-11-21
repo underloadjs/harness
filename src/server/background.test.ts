@@ -44,7 +44,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type {
     Harness,
     HarnessAssistantMessage,
@@ -53,7 +53,7 @@ import type {
     HarnessRunOptions,
     HarnessStreamEvent,
     HarnessToolCall
-} from '../harness';
+} from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessRuntime } from './runtime';

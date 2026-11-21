@@ -69,16 +69,16 @@ import { dirname, join, resolve } from 'node:path';
 import { readPersistedDocument, writePersistedDocument } from './persistence-test-helpers';
 import { fileURLToPath } from 'node:url';
 
-import { agent, harness } from '../harness';
-import type { HarnessStream, HarnessStreamEvent } from '../harness';
-import { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
-import type { HarnessPluginApi, HarnessPluginMetadata } from '../types';
+import { agent, harness } from '../engine/harness';
+import type { HarnessStream, HarnessStreamEvent } from '../engine/harness';
+import { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from '../engine/plugin/manifest';
+import type { HarnessPluginApi, HarnessPluginMetadata } from '../engine/types';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessPreset, HarnessPresetReport, RunnerSettings } from './harnesses/types';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime, HarnessRuntimeOptions } from './runtime';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
-import { HARNESS_REVISION_HEADER } from '../shared/harness-api';
+import { HARNESS_REVISION_HEADER } from '../engine/shared/harness-api';
 
 const MOUNT = '/v1/harness';
 

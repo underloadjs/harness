@@ -10,7 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import type { HarnessEvent } from '../harness';
+import type { HarnessEvent } from '../engine/harness';
 import {
     HARNESS_JOURNAL_FILE,
     HARNESS_JOURNAL_VERSION,

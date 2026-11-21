@@ -20,7 +20,7 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';

@@ -91,7 +91,7 @@
 //   - ../harness.ts           — the three consumers of the provider
 //   - ../types/index.ts       — `HarnessToolSettingsProvider`, `HarnessConfiguration.toolSettings`
 
-import type { HarnessToolSettingsProvider } from '../types';
+import type { HarnessToolSettingsProvider } from '../engine/types';
 import type { HarnessToolSettingsRecord } from './persistence';
 
 /**

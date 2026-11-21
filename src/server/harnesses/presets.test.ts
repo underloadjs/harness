@@ -48,14 +48,14 @@
 // per test, so the suite is isolated from the machine and from `.env`.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent } from '../../harness';
-import type { HarnessProgress, HarnessStreamEvent, HarnessStreamRequest } from '../../harness';
+import { agent } from '../../engine/harness';
+import type { HarnessProgress, HarnessStreamEvent, HarnessStreamRequest } from '../../engine/harness';
 // THE RANK PRIMITIVES. `isLowerRank` is the kernel's own delegation predicate
 // (../../types/index.ts:1539), and it is the ONLY way this suite can ask "who may this agent
 // reach?" without re-implementing a rule that lives in the kernel — `Harness.subagents` is gone,
 // so a target list is a projection over `Harness.ranks` (../../types/index.ts:5017).
-import type { AgentRank } from '../../types';
-import { isLowerRank } from '../../types';
+import type { AgentRank } from '../../engine/types';
+import { isLowerRank } from '../../engine/types';
 import { createToolboxHarness } from './toolbox';
 import {
     createHarnessRegistry,
@@ -71,7 +71,7 @@ import {
     SPECIALIST_AGENT_NAMES
 } from './index';
 import { FIXTURE_PRESETS, PRODUCTION_WITH_FIXTURES } from './fixture-presets.test-support';
-import { AGENT_PROFILE_NAMES, AGENT_PROFILES, agentInstruction } from '../../agents';
+import { AGENT_PROFILE_NAMES, AGENT_PROFILES, agentInstruction } from '../../engine/agents';
 import { DEFAULT_CLI_PRESET } from '../cli/options';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,

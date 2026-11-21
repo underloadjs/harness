@@ -58,8 +58,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
-import type { HarnessStreamEvent } from '../harness';
+import { agent, harness } from '../engine/harness';
+import type { HarnessStreamEvent } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';
@@ -68,7 +68,7 @@ import { SessionStore } from './sessions';
 import type { SessionSnapshot } from './protocol';
 // The run-key rule, so the fixture states join keys with the SAME helper the recorder writes with.
 import { invocationRunKeyOf } from './protocol';
-import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
+import { HARNESS_PROCESS_EPOCH } from '../engine/core/agent-limits';
 // W26 (2026-11-17): the WIRE plane. D1-D3 read `store.get()` and the persisted document; D4/D5 read the
 // same session through the canonical roster route, because that page is the document the client's
 // transcript join is built from (`../frontend/view-shell.ts` `getRawSession`).

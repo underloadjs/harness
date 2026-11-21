@@ -11,7 +11,7 @@
 // wall clock, the network, or a host environment.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { toolUiOf } from '../../harness';
+import { toolUiOf } from '../../engine/harness';
 import { harnessTools } from './tools';
 
 afterEach(() => {

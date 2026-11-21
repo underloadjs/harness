@@ -23,8 +23,8 @@
 //   - ../handler.ts             — GET /api/tools, POST /api/tools/:name
 //   - ../src/frontend/main.ts        — disabled/configured rendering
 
-import { createWebSearchTool, WEB_SEARCH_METADATA, WEB_SEARCH_TOOL_NAME } from '../../harness';
-import type { Tool, WebsearchConfiguration } from '../../harness';
+import { createWebSearchTool, WEB_SEARCH_METADATA, WEB_SEARCH_TOOL_NAME } from '../../engine/harness';
+import type { Tool, WebsearchConfiguration } from '../../engine/harness';
 import type { CatalogueEntry, ToolAvailability } from './types';
 
 // Variable names only. These are advertised to the UI/CLI so an operator knows

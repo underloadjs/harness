@@ -21,7 +21,7 @@
 //   - ../src/agents       — AgentProfile (the trusted agent definitions)
 //   - ../protocol  — HarnessDescriptor / AgentDescriptor (wire tuples)
 
-import type { AgentProfile } from '../../agents';
+import type { AgentProfile } from '../../engine/agents';
 import type { AgentDescriptor, HarnessDescriptor } from '../protocol';
 import type { HarnessPreset } from './types';
 import { coreToolNames } from './toolbox';

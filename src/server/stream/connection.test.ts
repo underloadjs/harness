@@ -11,8 +11,8 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { HARNESS_WS_SUBPROTOCOL } from '../../shared/harness-api';
-import type { WsServerMessage, WsSubscriptionState, WsUpdate } from '../../shared/harness-stream';
+import { HARNESS_WS_SUBPROTOCOL } from '../../engine/shared/harness-api';
+import type { WsServerMessage, WsSubscriptionState, WsUpdate } from '../../engine/shared/harness-stream';
 import { createStreamBroker, type StreamEvent } from './broker';
 import { startStreamConnection } from './connection';
 import { createHarnessStreamMount, type HarnessStreamMount } from './mount';

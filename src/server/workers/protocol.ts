@@ -59,7 +59,7 @@
 //   - ./lane-authority.ts- answers a `request` and commits a `mutation` on the canonical harness
 //   - ./lane-worker-loop.ts - the worker side: the message loop and its commit boundaries
 
-import type { HarnessActionRequest, HarnessAttachment, HarnessEvent, HarnessStateChangeEvent } from '../../types';
+import type { HarnessActionRequest, HarnessAttachment, HarnessEvent, HarnessStateChangeEvent } from '../../engine/types';
 import type { HarnessPluginSettingsRecord, HarnessPresetRecord } from '../persistence';
 import type { RunnerSettings } from '../harnesses/types';
 import type { IdentityLease, IdSpace } from './lane-identity';

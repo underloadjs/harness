@@ -14,7 +14,7 @@ import { ENVIRONMENT_PATH, loadEnvironmentFile } from './environment';
 import { startHarnessServer } from './index';
 // Canonical `/v1/harness/config` payload (../shared/harness-api.ts:394); the legacy
 // `HarnessIndex` type describes the retired `/api` mount.
-import type { GlobalConfigDocument } from '../shared/harness-api';
+import type { GlobalConfigDocument } from '../engine/shared/harness-api';
 
 // Repo-root Temp/ (five levels up from src/server/). Module-relative so the
 // location does not depend on the cwd Vitest was started from.

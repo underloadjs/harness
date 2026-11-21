@@ -200,40 +200,44 @@ const PUBLISHED_SPECIFIERS = [
     { subpath: './server', specifier: '@underload/harness/server', source: './src/server/index.ts' },
     { subpath: './worker', specifier: '@underload/harness/worker', source: './src/server/workers/lane-worker.ts' },
     { subpath: './io-worker', specifier: '@underload/harness/io-worker', source: './src/server/workers/io-worker.ts' },
-    { subpath: './shared', specifier: '@underload/harness/shared', source: './src/shared/index.ts' },
-    { subpath: './shared/harness-api', specifier: '@underload/harness/shared/harness-api', source: './src/shared/harness-api.ts' },
-    { subpath: './shared/harness-stream', specifier: '@underload/harness/shared/harness-stream', source: './src/shared/harness-stream.ts' },
-    { subpath: './shared/turn-display', specifier: '@underload/harness/shared/turn-display', source: './src/shared/turn-display.ts' },
-    { subpath: './shared/run-identity', specifier: '@underload/harness/shared/run-identity', source: './src/shared/run-identity.ts' },
+    { subpath: './shared', specifier: '@underload/harness/shared', source: './src/engine/shared/index.ts' },
+    { subpath: './shared/harness-api', specifier: '@underload/harness/shared/harness-api', source: './src/engine/shared/harness-api.ts' },
+    { subpath: './shared/harness-stream', specifier: '@underload/harness/shared/harness-stream', source: './src/engine/shared/harness-stream.ts' },
+    { subpath: './shared/turn-display', specifier: '@underload/harness/shared/turn-display', source: './src/engine/shared/turn-display.ts' },
+    { subpath: './shared/run-identity', specifier: '@underload/harness/shared/run-identity', source: './src/engine/shared/run-identity.ts' },
     { subpath: './server/turn-projector', specifier: '@underload/harness/server/turn-projector', source: './src/server/turn-projector.ts' },
-    { subpath: './types', specifier: '@underload/harness/types', source: './src/types/index.ts' }
+    { subpath: './types', specifier: '@underload/harness/types', source: './src/engine/types/index.ts' }
 ] as const;
 
 describe('package layout', () => {
-    it('keeps the application tree under src/ and removes the old top-level folders', () => {
+    it('keeps the engine under src/engine and the server tree under src/server', () => {
         const topLevel = fs.readdirSync(PACKAGE_ROOT);
         const legacy = ['cli', 'endpoint', 'harnesses', 'playground', 'server'];
 
         expect(topLevel.filter((name) => legacy.includes(name))).toEqual([]);
 
-        // The three application folders plus the untouched library tree. Files at
-        // the root are not pinned one by one: the library's own tests are added by
-        // other workstreams, so only the folder contract and the published entries
-        // are part of this layout.
+        // Two layers, one folder each. The engine owns every library module and all
+        // of its tests; the server owns the API wrapper and the endpoint modules.
         const folders = fs
             .readdirSync(SRC, { withFileTypes: true })
             .filter((entry) => entry.isDirectory())
             .map((entry) => entry.name)
             .sort();
-        expect(folders).toEqual([
+        expect(folders).toEqual(['engine', 'server']);
+
+        const engineFolders = fs
+            .readdirSync(path.join(SRC, 'engine'), { withFileTypes: true })
+            .filter((entry) => entry.isDirectory())
+            .map((entry) => entry.name)
+            .sort();
+        expect(engineFolders).toEqual([
             'agents',
             'core',
             'plugin',
-            // R2/R3/R4: the auto-discovered built-in plugins. `src/plugins` is the
-            // scanned folder (one `*.plugin.ts` per plugin); `src/plugin` stays the
-            // host/loader. The manifest generator requires the folder to exist.
+            // R2/R3/R4: the auto-discovered built-in plugins. `engine/plugins` is
+            // the scanned folder (one `*.plugin.ts` per plugin); `engine/plugin`
+            // stays the host/loader. The manifest generator requires the folder.
             'plugins',
-            'server',
             'shared',
             'tools',
             'transport',
@@ -244,10 +248,10 @@ describe('package layout', () => {
         // Each layer has exactly one barrel/entry: the published targets.
         for (const entry of [
             'src/index.ts',
-            'src/browser.ts',
+            'src/engine/browser.ts',
             'src/server/index.ts',
-            'src/shared/index.ts',
-            'src/harness.ts'
+            'src/engine/shared/index.ts',
+            'src/engine/harness.ts'
         ]) {
             expect(fs.existsSync(path.join(PACKAGE_ROOT, entry))).toBe(true);
         }
@@ -258,7 +262,7 @@ describe('package layout', () => {
         //   - every condition declares `types` explicitly (no implicit `.d.ts`
         //     sibling resolution), and the ROOT resolves its TYPES by environment
         //     too — `browser` first (so a browser consumer is typed against
-        //     src/browser.ts), then the Node/`types` path. A single unconditional root
+        //     src/engine/browser.ts), then the Node/`types` path. A single unconditional root
         //     `types` would shadow the browser condition and hand a browser consumer
         //     the Node server surface;
         //   - every target of every published subpath is the raw `src/*.ts` entry.
@@ -268,8 +272,8 @@ describe('package layout', () => {
         expect(manifest.exports).toEqual({
             '.': {
                 browser: {
-                    types: './src/browser.ts',
-                    default: './src/browser.ts'
+                    types: './src/engine/browser.ts',
+                    default: './src/engine/browser.ts'
                 },
                 types: './src/index.ts',
                 default: './src/index.ts'
@@ -298,32 +302,32 @@ describe('package layout', () => {
             // The reusable browser client moved to `@loadscript/harness`; this
             // package no longer publishes a `./frontend` entry.
             './shared': {
-                types: './src/shared/index.ts',
-                default: './src/shared/index.ts'
+                types: './src/engine/shared/index.ts',
+                default: './src/engine/shared/index.ts'
             },
             './shared/harness-api': {
-                types: './src/shared/harness-api.ts',
-                default: './src/shared/harness-api.ts'
+                types: './src/engine/shared/harness-api.ts',
+                default: './src/engine/shared/harness-api.ts'
             },
             './shared/harness-stream': {
-                types: './src/shared/harness-stream.ts',
-                default: './src/shared/harness-stream.ts'
+                types: './src/engine/shared/harness-stream.ts',
+                default: './src/engine/shared/harness-stream.ts'
             },
             './shared/turn-display': {
-                types: './src/shared/turn-display.ts',
-                default: './src/shared/turn-display.ts'
+                types: './src/engine/shared/turn-display.ts',
+                default: './src/engine/shared/turn-display.ts'
             },
             './shared/run-identity': {
-                types: './src/shared/run-identity.ts',
-                default: './src/shared/run-identity.ts'
+                types: './src/engine/shared/run-identity.ts',
+                default: './src/engine/shared/run-identity.ts'
             },
             './server/turn-projector': {
                 types: './src/server/turn-projector.ts',
                 default: './src/server/turn-projector.ts'
             },
             './types': {
-                types: './src/types/index.ts',
-                default: './src/types/index.ts'
+                types: './src/engine/types/index.ts',
+                default: './src/engine/types/index.ts'
             },
             './package.json': './package.json'
         });
@@ -395,18 +399,18 @@ describe('package layout', () => {
         // stale. Declaration order is manifest order.
         const typeTargets = published.filter(({ condition }) => isTypesCondition(condition));
         expect(typeTargets.map(({ target }) => target)).toEqual([
-            './src/browser.ts',
+            './src/engine/browser.ts',
             './src/index.ts',
             './src/server/index.ts',
             './src/server/workers/lane-worker.ts',
             './src/server/workers/io-worker.ts',
-            './src/shared/index.ts',
-            './src/shared/harness-api.ts',
-            './src/shared/harness-stream.ts',
-            './src/shared/turn-display.ts',
-            './src/shared/run-identity.ts',
+            './src/engine/shared/index.ts',
+            './src/engine/shared/harness-api.ts',
+            './src/engine/shared/harness-stream.ts',
+            './src/engine/shared/turn-display.ts',
+            './src/engine/shared/run-identity.ts',
             './src/server/turn-projector.ts',
-            './src/types/index.ts'
+            './src/engine/types/index.ts'
         ]);
 
         // Family 2 — every remaining condition is a RUNTIME target (`default`, plus the
@@ -414,18 +418,18 @@ describe('package layout', () => {
         // each subpath is one file, never a bundle.
         const runtimeTargets = published.filter(({ condition }) => !isTypesCondition(condition));
         expect(runtimeTargets.map(({ target }) => target)).toEqual([
-            './src/browser.ts',
+            './src/engine/browser.ts',
             './src/index.ts',
             './src/server/index.ts',
             './src/server/workers/lane-worker.ts',
             './src/server/workers/io-worker.ts',
-            './src/shared/index.ts',
-            './src/shared/harness-api.ts',
-            './src/shared/harness-stream.ts',
-            './src/shared/turn-display.ts',
-            './src/shared/run-identity.ts',
+            './src/engine/shared/index.ts',
+            './src/engine/shared/harness-api.ts',
+            './src/engine/shared/harness-stream.ts',
+            './src/engine/shared/turn-display.ts',
+            './src/engine/shared/run-identity.ts',
             './src/server/turn-projector.ts',
-            './src/types/index.ts'
+            './src/engine/types/index.ts'
         ]);
 
         // Every declared target must exist on disk — a typo here is a 404 for the
@@ -446,7 +450,7 @@ describe('package layout', () => {
         // of a re-implementation: with every condition naming `src/*.ts`, whichever
         // condition Vite selects (dev, SSR, or the client chain) the answer is a source
         // file. `ssr: true` matches the node test environment of ./vitest.config.ts;
-        // the client chain answers `src/browser.ts` for the root — a different, also
+        // the client chain answers `src/engine/browser.ts` for the root — a different, also
         // source file, which is why the expected ids below are per-specifier.
         //
         // `configFile: false` keeps the probe about manifest conditions only, and
@@ -519,17 +523,17 @@ describe('package layout', () => {
         // "every subpath carries one" proof: a subpath without a runtime target
         // would be missing from this object.
         expect(runtimeTargetsBySubpath).toEqual({
-            '.': ['./src/browser.ts', './src/index.ts'],
+            '.': ['./src/engine/browser.ts', './src/index.ts'],
             './server': ['./src/server/index.ts'],
             './worker': ['./src/server/workers/lane-worker.ts'],
             './io-worker': ['./src/server/workers/io-worker.ts'],
-            './shared': ['./src/shared/index.ts'],
-            './shared/harness-api': ['./src/shared/harness-api.ts'],
-            './shared/harness-stream': ['./src/shared/harness-stream.ts'],
-            './shared/turn-display': ['./src/shared/turn-display.ts'],
-            './shared/run-identity': ['./src/shared/run-identity.ts'],
+            './shared': ['./src/engine/shared/index.ts'],
+            './shared/harness-api': ['./src/engine/shared/harness-api.ts'],
+            './shared/harness-stream': ['./src/engine/shared/harness-stream.ts'],
+            './shared/turn-display': ['./src/engine/shared/turn-display.ts'],
+            './shared/run-identity': ['./src/engine/shared/run-identity.ts'],
             './server/turn-projector': ['./src/server/turn-projector.ts'],
-            './types': ['./src/types/index.ts']
+            './types': ['./src/engine/types/index.ts']
         });
 
         for (const { subpath, specifier, source } of PUBLISHED_SPECIFIERS) {
@@ -548,7 +552,7 @@ describe('package layout', () => {
         const browserRuntime = exportTargets
             .filter(({ condition }) => condition.endsWith('browser.default'))
             .map(({ subpath, target }) => `${subpath} -> ${target}`);
-        expect(browserRuntime).toEqual(['. -> ./src/browser.ts']);
+        expect(browserRuntime).toEqual(['. -> ./src/engine/browser.ts']);
     });
 
     it('keeps the standalone server launch separate from the UI app', () => {
@@ -613,7 +617,7 @@ describe('package layout', () => {
 
         for (const barrel of [
             'src/index.ts',
-            'src/browser.ts',
+            'src/engine/browser.ts',
             'src/server/index.ts'
         ]) {
             expect(readText(barrel)).not.toContain("'./dev'");
@@ -711,17 +715,17 @@ describe('package layout', () => {
 });
 
 describe('entry composition', () => {
-    it('Node root = library + shared + server', () => {
-        // The reusable browser client moved to `@loadscript/harness`.
+    it('Node root = engine + server', () => {
+        // The engine barrel carries the library and its shared helpers; the server
+        // barrel is the API surface an endpoint route consumes.
         expect(starExports(readText('src/index.ts'))).toEqual([
-            './harness',
-            './shared',
+            './engine',
             './server'
         ]);
     });
 
     it('browser root = library + shared, never the server tree', () => {
-        expect(starExports(readText('src/browser.ts'))).toEqual([
+        expect(starExports(readText('src/engine/browser.ts'))).toEqual([
             './harness',
             './shared'
         ]);
@@ -908,7 +912,7 @@ describe('import safety', () => {
         ]);
         // THE RANK SURFACE REPLACES THE TEAM FIELD (R6/R15). `HarnessPreset.subagents` is gone, so
         // "has no team" is now a statement about `ranks`: `delegate` registers exactly when the map
-        // spans TWO OR MORE distinct letters (src/harness.ts `activation: 'delegation'`, and
+        // spans TWO OR MORE distinct letters (src/engine/harness.ts `activation: 'delegation'`, and
         // ./server/harnesses/toolbox.ts `coreToolNames` projects the same rule). TWO cards have no
         // delegation target: the default — a load-bearing contract, one member at one rank — and the
         // tool-less `chat` card (issue 0005-D: one member, so no target either, on a harness that has

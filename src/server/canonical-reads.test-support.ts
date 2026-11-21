@@ -21,7 +21,7 @@
 // MOUNT IS NEVER GUESSED HERE: the caller passes a `call` bound to one mount, so the same
 // helpers serve the in-process `runtime.api(...)` tests and the real-HTTP tests.
 
-import { HARNESS_PATH_TEMPLATES, HARNESS_ROUTES } from '../shared/harness-api';
+import { HARNESS_PATH_TEMPLATES, HARNESS_ROUTES } from '../engine/shared/harness-api';
 import type {
     AttachmentResponse,
     HarnessEvent,
@@ -40,7 +40,7 @@ import type {
     TurnStepDetail,
     TurnSummary,
     TurnSummaryPage
-} from '../shared/harness-api';
+} from '../engine/shared/harness-api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 
 /** Anything whose answer is a canonical `HarnessApiResult`, i.e. one API call. */

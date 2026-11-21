@@ -73,8 +73,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { createKnowledgeEngine } from '../core/knowledge';
-import type { KnowledgeArticle, KnowledgeEngine } from '../types';
+import { createKnowledgeEngine } from '../engine/core/knowledge';
+import type { KnowledgeArticle, KnowledgeEngine } from '../engine/types';
 import {
     HARNESS_KNOWLEDGE_INDEX_FILE,
     HARNESS_KNOWLEDGE_INTERVAL_MS,

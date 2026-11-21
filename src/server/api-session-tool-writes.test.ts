@@ -65,8 +65,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { agent, harness } from '../harness';
-import type { HarnessPreset, HarnessSnapshot, HarnessStreamEvent } from '../harness';
+import { agent, harness } from '../engine/harness';
+import type { HarnessPreset, HarnessSnapshot, HarnessStreamEvent } from '../engine/harness';
 import type { RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { SHARED_TOOL_NAMES, createToolboxHarness } from './harnesses/toolbox';

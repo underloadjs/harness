@@ -62,7 +62,7 @@ import type {
     HarnessThreadStatus,
     ToolContext,
     ToolCreation
-} from '../../types';
+} from '../../engine/types';
 import type { RecordStoreName } from './lane-commit';
 import {
     DEFAULT_BOUNDS,

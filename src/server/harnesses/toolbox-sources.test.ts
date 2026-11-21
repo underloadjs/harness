@@ -20,9 +20,9 @@ import { readFileSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { agent, harness, tool } from '../../harness';
-import type { HarnessProgress } from '../../harness';
-import { discoverToolMetadata } from '../../core';
+import { agent, harness, tool } from '../../engine/harness';
+import type { HarnessProgress } from '../../engine/harness';
+import { discoverToolMetadata } from '../../engine/core';
 import {
     SHARED_APP_TOOL_FOLDER,
     SHARED_APP_TOOL_NAMES,
@@ -61,7 +61,7 @@ const posix = (value: string): string => value.split(path.sep).join('/');
 // the source it claims to hold.
 const READ_HELPER = {
     path: 'tools/files/cancellation.ts',
-    text: readFileSync(fileURLToPath(new URL('../../tools/files/cancellation.ts', import.meta.url)), 'utf8')
+    text: readFileSync(fileURLToPath(new URL('../../engine/tools/files/cancellation.ts', import.meta.url)), 'utf8')
 };
 
 // A scripted transport that never emits anything: a library harness is only

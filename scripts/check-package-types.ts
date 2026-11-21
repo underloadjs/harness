@@ -31,7 +31,7 @@
 //   F4  the browser root must stay free of the Node server surface. It used to be
 //       proved against `dist/browser.d.ts` plus a browser-build alias
 //       (`./tool-source` -> `tool-source-browser.ts`). There is no bundle and no
-//       alias any more, so §2 walks the REAL source graph from `src/browser.ts` and
+//       alias any more, so §2 walks the REAL source graph from `src/engine/browser.ts` and
 //       fails if the Node root or the server barrel becomes reachable. The old
 //       "no `node:` specifier anywhere in the browser graph" half of that assertion
 //       was a bundling artifact (it only held because the build swapped the source
@@ -68,7 +68,7 @@
 //   - ./scratch.ts         — repository Temp scratch root
 //   - ../package.json      — `exports`, `files`, `test:package`
 //   - src/structure.test.ts — the in-repo mirror of the same manifest rules (no dist)
-//   - src/browser.ts       — the browser root §2 walks
+//   - src/engine/browser.ts       — the browser root §2 walks
 
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -202,7 +202,7 @@ for (const field of ['main', 'module', 'types'] as const) {
 // `./browser` group inside the root entry, ...), which is exactly the unit a resolver
 // picks: it never mixes a target from the browser group with the Node/`default` one.
 // The root entry legitimately holds TWO groups (`.` -> src/index.ts and `./.browser`
-// -> src/browser.ts), so grouping is by condition parent, not by subpath.
+// -> src/engine/browser.ts), so grouping is by condition parent, not by subpath.
 const conditionGroup = (condition: string): string => condition.slice(0, Math.max(condition.lastIndexOf('.'), 0));
 
 const groups = new Map<string, ExportTarget[]>();
@@ -271,8 +271,8 @@ if (!sourceFiles.includes(PERMITTED_BUILD_ARTIFACT)) {
 // Every tool must have an inspectable, independently compilable source entry. The
 // kernel owns the exact per-tool files; packaging only guarantees the tree is present
 // and is not empty.
-const toolSources = sourceFiles.filter((file) => file.startsWith(`${EDITABLE_SOURCE_ROOT}/tools/`) && file.endsWith('.ts'));
-if (toolSources.length === 0) fail('no tool source files are published under src/tools/');
+const toolSources = sourceFiles.filter((file) => file.startsWith(`${EDITABLE_SOURCE_ROOT}/engine/tools/`) && file.endsWith('.ts'));
+if (toolSources.length === 0) fail('no tool source files are published under src/engine/tools/');
 
 // 1e. Undeclared-dependency scan over the PUBLISHED source (F3). Scanning `dist` used
 // to answer "what does the shipped bundle need"; it now answers "what does a consumer
@@ -375,8 +375,8 @@ const resolveSourceSpecifier = (fromFile: string, specifier: string): string | u
 // collected so the walk can report how it leaves the package).
 const RELATIVE_SPECIFIER = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+)['"](\.[^'"]+)['"]/g;
 
-const browserEntry = path.join(PACKAGE_ROOT, EDITABLE_SOURCE_ROOT, 'browser.ts');
-if (!existsSync(browserEntry)) fail(`${EDITABLE_SOURCE_ROOT}/browser.ts is missing — the browser condition has no entry`);
+const browserEntry = path.join(PACKAGE_ROOT, EDITABLE_SOURCE_ROOT, 'engine', 'browser.ts');
+if (!existsSync(browserEntry)) fail(`${EDITABLE_SOURCE_ROOT}/engine/browser.ts is missing — the browser condition has no entry`);
 
 const browserFiles = new Set<string>();
 const browserPending = [browserEntry];
@@ -504,7 +504,7 @@ const browserConsumer = consumer(
         include: ['index.ts']
     },
     `import { agent, estimateContextTokens, CONTEXT_OVERFLOW_CODE } from '@underload/harness';
-// @ts-expect-error - the "browser" condition must resolve src/browser.ts, which
+// @ts-expect-error - the "browser" condition must resolve src/engine/browser.ts, which
 // deliberately has no Node server surface. If this import ever type-checks, the
 // condition mapping regressed and a browser bundle could reach node:http types.
 import { startHarnessServer } from '@underload/harness';

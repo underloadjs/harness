@@ -27,7 +27,7 @@
 // No `@presource/*` import: `@underload/harness` ships with zero presource dependencies (see
 // package.json "dependencies"), so this package's server code uses plain Node/TS primitives.
 
-import { HARNESS_ROUTES, HARNESS_WS_SUBPROTOCOL } from '../../shared/harness-api';
+import { HARNESS_ROUTES, HARNESS_WS_SUBPROTOCOL } from '../../engine/shared/harness-api';
 import {
     HARNESS_WS_CLIENT_MESSAGE_TYPES,
     HARNESS_WS_STREAM_LIMITS,
@@ -39,7 +39,7 @@ import {
     type WsSubscriptionScope,
     type WsUpdate,
     type WsUpdateKind
-} from '../../shared/harness-stream';
+} from '../../engine/shared/harness-stream';
 
 /** The one stream path, canonical in BOTH mounts (`/api` is gone). */
 export const HARNESS_WS_STREAM_PATH = HARNESS_ROUTES.stream();

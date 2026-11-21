@@ -69,10 +69,10 @@ import {
 // engine comes from the library core, and the store is a SUBSCRIBER of that engine
 // (./knowledge-file-store.ts header), so this module owns one engine + at most one store per
 // resolved root and nothing else in the process may build a second pair.
-import { createKnowledgeEngine } from '../core';
+import { createKnowledgeEngine } from '../engine/core';
 import { loadKnowledgeFileStore } from './knowledge-file-store';
 import type { KnowledgeStore } from './knowledge-file-store';
-import type { HarnessKnowledge, KnowledgeEngine } from '../types';
+import type { HarnessKnowledge, KnowledgeEngine } from '../engine/types';
 
 // Error text helper kept local so this module has no dependency on the store.
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));

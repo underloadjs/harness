@@ -42,13 +42,13 @@
 // below is a PROJECTION of a rank map — see `juniorsOf`.
 
 import { describe, expect, it } from 'vitest';
-import type { HarnessProgress } from '../../harness';
+import type { HarnessProgress } from '../../engine/harness';
 import type { HarnessPresetRecord } from '../persistence';
 // THE RANK VOCABULARY. `rankIndexOf` is the ordering the kernel itself uses
 // (../../types/index.ts), so this file projects "who is below whom" with the same
 // comparison the runtime applies — it cannot disagree with `delegate` about who is a
 // legal target.
-import { rankIndexOf } from '../../types';
+import { rankIndexOf } from '../../engine/types';
 import type { HarnessPreset } from './types';
 import {
     createHarnessRegistry,

@@ -16,7 +16,7 @@
 
 // `core` is the harness-internal live helper entry (see ./timeNow.tool.ts): the
 // source compiler treats it as framework, not as a second editable tool copy.
-import { tool } from '../../../core';
+import { tool } from '../../../engine/core';
 
 // Declarative half (T19/R9): pure literal, read by the AST scanner.
 export const metadata = {

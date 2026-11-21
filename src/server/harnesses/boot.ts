@@ -78,16 +78,16 @@
 //   - ../start.ts       — `startHarnessServer` consumption
 //   - ../../../../service/src/server/harness-warmup.ts — `variables.harness` forwarding
 
-import type { AgentRank } from '../../types';
+import type { AgentRank } from '../../engine/types';
 // The two environment-backed row names the kernel registers. They are the vocabulary an
 // explicit `environmentTools` array is resolved against (see `compilePreset`).
-import { WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../harness';
+import { WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../engine/harness';
 import type {
     HarnessCommandConfiguration,
     HarnessPlugin,
     HarnessPluginMetadata,
     Tool
-} from '../../harness';
+} from '../../engine/harness';
 import { createHarnessRegistry } from './registry';
 import { SHARED_TOOL_NAMES, createProfiledHarness, declaredToolboxNames } from './toolbox';
 import type { HarnessPreset, HarnessToolboxDefaults } from './types';

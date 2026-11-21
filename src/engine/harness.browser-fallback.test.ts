@@ -1,0 +1,141 @@
+// Browser capability boundary — source-level adapter for the aliased browser
+// build. The real build aliases core/tool-source to the Node-free stub; this test
+// simulates that exact contract (empty source roots + prepare rejects) while the
+// rest of the kernel is real, so construction/fallback behavior is testable
+// without a build.
+import { describe, expect, it, vi } from 'vitest';
+import { agent, harness, tool } from './index';
+import type { HarnessStream, HarnessStreamEvent } from './index';
+
+vi.mock('./core', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('./core')>();
+
+    return {
+        ...actual,
+        supportsToolCompilation: false,
+        TOOL_SOURCE_ROOTS: [] as readonly string[],
+        TOOL_SOURCE_PACKAGE_ROOT: '',
+        prepareToolCandidate: () => {
+            throw new Error(
+                'Tool source compilation is unavailable in the browser build; run the harness on Node to compile or register editable source revisions.'
+            );
+        }
+    };
+});
+
+const answer = (text: string): HarnessStreamEvent[] => [
+    { type: 'text', delta: text },
+    { type: 'done', stopReason: 'stop', toolCalls: [] }
+];
+
+const scripted = (): HarnessStream =>
+    async function* () {
+        for (const frame of answer('browser-ok')) yield frame;
+    };
+
+describe('browser baseline fallback', () => {
+    it('constructs the baseline harness from prepared definitions when source compilation is unavailable', async () => {
+        const writer = harness({
+            agents: { writer: agent({ model: 'test/model', stream: scripted() }) }
+        });
+
+        // Harness-owned controls and presets are seedable without compiling.
+        expect(writer.tools.toolRegistry).toBeDefined();
+        expect(writer.tools.toolRequest.visibility).toBe('core');
+        expect(writer.tools.toolList.visibility).toBe('searchable');
+        expect(writer.tools.toolManage.visibility).toBe('searchable');
+        expect(writer.tools.toolCreate.visibility).toBe('searchable');
+        expect(writer.tools.tasks.visibility).toBe('core');
+        expect(writer.tools.read.name).toBe('read');
+        expect(writer.tools.read.visibility).toBe('core');
+        // No source record is claimed for a prepared-definition fallback.
+        expect(writer.toolSource('read')).toBeUndefined();
+
+        // Existing browser harness semantics remain: model turns and discovery
+        // metadata are available. The fallback registry carries the same searchable
+        // rows as the compiled one, so a 'files' query finds files, download
+        // (R9-R11), and the profile row that shares the files vocabulary.
+        const result = await writer('go');
+        expect(result.content).toBe('browser-ok');
+        expect(await writer.executeTool('toolRequest', { tags: ['files'] })).toMatchObject({
+            // `records` rides along on the 1-point description rung (its text names the
+            // built-in collections), behind the wrapper that matches by tag.
+            enabled: ['files', 'download', 'profiles', 'records']
+        });
+    });
+
+    it('installs a prebuilt catalogue tool with no source record when compilation is unavailable', async () => {
+        // Issue 0003 in the browser build: a host that compiled its tool elsewhere still
+        // gets the tool — the attachment is simply dropped, because the stubbed compiler
+        // cannot hash a module graph. Construction must not fail, and no record may be
+        // claimed for bytes this environment never read (the same boundary that keeps the
+        // baseline on prepared definitions above).
+        const definition = tool({
+            name: 'browserProbe',
+            description: 'Answer in the browser.',
+            tags: ['probe'],
+            execute: () => 'browser-probe'
+        });
+
+        const writer = harness({
+            agents: { writer: agent({ model: 'test/model', stream: scripted() }) },
+            presets: false,
+            tools: {
+                browserProbe: {
+                    tool: definition,
+                    source: { moduleText: 'export const execute = () => "browser-probe";' }
+                }
+            }
+        });
+
+        expect(writer.tools.browserProbe?.name).toBe('browserProbe');
+        expect(await writer.tools.browserProbe?.execute({ parameters: {} } as never)).toBe(
+            'browser-probe'
+        );
+        expect(writer.toolSource('browserProbe')).toBeUndefined();
+        expect(
+            writer
+                .toolSources()
+                .filter((source) => source.name === 'browserProbe')
+                .map((source) => source.revision)
+        ).toEqual([]);
+    });
+
+    it('keeps runtime source registration explicitly unsupported in this environment', async () => {
+        const writer = harness({
+            agents: { writer: agent({ model: 'test/model', stream: scripted() }) },
+            tools: {
+                custom: tool({
+                    description: 'Configured definition.',
+                    tags: ['test'],
+                    execute: () => 'configured'
+                })
+            }
+        });
+
+        await expect(writer.executeTool('custom', {})).resolves.toBe('configured');
+        await expect(
+            writer.registerTool({
+                name: 'fromSource',
+                moduleText:
+                    "export const metadata = { name: 'fromSource', description: 'x', tags: ['x'] }; export const execute = () => 1;"
+            })
+        ).rejects.toThrow(/unavailable in the browser build/);
+
+        expect(() =>
+            harness({
+                agents: { writer: agent({ model: 'test/model', stream: scripted() }) },
+                toolSources: { fromMap: 'tools/files/files.tool.ts' }
+            })
+        ).toThrow(/unavailable in the browser build/);
+
+        // A folder configuration is an explicit Node capability request; the
+        // browser build rejects it rather than silently scanning nothing.
+        expect(() =>
+            harness({
+                agents: { writer: agent({ model: 'test/model', stream: scripted() }) },
+                toolFolders: ['/tmp/does-not-matter']
+            })
+        ).toThrow(/toolFolders require the Node source compiler/);
+    });
+});

@@ -29,9 +29,9 @@
 //   - ../shared/harness-api.ts            — `PluginSetting`/`PluginSummary`, the wire spelling
 import { describe, expect, it } from 'vitest';
 
-import { BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
-import { createPluginSettingsView } from '../plugin/settings';
-import type { HarnessPluginMetadata } from '../types';
+import { BUILTIN_PLUGIN_DESCRIPTORS } from '../engine/plugin/manifest';
+import { createPluginSettingsView } from '../engine/plugin/settings';
+import type { HarnessPluginMetadata } from '../engine/types';
 import {
     HarnessPluginSettingsError,
     PLUGIN_ENABLED_KEY,

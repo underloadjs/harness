@@ -52,8 +52,8 @@
 //     titles General/Explore/Analyst/Manager/Debugger are not names and do not resolve.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { agent } from '../../harness';
-import type { HarnessProgress } from '../../harness';
+import { agent } from '../../engine/harness';
+import type { HarnessProgress } from '../../engine/harness';
 import type { HarnessPreset } from './types';
 import type { HarnessRegistry } from './registry';
 import {
@@ -74,7 +74,7 @@ import { SHARED_TOOL_NAMES } from './toolbox';
 // `agentInstruction` is imported rather than re-typed here: a no-override member must
 // equal exactly what the trusted catalogue composes, and duplicating the prose (or the
 // join rule) in this file is how a pin silently drifts from the shipped prompt.
-import { AGENT_PROFILES, agentInstruction } from '../../agents';
+import { AGENT_PROFILES, agentInstruction } from '../../engine/agents';
 
 // The exact tool-order assertions below assume a KEYLESS host: search is
 // registered only when EXA_API_KEY/TAVILY_API_KEY resolves (harness.ts:728-738),

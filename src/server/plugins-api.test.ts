@@ -49,22 +49,22 @@ import { dirname, join, resolve } from 'node:path';
 import { readPersistedDocument, writePersistedDocument } from './persistence-test-helpers';
 import { fileURLToPath } from 'node:url';
 
-import { agent, harness } from '../harness';
-import type { HarnessStream, HarnessStreamEvent } from '../harness';
-import { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
+import { agent, harness } from '../engine/harness';
+import type { HarnessStream, HarnessStreamEvent } from '../engine/harness';
+import { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from '../engine/plugin/manifest';
 // The prompt constant, so the projected value below is a real string rather than
 // `COMPACTION.systemPrompt`: read from the descriptor, a MISSING field would become
 // `system_prompt: undefined`, which `toEqual` treats as absent and the assertion would
 // pass vacuously. This spelling fails loudly if the field or the projection goes away.
-import { COMPACTION_INSTRUCTION } from '../plugins/context-compaction.plugin';
-import { createPluginSettingsView } from '../plugin/settings';
-import type { HarnessPluginApi, HarnessPluginMetadata } from '../types';
+import { COMPACTION_INSTRUCTION } from '../engine/plugins/context-compaction.plugin';
+import { createPluginSettingsView } from '../engine/plugin/settings';
+import type { HarnessPluginApi, HarnessPluginMetadata } from '../engine/types';
 import { createHarnessRegistry, createToolboxHarness } from './harnesses';
 import type { HarnessPreset, HarnessPresetReport, RunnerSettings } from './harnesses/types';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime, HarnessRuntimeOptions } from './runtime';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
-import { HARNESS_EPOCH_HEADER, HARNESS_REVISION_HEADER } from '../shared/harness-api';
+import { HARNESS_EPOCH_HEADER, HARNESS_REVISION_HEADER } from '../engine/shared/harness-api';
 
 const MOUNT = '/v1/harness';
 

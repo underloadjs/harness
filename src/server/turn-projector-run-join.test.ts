@@ -36,8 +36,8 @@
 // Run: yarn vitest run src/server/turn-projector-run-join.test.ts
 
 import { describe, expect, it } from 'vitest';
-import type { HarnessEvent } from '../harness';
-import type { DisplayProjectContext, TurnDisplay } from '../shared/turn-display';
+import type { HarnessEvent } from '../engine/harness';
+import type { DisplayProjectContext, TurnDisplay } from '../engine/shared/turn-display';
 import type { SessionTurn } from './protocol';
 import { invocationRunKeyOf } from './protocol';
 import { createTurnProjector } from './turn-projector';

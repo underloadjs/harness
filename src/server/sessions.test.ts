@@ -10,17 +10,17 @@
 // by shape and by identity relative to the emitted frames.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness, tool } from '../harness';
+import { agent, harness, tool } from '../engine/harness';
 // T-W8: every recorded `thread` payload now carries the minting process's epoch
 // (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity mints in
 // ../harness.ts). These assertions are WHOLE payloads, so the key has to be named; the
 // value is exact because every frame here was recorded IN THIS PROCESS (the delegated
 // child runs inline), and vitest gives one module registry per file — one epoch per file.
-import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
-import type { AgentRank, HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessUsage } from '../harness';
+import { HARNESS_PROCESS_EPOCH } from '../engine/core/agent-limits';
+import type { AgentRank, HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessUsage } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
-import { AGENT_PROFILES, agentInstruction } from '../agents';
+import { AGENT_PROFILES, agentInstruction } from '../engine/agents';
 import { SessionError, SessionStore } from './sessions';
 import type { SessionStreamItem } from './protocol';
 

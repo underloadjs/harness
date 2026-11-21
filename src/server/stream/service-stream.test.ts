@@ -23,8 +23,8 @@ import fs from 'node:fs';
 import path from 'path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { HARNESS_WS_SUBPROTOCOL, HARNESS_ROUTES } from '../../shared/harness-api';
-import type { TaskReceipt } from '../../shared/harness-api';
+import { HARNESS_WS_SUBPROTOCOL, HARNESS_ROUTES } from '../../engine/shared/harness-api';
+import type { TaskReceipt } from '../../engine/shared/harness-api';
 import { HARNESS_WS_STREAM_PATH } from './protocol';
 
 // src/server/stream/ -> package root is three levels up.

@@ -55,8 +55,8 @@
 // events — `TurnSummary.steers` carries the destination section id, which is what the
 // board consumes today via `turns.ts:390 tryRenderSteer`).
 
-import type { HarnessEvent, HarnessPendingTool, HarnessToolOutcome } from '../harness';
-import type { AgentResultBlock } from '../shared/agent-results';
+import type { HarnessEvent, HarnessPendingTool, HarnessToolOutcome } from '../engine/harness';
+import type { AgentResultBlock } from '../engine/shared/agent-results';
 import {
     DISPLAY_ARGS_PREVIEW_CHARS,
     DISPLAY_ATTACHMENT_INLINE_CHARS,
@@ -69,7 +69,7 @@ import {
     DISPLAY_PANEL_TITLE_CHARS,
     DISPLAY_PANELS_PER_STEP,
     DISPLAY_PREVIEW_CHARS
-} from '../shared/turn-display';
+} from '../engine/shared/turn-display';
 import type {
     ContextBlock,
     ContextBlockKind,
@@ -99,7 +99,7 @@ import type {
     TurnSection,
     TurnSectionPatch,
     TurnSummary
-} from '../shared/turn-display';
+} from '../engine/shared/turn-display';
 import type { SessionTurn } from './protocol';
 // R19 (2026-11-17): the invocation-RUN join rule, imported as a VALUE from the file that owns it
 // (../protocol.ts, beside the `invocationIds` wire contract it feeds). The store WRITES the join
@@ -109,11 +109,11 @@ import { invocationRunKeyOf } from './protocol';
 // The rank vocabulary (../types/index.ts `AGENT_RANKS`, ordered highest authority first). A
 // VALUE import on purpose: the fallback rank below is derived from the same ordered list every
 // other rank rule reads, never from a hard-coded letter that could drift from the vocabulary.
-import { AGENT_RANKS } from '../types';
+import { AGENT_RANKS } from '../engine/types';
 // (T2) The tool-composition payload, imported from the type module directly (the same
 // specifier ../shared/turn-display.ts:95 uses) so this file does not depend on what the
 // runtime barrel happens to re-export.
-import type { HarnessToolCallProgress } from '../types';
+import type { HarnessToolCallProgress } from '../engine/types';
 
 // The turn's own root flow. INTERNAL key only: a section's wire identity is always
 // its minted `${turnId}:${ordinal}` id, which is why a delegation placeholder can

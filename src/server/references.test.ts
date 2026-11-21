@@ -19,8 +19,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
-import type { AgentRank, HarnessMessage, HarnessStreamEvent } from '../harness';
+import { agent, harness } from '../engine/harness';
+import type { AgentRank, HarnessMessage, HarnessStreamEvent } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';
@@ -32,8 +32,8 @@ import {
     REFERENCED_RESULTS_FOOTER,
     REFERENCED_RESULTS_HEADER,
     listAgentResultBlocks
-} from '../shared/agent-results';
-import type { TaskReceipt, TurnResponse } from '../shared/harness-api';
+} from '../engine/shared/agent-results';
+import type { TaskReceipt, TurnResponse } from '../engine/shared/harness-api';
 import type { SessionSnapshot, SessionTurn } from './protocol';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,

@@ -36,7 +36,7 @@
 //   - Temp/coding-t21/probe2.ts        — the real-session A/B behind the numbers above
 
 import { describe, expect, it } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset, HarnessStream, HarnessStreamEvent, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { SessionStore } from './sessions';

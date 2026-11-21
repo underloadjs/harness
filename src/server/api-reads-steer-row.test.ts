@@ -23,7 +23,7 @@
 //   - ../frontend/view-test-support.ts `wireRowOf` — the fixture double that mirrors this mapping
 //     (its shell case is ../frontend/thread-conversation-shell.test.ts:281).
 
-import type { DisplayProjectContext, TurnProjector } from '../shared/turn-display';
+import type { DisplayProjectContext, TurnProjector } from '../engine/shared/turn-display';
 import type { SessionTurn } from './protocol';
 import { steerRowOf, turnRowOf, TURN_PROMPT_PREVIEW_CHARS } from './api-reads';
 import { createTurnProjector } from './turn-projector';

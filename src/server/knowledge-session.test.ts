@@ -50,7 +50,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type {
     Harness,
     HarnessKnowledgeStore,
@@ -60,13 +60,13 @@ import type {
     KnowledgeCreateResult,
     KnowledgeEngine,
     KnowledgeOperation
-} from '../harness';
+} from '../engine/harness';
 import { createHarnessRegistry, createToolCatalogue, createWebSearchCatalogueEntry } from './harnesses';
 import { createToolboxHarness } from './harnesses/toolbox';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { startHarnessServer } from './start';
 import { knowledgeArticleFileOf, knowledgeDirectoryOf } from './knowledge-file-store';
-import { createKnowledgeEngine } from '../core';
+import { createKnowledgeEngine } from '../engine/core';
 import { harnessKnowledgeOf, peekHarnessKnowledge } from './runtime';
 import { harnessSessionFileOf, readPersistedDocument } from './persistence-test-helpers';
 

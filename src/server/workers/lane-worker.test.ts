@@ -31,12 +31,12 @@ import { afterAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { agent, harness } from '../../harness';
-import type { Harness, HarnessMessage, HarnessStreamEvent } from '../../harness';
+import { agent, harness } from '../../engine/harness';
+import type { Harness, HarnessMessage, HarnessStreamEvent } from '../../engine/harness';
 import { createHarnessRegistry } from '../harnesses';
 // The built-in task collection SPEC, which a persisted collection block carries beside its
 // entries (Decision M) — so the expectation below names it instead of spelling it out.
-import { TASKS_COLLECTION } from '../../core';
+import { TASKS_COLLECTION } from '../../engine/core';
 import { PRODUCTION_WITH_FIXTURES } from '../harnesses/fixture-presets.test-support';
 import { SHARED_APP_TOOL_SOURCES } from '../harnesses/toolbox';
 import { DEFAULT_RUNTIME_CONFIGURATION } from '../config';
@@ -56,7 +56,7 @@ import type { LaneWorkerState, ReplicaReadView } from './lane-worker-loop';
 // The projection BOTH sides of the archive seam digest. The cases below gate a derived op on it, so
 // the expectation names the writer's own rule (./lane-commit.ts) instead of trusting the receipt.
 import { archiveDigestOf } from './lane-commit';
-import type { HarnessAgentResultSnapshot } from '../../types';
+import type { HarnessAgentResultSnapshot } from '../../engine/types';
 import { digestMemoryValue } from './lane-memory';
 import type { LaneAuthority } from './lane-authority';
 import { HarnessPersistence } from '../persistence';

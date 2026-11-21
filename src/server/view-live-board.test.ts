@@ -30,14 +30,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { agent, harness } from '../harness';
-import type { HarnessMessage, HarnessStreamEvent } from '../harness';
+import { agent, harness } from '../engine/harness';
+import type { HarnessMessage, HarnessStreamEvent } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';
 import { SessionStore } from './sessions';
 import type { SessionView } from './protocol';
-import type { TurnDisplay } from '../shared/turn-display';
+import type { TurnDisplay } from '../engine/shared/turn-display';
 
 const DEFAULTS: RunnerSettings = {
     baseURL: 'http://scripted.invalid/v1',

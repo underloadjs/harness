@@ -27,11 +27,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { MAX_API_BODY_BYTES } from './api';
-import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
+import { MAX_SUBMIT_BODY_BYTES } from '../engine/shared/attachments';
 // T18: paths, envelopes, and statuses are stated from the GENERATED contract module, so this suite
 // pins the target wire (canonical `/v1/harness`, paged catalogues, 202 submit receipts, the executions
 // route for a direct tool call) instead of the legacy adapter shapes it grew.
-import { HARNESS_API_ROOT, HARNESS_PATH_TEMPLATES, HARNESS_ROUTES } from '../shared/harness-api';
+import { HARNESS_API_ROOT, HARNESS_PATH_TEMPLATES, HARNESS_ROUTES } from '../engine/shared/harness-api';
 // v2 layout readers: this suite spawns a real server over a real database root, so it pins the
 // bytes that root ends up holding (header document + per-session shard).
 import {
@@ -55,8 +55,8 @@ import type {
     TurnEventRow,
     TurnResource,
     TurnResponse
-} from '../shared/harness-api';
-import type { ServiceInfo } from '../shared/harness-api';
+} from '../engine/shared/harness-api';
+import type { ServiceInfo } from '../engine/shared/harness-api';
 
 // src/server/ -> package root is two levels up.
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));

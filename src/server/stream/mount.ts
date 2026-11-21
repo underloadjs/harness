@@ -24,9 +24,9 @@
 
 import type { IncomingMessage, Server } from 'node:http';
 import type { Duplex } from 'node:stream';
-import { HARNESS_WS_SUBPROTOCOL } from '../../shared/harness-api';
-import { isLoopbackHostname, isPagesOrigin } from '../../shared/origin';
-import type { StreamResourceKind, WsStreamLimits, WsSubscriptionScope, WsRevisionRecord } from '../../shared/harness-stream';
+import { HARNESS_WS_SUBPROTOCOL } from '../../engine/shared/harness-api';
+import { isLoopbackHostname, isPagesOrigin } from '../../engine/shared/origin';
+import type { StreamResourceKind, WsStreamLimits, WsSubscriptionScope, WsRevisionRecord } from '../../engine/shared/harness-stream';
 // T13's shared epoch/revision hub. The stream MUST report the epoch the REST surface reports, and
 // MUST read the same counters a REST read stamps in `X-Harness-Revision`, so the hub — not this
 // module — is the source of both. Imported as the one cross-owner seam both sides agreed on.

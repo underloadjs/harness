@@ -46,8 +46,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
-import type { HarnessProgress, HarnessStream, HarnessStreamEvent } from '../harness';
+import { agent, harness } from '../engine/harness';
+import type { HarnessProgress, HarnessStream, HarnessStreamEvent } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry, createToolCatalogue, createWebSearchCatalogueEntry, describeHarness } from './harnesses';
 import { HarnessPersistence, HarnessPersistenceError } from './persistence';
@@ -63,7 +63,7 @@ import {
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 // Canonical session list page for the migrated route assertions.
-import type { SessionResource, SessionSummaryPage } from '../shared/harness-api';
+import type { SessionResource, SessionSummaryPage } from '../engine/shared/harness-api';
 import type { SessionSnapshot } from './protocol';
 import { SessionError, SessionStore } from './sessions';
 

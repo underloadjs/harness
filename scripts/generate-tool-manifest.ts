@@ -5,13 +5,13 @@
 // The requirement is that `harness({})` discovers tools by SCANNING `tools/*` and
 // that no tool module is statically imported to build the catalogue. A browser
 // cannot scan or parse TypeScript, so the scan result has to ship as generated data.
-// Generating it from the same reader the runtime uses (`src/core/tool-scan.ts`) is
+// Generating it from the same reader the runtime uses (`src/engine/core/tool-scan.ts`) is
 // what makes the two impossible to drift: there is exactly one literal walker
 // (TypeScript's own parser).
 //
 // WHAT IT WRITES
 // --------------
-//   src/core/tool-manifest.ts
+//   src/engine/core/tool-manifest.ts
 //     BUILTIN_TOOL_DESCRIPTORS  — one descriptor per discovered entry, as data
 //     loadDiscoveredTool(label) — one generated dynamic import per entry
 //
@@ -33,8 +33,8 @@ import { fileURLToPath } from 'node:url';
 import { renderManifest } from './tool-manifest-render.ts';
 
 const PACKAGE_ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
-const OUTPUT = path.join(PACKAGE_ROOT, 'src', 'core', 'tool-manifest.ts');
-const TOOLS_ROOT = path.join(PACKAGE_ROOT, 'src', 'tools');
+const OUTPUT = path.join(PACKAGE_ROOT, 'src', 'engine', 'core', 'tool-manifest.ts');
+const TOOLS_ROOT = path.join(PACKAGE_ROOT, 'src', 'engine', 'tools');
 
 // A stale or missing tools root must fail loudly rather than emit an empty manifest.
 if (!fs.existsSync(TOOLS_ROOT)) {
@@ -50,7 +50,7 @@ if (!fs.existsSync(TOOLS_ROOT)) {
 type DescriptorRow = { label: string } & Record<string, unknown>;
 
 const { scanToolMetadata } = (await import(
-    path.join(PACKAGE_ROOT, 'src', 'core', 'tool-scan.ts')
+    path.join(PACKAGE_ROOT, 'src', 'engine', 'core', 'tool-scan.ts')
 )) as {
     scanToolMetadata: (options: { includePresets: boolean }) => DescriptorRow[];
 };
@@ -71,7 +71,7 @@ if (process.argv.includes('--check')) {
 
     if (current !== rendered) {
         console.error(
-            'src/core/tool-manifest.ts is stale. Regenerate with: yarn vite-node scripts/generate-tool-manifest.ts'
+            'src/engine/core/tool-manifest.ts is stale. Regenerate with: yarn vite-node scripts/generate-tool-manifest.ts'
         );
         process.exit(1);
     }

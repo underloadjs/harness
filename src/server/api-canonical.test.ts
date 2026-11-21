@@ -31,10 +31,10 @@
 //   - ../shared/harness-api.ts    — the DTO/limit/capability constants quoted below
 
 import { describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
-import { HARNESS_PAGE_LIMIT, HARNESS_SERVICE_CAPABILITIES, HARNESS_SERVICE_LIMITS } from '../shared/harness-api';
+import { HARNESS_PAGE_LIMIT, HARNESS_SERVICE_CAPABILITIES, HARNESS_SERVICE_LIMITS } from '../engine/shared/harness-api';
 import { createHarnessApi } from './api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 import { SessionStore } from './sessions';

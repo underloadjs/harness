@@ -17,7 +17,7 @@ import {
     isTrustedRuntimeOrigin,
     LOOPBACK_HOSTNAMES,
     PAGES_HOST_SUFFIX
-} from '../shared/origin';
+} from '../engine/shared/origin';
 
 describe('isLoopbackHostname', () => {
     it('accepts the documented loopback spellings', () => {

@@ -42,12 +42,12 @@
             "@underload/harness/worker": ["./src/server/workers/lane-worker.ts"],
             "@underload/harness/io-worker": ["./src/server/workers/io-worker.ts"],
             "@underload/harness/server/turn-projector": ["./src/server/turn-projector.ts"],
-            "@underload/harness/shared": ["./src/shared/index.ts"],
-            "@underload/harness/shared/harness-api": ["./src/shared/harness-api.ts"],
-            "@underload/harness/shared/harness-stream": ["./src/shared/harness-stream.ts"],
-            "@underload/harness/shared/turn-display": ["./src/shared/turn-display.ts"],
-            "@underload/harness/shared/run-identity": ["./src/shared/run-identity.ts"],
-            "@underload/harness/types": ["./src/types/index.ts"]
+            "@underload/harness/shared": ["./src/engine/shared/index.ts"],
+            "@underload/harness/shared/harness-api": ["./src/engine/shared/harness-api.ts"],
+            "@underload/harness/shared/harness-stream": ["./src/engine/shared/harness-stream.ts"],
+            "@underload/harness/shared/turn-display": ["./src/engine/shared/turn-display.ts"],
+            "@underload/harness/shared/run-identity": ["./src/engine/shared/run-identity.ts"],
+            "@underload/harness/types": ["./src/engine/types/index.ts"]
         }
     },
     "exclude": ["node_modules", "Temp", "**/*.test.ts", "**/dist/*", "**/lib/*"],

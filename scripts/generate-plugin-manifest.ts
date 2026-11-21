@@ -4,7 +4,7 @@
 // ---------------
 // Plugins, like tools, are discovered by SCANNING a folder instead of a
 // hand-maintained list. A browser cannot read files, so the scan result ships as
-// generated wiring in `src/plugin/manifest.ts`.
+// generated wiring in `src/engine/plugin/manifest.ts`.
 //
 // This file is deliberately THIN: the discovery rules and the rendering live in
 // `./plugin-manifest-scan.ts` and `./plugin-manifest-render.ts`, both pure, so the
@@ -26,13 +26,13 @@ import { discoverPluginEntries, PluginScanError } from './plugin-manifest-scan.t
 import { renderManifest } from './plugin-manifest-render.ts';
 
 const PACKAGE_ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
-const OUTPUT = path.join(PACKAGE_ROOT, 'src', 'plugin', 'manifest.ts');
-const PLUGIN_ROOT = path.join(PACKAGE_ROOT, 'src', 'plugins');
+const OUTPUT = path.join(PACKAGE_ROOT, 'src', 'engine', 'plugin', 'manifest.ts');
+const PLUGIN_ROOT = path.join(PACKAGE_ROOT, 'src', 'engine', 'plugins');
 
 let entries;
 
 try {
-    // The generated file sits at src/plugin/manifest.ts, hence the default `../plugins`
+    // The generated file sits at src/engine/plugin/manifest.ts, hence the default `../plugins`
     // specifier prefix the scanner applies.
     entries = discoverPluginEntries({ pluginsRoot: PLUGIN_ROOT });
 } catch (error) {
@@ -49,7 +49,7 @@ if (process.argv.includes('--check')) {
 
     if (current !== rendered) {
         console.error(
-            'src/plugin/manifest.ts is stale. Regenerate with: yarn vite-node scripts/generate-plugin-manifest.ts'
+            'src/engine/plugin/manifest.ts is stale. Regenerate with: yarn vite-node scripts/generate-plugin-manifest.ts'
         );
         process.exit(1);
     }

@@ -56,8 +56,8 @@
 // Run: yarn vitest run src/server/turn-projector-settle-interrupted.test.ts  (cwd packages/underload/harness)
 
 import { describe, expect, it } from 'vitest';
-import type { HarnessEvent } from '../harness';
-import type { DisplayProjectContext, TurnDisplayOp, TurnRecordStatus, TurnSection } from '../shared/turn-display';
+import type { HarnessEvent } from '../engine/harness';
+import type { DisplayProjectContext, TurnDisplayOp, TurnRecordStatus, TurnSection } from '../engine/shared/turn-display';
 import { createTurnProjector, formatDuration, projectTurn } from './turn-projector';
 import type { SessionTurn } from './protocol';
 

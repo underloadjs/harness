@@ -45,7 +45,7 @@ import {
     startHarnessServer
 } from './index';
 // The canonical root, from the generated contract module — not a string spelled twice here.
-import { HARNESS_API_ROOT } from '../shared/harness-api';
+import { HARNESS_API_ROOT } from '../engine/shared/harness-api';
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 

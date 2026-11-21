@@ -39,7 +39,7 @@ import type { Harness, HarnessMessage, HarnessStream, HarnessStreamEvent } from 
 // W19 (2026-11-17): the row an archive lands now names its LEDGER GENERATION, so the exact row pins
 // below name the constant (it is random per process) — and the digest pins below stay WITHOUT it,
 // which is the proof that `archiveDigestOf` still projects its own explicit field list.
-import { HARNESS_PROCESS_EPOCH } from '../../core/agent-limits';
+import { HARNESS_PROCESS_EPOCH } from '../../engine/core/agent-limits';
 import { canonicalViewOf, createLaneAuthority } from './lane-authority';
 // `archiveDigestOf` is the projection both sides of the archive seam must agree on; the pair pins
 // below compare a receipt against it, so the test states the writer's own rule rather than trusting

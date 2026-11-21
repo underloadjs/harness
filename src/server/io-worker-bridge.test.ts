@@ -35,7 +35,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset, HarnessProgress, HarnessStream, HarnessStreamEvent, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry, presets } from './harnesses';
 import { HARNESS_JOURNAL_DIRECTORY, HarnessJournal } from './journal';

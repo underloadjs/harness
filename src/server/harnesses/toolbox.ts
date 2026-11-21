@@ -86,7 +86,7 @@
 //   - ../src/harness.ts — `presets: false` + `toolSources` startup compilation
 //   - ../api.ts  — descriptors resolved from the same preset metadata
 
-import { agent, harness, presetTools, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../harness';
+import { agent, harness, presetTools, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../engine/harness';
 import type {
     Agent,
     AgentConfiguration,
@@ -95,21 +95,21 @@ import type {
     HarnessConfiguration,
     HarnessProgress,
     Tool
-} from '../../harness';
+} from '../../engine/harness';
 // The A–Z rank union (../types/index.ts). This layer STORES and PROJECTS ranks;
 // the ordering and the delegation predicate live with the kernel.
-import type { AgentRank } from '../../types';
+import type { AgentRank } from '../../engine/types';
 // THE RANK PRIMITIVES (R1): the ladder itself and its one ordering. They are values, not
 // types, because ./registry.ts has to RESOLVE an operator's sparse map into the map the
 // harness runs with (see `resolveRosterRanks`), and the kernel's arithmetic
 // (../harness.ts:1528-1532) is written against these same two exports — so the scale and
 // the floor can never drift from what the runtime does.
-import { AGENT_RANKS, rankIndexOf } from '../../types';
-import { agentInstruction, agentProfile, isAgentProfileName } from '../../agents';
+import { AGENT_RANKS, rankIndexOf } from '../../engine/types';
+import { agentInstruction, agentProfile, isAgentProfileName } from '../../engine/agents';
 // T19: the global agent overlay (effective profile text + the retirement error). One
 // direction only — ./agent-state.ts imports nothing from here, so there is no cycle.
 import { AgentStateError, effectiveAgentProfile } from './agent-state';
-import { PRESET_DESCRIPTORS, RUNTIME_DESCRIPTORS, isCoreRegistered } from '../../tools/descriptors';
+import { PRESET_DESCRIPTORS, RUNTIME_DESCRIPTORS, isCoreRegistered } from '../../engine/tools/descriptors';
 import {
     SHARED_APP_TOOL_FOLDER,
     SHARED_APP_TOOL_NAMES,

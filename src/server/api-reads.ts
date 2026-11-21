@@ -36,11 +36,11 @@ import type {
     HarnessMessage,
     HarnessUsage,
     ToolVisibility
-} from '../harness';
+} from '../engine/harness';
 // The trusted agent catalogue profile (src/agents), distinct from the wire `AgentProfile`
 // below: one is the shipped record, the other is what a client reads.
-import type { AgentProfile as TrustedAgentProfile } from '../agents';
-import type { TurnProjector } from '../shared/turn-display';
+import type { AgentProfile as TrustedAgentProfile } from '../engine/agents';
+import type { TurnProjector } from '../engine/shared/turn-display';
 import type {
     AgentProfile,
     HarnessCard,
@@ -79,17 +79,17 @@ import type {
     TurnSummary as WireTurnSummary,
     UsageByThread,
     UsagePatch
-} from '../shared/harness-api';
-import type { AgentResultReference } from '../shared/agent-results';
-import { HARNESS_SERVICE_LIMITS } from '../shared/harness-api';
+} from '../engine/shared/harness-api';
+import type { AgentResultReference } from '../engine/shared/agent-results';
+import { HARNESS_SERVICE_LIMITS } from '../engine/shared/harness-api';
 // T4: the engine's own read model for the record store (`records()` / `recordsChanges()`),
 // which is what the two projections below turn into wire rows. Domain types come from
 // ../types, the same barrel ./sessions.ts reads, never from the runtime entry point.
-import type { RecordEntry, RecordFieldDefinition, RecordStoreChange } from '../types';
+import type { RecordEntry, RecordFieldDefinition, RecordStoreChange } from '../engine/types';
 // The rank vocabulary, imported as a VALUE so the fallback rank below comes from the same
 // ordered list every other rank rule in the repo reads (../types/index.ts `AGENT_RANKS`).
-import { AGENT_RANKS } from '../types';
-import type { AgentRank } from '../types';
+import { AGENT_RANKS } from '../engine/types';
+import type { AgentRank } from '../engine/types';
 import { previewText } from './turn-projector';
 import type { SessionRecord, ThreadLaneInfo } from './sessions';
 // R19: the roster's invocation joins are keyed by INVOCATION RUN (`id\0epoch` / bare id) inside

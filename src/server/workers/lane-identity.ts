@@ -46,7 +46,7 @@
 //   - ../../core/agent-limits.ts - AGENT_RESULT_RETENTION (64)
 //   - ../../core/creation.ts - DEFAULT_CREATED_TOOLS_LIMIT (32)
 
-import { AGENT_RESULT_RETENTION, DEFAULT_CREATED_TOOLS_LIMIT, MAX_THREAD_RECORDS } from '../../core';
+import { AGENT_RESULT_RETENTION, DEFAULT_CREATED_TOOLS_LIMIT, MAX_THREAD_RECORDS } from '../../engine/core';
 
 // Every id space whose counter otherwise lives inside a harness replica.
 // `record:<store>` exists because a model mints records from inside a lane; the rest

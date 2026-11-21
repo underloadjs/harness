@@ -24,10 +24,10 @@
 //   - ./api-canonical.test.ts       — the REST read/paging contract these counters also stamp
 
 import { describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
-import { HARNESS_EPOCH_HEADER, HARNESS_REVISION_HEADER } from '../shared/harness-api';
+import { HARNESS_EPOCH_HEADER, HARNESS_REVISION_HEADER } from '../engine/shared/harness-api';
 import type { HarnessStreamEvent } from './api-events';
 import { createHarnessApi } from './api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';

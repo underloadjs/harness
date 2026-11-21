@@ -22,7 +22,7 @@ import type { HarnessPreset, RunnerSettings } from '../harnesses/types';
 import { loadConfiguration } from '../config';
 import { loadEnvironmentFile } from '../environment';
 import { startHarnessServer } from '../index';
-import type { Harness, HarnessInteractionConfiguration } from '../../harness';
+import type { Harness, HarnessInteractionConfiguration } from '../../engine/harness';
 import { createRenderer } from './render';
 import type { Renderer } from './render';
 import { DEFAULT_CLI_PRESET, parseCliOptions } from './options';

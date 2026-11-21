@@ -57,9 +57,9 @@
 //   - ./toolbox.ts        — createToolboxHarness / extraTools / extraToolSources
 //   - ../../agents        — the trusted profiles; `demo`/`flaky` are no longer among them
 
-import { agent, harness, tool } from '../../harness';
-import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '../../harness';
-import { agentInstruction, AGENT_PROFILES } from '../../agents';
+import { agent, harness, tool } from '../../engine/harness';
+import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '../../engine/harness';
+import { agentInstruction, AGENT_PROFILES } from '../../engine/agents';
 import { presets } from './presets';
 import {
     SHARED_APP_TOOL_SOURCES,

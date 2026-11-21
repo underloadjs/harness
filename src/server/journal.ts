@@ -94,7 +94,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import type { HarnessEvent } from '../harness';
+import type { HarnessEvent } from '../engine/harness';
 
 // Sibling of the checkpoint header `index.json`, so an operator can see both in one
 // place; under the v2 layout this IS the session's own directory, holding its

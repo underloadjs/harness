@@ -34,7 +34,7 @@ import {
 } from './protocol';
 import { hubResourceId } from './mount';
 import { resourceBaselineLink } from '../api-events';
-import { HARNESS_STREAM_RESOURCE_KINDS, HARNESS_WS_STREAM_LIMITS, HARNESS_WS_UPDATE_KINDS } from '../../shared/harness-stream';
+import { HARNESS_STREAM_RESOURCE_KINDS, HARNESS_WS_STREAM_LIMITS, HARNESS_WS_UPDATE_KINDS } from '../../engine/shared/harness-stream';
 
 describe('the records scope tables', () => {
     it('publishes records.updated to the session scope, at the contract position', () => {

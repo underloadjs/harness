@@ -53,7 +53,7 @@
 //   - ../api.ts      — compose + session-bound call routing
 //   - ../sessions.ts — SessionStore.callTool → harness.executeTool
 
-import { RUNTIME_DESCRIPTORS } from '../../tools/descriptors';
+import { RUNTIME_DESCRIPTORS } from '../../engine/tools/descriptors';
 import type { CatalogueEntry } from './types';
 
 // The display group for the core set. A distinct group (rather than 'Harness

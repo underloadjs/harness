@@ -253,15 +253,15 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import type { KnowledgeArticle, KnowledgeEngine, KnowledgeStoreNotification } from '../types';
-import { KNOWLEDGE_UUID_PATTERN, createKnowledgeEngine, readKnowledgeStoreState } from '../core/knowledge';
+import type { KnowledgeArticle, KnowledgeEngine, KnowledgeStoreNotification } from '../engine/types';
+import { KNOWLEDGE_UUID_PATTERN, createKnowledgeEngine, readKnowledgeStoreState } from '../engine/core/knowledge';
 import {
     readSnapshotArray,
     readSnapshotInteger,
     readSnapshotKeys,
     readSnapshotRecord,
     readSnapshotString
-} from '../core/snapshot-validation';
+} from '../engine/core/snapshot-validation';
 import {
     HarnessPersistenceError,
     createHarnessStagingSequence,

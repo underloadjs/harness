@@ -31,14 +31,14 @@
 // ./api-canonical.test.ts (response-shape pins), ./config.test.ts (the shared bounds owner).
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
-import type { HarnessStreamEvent } from '../harness';
+import { agent, harness } from '../engine/harness';
+import type { HarnessStreamEvent } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessRuntime } from './runtime';
 import { createHarnessRuntime } from './runtime';
 import { SessionStore } from './sessions';
-import { HARNESS_ROUTES } from '../shared/harness-api';
+import { HARNESS_ROUTES } from '../engine/shared/harness-api';
 import { bindApiCall, readOk, readTurn, submitTask, type CanonicalCall } from './canonical-reads.test-support';
 
 const DEFAULTS = { baseURL: 'http://scripted.invalid/v1', model: 'scripted/test', hasApiKey: true };

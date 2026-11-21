@@ -21,8 +21,8 @@
 // Run: yarn vitest run src/server/api-provider-timeouts.test.ts
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
-import type { GlobalConfigDocument } from '../shared/harness-api';
+import { agent, harness } from '../engine/harness';
+import type { GlobalConfigDocument } from '../engine/shared/harness-api';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { createHarnessApi } from './api';

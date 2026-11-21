@@ -26,7 +26,7 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { agentInstruction, agentProfile } from '../agents';
+import { agentInstruction, agentProfile } from '../engine/agents';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 import { presets } from './harnesses';

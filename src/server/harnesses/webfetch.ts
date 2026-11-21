@@ -31,8 +31,8 @@
 //   - ./toolbox.ts                        — CORE_ENVIRONMENT_TOOL_NAMES + `webfetch: true`
 //   - ../../tools/runtime/fetch.tool.ts   — the discovery row (same visibility)
 
-import { createWebFetchTool, WEB_FETCH_METADATA, WEB_FETCH_TOOL_NAME } from '../../harness';
-import type { Tool, WebFetchConfiguration } from '../../harness';
+import { createWebFetchTool, WEB_FETCH_METADATA, WEB_FETCH_TOOL_NAME } from '../../engine/harness';
+import type { Tool, WebFetchConfiguration } from '../../engine/harness';
 import type { CatalogueEntry, ToolAvailability } from './types';
 
 // Variable names only, for the two hosted providers `fetch` can use. The `native`

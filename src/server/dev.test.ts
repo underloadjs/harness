@@ -30,8 +30,8 @@ import { harnessIndexFileOf, readPersistedSession } from './persistence-test-hel
 import { STANDALONE_MOUNT } from './api';
 // The generated health envelope and route builders, so the launcher test states the target
 // contract's fields rather than the implementation's current output.
-import { HARNESS_ROUTES } from '../shared/harness-api';
-import type { HarnessCardPage, HealthResponse } from '../shared/harness-api';
+import { HARNESS_ROUTES } from '../engine/shared/harness-api';
+import type { HarnessCardPage, HealthResponse } from '../engine/shared/harness-api';
 
 // src/server -> package root is two levels up.
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));

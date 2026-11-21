@@ -4,8 +4,8 @@
 //
 // Cross-references:
 //   - src/server/harness.swagger.yaml        - target contract (48 paths / 68 ops / 193 component schemas)
-//   - src/shared/harness-api.ts              - OUTPUT: resource + request/response DTO types, route table, constants
-//   - src/shared/harness-stream.ts           - OUTPUT: WebSocket frame unions + stream constants
+//   - src/engine/shared/harness-api.ts              - OUTPUT: resource + request/response DTO types, route table, constants
+//   - src/engine/shared/harness-stream.ts           - OUTPUT: WebSocket frame unions + stream constants
 //   - scripts/generate-tool-manifest.ts     - same shape of tool (vite-node, `--check` for CI)
 //
 // Run:   yarn vite-node --script scripts/generate-harness-contract.ts
@@ -17,7 +17,7 @@
 // Names that are verbatim re-exports of an existing in-repo camelCase model (projector /
 // domain types) are listed in ALIASES below; they are emitted as `import type` re-exports
 // instead of duplicates, and each alias is guarded by the assignability probe in
-// src/shared/harness-api.test.ts so a future spec edit that changes the shape fails loudly.
+// src/engine/shared/harness-api.test.ts so a future spec edit that changes the shape fails loudly.
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -27,8 +27,8 @@ import { parse } from 'yaml';
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(SCRIPT_DIR, '..');
 const SPEC_PATH = join(PKG_ROOT, 'src', 'server', 'harness.swagger.yaml');
-const API_OUT = join(PKG_ROOT, 'src', 'shared', 'harness-api.ts');
-const STREAM_OUT = join(PKG_ROOT, 'src', 'shared', 'harness-stream.ts');
+const API_OUT = join(PKG_ROOT, 'src', 'engine', 'shared', 'harness-api.ts');
+const STREAM_OUT = join(PKG_ROOT, 'src', 'engine', 'shared', 'harness-stream.ts');
 
 // Schemas that must live in the stream file even though their name has no `Ws` prefix,
 // because they are stream vocabulary (kinds/ops) rather than REST resources.
@@ -37,12 +37,12 @@ const STREAM_EXTRA = new Set(['StreamResourceKind', 'TurnDisplayOp', 'HarnessEve
 // specName -> { from: '<relative module>', as: 'ExportedName' }
 // Verified structurally identical (mutual assignability, probed with tsc before committing) to
 // an existing in-repo model, so the model stays the single definition and the contract file only
-// re-exports it. Guarded by the assignability probe in src/shared/harness-api.test.ts.
+// re-exports it. Guarded by the assignability probe in src/engine/shared/harness-api.test.ts.
 // Deliberately NOT aliased to src/server/protocol.ts (SessionStatus, SessionTurnStatus,
 // ToolAvailability, and every legacy `Session*` wire type): `shared/` must not type-depend on
 // `server/`, so those three tiny unions are generated standalone here instead.
 const ALIASES = {
-    // Display projection models (src/shared/turn-display.ts) - identical shapes.
+    // Display projection models (src/engine/shared/turn-display.ts) - identical shapes.
     DisplayState: { from: './turn-display', as: 'TurnDisplayState' },
     SectionDisplayState: { from: './turn-display', as: 'SectionDisplayState' },
     StepDisplayState: { from: './turn-display', as: 'StepDisplayState' },
@@ -66,9 +66,9 @@ const ALIASES = {
     // union is what keeps ONE vocabulary: the harness config, the frozen definition, the
     // session roster row, and the display section all name the same type, and a rank letter
     // added or removed on either side fails the assignability probe in
-    // src/shared/harness-api.test.ts instead of drifting quietly.
+    // src/engine/shared/harness-api.test.ts instead of drifting quietly.
     AgentRank: { from: '../types', as: 'AgentRank' },
-    // Subagent result reference (src/shared/agent-results.ts).
+    // Subagent result reference (src/engine/shared/agent-results.ts).
     AgentResultReference: { from: './agent-results', as: 'AgentResultReference' },
 };
 
@@ -78,7 +78,7 @@ const ALIASES = {
 const PROJECTION_DELTAS = [
     'DisplayNode / DisplayStep / ContextBlock / TurnSection / TurnDisplay / TurnSummary /',
     'TurnBlockDetail / TurnStepDetail / DisplaySteerSummary: the spec models each of these as ONE',
-    'closed record whose kind-specific fields are optional, while src/shared/turn-display.ts emits a',
+    'closed record whose kind-specific fields are optional, while src/engine/shared/turn-display.ts emits a',
     'discriminated union of narrower member types. A projector member therefore satisfies the wire',
     'record, but the wire record does not narrow back to the member. Read the spec shape as the wire',
     'contract and keep the projector union as the internal render model.',
@@ -350,7 +350,7 @@ function emitDeclaration(name: string, node: SchemaNode): string {
     if (alias) {
         // The imported binding is namespaced with a `Model` suffix so it can never collide with
         // another schema name; the exported name stays the spec's.
-        return `${jsdoc(`Verbatim alias of the in-repo model \`${alias.as}\` from ${alias.from}; shape equivalence is probed in src/shared/harness-api.test.ts.`, 'Not a duplicate: the model stays the single definition of this shape.')}export type ${name} = ${aliasLocal(name)};\n`;
+        return `${jsdoc(`Verbatim alias of the in-repo model \`${alias.as}\` from ${alias.from}; shape equivalence is probed in src/engine/shared/harness-api.test.ts.`, 'Not a duplicate: the model stays the single definition of this shape.')}export type ${name} = ${aliasLocal(name)};\n`;
     }
 
     emitter.begin(name);
@@ -572,7 +572,7 @@ const GENERATED_NOTE = (outPath: string): string =>
     `// keep the camelCase spelling the projector and domain already use, so neither side renames on\n` +
     `// the way out. All of it is shared verbatim by the server, frontend, and realtime owners.\n` +
     `// Internal domain models keep their own shapes (src/types, src/server/protocol.ts,\n` +
-    `// src/shared/turn-display.ts); the projector maps between the two, and the entries marked\n` +
+    `// src/engine/shared/turn-display.ts); the projector maps between the two, and the entries marked\n` +
     `// "Verbatim alias" below ARE those models imported, not duplicated.\n` +
     `//\n` +
     `// EPOCH POLICY (shared by REST and the stream, from the spec's paging/stream sections):\n` +
@@ -587,7 +587,7 @@ const GENERATED_NOTE = (outPath: string): string =>
     `//\n` +
     `// Output: ${outPath}\n`;
 
-const apiHeader = `${GENERATED_NOTE('src/shared/harness-api.ts')}
+const apiHeader = `${GENERATED_NOTE('src/engine/shared/harness-api.ts')}
 /*
  * PROJECTION DELTAS (verified, not guesses):
 ${PROJECTION_DELTAS.map((l) => ` * ${l}`).join('\n')}
@@ -629,7 +629,7 @@ ${capabilitiesExampleEntries.join('\n')}
 } satisfies ServiceCapabilities;
 `;
 
-const streamHeader = `${GENERATED_NOTE('src/shared/harness-stream.ts')}
+const streamHeader = `${GENERATED_NOTE('src/engine/shared/harness-stream.ts')}
 /** The stream numbers in force, from \`WsStreamLimits.default\` (welcome frame carries these). */
 export const HARNESS_WS_STREAM_LIMITS = {
 ${streamLimitsDefaults.join('\n')}
@@ -766,7 +766,7 @@ function runCli() {
         console.log('harness contract types are up to date');
     } else {
         console.log(
-            `generated ${apiNames.length} REST types -> src/shared/harness-api.ts, ${streamNames.length} stream types -> src/shared/harness-stream.ts (${Object.keys(spec.paths ?? {}).length} paths)`,
+            `generated ${apiNames.length} REST types -> src/engine/shared/harness-api.ts, ${streamNames.length} stream types -> src/engine/shared/harness-stream.ts (${Object.keys(spec.paths ?? {}).length} paths)`,
         );
     }
 }

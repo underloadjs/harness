@@ -58,24 +58,24 @@
 //   - ../../core/agent-limits.ts - AGENT_RESULT_RETENTION (64)
 //   - ../../core/creation.ts - DEFAULT_CREATED_TOOLS_LIMIT (32)
 
-import { AGENT_RESULT_RETENTION, DEFAULT_CREATED_TOOLS_LIMIT, MAX_THREAD_RECORDS } from '../../core';
+import { AGENT_RESULT_RETENTION, DEFAULT_CREATED_TOOLS_LIMIT, MAX_THREAD_RECORDS } from '../../engine/core';
 // The snapshot readers' value bounds (../../core/snapshot-validation.ts), reused verbatim by
 // `readArchiveForensicPair` below so the lane archive fold and the core's canonical write refuse the
 // same malformed FORENSIC PAIR (review finding #5 / issues 0020 + 0033). Direct module import, the
 // same convention src/harness.ts uses for these two helpers: the core barrel does not re-export them.
-import { readSnapshotInteger, readSnapshotString } from '../../core/snapshot-validation';
+import { readSnapshotInteger, readSnapshotString } from '../../engine/core/snapshot-validation';
 // R4: the ONLY definition of "why did a run stop", shared with the snapshot reader that validates the
 // same field on both durable rows (../core/snapshot.ts `readAgentResults` for the invocation row,
 // `readThreads` for the thread row). Same convention as the validation helpers above — the core
 // barrel does not re-export these, and importing the union from core is what keeps a lane payload
 // from inventing a reason that the reader then refuses on reload.
-import { HARNESS_RUN_STOP_REASONS, isHarnessRunStopReason } from '../../core/snapshot';
+import { HARNESS_RUN_STOP_REASONS, isHarnessRunStopReason } from '../../engine/core/snapshot';
 import type {
     AgentRank,
     HarnessAgentResultSnapshot,
     HarnessMessage,
     HarnessRunStopReason
-} from '../../types';
+} from '../../engine/types';
 import type { IdentityLedger } from './lane-identity';
 import { idOf } from './lane-identity';
 import { ABSENT_DIGEST, applyMemoryWrite, digestMemoryValue } from './lane-memory';

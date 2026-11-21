@@ -33,8 +33,8 @@
 // number, never a range.
 
 import { describe, expect, it } from 'vitest';
-import type { HarnessEvent } from '../harness';
-import type { DisplayProjectContext, TurnDisplay, TurnDisplayOp, TurnSummary } from '../shared/turn-display';
+import type { HarnessEvent } from '../engine/harness';
+import type { DisplayProjectContext, TurnDisplay, TurnDisplayOp, TurnSummary } from '../engine/shared/turn-display';
 import type { SessionTurn } from './protocol';
 import { createTurnProjector, projectTurn } from './turn-projector';
 

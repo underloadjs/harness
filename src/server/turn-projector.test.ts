@@ -16,15 +16,15 @@
 //   - ./api-views.test.ts         — the wire privacy rules on top of it
 
 import { describe, expect, it } from 'vitest';
-import type { HarnessEvent } from '../harness';
-import { DISPLAY_ARGS_PREVIEW_CHARS, DISPLAY_PANELS_PER_STEP, DISPLAY_PREVIEW_CHARS } from '../shared/turn-display';
+import type { HarnessEvent } from '../engine/harness';
+import { DISPLAY_ARGS_PREVIEW_CHARS, DISPLAY_PANELS_PER_STEP, DISPLAY_PREVIEW_CHARS } from '../engine/shared/turn-display';
 import type {
     DisplayProjectContext,
     TurnDisplayOp,
     TurnInstructionSource,
     TurnRecordStatus,
     TurnSection
-} from '../shared/turn-display';
+} from '../engine/shared/turn-display';
 import type { SessionTurn, SessionTurnEvent } from './protocol';
 import { createTurnProjector, DISPLAY_NO_TIMESTAMP, formatDuration, previewText, previewTextTail, projectTurn, refoldTurn, steerSubmitList } from './turn-projector';
 

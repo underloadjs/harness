@@ -57,13 +57,13 @@ import type { ServerRuntimeConfiguration } from '../config';
 // Runtime CONFIGURATION errors come from the server config layer; this module owns
 // only the readiness decision, so the two never disagree about the error type.
 import { ServerRuntimeError } from '../config';
-import type { HarnessCommandConfiguration, HarnessPlugin } from '../../harness';
+import type { HarnessCommandConfiguration, HarnessPlugin } from '../../engine/harness';
 import type { HarnessPreset, HarnessToolboxDefaults } from '../harnesses/types';
 // THE GENERATED BUILT-IN SET is the only plugin list a lane can reconstruct: its
 // `setup` functions live in this checkout and are importable on the worker thread.
 // The coordinator compares ELEMENT IDENTITY against this array, so "the host passed
 // the shipped three" is a fact rather than a name match (`laneBootPosture`).
-import { BUILTIN_PLUGINS } from '../../plugin';
+import { BUILTIN_PLUGINS } from '../../engine/plugin';
 import type { LanePluginPosture, LanePresetRebuild, LaneToolboxPosture } from './protocol';
 
 export type LaneWorkerCapability = {
@@ -585,8 +585,8 @@ export {
     assertNestedRunPolicy,
     nestedRunRefusalMessage,
     nestedRunUnsupportedError
-} from '../../core/nested-runs';
-import { NESTED_RUN_LIMITATION_CODE, nestedRunRefusalMessage } from '../../core/nested-runs';
+} from '../../engine/core/nested-runs';
+import { NESTED_RUN_LIMITATION_CODE, nestedRunRefusalMessage } from '../../engine/core/nested-runs';
 
 // The report's spelling of the refusal: a registry entry is named as a tool, a runtime door is
 // named as the call the author wrote. Both go through the SAME core formatter.

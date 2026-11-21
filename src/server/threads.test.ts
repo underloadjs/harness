@@ -25,21 +25,21 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness, tool } from '../harness';
+import { agent, harness, tool } from '../engine/harness';
 // T-W8: every recorded `thread` payload now carries the minting process's epoch
 // (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity mints in
 // ../harness.ts). These assertions are WHOLE event payloads, so the key has to be named;
 // the value is exact because every run here executed IN THIS PROCESS (fixture harnesses and
 // inline delegation, no lane worker), and vitest gives one module registry per test file —
 // one epoch for the whole file, across every store restart inside it.
-import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
+import { HARNESS_PROCESS_EPOCH } from '../engine/core/agent-limits';
 import type {
     AgentRank,
     HarnessMessage,
     HarnessPluginApi,
     HarnessStreamEvent,
     HarnessStreamRequest
-} from '../harness';
+} from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessRuntime } from './runtime';
@@ -70,14 +70,14 @@ import type {
     TurnResponse,
     TurnSummary,
     TurnSummaryPage
-} from '../shared/harness-api';
+} from '../engine/shared/harness-api';
 import type { SessionSnapshot, SessionThread, SessionView } from './protocol';
-import { listAgentResultBlocks, REFERENCED_RESULTS_FOOTER, REFERENCED_RESULTS_HEADER } from '../shared/agent-results';
+import { listAgentResultBlocks, REFERENCED_RESULTS_FOOTER, REFERENCED_RESULTS_HEADER } from '../engine/shared/agent-results';
 // 0018 item 2 — the two strings the SHIPPED summarize pass commits into the transcript
 // (../plugins/context-compaction.plugin.ts). They are the only witness that the pass, not a
 // hand-written bump, is what moved the lane in the joined case below: no other code in this
 // package can put them on the wire.
-import { COMPACTION_INSTRUCTION, CONTINUATION_NUDGE } from '../plugins/context-compaction.plugin';
+import { COMPACTION_INSTRUCTION, CONTINUATION_NUDGE } from '../engine/plugins/context-compaction.plugin';
 
 // Canonical transcript entries now carry a minted `messageId` (context T1,
 // src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a

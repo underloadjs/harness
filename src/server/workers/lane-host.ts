@@ -49,7 +49,7 @@
 
 import { existsSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
-import type { HarnessAttachment, HarnessEvent, HarnessThreadStatus } from '../../types';
+import type { HarnessAttachment, HarnessEvent, HarnessThreadStatus } from '../../engine/types';
 import type { ServerRuntimeConfiguration } from '../config';
 import { MAX_LANE_WORKERS_LIMIT, ServerRuntimeError } from '../config';
 import { packagePath } from '../package-root';

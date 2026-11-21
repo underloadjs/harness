@@ -18,8 +18,8 @@
 //   - ./harnesses/toolbox.ts — shared toolbox the custom preset captures
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { tool } from '../harness';
-import type { Harness, Tool } from '../harness';
+import { tool } from '../engine/harness';
+import type { Harness, Tool } from '../engine/harness';
 import {
     agentsFromProfiles,
     createHarnessRegistry,
@@ -31,7 +31,7 @@ import type { HarnessPreset } from './harnesses';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
 // ToolCallResult is the canonical wire shape (ok + duration_ms), from the contract.
-import type { ToolCallResult } from '../shared/harness-api';
+import type { ToolCallResult } from '../engine/shared/harness-api';
 import type { SessionSnapshot } from './protocol';
 
 afterEach(() => {

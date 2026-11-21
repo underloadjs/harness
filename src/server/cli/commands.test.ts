@@ -22,7 +22,7 @@
 // Run: npx vitest run src/server/cli/commands.test.ts
 
 import { describe, expect, it, vi } from 'vitest';
-import type { Harness, HarnessCommand, HarnessCommandResult } from '../../harness';
+import type { Harness, HarnessCommand, HarnessCommandResult } from '../../engine/harness';
 import { cliCommandHelp, isLocalCliCommand, runCliCommand } from './commands';
 import type { CliCommandHost } from './commands';
 

@@ -55,7 +55,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';
@@ -64,8 +64,8 @@ import { SessionStore } from './sessions';
 import { createHarnessApi } from './api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 import { threadRowOf } from './api-reads';
-import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
-import type { HarnessThreadRecord } from '../types';
+import { HARNESS_PROCESS_EPOCH } from '../engine/core/agent-limits';
+import type { HarnessThreadRecord } from '../engine/types';
 
 const SETTINGS: RunnerSettings = {
     baseURL: 'http://scripted.invalid/v1',

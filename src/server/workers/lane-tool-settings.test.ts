@@ -92,7 +92,7 @@ import { PRODUCTION_WITH_FIXTURES } from '../harnesses/fixture-presets.test-supp
 import { DEFAULT_RUNTIME_CONFIGURATION } from '../config';
 import type { ServerRuntimeConfiguration } from '../config';
 import { SessionStore } from '../sessions';
-import type { HarnessPluginSettingsProvider } from '../../types';
+import type { HarnessPluginSettingsProvider } from '../../engine/types';
 import type { RunnerSettings } from '../harnesses/types';
 import type { SessionTurn } from '../protocol';
 import type { LaneBlueprintSource } from './lane-host';

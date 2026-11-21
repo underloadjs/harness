@@ -49,7 +49,7 @@ import {
     type WsSubscriptionState,
     type WsUpdate,
     type WsUpdateKind
-} from '../../shared/harness-stream';
+} from '../../engine/shared/harness-stream';
 // T13's shared epoch hub: the stream's epoch is the SAME value the REST surface reports, because a
 // revision is only comparable within one epoch (see the header of ../../shared/harness-api.ts).
 import { HARNESS_RUNTIME_EPOCH } from '../api-events';

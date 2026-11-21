@@ -37,8 +37,8 @@ import { afterAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { agent, harness } from '../harness';
-import type { AgentRank, HarnessMessage, HarnessStreamEvent } from '../harness';
+import { agent, harness } from '../engine/harness';
+import type { AgentRank, HarnessMessage, HarnessStreamEvent } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { createHarnessRuntime } from './runtime';
@@ -53,7 +53,7 @@ import {
     REFERENCED_RESULTS_NO_RESULT_MARKER,
     referencedResultDeletedNote,
     referencedResultUnavailableNote
-} from '../shared/agent-results';
+} from '../engine/shared/agent-results';
 
 const SETTINGS: RunnerSettings = {
     baseURL: 'http://scripted.invalid/v1',

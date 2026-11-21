@@ -175,7 +175,7 @@ export type {
 // historical plugin set would have to reach into the library's private manifest path.
 // The low-level default (`harness({})`) still applies them implicitly; only the server
 // boot no longer does.
-export { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin';
+export { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from '../engine/plugin';
 
 // The catalogue the CLI and the server share (see ./harnesses/index.ts).
 export {

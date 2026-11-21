@@ -167,13 +167,13 @@ import type {
     HarnessAgentSnapshot,
     HarnessMessage,
     HarnessSnapshot
-} from '../harness';
+} from '../engine/harness';
 // THE RANK VOCABULARY (B-series). `AgentRank` is the A–Z letter union and
 // `isAgentRank` the shared untrusted-input guard (../types/index.ts); a durable
 // document carries rank letters, so this store validates them with the SAME predicate
 // the kernel and the registry use rather than re-spelling the letter set here.
-import { isAgentRank } from '../types';
-import type { AgentRank } from '../types';
+import { isAgentRank } from '../engine/types';
+import type { AgentRank } from '../engine/types';
 // THE SNAPSHOT VERSION GATE (`requireCoreSnapshotVersion` below). This value is IMPORTED
 // rather than re-spelled — unlike `HARNESS_THREAD_ID_PATTERN` further down, which copies a
 // grammar: a copied letter set only has to keep up with a grammar, while a copied VERSION
@@ -181,7 +181,7 @@ import type { AgentRank } from '../types';
 // and the whole point of this guard is that the durable reader and the snapshot owner can
 // never disagree about which shape they read. ../core/snapshot.ts imports nothing from ./,
 // so this cannot cycle.
-import { HARNESS_SNAPSHOT_VERSION } from '../core/snapshot';
+import { HARNESS_SNAPSHOT_VERSION } from '../engine/core/snapshot';
 import type {
     HarnessDescriptor,
     SessionPluginDiagnostic,
@@ -196,14 +196,14 @@ import { PLUGIN_DIAGNOSTIC_LIMIT } from './protocol';
 // reusing the constant keeps the two paths identical by construction instead of by
 // duplicated code). journal.ts imports nothing from this module, so this cannot cycle.
 import { HARNESS_JOURNAL_DIRECTORY } from './journal';
-import { validateAttachments } from '../shared/attachments';
-import { agentLabelParts, readAgentResultReferenceList } from '../shared/agent-results';
+import { validateAttachments } from '../engine/shared/attachments';
+import { agentLabelParts, readAgentResultReferenceList } from '../engine/shared/agent-results';
 // The durable per-turn instruction snapshot (see
 // `HarnessSessionRecord.turnInstructionSources` below) reuses the SHARED display
 // contract type, so the value written to disk, the value the projector reads back, and
 // the `system` context block it produces are one definition, not three shapes that have
 // to agree.
-import type { TurnInstructionSource } from '../shared/turn-display';
+import type { TurnInstructionSource } from '../engine/shared/turn-display';
 
 // Bumped only when the on-disk document becomes incompatible. The core snapshot
 // carries its own version (HARNESS_SNAPSHOT_VERSION); this one gates the

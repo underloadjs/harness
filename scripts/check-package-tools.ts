@@ -519,10 +519,10 @@ writeSource(REGISTRY_BROKEN_PATH, 'export const toolRegistry = (\n');
 
 await check('published shape is editable source, with the entry the manifest names', () => {
     const sourceEntry = path.join(copiedSourceRoot, 'index.ts');
-    const registrySourcePath = path.join(copiedSourceRoot, 'tools', 'runtime', 'toolRegistry.tool.ts');
+    const registrySourcePath = path.join(copiedSourceRoot, 'engine', 'tools', 'runtime', 'toolRegistry.tool.ts');
 
     assert.ok(existsSync(sourceEntry), 'copied src/index.ts is missing');
-    assert.ok(existsSync(registrySourcePath), 'copied src/tools/runtime/toolRegistry.tool.ts is missing');
+    assert.ok(existsSync(registrySourcePath), 'copied src/engine/engine/tools/runtime/toolRegistry.tool.ts is missing');
     // The production entry and the editable source root are the SAME directory: this is
     // the source-only contract, and the scenario below depends on it (it edits the
     // copied src tree and then executes what the entry loaded).
@@ -542,7 +542,7 @@ await check('published shape is editable source, with the entry the manifest nam
     const rootTargets = collectTargets(manifest.exports?.['.']);
     assert.deepEqual(
         rootTargets,
-        ['./src/browser.ts', './src/browser.ts', './src/index.ts', './src/index.ts'],
+        ['./src/engine/browser.ts', './src/engine/browser.ts', './src/index.ts', './src/index.ts'],
         `the root export conditions do not name the published source entry (collected: ${rootTargets.join(', ')})`
     );
     assert.deepEqual(
@@ -733,7 +733,7 @@ await check('production harness exposes the self-modification API', () => {
 // rather than an import: the production package is the subject, and a source tree
 // that lost an entry must fail before the synthetic fixtures divert attention.
 await check('shipped source entry inventory is present in the copied package', () => {
-    const runtimeDirectory = path.join(copiedSourceRoot, 'tools', 'runtime');
+    const runtimeDirectory = path.join(copiedSourceRoot, 'engine', 'tools', 'runtime');
     const runtimeEntries = readdirSync(runtimeDirectory)
         .filter((name) => name.endsWith('.ts'))
         .sort();
@@ -780,7 +780,7 @@ await check('shipped source entry inventory is present in the copied package', (
         ...appEntries.map((name) => `${APP_TOOLS_ROOT.join('/')}/${name}`),
         ...PRESET_SOURCE_ENTRIES
     ]) {
-        const file = path.join(copiedSourceRoot, relative);
+        const file = path.join(copiedSourceRoot, relative.startsWith('tools/') ? 'engine' : '', relative);
         assert.ok(existsSync(file), `shipped source entry is missing: ${relative}`);
         assert.ok(readFileSync(file, 'utf8').trim().length > 0, `shipped source entry is empty: ${relative}`);
     }
@@ -887,11 +887,14 @@ await check('opt-in web source entries compile and keep source records', async (
 // package's default tools tree must be discoverable — and loadable — without any
 // hand-maintained inventory being touched. This probe writes such a file into the
 // COPIED package (never the repository source tree) and proves both halves.
+// The editable label the source record carries (relative to the engine root), and
+// the disk path the copied package writes it to.
 const BRAND_NEW_PATH = 'tools/probe-auto/brandNew.tool.ts';
+const BRAND_NEW_DISK_PATH = `engine/${BRAND_NEW_PATH}`;
 
 await check('a brand-new .tool.ts is discovered and loadable with no inventory edit', async () => {
     writeSource(
-        BRAND_NEW_PATH,
+        BRAND_NEW_DISK_PATH,
         `// Brand-new package entry written by scripts/check-package-tools.ts (T21).
 import { tool } from '../../core';
 

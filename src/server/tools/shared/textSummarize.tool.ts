@@ -17,7 +17,7 @@
 
 // `core` is the harness-internal live helper entry (see ./timeNow.tool.ts): the
 // source compiler treats it as framework, not as a second editable tool copy.
-import { tool } from '../../../core';
+import { tool } from '../../../engine/core';
 
 // Notes handed to the summarizer are capped at 20k characters, with the truncation
 // stated in both the delegated prompt and the returned summary. Must equal the

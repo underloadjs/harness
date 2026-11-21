@@ -39,9 +39,9 @@ import type { HarnessPreset, RunnerSettings } from '../harnesses/types';
 import { DEFAULT_RUNTIME_CONFIGURATION } from '../config';
 import type { ServerRuntimeConfiguration } from '../config';
 import { SessionStore } from '../sessions';
-import { BUILTIN_PLUGINS } from '../../plugin';
-import { tool } from '../../harness';
-import type { Harness, HarnessCommandConfiguration, HarnessPlugin } from '../../types';
+import { BUILTIN_PLUGINS } from '../../engine/plugin';
+import { tool } from '../../engine/harness';
+import type { Harness, HarnessCommandConfiguration, HarnessPlugin } from '../../engine/types';
 import type { LaneBlueprintSource } from './lane-host';
 import {
     LANE_COMMANDS_NOT_REBUILDABLE_CODE,

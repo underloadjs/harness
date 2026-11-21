@@ -44,8 +44,8 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { AGENT_RANKS, agent, harness } from '../harness';
-import { agentInstruction } from '../agents';
+import { AGENT_RANKS, agent, harness } from '../engine/harness';
+import { agentInstruction } from '../engine/agents';
 import { effectiveAgentProfile } from './harnesses/agent-state';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';

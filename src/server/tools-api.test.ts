@@ -41,16 +41,16 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { agent, harness, tool } from '../harness';
-import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '../harness';
-import { createHookBus } from '../plugin/hooks';
+import { agent, harness, tool } from '../engine/harness';
+import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '../engine/harness';
+import { createHookBus } from '../engine/plugin/hooks';
 import { createHarnessRegistry, createToolCatalogue } from './harnesses';
 import type { HarnessPreset, HarnessPresetReport, RunnerSettings } from './harnesses/types';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime, HarnessRuntimeOptions } from './runtime';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 import { CORE_TOOL_NAMES } from './harnesses/toolbox';
-import { HARNESS_EPOCH_HEADER, HARNESS_REVISION_HEADER } from '../shared/harness-api';
+import { HARNESS_EPOCH_HEADER, HARNESS_REVISION_HEADER } from '../engine/shared/harness-api';
 // v2 layout readers/writers (./persistence-test-helpers.ts): the operator settings blocks live in
 // the header document `index.json`, so this suite pins THAT file.
 import { harnessIndexFileOf, readPersistedIndex } from './persistence-test-helpers';

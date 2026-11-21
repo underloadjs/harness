@@ -23,7 +23,7 @@
 // instance-unique), so these ids are opaque strings on purpose.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type {
     AgentRank,
     HarnessActionHandler,
@@ -31,8 +31,8 @@ import type {
     HarnessActionRequestContext,
     HarnessStream,
     HarnessStreamEvent
-} from '../harness';
-import type { DisplayProjectContext, DisplayStep } from '../shared/turn-display';
+} from '../engine/harness';
+import type { DisplayProjectContext, DisplayStep } from '../engine/shared/turn-display';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry, describeHarness } from './harnesses';
 import { presetToRecord } from './harnesses/registry';

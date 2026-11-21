@@ -173,16 +173,16 @@ import type {
     HarnessThreadSnapshot,
     HarnessThreadSteerReceipt,
     KnowledgeEngine
-} from '../harness';
+} from '../engine/harness';
 // The rank vocabulary, from the type module (../types/index.ts), which is where the contract puts
 // it. `AGENT_RANKS` is imported as a VALUE for two reasons: it is the ordered authority list
 // (A = highest) that the binding validator reads, and it is the source of the DEFAULT rank this
 // store gives a binding that names none — derived, never hard-coded, so a vocabulary change here
 // cannot drift from the runtime's own rank rules (`rankIndexOf`/`isLowerRank` live there).
-import { AGENT_RANKS, isAgentRank } from '../types';
-import type { AgentRank } from '../types';
+import { AGENT_RANKS, isAgentRank } from '../engine/types';
+import type { AgentRank } from '../engine/types';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
-import { validateAttachments } from '../shared/attachments';
+import { validateAttachments } from '../engine/shared/attachments';
 import {
     agentCodeOf,
     agentLabelParts,
@@ -196,17 +196,17 @@ import {
     readAgentResultReferenceList,
     referencedResultDeletedNote,
     referencedResultUnavailableNote
-} from '../shared/agent-results';
+} from '../engine/shared/agent-results';
 import type {
     AgentResultBlock,
     AgentResultReference,
     AgentResultSection,
     AgentResultTurn
-} from '../shared/agent-results';
+} from '../engine/shared/agent-results';
 // T16: the stream contract's resource-kind vocabulary, deep-imported (the shared barrel collides
 // with the server's own names). It is a TYPE-only dependency: the store answers the broker's
 // existence question with the same key the hub and REST stamp revisions under.
-import type { StreamResourceKind } from '../shared/harness-stream';
+import type { StreamResourceKind } from '../engine/shared/harness-stream';
 
 /**
  * T16: split a hub composite key (`session:turn`, `session:thread`) into its parts, accepting the
@@ -224,17 +224,17 @@ const splitStreamKey = (id: string, fallbackSessionId?: string): [string | undef
 
     return [id.slice(0, separator), id.slice(separator + 1)];
 };
-import { validateActionChoice } from '../core/action';
+import { validateActionChoice } from '../engine/core/action';
 // C4: the ONE transcript reader (`readHarnessMessages`) shared by snapshot(),
 // restore() and the transcript editor, so the server can never persist a
 // transcript its own restore would refuse, and a transcript it refuses is refused
 // with the exact same message everywhere. Barrel import (core/index.ts) keeps the
 // module graph identical to the rest of the server.
-import { MAX_THREAD_RECORDS, readHarnessMessages, THREAD_AGENT_PREFIX } from '../core';
+import { MAX_THREAD_RECORDS, readHarnessMessages, THREAD_AGENT_PREFIX } from '../engine/core';
 // The ONE slash-line parser (core/command.ts). The store uses it only to DECIDE
 // whether a submit is a command; the harness re-parses the same line when it
 // executes it, so a host can never disagree with the server about what "/x" means.
-import { parseCommandLine } from '../core/command';
+import { parseCommandLine } from '../engine/core/command';
 import { describeHarness } from './harnesses/descriptor';
 // T27: a session-scoped agent binding composes its brain from the SAME trusted profile the
 // preset factory uses (./harnesses/toolbox.ts `agentConfigurationFromProfile`), so a member
@@ -247,7 +247,7 @@ import {
     customAgentInstruction
 } from './harnesses/toolbox';
 import { effectiveAgentProfile } from './harnesses/agent-state';
-import { agentInstruction, isAgentProfileName } from '../agents';
+import { agentInstruction, isAgentProfileName } from '../engine/agents';
 import {
     createHarnessRegistry,
     HarnessRegistryError,
@@ -350,7 +350,7 @@ import { invocationIdOfRunKey, invocationRunKeyOf, PLUGIN_DIAGNOSTIC_LIMIT } fro
 // run being joined (V5 defect 2), and the reason an epoch-less record still binds instead of losing its
 // join. `./protocol.ts` re-exports the key builders; this one is used server-internally only, so it is
 // imported from its leaf rather than widening the published wire surface.
-import { isRunEpochMismatch } from '../shared/run-identity';
+import { isRunEpochMismatch } from '../engine/shared/run-identity';
 // R1/R3/R4: the compiled display surface. The fold is SERVER-only (the browser
 // imports the types from ../shared/turn-display.ts and never this runtime), and the
 // journal is the per-step durable log the compiled memory is rebuilt from.
@@ -361,7 +361,7 @@ import type {
     TurnDisplayOp,
     TurnInstructionSource,
     TurnProjector
-} from '../shared/turn-display';
+} from '../engine/shared/turn-display';
 import { createTurnProjector, refoldTurn, steerBlockKeyOf, steerBlockKeysOf, steerSubmitList } from './turn-projector';
 import { HARNESS_JOURNAL_VERSION, HarnessJournal } from './journal';
 // Part C: `JournalRewriteRecord` is not imported here any more — the session layer never reads a

@@ -53,13 +53,13 @@ import {
     WEBSEARCH_UNCONFIGURED_HINT
 } from './harnesses';
 import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 // T-W8: every recorded `thread` payload now carries the minting process's epoch
 // (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity mints in
 // ../harness.ts). These assertions are WHOLE payloads, so the key has to be named; the
 // value is exact because every frame here is recorded IN THIS PROCESS (no lane worker),
 // and vitest gives one module registry per test file — one epoch for the whole file.
-import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
+import { HARNESS_PROCESS_EPOCH } from '../engine/core/agent-limits';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 // The shared policy lines of the trusted catalogue (src/agents/guidelines.ts). Profile-specific
 // sentences are hardcoded below; these are IMPORTED so the arrays asserted here can never
@@ -71,7 +71,7 @@ import {
     READ_ONLY_GUIDELINE,
     TOOL_CREATE_GUIDELINE,
     WEB_SEARCH_GUIDELINE
-} from '../agents/guidelines';
+} from '../engine/agents/guidelines';
 import { MAX_API_BODY_BYTES, bodyLimitFor } from './api';
 import type { HarnessApiResult } from './api';
 import { createHarnessRuntime } from './runtime';
@@ -85,7 +85,7 @@ import {
     HARNESS_ROUTES,
     HARNESS_SERVICE_CAPABILITIES,
     HARNESS_SERVICE_LIMITS
-} from '../shared/harness-api';
+} from '../engine/shared/harness-api';
 // The shared composition layer for the canonical reads (assertion-neutral by design: this file
 // still decides every expected value).
 import {

@@ -35,7 +35,7 @@ import {
     PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
     PROVIDER_TIMEOUT_MAX_MS,
     resolveProviderTimeout
-} from '../transport';
+} from '../engine/transport';
 import { providerOf } from './harnesses/toolbox';
 import { mergeSettings, SettingsError } from './config';
 import type { RunnerSettings } from './harnesses/types';

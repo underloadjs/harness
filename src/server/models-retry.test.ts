@@ -16,14 +16,14 @@
 // src/server/models.test.ts; this file owns the attempt schedule itself.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { listModels, ModelListError } from '../transport/models';
-import type { ModelListConfiguration } from '../transport/models';
+import { listModels, ModelListError } from '../engine/transport/models';
+import type { ModelListConfiguration } from '../engine/transport/models';
 import { listModelsWithRetry } from './api';
 
 // Keep the real ModelListError class (api.ts branches on `instanceof`) and
 // replace only the network call.
-vi.mock('../transport/models', async (importOriginal) => {
-    const actual = await importOriginal<typeof import('../transport/models')>();
+vi.mock('../engine/transport/models', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../engine/transport/models')>();
     return { ...actual, listModels: vi.fn() };
 });
 

@@ -41,8 +41,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
-import type { HarnessStream, HarnessStreamEvent } from '../harness';
+import { agent, harness } from '../engine/harness';
+import type { HarnessStream, HarnessStreamEvent } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry, createToolCatalogue, createWebSearchCatalogueEntry } from './harnesses';
 import { createHarnessRuntime } from './runtime';
@@ -52,7 +52,7 @@ import type { HarnessDescriptor } from './protocol';
 // (./persistence.ts `requireCoreSnapshotVersion` -> ../core/snapshot.ts
 // `HARNESS_SNAPSHOT_VERSION`). It is imported rather than written as a literal so this file
 // cannot silently start feeding the fixture a stale snapshot the day the kernel bumps.
-import { HARNESS_SNAPSHOT_VERSION } from '../core/snapshot';
+import { HARNESS_SNAPSHOT_VERSION } from '../engine/core/snapshot';
 import {
     HARNESS_DATABASE_DIRECTORY,
     HARNESS_DATABASE_FILE,

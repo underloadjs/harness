@@ -47,8 +47,8 @@
 //   - ../persistence.ts               — `HarnessAgentRecord`, the durable shape (agents.json)
 //   - ../api.ts                       — PATCH/DELETE /agents/{id}
 
-import { agentProfiles, isAgentProfileName, agentProfile } from '../../agents';
-import type { AgentProfile } from '../../agents';
+import { agentProfiles, isAgentProfileName, agentProfile } from '../../engine/agents';
+import type { AgentProfile } from '../../engine/agents';
 import type { HarnessAgentRecord } from '../persistence';
 
 export type { HarnessAgentRecord };

@@ -18,7 +18,7 @@
 
 // `core` is the harness-internal live helper entry (see ./timeNow.tool.ts): the
 // source compiler treats it as framework, not as a second editable tool copy.
-import { tool } from '../../../core';
+import { tool } from '../../../engine/core';
 
 // A tiny corpus so the researcher preset has something to search that is not the
 // network. Each note is a fact about this package, which keeps the demo honest.

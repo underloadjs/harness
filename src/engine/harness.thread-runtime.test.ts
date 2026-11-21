@@ -1,0 +1,4619 @@
+// Persistent agent threads (R2) + cross-thread chat (R4) + steering (R5) +
+// selective stop/delete (R6).
+//
+// Contract pinned here (see src/types/index.ts and src/harness.ts):
+//   R2  Every configured agent owns `agent:<name>` (its registry transcript); a
+//       host thread (`createThread`) is an INDEPENDENT conversation of the same
+//       agent. Two threads of one agent run concurrently, serialize WITHIN
+//       themselves, and share this harness's stores (todos) — the session's
+//       shared memory, not its conversations.
+//   R4  A delegation links the child's default thread to the caller; `threadSend`
+//       attributes the message to the runtime-derived sender and delivers it
+//       STATE-AWARE: steered into the live run at its next boundary while the
+//       target is running (`queued`), and a dormant target is STARTED with the
+//       message as its prompt (`started`) — see the delegate-stress T3 group at
+//       the end of this file.
+//   R5  Steering never interrupts an in-flight request: queued text becomes a
+//       user message at the loop boundary, in receipt order.
+//   R6  stopThread aborts one conversation (and owner-linked children) and marks
+//       it stopped; stopAllThreads aborts every active run; deleteThread RELEASES a
+//       terminal host conversation — it marks the row `inactive`, and the row, its
+//       transcript and its agent-result rows are retained (only a session deletion
+//       destroys them). The receipt still NAMES what it released
+//       (see the stress-report group below), and IT19 R1 keeps the committed turns of
+//       a stopped/cancelled/failed run on the record instead of rolling them back.
+//   IT19 (2026-11-15, issue 0036 R1/R2/R3/R5) Two rules were reversed and this file is
+//       where they are pinned. (1) RETENTION: a run that stops, gets cancelled, fails, times
+//       out or hits its turn cap KEEPS its committed turns — the transcript rollback is gone
+//       for a conversation run (only a branch/ephemeral run still rolls back), and a committed
+//       tool call left without an answer gets exactly one synthesized `role:'tool'` result
+//       saying the call was interrupted (`src/core/transcript-repair.ts`). (2) SOFT DELETE:
+//       `threadDelete`/`deleteThread` MARK (`inactive` + `inactiveAt`) instead of destroying,
+//       so the conversation disappears from `threadList`/`actOn`/`thread()`/`threads()`/
+//       `agentManage` and stays durable: the row rides `snapshot().threads`, a HOST
+//       `threadMessages` still answers it, an agent-facing `threadRead` still refuses it, and a
+//       host `sendThreadInput` revives it. `stopReason` (the closed `HarnessRunStopReason`
+//       union) says WHY a run halted and is cleared by the next fresh turn; `delivered` names
+//       which operation a send performed (`queued` / `started` / `resumed`).
+//   B3/B4/B5 (2026-11-13, thread-tools wave) The THREAD FAMILY is the WRITE unit: a caller
+//       that names a thread (`callerThreadId` on `harness.thread` /
+//       `harness.threadMessages`, the tool context of `threadRead`/`threadSend`/
+//       `threadDelete`) may `threadSend` into itself, its ancestors, its descendants, and the
+//       DEFAULT conversations of exactly those agents — siblings are refused with
+//       `threadNotVisibleError`, and `deleteThread` narrows that to strict
+//       descendants only. A threadless caller (the host, `api.threads.*`, a
+//       context-less `executeTool`) stays UNSCOPED: the full roster, no send
+//       guards, no read gate. SINCE 2026-11-15 A READ IS SESSION-WIDE: both read seams
+//       (`harness.thread`, `harness.threadMessages`) answer any conversation in the session,
+//       because `agentManage`/`agentResult` were never lineage-gated and `threadList` now lists
+//       every row with the writable set stated as `actOn`. `threadSend` into another agent's DEFAULT
+//       conversation still lands, but answers with a `note` naming the live thread
+//       to address instead, and `deleteThread` returns a
+//       `HarnessThreadDeleteResult` receipt (`deleted` + `removedThreadIds` +
+//       `removedInvocationIds` + `removedBranchIds`) so a cascade is observable —
+//       see the group of the same name at the end of this file.
+//   LABELS AS ADDRESSES (2026-11-15) A conversation's `label` — the session-unique name the
+//       server mints (`IT14`) — resolves as an address at every thread door: an ID wins
+//       verbatim first, a label matches exactly after trimming, a label held by two
+//       conversations is REFUSED rather than resolved to the first, and an address that matches
+//       nothing passes through so the caller's own not-found sentence names what was typed.
+//   STRESS REPORT #4/#5 (2026-11-14) The family rules and the visible/invisible
+//       VERDICTS are frozen; three refusals were given truthful, actionable text:
+//       a BRANCH id on a delete door (`branch-N` is a fork record, not an unknown
+//       conversation — src/harness.fork.test.ts), and a DEFAULT conversation that
+//       left the family (the cause, plus the `delegate` that re-admits it — the
+//       #5 case below). A non-default out-of-family id keeps its old sentence byte
+//       for byte.
+//
+// Clock policy: the CLOCK is pinned (see EPOCH_MS below), the SCHEDULER is not.
+// Every task-store timestamp (`updatedAt`, the change-feed `at`, a claim's
+// `leaseUntil`) comes from Date in src/core/task.ts, so pinning Date gives each of
+// them ONE exact expected value. `toFake: ['Date']` leaves setTimeout and the
+// microtask queue real, which the gated transports and `flush()` here depend on.
+// The 2026-11-09 policy test *a host turn has no wall-clock bound* uses exactly that
+// split: moving Date with no fake timers is the probe for a deadline-style bound,
+// while the timer-style half is covered in src/harness.fork.test.ts.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { agent, harness, tool } from './index';
+// W19 (2026-11-17): a roster record's process epoch is written in the same statement as its
+// `invocationId` (../harness.ts `markThreadEpoch`, the pairing pinned in
+// ./harness-thread-epoch-authority.test.ts), so every record pin below that names an invocation id
+// names the generation that minted it too. It is the imported constant, never a literal: the token is
+// random per process, and one per test file.
+import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
+import type {
+    Agent,
+    Harness,
+    HarnessAssistantMessage,
+    HarnessSnapshot,
+    HarnessStream,
+    HarnessStreamEvent,
+    HarnessStreamRequest,
+    HarnessThreadRecord,
+    TaskChange,
+    TaskChangeOp,
+    TaskItem,
+    TaskResult
+} from './index';
+
+// Canonical transcript entries now carry a minted `messageId` (context T1,
+// src/core/message-id.ts): a stable ADDRESS for a turn, i.e. an identity field like a
+// timestamp rather than part of the content these assertions pin. Stripping it DEEPLY
+// keeps every expected value here exactly what it was, and the id itself is pinned
+// exactly where it is the subject: src/harness.inclusion.test.ts (minting, `entries`,
+// addressing by id), src/harness.snapshot.test.ts (persistence and restore-without-ids)
+// and src/harness.fork.test.ts (ids COPIED across a fork).
+const withoutIds = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(withoutIds);
+
+    if (typeof value === 'object' && value !== null) {
+        const entries: [string, unknown][] = [];
+
+        for (const [key, child] of Object.entries(value)) {
+            // The only key dropped is the id; `undefined`-valued keys stay, so a
+            // `toStrictEqual` comparison keeps its strictness about them.
+            if (key === 'messageId') continue;
+            entries.push([key, withoutIds(child)]);
+        }
+
+        return Object.fromEntries(entries);
+    }
+
+    return value;
+};
+
+// Replay scripted frames, one list per request; the last list repeats.
+const scripted = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]): HarnessStream => {
+    let index = 0;
+    return async function* stream(request) {
+        seen?.push(request);
+        const frames = turns[index] ?? turns[turns.length - 1];
+        index++;
+        for (const frame of frames) yield frame;
+    };
+};
+
+const answer = (text: string): HarnessStreamEvent[] => [
+    { type: 'text', delta: text },
+    { type: 'done', stopReason: 'stop', toolCalls: [] }
+];
+
+const callTool = (id: string, name: string, args: string): HarnessStreamEvent[] => [
+    { type: 'done', stopReason: 'tool_calls', toolCalls: [{ id, name, arguments: args }] }
+];
+
+const brain = (stream: HarnessStream, extra: Record<string, unknown> = {}): Agent =>
+    agent({ model: 'merge/ds4-flash', stream, ...extra });
+
+const quiet = (entry: Agent, tools: Record<string, any> = {}) =>
+    harness({ agents: { writer: entry }, tools, presets: false });
+
+// Drain microtasks and a zero-delay timer so the harness chain reaches its next
+// resting point without depending on wall-clock time.
+const flush = async (): Promise<void> => {
+    for (let pass = 0; pass < 16; pass += 1) await Promise.resolve();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    for (let pass = 0; pass < 16; pass += 1) await Promise.resolve();
+};
+
+// Join a run the harness started FIRE-AND-FORGET. A `threadSend` into a dormant
+// conversation returns its receipt WITHOUT awaiting the answer (T3.2), so no caller
+// holds that promise and a test that asserts the answer has to wait for the
+// conversation to come back to 'idle'. The bound is a failure, not a hang: a run
+// that never settles breaks this assertion instead of the test timeout.
+const settleThread = async (host: Harness, threadId: string): Promise<void> => {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+        await flush();
+        if (host.thread(threadId)?.status === 'idle') return;
+    }
+
+    throw new Error(`Thread "${threadId}" never returned to idle after a detached run.`);
+};
+
+type Gate = {
+    promise: Promise<void>;
+    open: () => void;
+};
+
+const gate = (): Gate => {
+    let open!: () => void;
+    const promise = new Promise<void>((resolve) => {
+        open = resolve;
+    });
+    return { promise, open };
+};
+
+// A transport that records how many requests arrived, waits for the gate, then
+// answers with one text frame. `arrivals` is what proves two threads ran at once.
+const gatedAnswer = (text: string) => {
+    const ready = gate();
+    let arrivals = 0;
+    const stream: HarnessStream = async function* () {
+        arrivals += 1;
+        await ready.promise;
+        yield { type: 'text', delta: text };
+        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+    };
+    return { stream, ready, arrivals: () => arrivals };
+};
+
+// One configured agent whose transport dispatches on the prompt, so several
+// threads (which all derive from the same agent factory) can have independent
+// scripts inside one harness.
+const routed = (routes: Record<string, HarnessStream>, fallback: HarnessStream): HarnessStream =>
+    async function* (request) {
+        // Route on the thread's FIRST user prompt: later tool-result turns keep
+        // the same conversation, so the last message is not a stable key.
+        const prompt = request.messages.find((message) => message.role === 'user') as
+            | { content?: string }
+            | undefined;
+        const chosen = routes[prompt?.content ?? ''] ?? fallback;
+        yield* chosen(request);
+    };
+
+// Attach handlers immediately so a cancellation rejection is never unhandled.
+const probe = <T>(promise: Promise<T>) => {
+    const state: { status: 'pending' | 'resolved' | 'rejected'; value?: T; error?: unknown } = {
+        status: 'pending'
+    };
+    promise.then(
+        (value) => {
+            state.status = 'resolved';
+            state.value = value;
+        },
+        (error) => {
+            state.status = 'rejected';
+            state.error = error;
+        }
+    );
+    return state;
+};
+
+const roles = (messages: { role: string }[]): string[] => messages.map((message) => message.role);
+
+const textOf = (messages: { content?: string }[]): string[] =>
+    messages.map((message) => message.content ?? '');
+
+// T28: a delegate result is an ENVELOPE (identity + paged content), not the old
+// `{ agent, content }` pair. These tests are about which answer crossed back and which
+// conversation it belongs to, so they project the fields they mean.
+const delegationOf = (message: { content: string }): Record<string, any> =>
+    JSON.parse(message.content) as Record<string, any>;
+
+// ---------------------------------------------------------------------------
+// T1 (Phase 2) task-claim fixtures
+// ---------------------------------------------------------------------------
+
+// THE FROZEN CLOCK, and the expiry of a claim taken at that instant (the tool's
+// default lease, src/core/task.ts TASK_DEFAULT_LEASE_MS).
+const EPOCH_ISO = '2026-01-01T00:00:00.000Z';
+const EPOCH_MS = Date.parse(EPOCH_ISO);
+
+beforeEach(() => {
+    // Date only: the transports, the scheduler and `flush()` keep real timers.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(EPOCH_MS);
+});
+
+afterEach(() => {
+    vi.useRealTimers();
+});
+
+type RecordShape = {
+    completed?: boolean;
+    rev?: number;
+    // The WRITER's identity (attribution), and the HOLDER's pair (the claim). They
+    // are separate facts: a lifecycle release clears the holder and keeps the
+    // writer, and an ownership action never moves `rev`.
+    by?: string;
+    threadId?: string;
+    owner?: string;
+    ownerThreadId?: string;
+    leaseUntil?: number;
+};
+
+// One stored record in the exact key set src/core/task.ts `copyItem` produces.
+// `updatedAt` is always present here because every write in this file has an
+// identity (a run, or a manual executeTool call as the entry agent).
+const task = (id: string, text: string, shape: RecordShape = {}): TaskItem => ({
+    id,
+    text,
+    completed: shape.completed ?? false,
+    rev: shape.rev ?? 1,
+    ...(shape.by === undefined ? {} : { updatedBy: shape.by }),
+    ...(shape.threadId === undefined ? {} : { updatedThreadId: shape.threadId }),
+    updatedAt: EPOCH_ISO,
+    ...(shape.owner === undefined ? {} : { owner: shape.owner }),
+    ...(shape.ownerThreadId === undefined ? {} : { ownerThreadId: shape.ownerThreadId }),
+    ...(shape.leaseUntil === undefined ? {} : { leaseUntil: shape.leaseUntil })
+});
+
+// One change-feed entry, in the canonical key order (`rev, id, op, by, threadId,
+// at, fields, itemRev`). A lifecycle release (`releaseThread`) is recognisable
+// because it names a `threadId` and carries NO `by`, unlike a voluntary one.
+const event = (
+    rev: number,
+    id: string,
+    op: TaskChangeOp,
+    shape: {
+        by?: string;
+        threadId?: string;
+        fields?: Array<'text' | 'completed'>;
+        itemRev?: number;
+    } = {}
+): TaskChange => ({
+    rev,
+    id,
+    op,
+    ...(shape.by === undefined ? {} : { by: shape.by }),
+    ...(shape.threadId === undefined ? {} : { threadId: shape.threadId }),
+    at: EPOCH_ISO,
+    ...(shape.fields === undefined ? {} : { fields: shape.fields }),
+    ...(shape.itemRev === undefined ? {} : { itemRev: shape.itemRev })
+});
+
+// The live store, read through the host door (identity: the entry agent, unthreaded).
+const storedTasks = async (writer: Harness): Promise<TaskItem[]> =>
+    ((await writer.executeTool('tasks', {})) as TaskResult).tasks;
+
+// The whole recorded history of one store (`since: 0`).
+const changeFeed = async (writer: Harness): Promise<TaskChange[]> =>
+    ((await writer.executeTool('tasks', { since: 0 })) as { changes: TaskChange[] }).changes;
+
+// The recorded tool results of one conversation, in order. A failed call is stored
+// as `Tool "<name>" failed: <message>` (src/harness.ts), which is how a refusal
+// reaches the model — and how these tests read one.
+const toolResultsOf = (messages: { role: string; content?: string }[]): string[] =>
+    messages.filter((message) => message.role === 'tool').map((message) => message.content ?? '');
+
+// A recorded task page, parsed: the assertion names the exact page without
+// depending on key order in the serialized string.
+const pageOf = (content: string): unknown => JSON.parse(content);
+
+describe('persistent agent threads (R2)', () => {
+    it('exposes one default conversation per agent and independent host threads', () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+
+        // Default conversations exist before any run, in configuration order.
+        expect(writer.threads()).toEqual([
+            {
+                id: 'agent:writer',
+                agent: 'writer',
+                origin: 'agent',
+                status: 'idle',
+                sequence: 1
+            }
+        ]);
+        expect(writer.thread('agent:writer')?.origin).toBe('agent');
+
+        const first = writer.createThread('writer', { label: '  Research  ' });
+        const second = writer.createThread('writer');
+
+        expect(first).toEqual({
+            id: 'thread-1',
+            agent: 'writer',
+            origin: 'host',
+            status: 'idle',
+            sequence: 2,
+            label: 'Research'
+        });
+        expect(second.id).toBe('thread-2');
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:writer',
+            'thread-1',
+            'thread-2'
+        ]);
+
+        // A read is a detached copy: mutating it never touches live state.
+        const copy = writer.thread('thread-1')!;
+        copy.status = 'stopped';
+        expect(writer.thread('thread-1')?.status).toBe('idle');
+
+        // Unknown ids are honest errors, and the default conversation cannot be
+        // deleted (it is the session's own agent history).
+        expect(() => writer.threadMessages('thread-99')).toThrow(
+            'Thread "thread-99" is not available in this harness; it was never created, or it was deleted.'
+        );
+        expect(() => writer.deleteThread('agent:writer')).toThrow(
+            'Thread "agent:writer" is the agent\'s own conversation and cannot be deleted; use reset() to clear the session.'
+        );
+        expect(() => writer.createThread('nobody')).toThrow(
+            'Agent "nobody" is not registered. Configured agents: writer.'
+        );
+        expect(() => writer.createThread('writer', { label: '   ' })).toThrow(
+            'A thread label must not be blank.'
+        );
+    });
+
+    it('runs two threads of the same agent concurrently with isolated transcripts', async () => {
+        // Concurrency counter: both requests must be in flight at the same time.
+        let active = 0;
+        let maxActive = 0;
+        const seen: string[] = [];
+
+        const stream: HarnessStream = async function* (request) {
+            const last = request.messages[request.messages.length - 1] as { content?: string };
+            seen.push(last.content ?? '');
+            active += 1;
+            maxActive = Math.max(maxActive, active);
+            // Yield control so a serialized implementation would show active = 1.
+            await Promise.resolve();
+            yield { type: 'text', delta: `echo:${last.content ?? ''}` };
+            active -= 1;
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const a = writer.createThread('writer');
+        const b = writer.createThread('writer');
+
+        const [firstAnswer, secondAnswer] = await Promise.all([
+            writer.sendThreadInput(a.id, 'alpha'),
+            writer.sendThreadInput(b.id, 'beta')
+        ]);
+
+        expect(firstAnswer.content).toBe('echo:alpha');
+        expect(secondAnswer.content).toBe('echo:beta');
+        expect(maxActive).toBe(2);
+        expect([...seen].sort()).toEqual(['alpha', 'beta']);
+
+        expect(roles(writer.threadMessages(a.id))).toEqual(['user', 'assistant']);
+        expect(textOf(writer.threadMessages(a.id))).toEqual(['alpha', 'echo:alpha']);
+        expect(textOf(writer.threadMessages(b.id))).toEqual(['beta', 'echo:beta']);
+
+        // The configured agent's own conversation was not touched.
+        expect(writer.agent.messages).toEqual([]);
+    });
+
+    it('serializes two turns inside one thread', async () => {
+        const first = gatedAnswer('one');
+        let requests = 0;
+
+        const stream: HarnessStream = async function* (request) {
+            requests += 1;
+
+            if (requests === 1) {
+                // Hold the first turn until the queued second input exists.
+                yield* first.stream(request);
+                return;
+            }
+
+            const last = request.messages[request.messages.length - 1] as { content?: string };
+            yield { type: 'text', delta: `reply:${last.content ?? ''}` };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const thread = writer.createThread('writer');
+
+        const runningPromise = writer.sendThreadInput(thread.id, 'first');
+        const running = probe(runningPromise);
+        await flush();
+        expect(running.status).toBe('pending');
+        expect(first.arrivals()).toBe(1);
+        expect(writer.thread(thread.id)?.status).toBe('running');
+
+        const queuedPromise = writer.sendThreadInput(thread.id, 'second');
+        const queued = probe(queuedPromise);
+        await flush();
+        // The second turn has NOT started: one thread never executes twice at once.
+        expect(first.arrivals()).toBe(1);
+        expect(queued.status).toBe('pending');
+
+        first.ready.open();
+        await Promise.all([runningPromise, queuedPromise]);
+
+        expect(requests).toBe(2);
+        expect(textOf(writer.threadMessages(thread.id))).toEqual([
+            'first',
+            'one',
+            'second',
+            'reply:second'
+        ]);
+    });
+
+    it('follows the owning agent model on each thread run', async () => {
+        const models: string[] = [];
+        const stream: HarnessStream = async function* (request) {
+            models.push(request.model);
+            yield { type: 'text', delta: `answer ${models.length}` };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const thread = writer.createThread('writer');
+
+        await writer.sendThreadInput(thread.id, 'one');
+        // Provenance is the OWNING agent: a host thread is a conversation of that
+        // agent, so a model change reaches every live thread on its next run.
+        writer.agents.writer.model('second/model');
+        await writer.sendThreadInput(thread.id, 'two');
+        await writer('three');
+
+        expect(models).toEqual(['merge/ds4-flash', 'second/model', 'second/model']);
+        expect(textOf(writer.threadMessages(thread.id))).toEqual([
+            'one',
+            'answer 1',
+            'two',
+            'answer 2'
+        ]);
+    });
+
+    it('shares session tasks across threads without sharing transcripts', async () => {
+        const stream = routed(
+            {
+                // Thread one adds a task, thread two lists it from the same session.
+                plan: scripted([
+                    callTool('c1', 'tasks', '{"tasks":[{"text":"Shared plan"}]}'),
+                    answer('added')
+                ]),
+                'list it': scripted([
+                    callTool('c2', 'tasks', '{}'),
+                    answer('listed')
+                ])
+            },
+            scripted([answer('unused')])
+        );
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const planner = writer.createThread('writer');
+        const lister = writer.createThread('writer');
+
+        await writer.sendThreadInput(planner.id, 'plan');
+        await writer.sendThreadInput(lister.id, 'list it');
+
+        // The second conversation's tool result is the FIRST conversation's task:
+        // the store is session state, shared by every thread. T1 adds attribution to
+        // every record (`rev`, `updatedBy`, `updatedThreadId`, `updatedAt`) and
+        // `storeRev` to every page, and the writer recorded is the conversation that
+        // wrote — the same fact a claim is keyed on.
+        const toolMessage = writer
+            .threadMessages(lister.id)
+            .find((message) => message.role === 'tool') as { role: string; content: string };
+        expect(toolMessage.role).toBe('tool');
+        expect(pageOf(toolMessage.content)).toEqual({
+            tasks: [task('1', 'Shared plan', { by: 'writer', threadId: planner.id })],
+            counts: { total: 1, completed: 0, pending: 1 },
+            page: { offset: 0, limit: 20, hasMore: false },
+            storeRev: 1
+            // R1/T1.1: NO `entry` here on purpose — this is the SECOND conversation's
+            // plain read, and a read affects no record. The `entry` the ADD produced is
+            // asserted in the cross-conversation comparison further below.
+        });
+
+        // Transcripts stay separate.
+        expect(roles(writer.threadMessages(lister.id))).toEqual([
+            'user',
+            'assistant',
+            'tool',
+            'assistant'
+        ]);
+        expect(textOf(writer.threadMessages(lister.id))).toEqual([
+            'list it',
+            '',
+            toolMessage.content,
+            'listed'
+        ]);
+        expect(roles(writer.threadMessages(planner.id))).toEqual([
+            'user',
+            'assistant',
+            'tool',
+            'assistant'
+        ]);
+        // R9-R11: every successful task call answers with the same bounded list, so
+        // both conversations recorded the SAME page (one store, one revision).
+        //
+        // R1/T1.1 — the two answers differ by per-CALL keys only: the planner's ADD affected a
+        // single record and answers with that record as `entry`, while the lister's plain read
+        // affected none. Naming the difference here keeps the comparison exact instead of
+        // loosening it into a subset check.
+        //
+        // RE-PINNED 2026-11-17 (task C1's accepted receipt-key change, src/core/records.ts
+        // `result.addedIds = minted` at `minted.length > 0`): the id lists now appear AT ANY
+        // COUNT, so a one-task ADD names its minted id in `addedIds` too. This is the same
+        // envelope the pinned `tasks` description now promises ("those three id lists appear
+        // whenever the call did that kind of write, AT ANY COUNT"), and the plain read above
+        // still carries neither key, which is what the spread below still proves.
+        expect(pageOf(toolResultsOf(writer.threadMessages(planner.id))[0])).toEqual({
+            ...(pageOf(toolMessage.content) as Record<string, unknown>),
+            addedIds: ['1'],
+            entry: task('1', 'Shared plan', { by: 'writer', threadId: planner.id })
+        });
+        expect(textOf(writer.threadMessages(planner.id))).toEqual([
+            'plan',
+            '',
+            toolResultsOf(writer.threadMessages(planner.id))[0],
+            'added'
+        ]);
+    });
+});
+
+describe('steering (R5)', () => {
+    it('queues steering at the next safe boundary, in receipt order', async () => {
+        const turn = gate();
+        const seen: HarnessStreamRequest[] = [];
+        let requests = 0;
+
+        const stream: HarnessStream = async function* (request) {
+            seen.push(request);
+            requests += 1;
+
+            if (requests === 1) {
+                await turn.promise;
+                yield { type: 'text', delta: 'first answer' };
+                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                return;
+            }
+
+            yield { type: 'text', delta: 'steered answer' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const thread = writer.createThread('writer');
+
+        const running = writer.sendThreadInput(thread.id, 'start');
+        await flush();
+        expect(requests).toBe(1);
+
+        // Both steers are accepted while the first request is still in flight.
+        expect(writer.steerThread(thread.id, 'focus one')).toEqual({
+            threadId: thread.id,
+            queued: true
+        });
+        expect(writer.steerThread(thread.id, 'focus two')).toEqual({
+            threadId: thread.id,
+            queued: true
+        });
+
+        // Nothing is inserted into the transcript mid-request.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([{ role: 'user', content: 'start' }]);
+
+        turn.open();
+        const result: HarnessAssistantMessage = await running;
+        expect(result.content).toBe('steered answer');
+
+        // Both steers became user messages, in order, before the second request.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'start' },
+            { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'focus one' },
+            { role: 'user', content: 'focus two' },
+            { role: 'assistant', content: 'steered answer' }
+        ]);
+        expect(textOf(seen[1]!.messages)).toEqual([
+            'start',
+            'first answer',
+            'focus one',
+            'focus two'
+        ]);
+    });
+
+    it('steers the callable root through the entry default conversation', async () => {
+        const turn = gate();
+        let requests = 0;
+
+        const stream: HarnessStream = async function* () {
+            requests += 1;
+
+            if (requests === 1) {
+                await turn.promise;
+                yield { type: 'text', delta: 'root first' };
+                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                return;
+            }
+
+            yield { type: 'text', delta: 'root steered' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+
+        const running = writer('brief');
+        await flush();
+        // The root run owns the entry agent's default conversation while it executes.
+        expect(writer.thread('agent:writer')).toEqual({
+            id: 'agent:writer',
+            agent: 'writer',
+            origin: 'agent',
+            status: 'running',
+            sequence: 1,
+            invocationId: '1',
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+
+        expect(writer.steerThread('agent:writer', 'focus root')).toEqual({
+            threadId: 'agent:writer',
+            queued: true
+        });
+
+        turn.open();
+        const result = await running;
+        expect(result.content).toBe('root steered');
+        expect(textOf(writer.threadMessages('agent:writer'))).toEqual([
+            'brief',
+            'root first',
+            'focus root',
+            'root steered'
+        ]);
+        expect(writer.thread('agent:writer')?.status).toBe('idle');
+    });
+
+    it('refuses to steer an idle or stopped conversation', () => {
+        const writer = quiet(brain(scripted([answer('done')])));
+        const thread = writer.createThread('writer');
+
+        expect(writer.steerThread(thread.id, 'later')).toEqual({
+            threadId: thread.id,
+            queued: false,
+            reason: `Thread "${thread.id}" is idle; use sendThreadInput to start a turn.`
+        });
+
+        writer.stopThread(thread.id);
+        expect(writer.steerThread(thread.id, 'never')).toEqual({
+            threadId: thread.id,
+            queued: false,
+            reason: `Thread "${thread.id}" is stopped; a host must resume it before steering.`
+        });
+        expect(() => writer.stopThread('thread-404')).toThrow(
+            'Thread "thread-404" is not available in this harness; it was never created, or it was deleted.'
+        );
+    });
+});
+
+describe('selective cancellation (R6)', () => {
+    it('stops one running thread and leaves its sibling executing', async () => {
+        const left = gatedAnswer('left done');
+        const right = gatedAnswer('right done');
+
+        const stream = routed(
+            { 'left task': left.stream, 'right task': right.stream },
+            scripted([answer('unused')])
+        );
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const a = writer.createThread('writer');
+        const b = writer.createThread('writer');
+
+        const runningA = probe(writer.sendThreadInput(a.id, 'left task'));
+        const runningB = probe(writer.sendThreadInput(b.id, 'right task'));
+        await flush();
+
+        expect(left.arrivals()).toBe(1);
+        expect(right.arrivals()).toBe(1);
+        expect(writer.thread(a.id)?.status).toBe('running');
+        expect(writer.thread(b.id)?.status).toBe('running');
+
+        expect(writer.stopThread(a.id, 'stop it')).toBe(true);
+
+        await flush();
+        expect(runningA.status).toBe('rejected');
+        expect((runningA.error as Error).message).toBe('stop it');
+        // IT19 R1: the stopped run KEEPS its committed tail. The prompt is the one thing
+        // a host inspecting a halted conversation needs to see, and rolling it back made a
+        // thread that had worked look like a thread that never had. Nothing else was
+        // committed here — the answer never arrived — so the retained transcript is exactly
+        // the one user turn the run had taken.
+        expect(withoutIds(writer.threadMessages(a.id))).toEqual([{ role: 'user', content: 'left task' }]);
+        expect(writer.thread(a.id)?.status).toBe('stopped');
+        // R3: the halt carries its CAUSE, and the cause of a host `stopThread` is
+        // `user-stopped` — deliberately OUTSIDE the resumable set (`sendThreadInput` is the
+        // documented revival), which is why the status stays 'stopped' below.
+        expect(writer.thread(a.id)?.stopReason).toBe('user-stopped');
+
+        // The sibling is untouched and completes normally.
+        expect(runningB.status).toBe('pending');
+        right.ready.open();
+        await flush();
+        expect(runningB.status).toBe('resolved');
+        expect(runningB.value?.content).toBe('right done');
+        expect(writer.thread(b.id)?.status).toBe('idle');
+    });
+
+    it('stops every active run and marks owner-linked children stopped', async () => {
+        const one = gatedAnswer('one');
+        const two = gatedAnswer('two');
+
+        const stream = routed(
+            { one: one.stream, two: two.stream },
+            scripted([answer('unused')])
+        );
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const parent = writer.createThread('writer', { label: 'parent' });
+        const child = writer.createThread('writer', { ownerThreadId: parent.id });
+        const third = writer.createThread('writer');
+
+        const p = probe(writer.sendThreadInput(parent.id, 'one'));
+        const t = probe(writer.sendThreadInput(third.id, 'two'));
+        await flush();
+        expect(one.arrivals()).toBe(1);
+        expect(two.arrivals()).toBe(1);
+
+        expect(writer.stopAllThreads('all stop')).toBe(2);
+        await flush();
+
+        expect(p.status).toBe('rejected');
+        expect(t.status).toBe('rejected');
+        expect(writer.thread(parent.id)?.status).toBe('stopped');
+        expect(writer.thread(third.id)?.status).toBe('stopped');
+        // Owner-linked children are stopped even though they had no active run.
+        expect(writer.thread(child.id)?.status).toBe('stopped');
+        expect(writer.thread('agent:writer')?.status).toBe('stopped');
+
+        // Let the detached providers settle, then revive one conversation as the
+        // host. A host turn is the only path that clears "stopped".
+        one.ready.open();
+        two.ready.open();
+        await writer.sendThreadInput(parent.id, 'one');
+        expect(writer.thread(parent.id)?.status).toBe('idle');
+        expect(writer.thread(third.id)?.status).toBe('stopped');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T1 (Phase 2) — a task claim belongs to a conversation, and the conversation's
+// lifecycle owns the claim.
+// ---------------------------------------------------------------------------
+//
+// A holder is the pair (owner, ownerThreadId) plus a lease (src/core/task.ts). A
+// stopped or deleted conversation can never release or renew what it reserved, so
+// `harness` lifts those claims at the boundary itself: `stopThreadState` (the one
+// call site every stop path passes: stopThread, its owner cascade, stopAllThreads),
+// `purgeThread` (deleteThread and its cascade), `removeAgent` (the default
+// conversation it drops without a purge), and `restore` (a snapshot that carries a
+// claim for a thread the snapshot does not). Each release is one recorded
+// `release` event with the thread id and NO `by`, so the feed says who lifted it.
+describe('task claim ownership across the thread lifecycle', () => {
+
+
+
+
+
+});
+
+// Poll a predicate with microtask/timer flushes until it holds or the bound is
+// exhausted. The gates keep the conditions stable, so this waits for scheduling
+// progress rather than for a timeout to guess.
+const until = async (predicate: () => boolean, detail?: () => unknown): Promise<void> => {
+    for (let pass = 0; pass < 50; pass += 1) {
+        if (predicate()) return;
+        await flush();
+    }
+    if (!predicate()) {
+        throw new Error(`until: condition not reached: ${JSON.stringify(detail?.() ?? null)}`);
+    }
+};
+
+describe('host-parent delegation (R4)', () => {
+    // A lead agent that delegates the prompt-derived task to `helper` and then
+    // answers. The FIRST user prompt routes the whole conversation, so the
+    // post-tool-result request reuses the same script.
+    const leadStream = (prefix: string) =>
+        routed(
+            {
+                [`${prefix} task`]: scripted([
+                    callTool('d1', 'delegate', JSON.stringify({ agent: 'helper', input: `child ${prefix}` })),
+                    answer('parent done')
+                ])
+            },
+            scripted([answer('unused')])
+        );
+
+    const build = () => {
+        const alphaChild = gatedAnswer('alpha facts');
+        const betaChild = gatedAnswer('beta facts');
+        const helper = brain(
+            routed(
+                { 'child alpha': alphaChild.stream, 'child beta': betaChild.stream },
+                scripted([answer('unused')])
+            )
+        );
+        const lead = brain(
+            routed(
+                {
+                    'alpha task': leadStream('alpha'),
+                    'beta task': leadStream('beta')
+                },
+                scripted([answer('unused')])
+            )
+        );
+
+        const writer = harness({
+            agents: { lead, helper },
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
+            presets: false
+        });
+
+        return { writer, helper, alphaChild, betaChild };
+    };
+
+    it('gives concurrent host parents independent child conversations', async () => {
+        const { writer, helper, alphaChild, betaChild } = build();
+
+        const alpha = writer.createThread('lead');
+        const beta = writer.createThread('lead');
+
+        const alphaRun = writer.sendThreadInput(alpha.id, 'alpha task');
+        const betaRun = writer.sendThreadInput(beta.id, 'beta task');
+
+        // Both delegations are in flight AT THE SAME TIME (each child thread has
+        // its own actor slot), which a shared default conversation could not do.
+        await until(
+            () =>
+                writer.threads().filter((record) => record.agent === 'helper' && record.origin === 'host').length === 2 &&
+                alphaChild.arrivals() === 1 &&
+                betaChild.arrivals() === 1,
+            () => ({
+                threads: writer.threads(),
+                arrivals: [alphaChild.arrivals(), betaChild.arrivals()],
+                alpha: textOf(writer.threadMessages(alpha.id)),
+                beta: textOf(writer.threadMessages(beta.id))
+            })
+        );
+
+        const children = writer.threads().filter((record) => record.agent === 'helper' && record.origin === 'host');
+        expect(children.map((record) => record.id).sort()).toEqual(['thread-3', 'thread-4']);
+        expect(children.map((record) => record.ownerThreadId).sort()).toEqual([
+            alpha.id,
+            beta.id
+        ]);
+        expect(children.every((record) => record.status === 'running')).toBe(true);
+
+        alphaChild.ready.open();
+        betaChild.ready.open();
+        const [alphaAnswer, betaAnswer] = await Promise.all([alphaRun, betaRun]);
+        expect(alphaAnswer.content).toBe('parent done');
+        expect(betaAnswer.content).toBe('parent done');
+
+        // The child agent's DEFAULT conversation is untouched: host delegations
+        // never fall back to a shared transcript.
+        expect(helper.messages).toEqual([]);
+        expect(writer.threadMessages('agent:helper')).toEqual([]);
+
+        // Each child owns only its own prompt/answer, matched through its parent.
+        const byId = new Map(children.map((record) => [record.id, record]));
+        const alphaChildRecord = children.find((record) => record.ownerThreadId === alpha.id)!;
+        const betaChildRecord = children.find((record) => record.ownerThreadId === beta.id)!;
+        expect(byId.get(alphaChildRecord.id)?.agent).toBe('helper');
+        expect(textOf(writer.threadMessages(alphaChildRecord.id))).toEqual([
+            'child alpha',
+            'alpha facts'
+        ]);
+        expect(textOf(writer.threadMessages(betaChildRecord.id))).toEqual([
+            'child beta',
+            'beta facts'
+        ]);
+
+        // The answers crossed back as ordinary delegation results.
+        const alphaTool = writer
+            .threadMessages(alpha.id)
+            .find((message) => message.role === 'tool') as { content: string };
+        const betaTool = writer
+            .threadMessages(beta.id)
+            .find((message) => message.role === 'tool') as { content: string };
+        expect(delegationOf(alphaTool)).toMatchObject({
+            agent: 'helper',
+            content: 'alpha facts',
+            status: 'completed'
+        });
+        expect(delegationOf(betaTool)).toMatchObject({
+            agent: 'helper',
+            content: 'beta facts',
+            status: 'completed'
+        });
+
+        // Ownership and status are persisted, so a restore keeps the same tree.
+        const snapshot = writer.snapshot();
+        const persistedChildren = (snapshot.threads ?? []).filter(
+            (record) => record.agent === 'helper'
+        );
+        expect(persistedChildren.map((record) => record.ownerThreadId).sort()).toEqual([
+            alpha.id,
+            beta.id
+        ]);
+        expect(persistedChildren.every((record) => record.status === 'idle')).toBe(true);
+
+        const restored = harness({
+            agents: {
+                lead: brain(scripted([answer('unused')])),
+                helper: brain(scripted([answer('unused')]))
+            },
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
+            presets: false
+        });
+        restored.restore(snapshot);
+
+        for (const child of children) {
+            expect(restored.thread(child.id)?.ownerThreadId).toBe(child.ownerThreadId);
+            expect(textOf(restored.threadMessages(child.id))).toEqual(
+                textOf(writer.threadMessages(child.id))
+            );
+        }
+    });
+
+    // R3 IDENTITY: a focused child is RESUMED in place — the same persistent id and
+    // owner, the same transcript — and never replaced by a fresh conversation. A
+    // SEPARATE delegation invocation from the same parent is a new conversation
+    // (distinct id, untouched history), and a restore keeps every id/owner/routing.
+    it('resumes a focused child in place and keeps its id, owner, and history across restore', async () => {
+        // Routes on the LAST user message: the lead's second turn continues the
+        // SAME parent conversation, so its FIRST user prompt is still the earlier
+        // task and would select the wrong script.
+        const routedLast = (
+            routes: Record<string, HarnessStream>,
+            fallback: HarnessStream
+        ): HarnessStream =>
+            async function* (request) {
+                const users = request.messages.filter((message) => message.role === 'user') as {
+                    content?: string;
+                }[];
+                const last = users[users.length - 1];
+                yield* (routes[last?.content ?? ''] ?? fallback)(request);
+            };
+
+        const buildIdentity = () => {
+            const helper = brain(
+                routedLast(
+                    {
+                        'child one': scripted([answer('one facts')]),
+                        'child two': scripted([answer('two facts')]),
+                        'child follow': scripted([answer('follow facts')])
+                    },
+                    scripted([answer('unused')])
+                )
+            );
+            // Distinct tool-call ids per parent turn: the harness rejects a call id
+            // reused from an earlier turn of the same conversation.
+            const lead = brain(
+                routedLast(
+                    {
+                        first: scripted([
+                            callTool(
+                                'd1',
+                                'delegate',
+                                JSON.stringify({ agent: 'helper', input: 'child one' })
+                            ),
+                            answer('first done')
+                        ]),
+                        continue: scripted([
+                            callTool(
+                                'd2',
+                                'delegate',
+                                JSON.stringify({ agent: 'helper', input: 'child two' })
+                            ),
+                            answer('second done')
+                        ])
+                    },
+                    scripted([answer('unused')])
+                )
+            );
+
+            return harness({
+                agents: { lead, helper },
+                entry: 'lead',
+                ranks: { lead: 'A', helper: 'B' },
+                presets: false
+            });
+        };
+
+        const writer = buildIdentity();
+        const parent = writer.createThread('lead');
+        expect(parent.id).toBe('thread-1');
+
+        // First delegation: the child gets its OWN host conversation, linked to the
+        // parent. `helper`'s default conversation stays untouched.
+        await writer.sendThreadInput(parent.id, 'first');
+        expect(writer.threads()).toEqual([
+            { id: 'agent:lead', agent: 'lead', origin: 'agent', status: 'idle', sequence: 1 },
+            { id: 'agent:helper', agent: 'helper', origin: 'agent', status: 'idle', sequence: 2 },
+            {
+                id: 'thread-1',
+                agent: 'lead',
+                origin: 'host',
+                status: 'idle',
+                sequence: 3,
+                invocationId: '1',
+                epoch: HARNESS_PROCESS_EPOCH
+            },
+            {
+                id: 'thread-2',
+                agent: 'helper',
+                origin: 'host',
+                status: 'idle',
+                sequence: 4,
+                ownerThreadId: 'thread-1',
+                invocationId: '2',
+                epoch: HARNESS_PROCESS_EPOCH
+            }
+        ]);
+        expect(textOf(writer.threadMessages('thread-2'))).toEqual(['child one', 'one facts']);
+        expect(writer.threadMessages('agent:helper')).toEqual([]);
+
+        // Resume the child: SAME record (id/owner/sequence), new invocation id, and
+        // the follow-up accumulates in its own transcript.
+        await writer.sendThreadInput('thread-2', 'child follow');
+        expect(writer.thread('thread-2')).toEqual({
+            id: 'thread-2',
+            agent: 'helper',
+            origin: 'host',
+            status: 'idle',
+            sequence: 4,
+            ownerThreadId: 'thread-1',
+            invocationId: '3',
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+        expect(textOf(writer.threadMessages('thread-2'))).toEqual([
+            'child one',
+            'one facts',
+            'child follow',
+            'follow facts'
+        ]);
+        // No extra conversation was minted by the resume.
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:lead',
+            'agent:helper',
+            'thread-1',
+            'thread-2'
+        ]);
+
+        // A SEPARATE delegation invocation is a NEW child conversation: sibling
+        // identity stays distinct and the resumed child is not appended to.
+        await writer.sendThreadInput('thread-1', 'continue');
+        expect(
+            writer.threads().map((record) => [record.id, record.ownerThreadId, record.invocationId])
+        ).toEqual([
+            ['agent:lead', undefined, undefined],
+            ['agent:helper', undefined, undefined],
+            ['thread-1', undefined, '4'],
+            ['thread-2', 'thread-1', '3'],
+            ['thread-3', 'thread-1', '5']
+        ]);
+        expect(textOf(writer.threadMessages('thread-2'))).toEqual([
+            'child one',
+            'one facts',
+            'child follow',
+            'follow facts'
+        ]);
+        expect(textOf(writer.threadMessages('thread-3'))).toEqual(['child two', 'two facts']);
+        // The parent conversation grew only by its own turns, never the child's.
+        expect(roles(writer.threadMessages('thread-1'))).toEqual([
+            'user',
+            'assistant',
+            'tool',
+            'assistant',
+            'user',
+            'assistant',
+            'tool',
+            'assistant'
+        ]);
+
+        // Snapshot persists every host conversation with its owner and invocation.
+        const snapshot = writer.snapshot();
+        expect(
+            (snapshot.threads ?? []).map((entry) => [
+                entry.id,
+                entry.agent,
+                entry.status,
+                entry.sequence,
+                entry.ownerThreadId,
+                entry.invocationId
+            ])
+        ).toEqual([
+            ['thread-1', 'lead', 'idle', 3, undefined, '4'],
+            ['thread-2', 'helper', 'idle', 4, 'thread-1', '3'],
+            ['thread-3', 'helper', 'idle', 5, 'thread-1', '5']
+        ]);
+
+        // Restore then resume the SAME child: id, owner, and transcript are kept
+        // (the counter continues after every archived invocation).
+        const restored = buildIdentity();
+        restored.restore(snapshot);
+
+        expect(restored.thread('thread-2')).toEqual({
+            id: 'thread-2',
+            agent: 'helper',
+            origin: 'host',
+            status: 'idle',
+            sequence: 4,
+            ownerThreadId: 'thread-1',
+            invocationId: '3',
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+        expect(textOf(restored.threadMessages('thread-2'))).toEqual([
+            'child one',
+            'one facts',
+            'child follow',
+            'follow facts'
+        ]);
+
+        await restored.sendThreadInput('thread-2', 'child follow');
+        expect(restored.thread('thread-2')).toEqual({
+            id: 'thread-2',
+            agent: 'helper',
+            origin: 'host',
+            status: 'idle',
+            sequence: 4,
+            ownerThreadId: 'thread-1',
+            invocationId: '6',
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+        expect(textOf(restored.threadMessages('thread-2'))).toEqual([
+            'child one',
+            'one facts',
+            'child follow',
+            'follow facts',
+            'child follow',
+            'follow facts'
+        ]);
+        // The restored sibling conversations are neither replaced nor extended.
+        expect(restored.threads().map((record) => record.id)).toEqual([
+            'agent:lead',
+            'agent:helper',
+            'thread-1',
+            'thread-2',
+            'thread-3'
+        ]);
+        expect(textOf(restored.threadMessages('thread-3'))).toEqual(['child two', 'two facts']);
+    });
+
+    it('stops one child conversation without disturbing its sibling or either parent', async () => {
+        const { writer, alphaChild, betaChild } = build();
+
+        const alpha = writer.createThread('lead');
+        const beta = writer.createThread('lead');
+
+        const alphaRun = probe(writer.sendThreadInput(alpha.id, 'alpha task'));
+        const betaRun = probe(writer.sendThreadInput(beta.id, 'beta task'));
+
+        await until(
+            () =>
+                writer.threads().filter((record) => record.agent === 'helper' && record.origin === 'host').length === 2 &&
+                alphaChild.arrivals() === 1 &&
+                betaChild.arrivals() === 1,
+            () => ({
+                threads: writer.threads(),
+                arrivals: [alphaChild.arrivals(), betaChild.arrivals()],
+                alpha: textOf(writer.threadMessages(alpha.id)),
+                beta: textOf(writer.threadMessages(beta.id))
+            })
+        );
+
+        const children = writer.threads().filter((record) => record.agent === 'helper' && record.origin === 'host');
+        const alphaChildRecord = children.find((record) => record.ownerThreadId === alpha.id)!;
+        const betaChildRecord = children.find((record) => record.ownerThreadId === beta.id)!;
+
+        // Targeted stop: exactly the alpha child, with a caller-visible reason.
+        expect(writer.stopThread(alphaChildRecord.id, 'child stopped')).toBe(true);
+        await flush();
+
+        expect(writer.thread(alphaChildRecord.id)?.status).toBe('stopped');
+        // IT19 R1: the stopped CHILD keeps the turn it had committed — the delegated prompt
+        // is the record of what the parent asked and never got an answer to. Its cause is the
+        // host stop that halted it.
+        expect(withoutIds(writer.threadMessages(alphaChildRecord.id))).toEqual([
+            { role: 'user', content: 'child alpha' }
+        ]);
+        expect(writer.thread(alphaChildRecord.id)?.stopReason).toBe('user-stopped');
+        // The sibling is still executing and unaffected.
+        expect(writer.thread(betaChildRecord.id)?.status).toBe('running');
+
+        betaChild.ready.open();
+        await until(() => alphaRun.status === 'resolved' && betaRun.status === 'resolved');
+
+        // The parent observes a NORMAL failed tool call and recovers.
+        expect(alphaRun.value?.content).toBe('parent done');
+        expect(betaRun.value?.content).toBe('parent done');
+
+        const alphaTool = writer
+            .threadMessages(alpha.id)
+            .find((message) => message.role === 'tool') as { content: string };
+        const betaTool = writer
+            .threadMessages(beta.id)
+            .find((message) => message.role === 'tool') as { content: string };
+
+        // T28: a stopped child is a CANCELLED run, not a bare tool failure. The parent
+        // still observes a normal tool result it can read and recover from, and that
+        // result now carries the child's identity plus how far it got — the forensic
+        // record the transcript rollback used to erase.
+        expect(delegationOf(alphaTool)).toMatchObject({
+            agent: 'helper',
+            content: '',
+            status: 'cancelled',
+            error: 'child stopped',
+            cancelledAtMessage: 1
+        });
+        expect(delegationOf(betaTool)).toMatchObject({
+            agent: 'helper',
+            content: 'beta facts',
+            status: 'completed'
+        });
+
+        // The unrelated child completed, and both parents are idle and resumable.
+        expect(textOf(writer.threadMessages(betaChildRecord.id))).toEqual([
+            'child beta',
+            'beta facts'
+        ]);
+        expect(writer.thread(alpha.id)?.status).toBe('idle');
+        expect(writer.thread(beta.id)?.status).toBe('idle');
+        expect(writer.thread(betaChildRecord.id)?.status).toBe('idle');
+    });
+
+    it('lists live conversations for agents and hides a deleted thread from the session doors', async () => {
+        // A model that reads the roster, then answers.
+        const rosterStream: HarnessStream = async function* (request) {
+            const seenTool = request.messages.some((message) => message.role === 'tool');
+
+            if (!seenTool) {
+                for (const frame of callTool('l1', 'threadList', '{}')) yield frame;
+                return;
+            }
+
+            yield { type: 'text', delta: 'roster read' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(rosterStream) }, presets: false });
+        const first = writer.createThread('writer');
+        const second = writer.createThread('writer', { label: 'later' });
+
+        await writer.sendThreadInput(first.id, 'read the roster');
+
+        const toolMessage = writer
+            .threadMessages(first.id)
+            .find((message) => message.role === 'tool') as { content: string };
+        // THE ROSTER IS SESSION-WIDE (2026-11-15), THE WRITE SCOPE IS NOT. From inside `first`
+        // the caller is shown every live conversation — including `second`, a sibling host thread
+        // it did not create — because a READ reaches the whole session and a prompt that names a
+        // thread must be findable. What the family still decides is stated on the page as
+        // `actOn`: the ids this caller may also `threadSend` into or `threadDelete`.
+        expect(JSON.parse(toolMessage.content)).toEqual({
+            currentThreadId: first.id,
+            actOn: ['agent:writer', first.id],
+            threads: [
+                {
+                    id: 'agent:writer',
+                    agent: 'writer',
+                    origin: 'agent',
+                    status: 'idle',
+                    sequence: 1
+                },
+                {
+                    id: first.id,
+                    agent: 'writer',
+                    origin: 'host',
+                    status: 'running',
+                    sequence: 2,
+                    invocationId: '1'
+                },
+                {
+                    id: second.id,
+                    agent: 'writer',
+                    origin: 'host',
+                    label: 'later',
+                    status: 'idle',
+                    sequence: 3
+                }
+            ]
+        });
+
+        // A CALLER WITH NO THREAD IS UNSCOPED IN BOTH SENSES: the host (here, the manual
+        // executeTool with no thread) gets every live conversation AND no `actOn`, because for a
+        // host the readable set and the writable set are the same set.
+        const scopedOutRoster = (await writer.executeTool('threadList', {})) as {
+            currentThreadId?: string;
+            threads: { id: string }[];
+        };
+        expect(scopedOutRoster.currentThreadId).toBeUndefined();
+        expect(scopedOutRoster.threads.map((record) => record.id)).toEqual([
+            'agent:writer',
+            first.id,
+            second.id
+        ]);
+
+        // SOFT DELETE (IT19 R2) — HALF OF THE CONTRACT: the conversation is no longer
+        // discoverable by the SESSION TOOLING. The record seam answers nothing, the host roster
+        // omits it, and the model-facing `threadList` omits it (both scoped and unscoped). What
+        // it does NOT do is destroy anything: the row, its transcript and its result rows stay,
+        // which the snapshot assertions below pin.
+        writer.deleteThread(second.id);
+        expect(writer.thread(second.id)).toBeUndefined();
+        expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer', first.id]);
+
+        const manualRoster = (await writer.executeTool('threadList', {})) as {
+            currentThreadId?: string;
+            threads: { id: string }[];
+        };
+        expect(manualRoster.currentThreadId).toBeUndefined();
+        expect(manualRoster.threads.map((record) => record.id)).toEqual([
+            'agent:writer',
+            first.id
+        ]);
+
+        const snapshot = writer.snapshot();
+        // THE OTHER HALF: the released row is still in the durable document, in creation order
+        // beside the live one — a snapshot keeps what a delete released.
+        expect((snapshot.threads ?? []).map((record) => record.id)).toEqual([first.id, second.id]);
+        // `second`'s row, exactly: still labelled, never-run transcript, and the soft-delete
+        // mark. `inactiveAt` is `Date.now()` at the mark, and the frozen clock of this file makes
+        // it one exact value rather than a wall-clock range.
+        expect(withoutIds((snapshot.threads ?? [])[1])).toEqual({
+            id: second.id,
+            agent: 'writer',
+            status: 'idle',
+            sequence: 3,
+            label: 'later',
+            inactive: true,
+            inactiveAt: EPOCH_MS,
+            messages: []
+        });
+        expect(snapshot.threadSequence).toBe(2);
+
+        // The released conversation is hidden from the roster, and its result row is RETAINED:
+        // `agentManage` no longer previews it (pinned in the M2 group below), while an id the
+        // caller still holds keeps answering until the session itself is deleted.
+        writer.deleteThread(first.id);
+        expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer']);
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'roster read',
+            contentLength: 11,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+    });
+});
+
+describe('cross-thread chat and delegation links (R4)', () => {
+    it('delivers a threadSend message with runtime-derived sender attribution', async () => {
+        const seen: HarnessStreamRequest[] = [];
+
+        // One script per conversation, keyed on its FIRST prompt (see `routed`). The
+        // target's first prompt is the ATTRIBUTED MESSAGE itself, because an idle
+        // target is now started with it (delegate-stress T3.2) instead of having it
+        // parked in its transcript.
+        const stream = routed(
+            {
+                'talk to beta': scripted(
+                    [
+                        // The tool schema has no sender field: identity comes from the run.
+                        callTool(
+                            'c1',
+                            'threadSend',
+                            JSON.stringify({ thread: 'thread-2', message: 'hello from alpha' })
+                        ),
+                        answer('alpha sent')
+                    ],
+                    seen
+                ),
+                'from agent "writer" (thread thread-1):\nhello from alpha': scripted([
+                    answer('beta heard you')
+                ])
+            },
+            scripted([answer('unexpected')])
+        );
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+
+        // createThread registers the conditional core tool, so the very next
+        // request declares it.
+        const alpha = writer.createThread('writer');
+        // LINEAGE (2026-11-13): alpha may only write into its own lineage, so beta is
+        // created as alpha's child rather than as its sibling. A sibling send is a
+        // refusal, and that case has its own test below; this test is about the
+        // runtime-derived SENDER on a delivery that is allowed.
+        const beta = writer.createThread('writer', { ownerThreadId: alpha.id });
+
+        const result = await writer.sendThreadInput(alpha.id, 'talk to beta');
+        expect(result.content).toBe('alpha sent');
+        // R9-R11: the demoted runtime rows are searchable, so the declared set is
+        // the bootstrap pair plus the four thread controls this harness just
+        // registered (roster first, then the transcript reader, then the sender, then
+        // the deleter — descending `order` inside the 'threads' activation group).
+        expect(seen[0]!.tools?.map((tool) => tool.name)).toEqual([
+            'toolRequest',
+            'tasks',
+            'threadList',
+            'threadRead',
+            'threadSend',
+            'threadDelete'
+        ]);
+
+        // The tool result reports the delivery and the REAL sender: a dormant target
+        // is reported as `started`, the value the ambiguity this finding was built on
+        // used to hide behind the bare word `appended` (T3.6).
+        const toolMessage = writer
+            .threadMessages(alpha.id)
+            .find((message) => message.role === 'tool') as { content: string };
+        expect(JSON.parse(toolMessage.content)).toEqual({
+            threadId: beta.id,
+            delivered: 'started',
+            sender: 'writer',
+            senderThreadId: alpha.id
+        });
+
+        // THE WOKEN CONVERSATION: the attributed message is the prompt of a run that
+        // answered it, not a line waiting for some unrelated turn to read it.
+        await settleThread(writer, beta.id);
+
+        expect(withoutIds(writer.threadMessages(beta.id))).toEqual([
+            {
+                role: 'user',
+                content: 'from agent "writer" (thread thread-1):\nhello from alpha'
+            },
+            { role: 'assistant', content: 'beta heard you' }
+        ]);
+        expect(writer.thread(beta.id)?.status).toBe('idle');
+    });
+
+    it('cannot spoof a sender: identity is not part of the tool schema', async () => {
+        let requests = 0;
+        const stream: HarnessStream = async function* () {
+            requests += 1;
+
+            if (requests === 1) {
+                for (const frame of callTool(
+                    'c1',
+                    'threadSend',
+                    JSON.stringify({ thread: 'thread-2', message: 'hi', sender: 'lead' })
+                )) {
+                    yield frame;
+                }
+                return;
+            }
+
+            yield { type: 'text', delta: 'done' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const alpha = writer.createThread('writer');
+        const beta = writer.createThread('writer');
+        await writer.sendThreadInput(alpha.id, 'try to spoof');
+
+        const toolMessage = writer
+            .threadMessages(alpha.id)
+            .find((message) => message.role === 'tool') as { content: string };
+        expect(toolMessage.content).toBe(
+            'Tool "threadSend" received arguments that do not match its schema: $ must not include the additional property "sender".'
+        );
+        // The rejected call delivered nothing.
+        expect(writer.threadMessages(beta.id)).toEqual([]);
+    });
+
+    it('queues a chat message into a running thread at its next boundary', async () => {
+        const turn = gate();
+        let requests = 0;
+        const seen: HarnessStreamRequest[] = [];
+
+        const stream: HarnessStream = async function* (request) {
+            seen.push(request);
+            requests += 1;
+
+            if (requests === 1) {
+                await turn.promise;
+                yield { type: 'text', delta: 'busy' };
+                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                return;
+            }
+
+            yield { type: 'text', delta: 'after chat' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const target = writer.createThread('writer');
+        const running = writer.sendThreadInput(target.id, 'work');
+        await flush();
+        expect(requests).toBe(1);
+
+        // The manual path has no run identity, so the sender is the entry agent
+        // and no sender thread is claimed.
+        await expect(
+            writer.executeTool('threadSend', { thread: target.id, message: 'ping' })
+        ).resolves.toEqual({
+            threadId: target.id,
+            delivered: 'queued',
+            sender: 'writer'
+        });
+
+        // Nothing landed mid-request.
+        expect(withoutIds(writer.threadMessages(target.id))).toEqual([{ role: 'user', content: 'work' }]);
+
+        turn.open();
+        await running;
+
+        expect(withoutIds(writer.threadMessages(target.id))).toEqual([
+            { role: 'user', content: 'work' },
+            { role: 'assistant', content: 'busy' },
+            { role: 'user', content: 'from agent "writer":\nping' },
+            { role: 'assistant', content: 'after chat' }
+        ]);
+        expect(textOf(seen[1]!.messages)).toEqual(['work', 'busy', 'from agent "writer":\nping']);
+    });
+
+    it('links a delegated child conversation to its caller and refuses a stopped one', async () => {
+        const helper = brain(scripted([answer('the facts')]));
+        const lead = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"helper","input":"find facts"}'),
+                answer('lead done'),
+                callTool('c2', 'delegate', '{"agent":"helper","input":"more facts"}'),
+                answer('lead done again')
+            ])
+        );
+
+        const writer = harness({
+            agents: { lead, helper },
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
+            presets: false
+        });
+
+        await writer('go');
+
+        // Legacy accumulation is preserved: the child's default conversation is the
+        // configured Agent's transcript.
+        expect(writer.threadMessages('agent:helper')).toEqual(helper.messages);
+        expect(roles(writer.threadMessages('agent:helper'))).toEqual(['user', 'assistant']);
+        expect(writer.thread('agent:helper')).toEqual({
+            id: 'agent:helper',
+            agent: 'helper',
+            origin: 'agent',
+            status: 'idle',
+            sequence: 2,
+            ownerThreadId: 'agent:lead',
+            invocationId: '2',
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+        expect(writer.thread('agent:lead')?.invocationId).toBe('1');
+
+        // Model-driven work must respect a host stop: the next delegation is an
+        // honest tool result, not a resurrected conversation.
+        writer.stopThread('agent:helper', 'no more');
+        await writer('again');
+
+        const toolMessages = lead.messages.filter((message) => message.role === 'tool');
+        expect((toolMessages.at(-1) as { content: string }).content).toBe(
+            'Tool "delegate" failed: Thread "agent:helper" is stopped; a host must resume it before it can run.'
+        );
+        expect(withoutIds(helper.messages)).toEqual([
+            { role: 'user', content: 'find facts' },
+            { role: 'assistant', content: 'the facts' }
+        ]);
+    });
+});
+
+describe('delete release and snapshot durability', () => {
+    it('releases a terminal host thread: hidden from the session doors, retained for the host', async () => {
+        let requests = 0;
+        const stream: HarnessStream = async function* () {
+            requests += 1;
+            yield { type: 'text', delta: `answer ${requests}` };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const thread = writer.createThread('writer');
+        await writer.sendThreadInput(thread.id, 'hello');
+
+        expect(writer.thread(thread.id)?.invocationId).toBe('1');
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
+        ).resolves.toMatchObject({ invocationId: '1', content: 'answer 1' });
+
+        // A running thread cannot be deleted.
+        const running = writer.sendThreadInput(thread.id, 'again');
+        expect(() => writer.deleteThread(thread.id)).toThrow(
+            `Thread "${thread.id}" is running; stop it before deleting it.`
+        );
+        await running;
+
+        // IT19 R2 — THE RECEIPT STILL NAMES WHAT WAS RELEASED, but the words changed meaning:
+        // `removedThreadIds`/`removedInvocationIds` are the ids that stop being LISTED, and
+        // `removedBranchIds` is the one genuinely removed set (a branch row is a throwaway clone).
+        expect(writer.deleteThread(thread.id)).toEqual({
+            deleted: thread.id,
+            removedThreadIds: [thread.id],
+            removedInvocationIds: ['1', '2'],
+            removedBranchIds: []
+        });
+
+        // WHAT THE DELETE TAKES AWAY: the record seam and the roster, i.e. the session tooling
+        // that a model or a host uses to find a conversation at all.
+        expect(writer.thread(thread.id)).toBeUndefined();
+        expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer']);
+
+        // WHAT IT KEEPS: the transcript, and it is still readable through the HOST door — the
+        // server's transcript reader and every route that passes no caller thread. The released
+        // conversation worked, and those turns are the durable state the host owns.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'hello' },
+            { role: 'assistant', content: 'answer 1' },
+            { role: 'user', content: 'again' },
+            { role: 'assistant', content: 'answer 2' }
+        ]);
+
+        // The agent-result row is retained on the same rule: the answer the released
+        // conversation gave is still addressable by id (the roster that LISTS it is what shrank).
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'answer 1',
+            contentLength: 8,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // And a conversation can no longer WRITE there. An agent-facing `threadSend` refuses with
+        // the inactive sentence rather than the canonical not-found one, because "it was never
+        // created, or it was deleted" is the one answer that is false for a retained record.
+        await expect(
+            writer.executeTool('threadSend', { thread: thread.id, message: 'ping' })
+        ).rejects.toThrow(
+            `Thread "${thread.id}" is inactive: it was deleted, so threadSend cannot run in it. ` +
+                'Its record and transcript are retained and stay readable by id; start a new thread, ' +
+                'or have a host restore it.'
+        );
+
+        // The released ROW is still in the durable document, mark and all — a restore re-seats
+        // it, and only a session deletion drops it. `inactiveAt` is `Date.now()` at the mark, so
+        // the frozen clock of this file pins it to one value.
+        const released = (writer.snapshot().threads ?? [])[0];
+        expect({
+            id: released?.id,
+            status: released?.status,
+            sequence: released?.sequence,
+            invocationId: released?.invocationId,
+            inactive: released?.inactive,
+            inactiveAt: released?.inactiveAt
+        }).toEqual({
+            id: thread.id,
+            status: 'idle',
+            sequence: 2,
+            invocationId: '2',
+            inactive: true,
+            inactiveAt: EPOCH_MS
+        });
+
+        // A host send is the documented revival (IT19 R2): it clears the mark, and the retained
+        // transcript is the base it continues from — which is what makes "retained" more than a
+        // word for "still in the file".
+        const revived = await writer.sendThreadInput(thread.id, 'restored');
+        expect(revived.content).toBe('answer 3');
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+        expect(textOf(writer.threadMessages(thread.id))).toEqual([
+            'hello',
+            'answer 1',
+            'again',
+            'answer 2',
+            'restored',
+            'answer 3'
+        ]);
+
+        // The revival cleared the mark, so no reader of the document can mistake this
+        // conversation for a released one.
+        const revivedRow = (writer.snapshot().threads ?? [])[0];
+        expect({
+            status: revivedRow?.status,
+            inactive: revivedRow?.inactive,
+            inactiveAt: revivedRow?.inactiveAt
+        }).toEqual({ status: 'idle', inactive: undefined, inactiveAt: undefined });
+
+        // The id high-water mark survives the release, and a RELEASED thread is not re-minted:
+        // the row still occupies its id, so the next host thread is `thread-2`.
+        expect(writer.snapshot().threadSequence).toBe(1);
+        expect(writer.createThread('writer').id).toBe('thread-2');
+    });
+
+    it('round-trips host threads through snapshot/restore', async () => {
+        const stream: HarnessStream = async function* () {
+            yield { type: 'text', delta: 'stored' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const source = harness({ agents: { writer: brain(stream) }, presets: false });
+        const thread = source.createThread('writer', { label: 'kept' });
+        await source.sendThreadInput(thread.id, 'remember this');
+
+        const snapshot = source.snapshot();
+        expect(withoutIds(snapshot.threads)).toEqual([
+            {
+                id: 'thread-1',
+                agent: 'writer',
+                status: 'idle',
+                sequence: 2,
+                label: 'kept',
+                invocationId: '1',
+                epoch: HARNESS_PROCESS_EPOCH,
+                messages: [
+                    { role: 'user', content: 'remember this' },
+                    { role: 'assistant', content: 'stored' }
+                ]
+            }
+        ]);
+        expect(snapshot.threadSequence).toBe(1);
+
+        // A default-only snapshot keeps the pre-thread shape: the field pair is
+        // absent rather than an empty array.
+        const plain = harness({ agents: { writer: brain(stream) }, presets: false });
+        expect('threads' in plain.snapshot()).toBe(false);
+        expect('threadSequence' in plain.snapshot()).toBe(false);
+
+        const target = harness({ agents: { writer: brain(stream) }, presets: false });
+        target.restore(snapshot);
+
+        expect(withoutIds(target.thread('thread-1'))).toEqual({
+            id: 'thread-1',
+            agent: 'writer',
+            origin: 'host',
+            status: 'idle',
+            sequence: 2,
+            label: 'kept',
+            invocationId: '1',
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+        expect(withoutIds(target.threadMessages('thread-1'))).toEqual([
+            { role: 'user', content: 'remember this' },
+            { role: 'assistant', content: 'stored' }
+        ]);
+        // The tool came back with the restored thread.
+        expect(target.tools.threadSend).toBeDefined();
+
+        // Resuming appends to the restored conversation only.
+        await target.sendThreadInput('thread-1', 'continue');
+        expect(textOf(target.threadMessages('thread-1'))).toEqual([
+            'remember this',
+            'stored',
+            'continue',
+            'stored'
+        ]);
+        // The default conversation stayed empty, as the source snapshot said.
+        expect(target.threadMessages('agent:writer')).toEqual([]);
+    });
+});
+
+describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
+    it('rejects a default conversation as thread owner (H1)', () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+
+        expect(() => writer.createThread('writer', { ownerThreadId: 'agent:writer' })).toThrow(
+            'Thread "agent:writer" is an agent\'s default conversation; only an independent host thread can own another thread.'
+        );
+
+        // The accepted owner states still round-trip: none, and a HOST parent.
+        const parent = writer.createThread('writer');
+        const child = writer.createThread('writer', { ownerThreadId: parent.id });
+        const bare = writer.createThread('writer');
+        const snapshot = writer.snapshot();
+
+        expect(snapshot.threads?.map((entry) => entry.ownerThreadId)).toEqual([
+            undefined,
+            parent.id,
+            undefined
+        ]);
+
+        const target = quiet(brain(scripted([answer('unused')])));
+        target.restore(snapshot);
+
+        expect(target.thread(child.id)?.ownerThreadId).toBe(parent.id);
+        expect(target.thread(bare.id)?.ownerThreadId).toBeUndefined();
+        expect(target.thread(parent.id)).toEqual(parent);
+    });
+
+    it('rejects host turns queued before a stop; a new send is the only revival (M1)', async () => {
+        const first = gatedAnswer('one');
+        let requests = 0;
+
+        const stream: HarnessStream = async function* (request) {
+            requests += 1;
+            if (requests === 1) {
+                for await (const frame of first.stream(request)) yield frame;
+                return;
+            }
+            yield { type: 'text', delta: 'after stop' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const thread = writer.createThread('writer');
+
+        const running = probe(writer.sendThreadInput(thread.id, 'one'));
+        await flush();
+        expect(running.status).toBe('pending');
+        expect(first.arrivals()).toBe(1);
+
+        const queued = probe(writer.sendThreadInput(thread.id, 'two'));
+        await flush();
+        expect(queued.status).toBe('pending');
+
+        expect(writer.stopThread(thread.id, 'host stop')).toBe(true);
+        first.ready.open();
+        await flush();
+
+        expect(running.status).toBe('rejected');
+        expect((running.error as Error).message).toBe('host stop');
+        expect(queued.status).toBe('rejected');
+        expect((queued.error as Error).message).toBe(
+            `Thread "${thread.id}" was stopped while this turn was queued; the turn was not started.`
+        );
+
+        // The queued turn never reached the model, the status stayed stopped, and (IT19 R1) the
+        // aborted prompt is RETAINED rather than rolled back — the one turn the halted run took is
+        // exactly what a host needs to see to know what was lost.
+        expect(requests).toBe(1);
+        expect(writer.thread(thread.id)?.status).toBe('stopped');
+        expect(textOf(writer.threadMessages(thread.id))).toEqual(['one']);
+        expect(writer.thread(thread.id)?.stopReason).toBe('user-stopped');
+
+        // A NEW host send after the stop is the one legal revival path, and it continues the
+        // RETAINED conversation instead of starting a blank one.
+        const revived = await writer.sendThreadInput(thread.id, 'three');
+        expect(revived.content).toBe('after stop');
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+        expect(textOf(writer.threadMessages(thread.id))).toEqual(['one', 'three', 'after stop']);
+        // R3: the cause of the halted run is cleared by the fresh turn — the reason belonged to
+        // the run that ended, not to the conversation.
+        expect(writer.thread(thread.id)?.stopReason).toBeUndefined();
+        expect(requests).toBe(2);
+    });
+
+    it('applies the same queued rejection under stopAllThreads', async () => {
+        const first = gatedAnswer('one');
+        let requests = 0;
+
+        const stream: HarnessStream = async function* (request) {
+            requests += 1;
+            if (requests === 1) {
+                for await (const frame of first.stream(request)) yield frame;
+                return;
+            }
+            yield { type: 'text', delta: 'late' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const thread = writer.createThread('writer');
+
+        const running = probe(writer.sendThreadInput(thread.id, 'one'));
+        await flush();
+        const queued = probe(writer.sendThreadInput(thread.id, 'two'));
+        await flush();
+
+        expect(writer.stopAllThreads('all stop')).toBe(1);
+        first.ready.open();
+        await flush();
+
+        expect(running.status).toBe('rejected');
+        expect((running.error as Error).message).toBe('all stop');
+        expect(queued.status).toBe('rejected');
+        expect((queued.error as Error).message).toBe(
+            `Thread "${thread.id}" was stopped while this turn was queued; the turn was not started.`
+        );
+        expect(requests).toBe(1);
+        expect(writer.thread(thread.id)?.status).toBe('stopped');
+        // IT19 R1/R3: the halted run keeps the prompt it had committed, and the cause a
+        // `stopAllThreads` halt records is the same host-owned `user-stopped` a single stop
+        // writes — the cascade is an actor difference, not a cause difference.
+        expect(textOf(writer.threadMessages(thread.id))).toEqual(['one']);
+        expect(writer.thread(thread.id)?.stopReason).toBe('user-stopped');
+    });
+
+    it('releases thread-owned branches on delete and keeps their result rows (M2)', async () => {
+        let requests = 0;
+
+        const stream: HarnessStream = async function* () {
+            requests += 1;
+            if (requests === 1) {
+                for (const frame of callTool('f1', 'threadFork', '{"input":"look into it"}')) {
+                    yield frame;
+                }
+                return;
+            }
+            yield { type: 'text', delta: 'ok' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({
+            agents: { writer: brain(stream) },
+            presets: false,
+            forks: { enabled: true }
+        });
+        const thread = writer.createThread('writer');
+        await writer.sendThreadInput(thread.id, 'start');
+
+        expect(
+            writer.branches().map((record) => [record.branchId, record.kind, record.threadId, record.status])
+        ).toEqual([['branch-1', 'fork', thread.id, 'completed']]);
+        expect(writer.branch('branch-1')).toBeDefined();
+        // A branch is an INVOCATION, never a user thread.
+        expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer', thread.id]);
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: 'branch-1' })
+        ).resolves.toMatchObject({ invocationId: 'branch-1' });
+
+        writer.deleteThread(thread.id);
+
+        // THE BRANCH LEDGER IS THE ONE THING THIS DELETE REALLY REMOVES: a branch is a throwaway
+        // clone of its parent, the parent owns the answer, and with the conversation released
+        // there is nothing left to resolve a `branch-N` address against.
+        expect(writer.branches()).toEqual([]);
+        expect(writer.branch('branch-1')).toBeUndefined();
+
+        // The branch's RESULT ROW is retained, like every other row: IT19 R2 marks the thread and
+        // nothing else destroys, so the finished branch answer is still addressable by id until
+        // the session itself goes. (A completed row carries no `stopReason` — that key belongs to
+        // a run that did not conclude.)
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: 'branch-1' })
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: 'branch-1',
+            kind: 'fork',
+            status: 'completed',
+            content: 'ok',
+            contentLength: 2,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+    });
+
+    // STRESS REPORT #6 (2026-11-14) — THE RELEASE IS NO LONGER SILENT.
+    //
+    // Deleting a conversation took its agent-result records out of `agentManage` and its branch
+    // lookups out of the branch ledger, which the caller otherwise experienced as `agentManage`
+    // shrinking and `agentResult(id)` changing behaviour with no stated reason. `purgeThread`
+    // always computed those exact sets and threw them away; `deleteThread` now folds them into
+    // the receipt (owner first, then cascade children), so the state the caller caused is the
+    // state it can report.
+    //
+    // IT19 R2 changed what the fields MEAN without changing the wire shape: `threadDelete` marks
+    // its target inactive, so `removedThreadIds` and `removedInvocationIds` name what stopped
+    // being LISTED (the roster and `agentManage`), while `removedBranchIds` is the one set that
+    // is genuinely dropped. The field names stay for wire compatibility.
+    //
+    // The branch id is taken from the ledger rather than written out: the branch counter is not
+    // per-harness, and this file's M2 case already pinned `branch-1` for ITS harness.
+    it('reports on the receipt which invocations and branches the delete released (M2 + stress report #6)', async () => {
+        let requests = 0;
+
+        const stream: HarnessStream = async function* () {
+            requests += 1;
+            if (requests === 1) {
+                for (const frame of callTool('f1', 'threadFork', '{"input":"look into it"}')) {
+                    yield frame;
+                }
+                return;
+            }
+            yield { type: 'text', delta: 'ok' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({
+            agents: { writer: brain(stream) },
+            presets: false,
+            forks: { enabled: true }
+        });
+        const thread = writer.createThread('writer');
+        await writer.sendThreadInput(thread.id, 'start');
+
+        const branchId = writer.branches()[0].branchId;
+
+        // Two terminal lookups exist before the delete: the conversation's own turn ('1') and
+        // the fork's branch invocation, both owned by `thread`.
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
+        ).resolves.toMatchObject({ invocationId: '1' });
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: branchId })
+        ).resolves.toMatchObject({ invocationId: branchId });
+
+        expect(writer.deleteThread(thread.id)).toEqual({
+            deleted: thread.id,
+            removedThreadIds: [thread.id],
+            // Registry insertion order: the conversation's run registered first, the branch's
+            // run second.
+            removedInvocationIds: ['1', branchId],
+            removedBranchIds: [branchId]
+        });
+
+        // The receipt is the truth about the LISTING: neither invocation of the released
+        // conversation is previewed by `agentManage` any more — that is the state change the
+        // caller caused and can report. `totalResults` still counts both rows, which is the
+        // retention half of the same page.
+        //
+        // A wart this page now exposes, pinned by the values rather than disputed in code: with
+        // every row hidden, `agentManage` answers `invocationCount: 0` and an empty `results`
+        // beside `truncated: true`, and the tool's own description defines that flag as "some
+        // agent has more retained invocations than the 5 shown here". The sentence is now true for
+        // a reason it does not describe (retention, not the 5-row cap), and there is no cursor to
+        // act on it — the ids are still reachable, only by id. REPORTED, not asserted: a fix here
+        // is a production change, and production is frozen for this pass.
+        const listing = (await writer.executeTool('agentManage', {})) as {
+            agents: { invocationCount: number; name: string; results: unknown[] }[];
+            totalResults: number;
+        };
+        expect(listing.agents.map((entry) => [entry.name, entry.invocationCount, entry.results])).toEqual([
+            ['writer', 0, []]
+        ]);
+        expect(listing.totalResults).toBe(2);
+
+        // Both lookups still ANSWER by id. IT19 R2 destroys nothing on a thread delete, so the
+        // rows the receipt names are retired from the listing, not deleted: only a session
+        // deletion takes them, and an id a caller still holds keeps working.
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'ok',
+            contentLength: 2,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: branchId })
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: branchId,
+            kind: 'fork',
+            status: 'completed',
+            content: 'ok',
+            contentLength: 2,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+    });
+
+    it('clears the runtime-only default owner link on reset and restore (L2)', async () => {
+        const helper = brain(scripted([answer('facts')]));
+        const lead = brain(
+            scripted([
+                callTool('d1', 'delegate', JSON.stringify({ agent: 'helper', input: 'find' })),
+                answer('lead done')
+            ])
+        );
+        const writer = harness({
+            agents: { lead, helper },
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
+            presets: false
+        });
+
+        await writer('go');
+        const afterRun = writer.thread('agent:helper')?.ownerThreadId;
+        expect(afterRun).toBe('agent:lead');
+
+        writer.reset();
+        expect(writer.thread('agent:helper')?.ownerThreadId).toBeUndefined();
+
+        await writer('go');
+        const snapshot = writer.snapshot();
+
+        // Restore onto a harness that currently carries a stale link.
+        const target = harness({
+            agents: {
+                lead: brain(
+                    scripted([
+                        callTool('d1', 'delegate', JSON.stringify({ agent: 'helper', input: 'find' })),
+                        answer('lead done')
+                    ])
+                ),
+                helper: brain(scripted([answer('facts')]))
+            },
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
+            presets: false
+        });
+        await target('go');
+        expect(target.thread('agent:helper')?.ownerThreadId).toBe('agent:lead');
+
+        target.restore(snapshot);
+        expect(target.thread('agent:helper')?.ownerThreadId).toBeUndefined();
+    });
+
+    it('preserves steering for the next host turn when a run fails without a stop', async () => {
+        const hold = gate();
+        let requests = 0;
+        // Every provider request, in order, so "the retry must not be handed the steer twice"
+        // is a fact about what the model was SENT, not an inference from the transcript.
+        const seen: HarnessStreamRequest[] = [];
+
+        const holdTool = tool({
+            description: 'Hold until released.',
+            tags: ['test'],
+            visibility: 'core',
+            // T2/R2: async — the run must keep taking requests (pause, then a failing
+            // attempt) while this call is outstanding, which is the async contract.
+            mode: 'async',
+            execute: () => hold.promise
+        });
+
+        const stream: HarnessStream = async function* (request) {
+            requests += 1;
+
+            if (requests === 1) {
+                for (const frame of callTool('h1', 'hold', '{}')) yield frame;
+                return;
+            }
+
+            if (requests === 2) {
+                yield { type: 'text', delta: 'paused' };
+                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                return;
+            }
+
+            if (requests === 3) {
+                yield { type: 'text', delta: 'partial' };
+                // R1: one attempt — this pins the failed-run steering preservation,
+                // so the retry backoff must not sit between the two requests.
+                yield { type: 'error', message: 'boom' };
+                return;
+            }
+
+            // The retry request is the one this test must be able to read: the model's prompt
+            // list is what proves the steer was not handed over twice.
+            seen.push(request);
+            yield { type: 'text', delta: 'recovered' };
+            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+        };
+
+        const writer = harness({
+            agents: { writer: brain(stream, { retry: false }) },
+            tools: { hold: holdTool },
+            presets: false
+        });
+        const thread = writer.createThread('writer');
+
+        const running = probe(writer.sendThreadInput(thread.id, 'start'));
+        await flush();
+        expect(requests).toBe(2);
+
+        // The paused run accepts guidance; it wakes, drains the steering into
+        // the transcript, and then that REQUEST fails.
+        expect(writer.steerThread(thread.id, 'focus')).toEqual({ threadId: thread.id, queued: true });
+        await flush();
+
+        expect(running.status).toBe('rejected');
+        expect((running.error as Error).message).toBe('boom');
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+
+        // IT19 R1 — the failed run's committed turns are RETAINED, and this is the shape that
+        // makes retention safe to ship: the tail ends in an assistant turn whose `hold` call was
+        // committed but never answered, so `repairInterruptedToolCalls` gives that one call exactly
+        // one synthesized result saying it has no recorded outcome. A completed call is left alone,
+        // and the text is deliberately not pinned past its honest core — the provider-error wording
+        // a crashed lane writes is a different sentence and a sibling pass owns it.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'start' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'h1', name: 'hold', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'h1',
+                name: 'hold',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            { role: 'assistant', content: 'paused' },
+            { role: 'user', content: 'focus' }
+        ]);
+
+        // R3: the cause is on the record, and presence is keyed to the EXIT, not to the status —
+        // an interrupted run comes to rest at 'idle' and the cause still has to be readable.
+        expect(writer.thread(thread.id)?.stopReason).toBe('api-error');
+
+        // The next host turn continues from that retained record, in order.
+        const retried = await writer.sendThreadInput(thread.id, 'retry');
+        expect(retried.content).toBe('recovered');
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'start' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'h1', name: 'hold', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                toolCallId: 'h1',
+                name: 'hold',
+                content: expect.stringContaining('cancelled or interrupted')
+            },
+            { role: 'assistant', content: 'paused' },
+            { role: 'user', content: 'focus' },
+            { role: 'user', content: 'retry' },
+            { role: 'assistant', content: 'recovered' }
+        ]);
+        // THE PRESERVATION IS THE RETAINED TURN, NOT A RE-SEND. The steer was drained into the
+        // transcript during the failed run, so the queue that carried it is empty and the retry
+        // request must hold `focus` exactly once — a second copy would mean the run was handed the
+        // guidance twice, which the old rollback used to hide.
+        expect(
+            (seen[0]?.messages ?? []).filter(
+                (message) => message.role === 'user' && message.content === 'focus'
+            )
+        ).toHaveLength(1);
+        // The fresh turn cleared the cause of the failed one (R3: it belonged to the run that ended).
+        expect(writer.thread(thread.id)?.stopReason).toBeUndefined();
+        expect(requests).toBe(4);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// C4: `setThreadMessages` — the wholesale transcript REPLACEMENT primitive the
+// server's transcript editor (GET/PUT .../threads/:id/transcript) is built on.
+//
+// Pinned here (implementation: setThreadMessages in src/harness.ts):
+//   - validation uses the SAME reader snapshot()/restore() enforce, so a write
+//     this harness accepts can never produce a snapshot its own restore refuses;
+//   - a refused write mutates NOTHING (validate before mutate);
+//   - replacement is IN PLACE, so a caller holding `agent.messages` (the run loop,
+//     the server roster) keeps seeing the current transcript;
+//   - live work is refused; a STOPPED conversation is writable — that is exactly
+//     the repair path a broken transcript needs;
+//   - the submitted array is copied (detached), and persistence is notified with
+//     the existing `agent_message` reason while NO progress event is emitted.
+// ---------------------------------------------------------------------------
+describe('thread transcript replacement (C4 setThreadMessages)', () => {
+    it('replaces a host transcript wholesale and reports it to persistence only', () => {
+        const changes: { type: string; reason?: string; agent?: string }[] = [];
+        const progress: unknown[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false,
+            report: {
+                // Contextually typed by HarnessConfiguration, so the event shapes
+                // stay the compiler's business, not this file's.
+                progress: (event) => {
+                    progress.push(event);
+                },
+                stateChange: (event) => {
+                    changes.push(event);
+                }
+            }
+        });
+
+        const thread = writer.createThread('writer', { label: 'Editor' });
+        // A thread of an instruction-less agent starts empty: every expectation
+        // below is therefore about THIS write, not about a seed.
+        expect(writer.threadMessages(thread.id)).toEqual([]);
+
+        // `createThread` notified the roster first (`reason: 'thread'`). The
+        // recording window below starts at the write under test, so its assertion
+        // is about exactly one operation.
+        expect(changes).toEqual([{ type: 'state_change', reason: 'thread' }]);
+        changes.length = 0;
+        progress.length = 0;
+
+        writer.setThreadMessages(thread.id, [
+            { role: 'system', content: 'seed' },
+            { role: 'user', content: 'rewritten' }
+        ]);
+
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'system', content: 'seed' },
+            { role: 'user', content: 'rewritten' }
+        ]);
+
+        // The snapshot sees it, so the next save of this harness IS the new truth.
+        expect(withoutIds(writer.snapshot().threads)).toEqual([
+            {
+                id: 'thread-1',
+                agent: 'writer',
+                status: 'idle',
+                sequence: 2,
+                label: 'Editor',
+                messages: [
+                    { role: 'system', content: 'seed' },
+                    { role: 'user', content: 'rewritten' }
+                ]
+            }
+        ]);
+
+        // Persistence is notified once, with the EXISTING reason and the owning
+        // agent. The write is a host edit, not model output, so nothing streamed.
+        expect(changes).toEqual([{ type: 'state_change', reason: 'agent_message', agent: 'writer' }]);
+        expect(progress).toEqual([]);
+
+        // Round-trip: a snapshot of this harness restores the replaced transcript.
+        const restored = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+        restored.restore(writer.snapshot());
+        expect(withoutIds(restored.threadMessages('thread-1'))).toEqual([
+            { role: 'system', content: 'seed' },
+            { role: 'user', content: 'rewritten' }
+        ]);
+    });
+
+    it('replaces the live array in place, so an existing reference keeps working', () => {
+        const entry = brain(scripted([answer('unused')]));
+        const writer = quiet(entry);
+
+        // `agent.messages` is the LIVE array the run loop appends to (restore()
+        // mutates it the same way). The primitive must not swap the reference.
+        const live = writer.agents.writer.messages;
+        expect(live).toEqual([]);
+
+        writer.setThreadMessages('agent:writer', [{ role: 'user', content: 'kept' }]);
+
+        expect(writer.agents.writer.messages).toBe(live);
+        expect(withoutIds(writer.agents.writer.messages)).toEqual([{ role: 'user', content: 'kept' }]);
+        // The default conversation and the registry transcript are one and the
+        // same thing, which is why an in-place write matters here.
+        expect(withoutIds(writer.threadMessages('agent:writer'))).toEqual([{ role: 'user', content: 'kept' }]);
+    });
+
+    it('detaches the submitted value, validates it, and mutates nothing on refusal', () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+        const thread = writer.createThread('writer');
+
+        // An unknown id is the same honest error every thread operation throws.
+        expect(() => writer.setThreadMessages('thread-99', [{ role: 'user', content: 'x' }])).toThrow(
+            'Thread "thread-99" is not available in this harness; it was never created, or it was deleted.'
+        );
+
+        // Bad role / non-array / missing field: the shared reader's own wording,
+        // labelled with the thread it belongs to.
+        expect(() => writer.setThreadMessages(thread.id, [{ role: 'bogus', content: 'x' } as never])).toThrow(
+            'thread "thread-1" messages[0].role must be one of: system, user, assistant, tool.'
+        );
+        expect(() => writer.setThreadMessages(thread.id, { not: 'an array' } as never)).toThrow(
+            'thread "thread-1" messages must be an array.'
+        );
+        expect(() => writer.setThreadMessages(thread.id, [{ role: 'user' } as never])).toThrow(
+            'thread "thread-1" messages[0] is missing the field "content".'
+        );
+
+        // A refused write left the conversation exactly as it was.
+        expect(writer.threadMessages(thread.id)).toEqual([]);
+
+        // The accepted write is COPIED: mutating the caller's array afterwards
+        // cannot rewrite the stored transcript (restore's detachment rule).
+        const submitted = [{ role: 'user' as const, content: 'one' }];
+        writer.setThreadMessages(thread.id, submitted);
+        submitted[0].content = 'mutated';
+        submitted.push({ role: 'user', content: 'appended' });
+
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([{ role: 'user', content: 'one' }]);
+
+        // An empty transcript is legal (the editor's "clear" action).
+        writer.setThreadMessages(thread.id, []);
+        expect(writer.threadMessages(thread.id)).toEqual([]);
+        expect(writer.snapshot().threads?.[0]?.messages).toEqual([]);
+    });
+
+    it('refuses a running conversation and accepts a stopped or settled one', async () => {
+        const slow = gatedAnswer('late');
+        const writer = quiet(brain(slow.stream));
+        const thread = writer.createThread('writer');
+
+        const pending = writer.sendThreadInput(thread.id, 'start');
+        const running = probe(pending);
+        await flush();
+
+        expect(writer.thread(thread.id)?.status).toBe('running');
+        expect(() => writer.setThreadMessages(thread.id, [{ role: 'user', content: 'too late' }])).toThrow(
+            'Thread "thread-1" is running; stop it before replacing its transcript.'
+        );
+        // The refusal left the run's own transcript alone.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([{ role: 'user', content: 'start' }]);
+
+        slow.ready.open();
+        expect(running.status).toBe('pending');
+        const answerMessage = await pending;
+        expect(answerMessage.content).toBe('late');
+
+        // Settled: the same write now lands and replaces EVERYTHING, including the
+        // transcript the run just committed.
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'start' },
+            { role: 'assistant', content: 'late' }
+        ]);
+
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: 'after the run' }]);
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'after the run' }
+        ]);
+
+        // A STOPPED conversation stays editable — repairing a broken transcript on
+        // a stopped thread is the recovery path the visualiser needs.
+        writer.stopThread(thread.id);
+        expect(writer.thread(thread.id)?.status).toBe('stopped');
+
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: 'repaired while stopped' }]);
+        expect(writer.threadMessages(thread.id)).toEqual([
+            // A replaced transcript is a NEW conversation state, so the reader mints its
+            // addresses from the top of the new list (context T1.3) — the id is pinned
+            // exactly here because this write is one of the entry points that backfills.
+            { role: 'user', content: 'repaired while stopped', messageId: 'msg-1' }
+        ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Policy 2026-11-09 (docs/tasks/2026-11-09-thread-timeout-policy.md) —
+//   T5.3  no thread other than a delegated child has EVER had a clock, and the
+//         host thread is the second half of that regression guard (the fork half
+//         is in src/harness.fork.test.ts);
+//   T6    "a stopped thread restarts when a new prompt is sent" (R3) means the
+//         HOST prompt. The host (operator/server) owns stopping AND reviving; an
+//         agent message never revives a stopped conversation. That is the reading
+//         both task docs now record, and it is what the sibling entry's T3.3 keeps.
+// ---------------------------------------------------------------------------
+
+describe('a host turn has no wall-clock bound (policy 2026-11-09 T5.3)', () => {
+    it('keeps a host turn in flight past the bound a delegated child used to get, and answers on its own', async () => {
+        const model = gatedAnswer('the late answer');
+        const writer = quiet(brain(model.stream));
+        const thread = writer.createThread('writer', { label: 'Long' });
+
+        const running = probe(writer.sendThreadInput(thread.id, 'take your time'));
+        await flush();
+
+        expect(model.arrivals()).toBe(1);
+        expect(writer.thread(thread.id)?.status).toBe('running');
+
+        // THE ELAPSED-TIME JUMP. This file fakes Date ONLY (see the clock policy at
+        // the top: real timers are what the gated transports need), so a fake-timer
+        // callback cannot fire here and nothing in the harness may consult a clock
+        // for a turn deadline. What this rules out is the OTHER shape a thread limit
+        // takes — `Date.now() - startedAt > bound` checked at a loop boundary. The
+        // timer-shaped bound is ruled out for the fork path in
+        // src/harness.fork.test.ts, where fake timers own setTimeout as well.
+        vi.setSystemTime(new Date(EPOCH_MS + 300_001));
+        await flush();
+        expect(running.status).toBe('pending');
+        expect(writer.thread(thread.id)?.status).toBe('running');
+
+        // Two and a half more minutes of elapsed time: still nothing to time out.
+        vi.setSystemTime(new Date(EPOCH_MS + 300_001 + 1_200_000));
+        await flush();
+        expect(running.status).toBe('pending');
+        expect(writer.thread(thread.id)?.status).toBe('running');
+        expect(model.arrivals()).toBe(1);
+
+        // It finishes because the provider answered, not because a deadline passed.
+        model.ready.open();
+        await flush();
+
+        expect(running.status).toBe('resolved');
+        expect(running.value?.content).toBe('the late answer');
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+    });
+});
+
+describe('a stopped thread is revived by a host only (policy 2026-11-09 T6)', () => {
+    it('refuses an agent message, stays stopped, and accepts the next host turn', async () => {
+        const writer = quiet(brain(scripted([answer('host resumed')])));
+        const thread = writer.createThread('writer', { label: 'Stopped' });
+
+        // The thread tools are conditional; owning an independent thread is what
+        // registers `threadSend`, so the agent-facing door under test exists here.
+        expect(writer.tools.threadSend).toBeDefined();
+
+        // Real work on the record BEFORE the stop, so the assertion below that "the refusal moved
+        // nothing" is a statement about RETAINED turns (IT19 R1) rather than about emptiness.
+        expect((await writer.sendThreadInput(thread.id, 'a turn')).content).toBe('host resumed');
+
+        writer.stopThread(thread.id, 'operator stop');
+        expect(writer.thread(thread.id)?.status).toBe('stopped');
+
+        // THE REFUSAL. `threadSend` is an agent talking to another conversation, not
+        // the host, so a stopped thread cannot receive it. This is deliberate
+        // (src/harness.ts `postThreadMessage`, and the comment on `sendThreadInput`
+        // that only an explicit HOST turn revives a stopped conversation): folding
+        // `stopped` into an auto-restart would silently undo a user's Stop.
+        await expect(
+            writer.executeTool('threadSend', { thread: thread.id, message: 'agent ping' })
+        ).rejects.toThrow(
+            `Thread "${thread.id}" is stopped; it cannot receive messages until a host resumes or deletes it.`
+        );
+
+        // The refusal changes nothing: no revival, and no text appended on top of the turns the
+        // stopped conversation already owns. A `stopThread` with no run in flight also records no
+        // CAUSE, because there was no run to classify — the cause belongs to a run, not to a status.
+        expect(writer.thread(thread.id)?.status).toBe('stopped');
+        expect(writer.thread(thread.id)?.stopReason).toBeUndefined();
+        expect(withoutIds(writer.threadMessages(thread.id))).toEqual([
+            { role: 'user', content: 'a turn' },
+            { role: 'assistant', content: 'host resumed' }
+        ]);
+
+        // THE OWNER. R3 ("a stopped thread can always be restarted by sending it a
+        // new prompt") is the HOST path, and this is the surface that implements it —
+        // and since IT19 R1 it continues the retained conversation rather than replacing it.
+        const message = await writer.sendThreadInput(thread.id, 'host resumes');
+
+        expect(message.content).toBe('host resumed');
+        expect(writer.thread(thread.id)?.status).toBe('idle');
+        expect(textOf(writer.threadMessages(thread.id))).toEqual([
+            'a turn',
+            'host resumed',
+            'host resumes',
+            'host resumed'
+        ]);
+    });
+
+    // IT19 R5 — THE THIRD RECEIPT, AND THE LINE BETWEEN THE TWO KINDS OF STOP.
+    //
+    // R1 made a cut-short run keep its turns, so a `stopped` conversation can now have work in
+    // hand, and a peer's message is the thing that continues it. `postThreadMessage` reads the
+    // CAUSE on the record (`stopReason`, R3) and answers `delivered: 'resumed'` for a cause that
+    // was never an instruction (`src/harness.ts` `RESUMMABLE_RUN_STOP_REASONS`), while
+    // `user-stopped` keeps the refusal of the test above — stopping is the host's intent — and so
+    // does `plugin-parked` and an absent cause.
+    //
+    // WHY THE TWO RECORDS ARRIVE THROUGH A DOCUMENT: every LIVE producer of `status: 'stopped'`
+    // writes a NON-resummable cause (the stop family stamps `user-stopped`, a plugin's
+    // `turn.before` stop stamps `plugin-parked`), so an interrupted run normally comes to rest at
+    // `idle` with its cause beside it. `stopped` PLUS a resummable cause is the DURABLE shape —
+    // the row a session carries after a run was cut short by a released call, an expired clock or
+    // an exhausted turn cap — and `HarnessThreadSnapshot.stopReason` is the field that carries it
+    // across the restart (`src/harness.ts:13904` writes exactly that pair). It is also the shape a
+    // consumer branches on, so pinning it here is the honest form; inventing a live race would pin
+    // a coincidence instead.
+    it('resumes a stopped thread whose cause was not an instruction, and refuses one the host stopped (R5)', async () => {
+        const source = quiet(brain(scripted([answer('carried on')])));
+        const interrupted = source.createThread('writer', { label: 'Cut short' });
+        const halted = source.createThread('writer', { label: 'Host stopped' });
+
+        // Both conversations have real work on the record before either is stopped, so the
+        // difference the send has to respect is the CAUSE, not whether anything is there.
+        await source.sendThreadInput(interrupted.id, 'work in hand');
+        await source.sendThreadInput(halted.id, 'other work');
+
+        const document = source.snapshot();
+        const rows = document.threads ?? [];
+        rows[0].status = 'stopped';
+        rows[0].stopReason = 'turn-cap';
+        rows[1].status = 'stopped';
+        rows[1].stopReason = 'user-stopped';
+
+        const writer = quiet(brain(scripted([answer('carried on')])));
+        writer.restore(document);
+
+        // Both are `stopped`, and from the roster alone they are indistinguishable — which is the
+        // whole point of R3: the cause is what decides, and it is durable.
+        expect(
+            writer.threads().map((record) => [record.id, record.status, record.stopReason])
+        ).toEqual([
+            ['agent:writer', 'idle', undefined],
+            [interrupted.id, 'stopped', 'turn-cap'],
+            [halted.id, 'stopped', 'user-stopped']
+        ]);
+
+        // RESUMABLE: the message continues the retained conversation, and the receipt says so —
+        // `resumed`, never `started`, so a caller is never told an interruption went unnoticed.
+        await expect(
+            writer.executeTool('threadSend', { thread: interrupted.id, message: 'continue' })
+        ).resolves.toEqual({
+            threadId: interrupted.id,
+            delivered: 'resumed',
+            sender: 'writer'
+        });
+
+        await settleThread(writer, interrupted.id);
+
+        // THE STOP WAS LIFTED AND THE CAUSE CLEARED with the turn that replaced it, and the run
+        // appended to the RETAINED transcript instead of starting a blank conversation.
+        expect(withoutIds(writer.thread(interrupted.id))).toEqual({
+            id: interrupted.id,
+            agent: 'writer',
+            origin: 'host',
+            status: 'idle',
+            sequence: 2,
+            label: 'Cut short',
+            invocationId: '3',
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+        expect(withoutIds(writer.threadMessages(interrupted.id))).toEqual([
+            { role: 'user', content: 'work in hand' },
+            { role: 'assistant', content: 'carried on' },
+            { role: 'user', content: 'from agent "writer":\ncontinue' },
+            { role: 'assistant', content: 'carried on' }
+        ]);
+
+        // NOT RESUMABLE: a host stop is an instruction, and only the host lifts it. Same door, same
+        // target status, opposite answer — and the refusal mutates nothing: no queue entry, no
+        // append, no run, and the cause stays on the record for the next reader.
+        await expect(
+            writer.executeTool('threadSend', { thread: halted.id, message: 'continue' })
+        ).rejects.toThrow(
+            `Thread "${halted.id}" is stopped; it cannot receive messages until a host resumes or deletes it.`
+        );
+
+        expect(withoutIds(writer.thread(halted.id))).toEqual({
+            id: halted.id,
+            agent: 'writer',
+            origin: 'host',
+            status: 'stopped',
+            sequence: 3,
+            label: 'Host stopped',
+            invocationId: '2',
+            epoch: HARNESS_PROCESS_EPOCH,
+            stopReason: 'user-stopped'
+        });
+        expect(withoutIds(writer.threadMessages(halted.id))).toEqual([
+            { role: 'user', content: 'other work' },
+            { role: 'assistant', content: 'carried on' }
+        ]);
+
+        // The host door is still the way back into a host-stopped conversation, and it answers
+        // `'started'` (a fresh turn), never `'resumed'`.
+        const revived = await writer.sendThreadInput(halted.id, 'host resumes');
+        expect(revived.content).toBe('carried on');
+        expect(writer.thread(halted.id)?.status).toBe('idle');
+        expect(writer.thread(halted.id)?.stopReason).toBeUndefined();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// delegate-stress 2026-11-08, finding 3 (docs/tasks/2026-11-08-delegate-stress-
+// test.md T3.1–T3.6) — `threadSend` is ONE state-aware operation, decided by the
+// RUNTIME (src/harness.ts `postThreadMessage`) rather than by the HTTP layer that
+// used to own it (`src/server/sessions.ts` `steerIntoThread`):
+//
+//   running → STEER  (`delivered: 'queued'`)  — drained into the live run
+//   idle    → START  (`delivered: 'started'`) — the message is the new prompt
+//   paused  → QUEUE  (`delivered: 'queued'`)  — the park SURVIVES the message (T8: the
+//             holder owns `resume`; only a host `sendThreadInput` lifts a park)
+//   stopped → the same throw (T3.3 — the host owns stopping and reviving), with ONE
+//             exception since IT19 R5: a stop whose recorded CAUSE was never an instruction
+//             (a released call, an expired clock, an exhausted provider — see
+//             `RESUMMABLE_RUN_STOP_REASONS`) is continued instead, and answers
+//             `delivered: 'resumed'`. `user-stopped`, `plugin-parked` and an absent cause
+//             stay in the throw, and the pair is pinned in the T6 group above.
+//
+// The rest of the finding's checks are pinned where they already live:
+//   T3.4 — src/server/workers/capability.test.ts, unchanged: `threadSend` stays in
+//          `AUTHORITY_RUNTIME_METHODS` and out of `NESTED_RUN_ARMED_DOORS`, because
+//          the merge never awaits the answer (non-blocking is what keeps a chat
+//          primitive from becoming a nested run);
+//   T3.5 — the `steerThread`/`sendThreadInput` tests above, whose signatures and
+//          return types (`HarnessThreadSteerReceipt`, `HarnessAssistantMessage`) the
+//          merge deliberately did not touch;
+//   T3.6 — `delivered` is now `'queued' | 'started' | 'resumed'` (IT19 R5 added the third),
+//          and every value below is the reachability proof for one of them. `'appended'` is
+//          retired: with a dormant target now started, nothing is ever parked unread.
+// ---------------------------------------------------------------------------
+
+describe('threadSend is state-aware (delegate-stress T3.1–T3.6)', () => {
+    // T3.1 — THE LOAD-BEARING UNCERTAINTY of the finding: the interrupt path was
+    // read from source and never observed, because the one live attempt landed after
+    // the child had already finished. Here the target is PROVABLY mid-request (its
+    // first answer is held behind a gate) when the send lands, and the assertion is
+    // about the child's ANSWER: the model restates the steered text, which an inert
+    // append could never produce.
+    it('steers a genuinely running conversation and its next turn reflects the message (T3.1)', async () => {
+        const heldAnswer = gate();
+        const seen: HarnessStreamRequest[] = [];
+        let targetRequests = 0;
+
+        const stream = routed(
+            {
+                // The sender is a model in a live run of its own, so the call goes
+                // through the real tool path (runtime-derived sender + senderThreadId).
+                'tell beta to stop': scripted([
+                    callTool(
+                        'c1',
+                        'threadSend',
+                        JSON.stringify({
+                            thread: 'thread-2',
+                            message: 'count to 30, not 120'
+                        })
+                    ),
+                    answer('alpha told beta')
+                ]),
+                // The target: request 1 is held so the run is genuinely in flight;
+                // request 2 answers FROM THE TRANSCRIPT, which is what proves the
+                // steer reached the model rather than only the history.
+                'count to 120': async function* (request) {
+                    seen.push(request);
+                    targetRequests += 1;
+
+                    if (targetRequests === 1) {
+                        await heldAnswer.promise;
+                        yield { type: 'text', delta: 'REACHED: 120' };
+                        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                        return;
+                    }
+
+                    const users = request.messages.filter(
+                        (message) => message.role === 'user'
+                    ) as { content?: string }[];
+                    yield {
+                        type: 'text',
+                        delta: `last instruction: ${users[users.length - 1]?.content ?? 'none'}`
+                    };
+                    yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                }
+            },
+            scripted([answer('unexpected')])
+        );
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const alpha = writer.createThread('writer');
+        // LINEAGE (2026-11-13): beta is alpha's CHILD, not its sibling, so alpha's model
+        // may steer it (a sibling send is refused — pinned in its own test below).
+        const beta = writer.createThread('writer', { ownerThreadId: alpha.id });
+
+        const running = writer.sendThreadInput(beta.id, 'count to 120');
+        await flush();
+
+        // The target is in flight: one request has arrived and no answer exists yet.
+        expect(targetRequests).toBe(1);
+        expect(writer.thread(beta.id)?.status).toBe('running');
+
+        // THE SEND ITSELF. The sender's own turn COMPLETES while beta's request is
+        // still held — that is the non-blocking half of T3.2 on the running branch.
+        const sender = await writer.sendThreadInput(alpha.id, 'tell beta to stop');
+        expect(sender.content).toBe('alpha told beta');
+        expect(targetRequests).toBe(1);
+        expect(writer.thread(beta.id)?.status).toBe('running');
+
+        expect(JSON.parse(toolResultsOf(writer.threadMessages(alpha.id))[0]!)).toEqual({
+            threadId: beta.id,
+            delivered: 'queued',
+            sender: 'writer',
+            senderThreadId: alpha.id
+        });
+
+        // Nothing landed inside the request that was already in flight (R5).
+        expect(withoutIds(writer.threadMessages(beta.id))).toEqual([
+            { role: 'user', content: 'count to 120' }
+        ]);
+
+        heldAnswer.open();
+        await running;
+
+        // THE ANSWER CHANGED. The steered text became a user message at the boundary
+        // and the very next turn answered to it: 120 is what the first request was
+        // working on, and the restated instruction is what the steer produced.
+        expect(withoutIds(writer.threadMessages(beta.id))).toEqual([
+            { role: 'user', content: 'count to 120' },
+            { role: 'assistant', content: 'REACHED: 120' },
+            {
+                role: 'user',
+                content: 'from agent "writer" (thread thread-1):\ncount to 30, not 120'
+            },
+            {
+                role: 'assistant',
+                content:
+                    'last instruction: from agent "writer" (thread thread-1):\ncount to 30, not 120'
+            }
+        ]);
+        expect(textOf(seen[1]!.messages)).toEqual([
+            'count to 120',
+            'REACHED: 120',
+            'from agent "writer" (thread thread-1):\ncount to 30, not 120'
+        ]);
+        expect(writer.thread(beta.id)?.status).toBe('idle');
+    });
+
+    // T3.2 + T3.6 — an idle conversation is no longer a parking lot for a message:
+    // the send starts a run, and the receipt says so without waiting for the answer.
+    it('starts a run in an idle conversation and returns before the answer exists (T3.2, T3.6)', async () => {
+        const model = gatedAnswer('the late answer');
+        const writer = quiet(brain(model.stream));
+        const target = writer.createThread('writer', { label: 'Idle' });
+
+        expect(writer.thread(target.id)?.status).toBe('idle');
+
+        const receipt = probe(
+            writer.executeTool('threadSend', { thread: target.id, message: 'wake up' })
+        );
+        await flush();
+
+        // The receipt is in, and the run it promised is live but UNANSWERED: the
+        // provider has been reached and the reply is still behind the gate. A send
+        // that awaited the answer could not report both of these facts at once.
+        expect(receipt.status).toBe('resolved');
+        expect(receipt.value).toEqual({
+            threadId: target.id,
+            delivered: 'started',
+            sender: 'writer'
+        });
+        expect(model.arrivals()).toBe(1);
+        expect(writer.thread(target.id)?.status).toBe('running');
+
+        model.ready.open();
+        await settleThread(writer, target.id);
+
+        // The attributed message IS the run's prompt, and the answer is its own.
+        expect(withoutIds(writer.threadMessages(target.id))).toEqual([
+            { role: 'user', content: 'from agent "writer":\nwake up' },
+            { role: 'assistant', content: 'the late answer' }
+        ]);
+        expect(writer.thread(target.id)?.status).toBe('idle');
+    });
+
+    // T3.2 — the `paused` gap, REVISED by compaction T8 (2026-11-10). This case used to
+    // pin "lift the park, then start a turn"; T8 retired that because a message that
+    // merely ARRIVES at a parked conversation was stealing the turn of whoever parked it
+    // (the compaction holder). A `turn.before` hook still parks the conversation and
+    // never resumes it, so the park outlives the run exactly as
+    // src/harness.plugin.test.ts pins — and the send now queues.
+    it('queues into a plugin park and leaves the parked conversation alone (T3.2, T8)', async () => {
+        const observed: string[] = [];
+        let parkOnce = true;
+
+        const writer = harness({
+            agents: {
+                writer: brain(scripted([answer('first answer'), answer('second answer')]))
+            },
+            plugins: [
+                {
+                    name: 'parker',
+                    setup: (api) => {
+                        api.on('thread.resumed', (payload) => {
+                            observed.push(`resumed:${payload.status}`);
+                        });
+                        api.on('turn.before', async (payload) => {
+                            if (!parkOnce) return;
+                            parkOnce = false;
+                            // Parked, and deliberately never resumed by the plugin.
+                            await payload.pause();
+                        });
+                    }
+                }
+            ],
+            presets: false
+        });
+
+        const target = writer.createThread('writer', { label: 'Parked' });
+        await writer.sendThreadInput(target.id, 'first turn');
+
+        expect(writer.thread(target.id)?.status).toBe('paused');
+        expect(observed).toEqual([]);
+
+        await expect(
+            writer.executeTool('threadSend', { thread: target.id, message: 'carry on' })
+        ).resolves.toEqual({
+            threadId: target.id,
+            delivered: 'queued',
+            sender: 'writer'
+        });
+
+        // THE PARK IS NOT LIFTED: no `thread.resumed` for the plugin that parked it, the
+        // record is still `paused`, and the attributed text has not reached the
+        // transcript — it sits in the thread's queue until a boundary drains it.
+        expect(observed).toEqual([]);
+        expect(writer.thread(target.id)?.status).toBe('paused');
+        expect(withoutIds(writer.threadMessages(target.id))).toEqual([
+            { role: 'user', content: 'first turn' },
+            { role: 'assistant', content: 'first answer' }
+        ]);
+
+        // A HOST turn remains the revival path (unchanged; pinned from the plugin side in
+        // src/harness.thread-park-queue.test.ts). Un-parking returns the record to the
+        // status the run loop would give it — `idle`, because the parked run had already
+        // ended — and the queued message then becomes a user turn at the new run's FIRST
+        // boundary, after that run's own prompt (`drainThreadQueue`).
+        await writer.sendThreadInput(target.id, 'host turn');
+
+        expect(observed).toEqual(['resumed:idle']);
+        expect(withoutIds(writer.threadMessages(target.id))).toEqual([
+            { role: 'user', content: 'first turn' },
+            { role: 'assistant', content: 'first answer' },
+            { role: 'user', content: 'host turn' },
+            { role: 'user', content: 'from agent "writer":\ncarry on' },
+            { role: 'assistant', content: 'second answer' }
+        ]);
+        expect(writer.thread(target.id)?.status).toBe('idle');
+    });
+
+    // T3.3 — the merge covers idle and paused, NOT stopped. Pinned here from a real
+    // model-driven call (the sibling T6 test above pins the manual host door); the
+    // throw must survive as an ordinary failed tool result, so the caller learns the
+    // refusal instead of quietly resurrecting a conversation the operator stopped.
+    it('leaves a stopped conversation untouched when a model sends into it (T3.3)', async () => {
+        const writer = harness({
+            agents: {
+                writer: brain(
+                    routed(
+                        {
+                            // The target's own turn: it answers, so the transcript the refusal
+                            // below must leave alone is REAL retained content.
+                            'beta work': scripted([answer('beta was here')]),
+                            // The sender is a model in a run of its own, so the call goes through
+                            // the real tool path and the refusal comes back as a tool result.
+                            'ping the stopped one': scripted([
+                                callTool(
+                                    'c1',
+                                    'threadSend',
+                                    JSON.stringify({ thread: 'thread-2', message: 'agent ping' })
+                                ),
+                                answer('alpha read the refusal')
+                            ])
+                        },
+                        scripted([answer('unexpected')])
+                    )
+                )
+            },
+            presets: false
+        });
+
+        const alpha = writer.createThread('writer');
+        const beta = writer.createThread('writer');
+
+        // IT19 R1: `beta` ran and answered BEFORE the operator stopped it, and those turns are
+        // retained — which is what makes "the refusal moved nothing" an assertion with a subject.
+        await writer.sendThreadInput(beta.id, 'beta work');
+
+        writer.stopThread(beta.id, 'operator stop');
+
+        const message = await writer.sendThreadInput(alpha.id, 'ping the stopped one');
+        expect(message.content).toBe('alpha read the refusal');
+
+        expect(toolResultsOf(writer.threadMessages(alpha.id))).toEqual([
+            `Tool "threadSend" failed: Thread "${beta.id}" is stopped; it cannot receive messages until a host resumes or deletes it.`
+        ]);
+
+        // Nothing moved: no revival, no queued guidance, and no line added to the retained
+        // transcript. A stop with no run in flight also carries no `stopReason` — the record pair
+        // `status: 'stopped'` without a cause is the shape of "the host halted this, and there was
+        // no run to classify", and `postThreadMessage` refuses that combination on purpose.
+        expect(writer.thread(beta.id)).toEqual({
+            id: beta.id,
+            agent: 'writer',
+            origin: 'host',
+            status: 'stopped',
+            sequence: 3,
+            invocationId: '1',
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+        expect(withoutIds(writer.threadMessages(beta.id))).toEqual([
+            { role: 'user', content: 'beta work' },
+            { role: 'assistant', content: 'beta was here' }
+        ]);
+    });
+});
+// ---------------------------------------------------------------------------
+// B3 / B4 / B5 (2026-11-13) — the thread family is the address space
+// ---------------------------------------------------------------------------
+//
+// Before this, EVERY thread id was a global id: `threadList` printed the session, and
+// `threadSend`/`threadRead`/`threadDelete` accepted any id it printed. In a fan-out
+// session (issue 0027: one parent, nineteen delegated children) a settled child could
+// therefore post into a sibling subtree it had never spoken to, read a conversation nobody
+// pointed it at, and drown in roster rows it could not act on. The three findings are one
+// rule seen from three doors:
+//
+//   B3 the roster (`threadList`) and the two reads (`harness.thread`,
+//      `harness.threadMessages`, the `threadRead` tool) see the caller's THREAD FAMILY —
+//      itself, its ancestors, its descendants however deep, and the DEFAULT conversations
+//      of the agents that family spans. A sibling is NOT in the family: it shares an
+//      ancestor, and this caller did not create it.
+//   B4 `threadSend` accepts exactly the ids B3 makes visible, and a caller may not START a
+//      conversation it is already standing in (its own thread, or this agent's idle
+//      default) — starting those is a nested run with worse manners, not a chat.
+//   B5 `threadDelete` is the NARROWEST door: strict descendants only, and its receipt
+//      names every conversation that actually left, cascade included.
+//
+// A CALLER WITH NO THREAD (the host, a plugin outside any conversation, a manual
+// `executeTool`) stays UNSCOPED everywhere, and that is pinned once per group: the host is
+// the one party allowed to address any conversation, and the server's thread surfaces
+// depend on it staying true.
+//
+// The model-facing refusals go through REAL TURNS, because `executeTool(name, parameters)`
+// takes no caller thread — it is the unscoped host door by construction and cannot
+// exhibit a guard. One thread therefore runs one scripted SEQUENCE of door calls, one per
+// turn; `routed` keys on a thread's first prompt, so a thread with several turns cannot
+// also be several scenarios.
+describe('thread family visibility, send policy, and release (B3/B4/B5)', () => {
+    // One thread calling thread doors once per turn, then answering. The arguments are
+    // THUNKS because the ids they name do not exist until the fixture has created the
+    // threads, and a route table is declared before that.
+    const modelDoors = (
+        calls: Array<{ name: string; args: () => Record<string, unknown> }>,
+        reply: string
+    ): HarnessStream => {
+        let turn = 0;
+
+        return async function* stream() {
+            const call = calls[turn];
+            turn += 1;
+
+            const frames =
+                call === undefined
+                    ? answer(reply)
+                    : callTool(`m${turn}`, call.name, JSON.stringify(call.args()));
+
+            for (const frame of frames) yield frame;
+        };
+    };
+
+    // The SAME doors, one per HOST TURN. Every call is followed by an answer step, which
+    // ENDS that run: a harness keeps taking model turns while the model calls tools, so
+    // without the answer step a list of calls all lands inside ONE run — and these cases
+    // are about a LATER turn of the conversation, after the situation changed.
+    const modelTurns = (
+        calls: Array<{ name: string; args: () => Record<string, unknown> }>,
+        reply: string
+    ): HarnessStream => {
+        let step = 0;
+
+        return async function* stream() {
+            const index = step;
+            step += 1;
+
+            const call = calls[Math.floor(index / 2)];
+            const frames =
+                call === undefined || index % 2 === 1
+                    ? answer(reply)
+                    : callTool(
+                          `m${Math.floor(index / 2) + 1}`,
+                          call.name,
+                          JSON.stringify(call.args())
+                      );
+
+            for (const frame of frames) yield frame;
+        };
+    };
+
+    // The single-call form, which is most of these cases.
+    const modelDoor = (
+        name: string,
+        args: () => Record<string, unknown>,
+        reply: string
+    ): HarnessStream => modelDoors([{ name, args }], reply);
+
+    // Every recorded tool result of one conversation, in call order. A refusal reaches the
+    // model as `Tool "<name>" failed: <message>` (src/harness.ts), which is exactly what
+    // these assertions read back out of the sender's transcript.
+    const doorResults = (host: Harness, threadId: string): string[] =>
+        toolResultsOf(host.threadMessages(threadId));
+
+    const firstResult = (host: Harness, threadId: string): string => doorResults(host, threadId)[0] ?? '';
+
+    // A conversation tree the HOST opened, spanning two agents:
+    //   parent (writer)  <- child (writer)  <- borrowed (scout)
+    //   sibling (writer) — no owner, so OUTSIDE child's family
+    // plus the two default conversations `agent:writer` and `agent:scout`.
+    const lineage = (
+        routes: Record<string, HarnessStream>,
+        scoutRoutes: Record<string, HarnessStream> = {}
+    ) => {
+        const writer = harness({
+            agents: {
+                writer: brain(routed(routes, scripted([answer('writer answers')]))),
+                scout: brain(routed(scoutRoutes, scripted([answer('scout answers')])))
+            },
+            presets: false
+        });
+
+        const parent = writer.createThread('writer');
+        const child = writer.createThread('writer', { ownerThreadId: parent.id });
+        const sibling = writer.createThread('writer');
+        const borrowed = writer.createThread('scout', { ownerThreadId: child.id });
+
+        return { writer, parent, child, sibling, borrowed };
+    };
+
+    // The family of `child`, in roster order (sequence, which is creation order). The two
+    // defaults come first because the harness mints one per agent up front.
+    const childFamily = (ids: { parent: string; child: string; borrowed: string }): string[] => [
+        'agent:writer',
+        'agent:scout',
+        ids.parent,
+        ids.child,
+        ids.borrowed
+    ];
+
+    it('a scoped roster is session-wide, and names the family it may act on (B3)', async () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({
+            'who can I see?': modelDoor('threadList', () => ({}), 'roster read')
+        });
+
+        await writer.sendThreadInput(child.id, 'who can I see?');
+
+        const roster = JSON.parse(firstResult(writer, child.id)) as {
+            currentThreadId?: string;
+            actOn?: string[];
+            threads: Record<string, unknown>[];
+        };
+
+        // SESSION-WIDE ROWS, FAMILY-SCOPED ACT (2026-11-15). Every live conversation is listed —
+        // the ancestor, the conversation two levels down (a scout thread, because the family spans
+        // agents), BOTH defaults, AND `sibling`, a host thread this caller never created. A READ
+        // reaches the whole session, so a prompt that names a sibling must be able to FIND it.
+        // What the lineage rule still owns is stated as `actOn`: the ids `threadSend` and
+        // `threadDelete` will accept, and that set excludes `sibling`.
+        expect(roster.currentThreadId).toBe(child.id);
+        expect(roster.actOn).toEqual(
+            childFamily({ parent: parent.id, child: child.id, borrowed: borrowed.id }).sort()
+        );
+        expect(roster.threads).toEqual([
+            { id: 'agent:writer', agent: 'writer', origin: 'agent', status: 'idle', sequence: 1 },
+            { id: 'agent:scout', agent: 'scout', origin: 'agent', status: 'idle', sequence: 2 },
+            { id: parent.id, agent: 'writer', origin: 'host', status: 'idle', sequence: 3 },
+            {
+                id: child.id,
+                agent: 'writer',
+                origin: 'host',
+                status: 'running',
+                sequence: 4,
+                ownerThreadId: parent.id,
+                invocationId: '1'
+            },
+            { id: sibling.id, agent: 'writer', origin: 'host', status: 'idle', sequence: 5 },
+            {
+                id: borrowed.id,
+                agent: 'scout',
+                origin: 'host',
+                status: 'idle',
+                sequence: 6,
+                ownerThreadId: child.id
+            }
+        ]);
+
+        expect(roster.actOn).not.toContain(sibling.id);
+
+        // UNSCOPED stays UNSCOPED: the same tool with no caller thread (a manual
+        // executeTool is an operator action) is the session-wide host view — sibling
+        // included, `currentThreadId` absent, and NO `actOn`, because for a host the
+        // readable set and the writable set are the same set.
+        const hostRoster = (await writer.executeTool('threadList', {})) as {
+            currentThreadId?: string;
+            actOn?: string[];
+            threads: { id: string }[];
+        };
+
+        expect(hostRoster.currentThreadId).toBeUndefined();
+        expect(hostRoster.actOn).toBeUndefined();
+        expect(hostRoster.threads.map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            parent.id,
+            child.id,
+            sibling.id,
+            borrowed.id
+        ]);
+    });
+
+    it('the two host read seams reach the whole session, and only the write doors refuse a sibling (B3)', () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({});
+
+        // Every family member reads with `child` as the caller — the ancestor, its own
+        // thread, a descendant two levels down, and BOTH defaults (including the scout's,
+        // because a scout conversation hangs inside this family).
+        for (const id of childFamily({ parent: parent.id, child: child.id, borrowed: borrowed.id })) {
+            expect(writer.thread(id, child.id)?.id).toBe(id);
+            expect(writer.threadMessages(id, child.id)).toEqual([]);
+        }
+
+        // A SIBLING READS TOO (2026-11-15). The read seams used to answer the lineage
+        // sentence here; a read is now session-wide, because `agentManage`/`agentResult` were
+        // never lineage-gated and a caller told to review a named conversation could read its
+        // finished RESULT but not the transcript that produced it. The id resolves, the record
+        // and the transcript come back, and the caller never has to guess whether the id was a
+        // typo. What still refuses a sibling is the WRITE doors — pinned in the send and delete
+        // cases below.
+        expect(writer.thread(sibling.id, child.id)?.id).toBe(sibling.id);
+        expect(writer.threadMessages(sibling.id, child.id)).toEqual([]);
+
+        // An id that resolves for NOBODY keeps `threadStateOf`'s canonical sentence, and the
+        // two seams differ in their honest way of saying it: `thread` answers `undefined`
+        // (its contract is a record or nothing), `threadMessages` throws. Neither one turns a
+        // typo into a lineage lesson, with a caller present or not.
+        const unknown = 'Thread "thread-99" is not available in this harness; it was never created, or it was deleted.';
+
+        expect(writer.thread('thread-99', child.id)).toBeUndefined();
+        expect(writer.thread('thread-99')).toBeUndefined();
+        expect(() => writer.threadMessages('thread-99', child.id)).toThrow(unknown);
+        expect(() => writer.threadMessages('thread-99')).toThrow(unknown);
+
+        // Without a caller both seams are the host view, exactly as before.
+        expect(writer.thread(sibling.id)?.id).toBe(sibling.id);
+        expect(writer.threadMessages(sibling.id)).toEqual([]);
+    });
+
+    // STRESS REPORT #5 (2026-11-14) — A REFUSAL THAT IS TRUE BUT USELESS.
+    //
+    // A default conversation is in a family through the conversations of that agent the family
+    // spans (`threadFamilyOf` step 4), so releasing the last one of them quietly dropped
+    // `agent:<name>` out of the roster — and the door then answered only "the id exists, it is
+    // outside your lineage", which named no cause and no way back. The FAMILY RULE AND THE
+    // WRITE VERDICT ARE UNCHANGED here (issue 0027's narrowing stands for `threadSend` and
+    // `threadDelete`, and widening the family to all configured agents was reviewed and
+    // rejected: a default is the agent's standing transcript and would leak other callers'
+    // content across families). What changed is the sentence, for a default target only.
+    //
+    // WHAT CHANGED SINCE (2026-11-15, IT19 R2): the READ half of this case no longer refuses. A
+    // read is session-wide, so the scout's standing transcript is readable from any lineage —
+    // which is exactly the remedy the clause recommends, minus the re-delegation. The clause stays
+    // for the SEND door, where re-delegating really is the only way back, and its wording is pinned
+    // byte for byte below.
+    //
+    // AND SINCE THE SOFT DELETE (same wave): A RELEASE CAN NO LONGER EJECT A DEFAULT. `deleteThread`
+    // marks the scout row `inactive` and the ROW STAYS IN THE FAMILY, so the child's send into
+    // `agent:scout` now LANDS — the lineage the clause told the caller how to rebuild was never
+    // broken. The "it left when the last of your conversations running X was deleted" branch is
+    // therefore unreachable through any door a model can walk (only a session deletion destroys the
+    // row, and that ends the session it would address). That is a real narrowing of this case, so it
+    // is stated here rather than left to the diff — and the clause is NOT quietly dropped: the hedge
+    // it carries has a second branch, "it was never in your lineage", and that one is still live.
+    // It is pinned by the sibling door at the end of this test, which is the same fixture with a
+    // caller whose family never held a scout conversation. The case was re-homed, not deleted.
+    it('a default outside the family names the cause and the remedy, and a released row keeps its family (stress report #5)', async () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({
+            'ask my family': modelDoors(
+                [
+                    // The read now LANDS (session-wide), so this door answers a page rather
+                    // than a refusal.
+                    { name: 'threadRead', args: () => ({ thread: 'agent:scout' }) },
+                    { name: 'threadSend', args: () => ({ thread: 'agent:scout', message: 'still there?' }) },
+                    // The control: a NON-default address outside the family (a sibling) has no
+                    // remedy, and its sentence must not gain one.
+                    { name: 'threadSend', args: () => ({ thread: sibling.id, message: 'unsolicited' }) }
+                ],
+                'all refused'
+            ),
+            // THE LIVE BRANCH OF THE CLAUSE. `sibling` is a top-level writer thread: no scout
+            // conversation has ever been in its family, so `agent:scout` is out of its lineage on
+            // the "never in your lineage" branch, which is the branch a soft delete cannot fake.
+            'ask the scout from outside?': modelDoors(
+                [{ name: 'threadSend', args: () => ({ thread: 'agent:scout', message: 'outside?' }) }],
+                'outside answered'
+            )
+        });
+
+        // BEFORE the release: the scout thread is in this family, so its agent's default is
+        // addressable, and the roster says so. Pinning the visible state first is what makes the
+        // AFTER assertions about the sentence rather than about the verdict.
+        expect(writer.thread('agent:scout', child.id)?.id).toBe('agent:scout');
+        expect(writer.threadMessages('agent:scout', child.id)).toEqual([]);
+
+        // Releasing the last scout conversation of the family. This delete released nothing else,
+        // which is the other half of the receipt contract (stress report #6): empty arrays, not
+        // missing fields.
+        expect(writer.deleteThread(borrowed.id)).toEqual({
+            deleted: borrowed.id,
+            removedThreadIds: [borrowed.id],
+            removedInvocationIds: [],
+            removedBranchIds: []
+        });
+
+        // C2 (2026-11-14, independent review): the CAUSE is hedged — this clause fires for any
+        // out-of-family `agent:<name>`, and a caller that never delegated to `scout` never had
+        // its default in its lineage. It must not assert a delete the caller did not perform.
+        // The REMEDY is unconditional, because re-delegating admits the address under either cause.
+        const defaultClause =
+            ` The cause is specific: "agent:scout" is agent "scout"'s default conversation, so either it was ` +
+            'never in your lineage or it left when the last of your conversations running "scout" was ' +
+            'deleted. Delegate to "scout" again — the conversation it mints re-admits this address, and ' +
+            'threadRead/threadSend reach it from then on.';
+
+        // THE RELEASE IS INVISIBLE TO THE FAMILY AND VISIBLE TO THE ROSTER (IT19 R2): the scout row
+        // is gone from the host record seam and the roster — hidden from the session tooling — while
+        // the family that admits `agent:scout` is computed from the RETAINED row, so the default
+        // stays in this caller's lineage.
+        expect(writer.thread(borrowed.id)).toBeUndefined();
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            parent.id,
+            child.id,
+            sibling.id
+        ]);
+        expect(writer.thread('agent:scout', child.id)?.id).toBe('agent:scout');
+        expect(writer.threadMessages('agent:scout', child.id)).toEqual([]);
+
+        // THE MODEL FEELS THREE DOORS. One run of `child`, three calls: the read that LANDS, the
+        // send that now LANDS too (the retained row kept the default in the family), and the send
+        // refusal for a sibling — which keeps the old text byte for byte, with no clause appended.
+        await writer.sendThreadInput(child.id, 'ask my family');
+
+        const results = doorResults(writer, child.id);
+        const readPage = JSON.parse(results[0] ?? '{}') as { thread: { id: string } };
+
+        expect({ thread: readPage.thread.id }).toEqual({ thread: 'agent:scout' });
+        expect(results.slice(1)).toEqual([
+            // `started`, not `resumed`: the scout default was idle, and the message is its prompt.
+            `{"threadId":"agent:scout","delivered":"started","sender":"writer","senderThreadId":"${child.id}"}`,
+            `Tool "threadSend" failed: Thread "${sibling.id}" is not one thread "${child.id}" can address: ` +
+                "threadSend reaches your own thread, an ancestor, one of your descendants, or a default " +
+                'conversation (agent:<name>) your roster lists (see threadList). The id exists — it is simply ' +
+                'outside your lineage.'
+        ]);
+
+        // THE SEND REALLY LANDED, AND THE TURNS ARE THE SCOUT'S OWN: the message reached the
+        // standing default conversation of the agent whose released row kept the address in this
+        // family, and it answered there. The attribution names the sender thread, which is what a
+        // runtime-derived identity looks like on this door.
+        await settleThread(writer, 'agent:scout');
+        expect(withoutIds(writer.threadMessages('agent:scout'))).toEqual([
+            {
+                role: 'user',
+                content: `from agent "writer" (thread ${child.id}):\nstill there?`
+            },
+            { role: 'assistant', content: 'scout answers' }
+        ]);
+
+        // THE CLAUSE, STILL BYTE FOR BYTE, FROM THE BRANCH THAT IS STILL REACHABLE. `sibling`'s
+        // family never spanned `scout`, so its send is refused with the base sentence plus the
+        // cause-and-remedy clause — the same text the pre-soft-delete case produced, which is the
+        // statement that the message contract survived the retention change.
+        await writer.sendThreadInput(sibling.id, 'ask the scout from outside?');
+        expect(doorResults(writer, sibling.id)).toEqual([
+            `Tool "threadSend" failed: Thread "agent:scout" is not one thread "${sibling.id}" can address: ` +
+                "threadSend reaches your own thread, an ancestor, one of your descendants, or a default " +
+                'conversation (agent:<name>) your roster lists (see threadList). The id exists — it is simply ' +
+                'outside your lineage.' +
+                defaultClause
+        ]);
+    });
+
+    it('threadSend reaches an ancestor, a descendant, and the default of another agent (B4)', async () => {
+        const { writer, parent, child, borrowed } = lineage({
+            // ONE call per thread: a thread routes on its first prompt, so several
+            // scenarios need several conversations.
+            'tell my parent': modelDoor(
+                'threadSend',
+                () => ({ thread: parent.id, message: 'the child is reporting' }),
+                'parent told'
+            ),
+            'tell my grandchild and the scout': modelDoors(
+                [
+                    { name: 'threadSend', args: () => ({ thread: borrowed.id, message: 'the parent is asking' }) },
+                    { name: 'threadSend', args: () => ({ thread: 'agent:scout', message: 'a writer thread is asking' }) }
+                ],
+                'both told'
+            )
+        });
+
+        // The PARENT speaks first, and its own conversation is the caller for two
+        // addresses: a DESCENDANT two levels down — another agent's host thread, but one
+        // this family minted — and that other agent's DEFAULT conversation, which stays
+        // addressable because the family spans the agents in it, not only the threads.
+        // (`modelDoors` is one door per turn of one conversation, so both calls happen in
+        // the same run of the parent.)
+        await writer.sendThreadInput(parent.id, 'tell my grandchild and the scout');
+        expect(doorResults(writer, parent.id).map((content) => JSON.parse(content))).toEqual([
+            {
+                threadId: borrowed.id,
+                delivered: 'started',
+                sender: 'writer',
+                senderThreadId: parent.id
+            },
+            {
+                threadId: 'agent:scout',
+                delivered: 'started',
+                sender: 'writer',
+                senderThreadId: parent.id,
+                // The `note` is present HERE, and its presence is the point: the first send
+                // of this same run started `borrowed`, a scout conversation that is still
+                // in flight while the second send lands. `agent:scout` therefore reads as
+                // an ambiguous address, and the receipt names the live thread instead of
+                // letting the caller assume the default is where the agent is working.
+                note:
+                    '"agent:scout" is scout\'s default conversation, and this message went there. ' +
+                    `The live scout conversation is thread "${borrowed.id}"; address that id to reach the turn in flight.`
+            }
+        ]);
+
+        await settleThread(writer, borrowed.id);
+        expect(textOf(writer.threadMessages(borrowed.id))).toEqual([
+            `from agent "writer" (thread ${parent.id}):\nthe parent is asking`,
+            'scout answers'
+        ]);
+
+        // The cross-agent chat is the historical behaviour B4 keeps: no `note` here,
+        // because no scout turn was in flight, so the address is not ambiguous.
+        await settleThread(writer, 'agent:scout');
+        expect(textOf(writer.threadMessages('agent:scout'))).toEqual([
+            `from agent "writer" (thread ${parent.id}):\na writer thread is asking`,
+            'scout answers'
+        ]);
+
+        // An ANCESTOR, dormant: the message becomes its new prompt (`started`), and the
+        // receipt names the sender's thread so the target can address IT back. The last
+        // two entries of the parent's transcript are the attributed message and the turn
+        // it started.
+        await writer.sendThreadInput(child.id, 'tell my parent');
+        expect(JSON.parse(firstResult(writer, child.id))).toEqual({
+            threadId: parent.id,
+            delivered: 'started',
+            sender: 'writer',
+            senderThreadId: child.id
+        });
+
+        await settleThread(writer, parent.id);
+        expect(textOf(writer.threadMessages(parent.id)).slice(-2)).toEqual([
+            `from agent "writer" (thread ${child.id}):\nthe child is reporting`,
+            'both told'
+        ]);
+    });
+
+    it('threadSend refuses a sibling, and never starts the conversation it is standing in (B4)', async () => {
+        const { writer, parent, child, sibling } = lineage({
+            'tell my sibling': modelDoor(
+                'threadSend',
+                () => ({ thread: sibling.id, message: 'unsolicited' }),
+                'sibling refused'
+            ),
+            'my own doors': modelDoors(
+                [
+                    // its own thread, dormant
+                    { name: 'threadSend', args: () => ({ thread: parent.id, message: 'thinking aloud' }) },
+                    // this agent's own default, idle
+                    { name: 'threadSend', args: () => ({ thread: 'agent:writer', message: 'standing order' }) },
+                    // a dormant thread it minted: allowed, and the point of the pair
+                    { name: 'threadSend', args: () => ({ thread: child.id, message: 'do the work' }) }
+                ],
+                'own doors answered'
+            )
+        });
+
+        // A SIBLING is neither visible nor writable, and the sentence points at the roster
+        // because the caller's next move is a roster read.
+        await writer.sendThreadInput(child.id, 'tell my sibling');
+        expect(firstResult(writer, child.id)).toBe(
+            `Tool "threadSend" failed: Thread "${sibling.id}" is not one thread "${child.id}" can address: ` +
+                "threadSend reaches your own thread, an ancestor, one of your descendants, or a default " +
+                'conversation (agent:<name>) your roster lists (see threadList). The id exists — it is simply outside your lineage.'
+        );
+        expect(writer.threadMessages(sibling.id)).toEqual([]);
+
+        // ITS OWN THREAD (dormant): the answer is THIS turn, not a second turn. A message
+        // into yourself queues behind the turn that is asking it, which is how "I messaged
+        // myself" becomes a lost round-trip.
+        // THIS AGENT'S OWN DEFAULT (idle): the same trap one step away — `agent:writer`
+        // looks like "the conversation this agent is having", and a message into it starts
+        // a second turn of the agent that is asking.
+        await writer.sendThreadInput(parent.id, 'my own doors');
+        // ITS OWN THREAD: a caller standing in a turn can only STEER that turn, and that is
+        // exactly what the send becomes — the next-boundary queue of the run that is
+        // asking. (The dormant variant of this address has its own refusal sentence, "is the
+        // conversation this message comes from", which no live run can reach: while a
+        // thread's model is calling the tool, its own thread is by definition running. That
+        // sentence is for a caller whose thread has been released around it.)
+        expect(JSON.parse(doorResults(writer, parent.id)[0])).toEqual({
+            threadId: parent.id,
+            delivered: 'queued',
+            sender: 'writer',
+            senderThreadId: parent.id
+        });
+        expect(doorResults(writer, parent.id)[1]).toBe(
+            `Tool "threadSend" failed: "agent:writer" is agent "writer"'s own conversation and is idle: a ` +
+                'message into it would start a second turn of the agent that is asking. Use this turn, or ' +
+                'address a thread you created (see threadList).'
+        );
+
+        // The rule does NOT reach down: a parent still wakes a dormant thread it minted —
+        // that is how a fan-out parent drives its one-shot children.
+        expect(JSON.parse(doorResults(writer, parent.id)[2])).toEqual({
+            threadId: child.id,
+            delivered: 'started',
+            sender: 'writer',
+            senderThreadId: parent.id
+        });
+
+        await settleThread(writer, child.id);
+        // The woken conversation is the SECOND run of `child` (its first run was the
+        // sibling send), so the attributed message and the turn it started are the last
+        // two entries — the message IS the new prompt, appended by that run itself.
+        expect(textOf(writer.threadMessages(child.id)).slice(-2)).toEqual([
+            `from agent "writer" (thread ${parent.id}):\ndo the work`,
+            'sibling refused'
+        ]);
+
+        // The RUNNING branch (steer rather than start) is unchanged by B4 and is pinned
+        // with a genuinely mid-request target in `threadSend is state-aware
+        // (delegate-stress T3.1-T3.6)` above.
+    });
+
+    it('a send addressed at a default conversation names the thread already in flight (B4/C1)', async () => {
+        const slow = gatedAnswer('slow writer turn');
+
+        const { writer, parent, borrowed } = lineage(
+            { 'slow work': slow.stream },
+            {
+                'tell the writers': modelDoor(
+                    'threadSend',
+                    () => ({ thread: 'agent:writer', message: 'a scout thread is asking' }),
+                    'default told'
+                )
+            }
+        );
+
+        // A writer turn genuinely in flight, created BY THE SENDER so it sits inside the
+        // sender's family rather than beside it (T5/#2, 2026-11-14 — `note` may only name an
+        // id the caller can actually use; the sibling shape is pinned one test below, where
+        // the same live thread is out of reach and the note is withheld).
+        const worker = writer.createThread('writer', { ownerThreadId: borrowed.id });
+        const running = writer.sendThreadInput(worker.id, 'slow work');
+        await flush();
+        expect(writer.thread(worker.id)?.status).toBe('running');
+
+        // The sender is a SCOUT thread, so `agent:writer` is not its own conversation and
+        // the send is legal. The address is still ambiguous: the message lands in the
+        // writer DEFAULT conversation while the turn a reader cares about is `worker`. The
+        // receipt stays honest about where the message went (`threadId` is the truth), and
+        // `note` names the live thread so the caller can address the turn instead — the
+        // confusion this field exists for, reported instead of inferred.
+        await writer.sendThreadInput(borrowed.id, 'tell the writers');
+        expect(JSON.parse(firstResult(writer, borrowed.id))).toEqual({
+            threadId: 'agent:writer',
+            delivered: 'started',
+            sender: 'scout',
+            senderThreadId: borrowed.id,
+            note:
+                '"agent:writer" is writer\'s default conversation, and this message went there. ' +
+                `The live writer conversation is thread "${worker.id}"; address that id to reach the turn in flight.`
+        });
+
+        await settleThread(writer, 'agent:writer');
+        expect(textOf(writer.threadMessages('agent:writer'))).toEqual([
+            `from agent "scout" (thread ${borrowed.id}):\na scout thread is asking`,
+            'writer answers'
+        ]);
+
+        slow.ready.open();
+        await running;
+        expect(writer.thread(worker.id)?.status).toBe('idle');
+    });
+
+    it('the threadless host door keeps sending across the whole session (B4)', async () => {
+        const { writer, child, sibling } = lineage({});
+
+        // A manual `executeTool` has no caller thread, so it is the HOST speaking: the
+        // sibling send a scoped model turn cannot make still works, and the receipt carries
+        // no `senderThreadId` because the host stands in no conversation.
+        const receipt = (await writer.executeTool('threadSend', {
+            thread: sibling.id,
+            message: 'host note'
+        })) as Record<string, unknown>;
+
+        expect(receipt).toEqual({ threadId: sibling.id, delivered: 'started', sender: 'writer' });
+
+        await settleThread(writer, sibling.id);
+        expect(textOf(writer.threadMessages(sibling.id))).toEqual([
+            'from agent "writer":\nhost note',
+            'writer answers'
+        ]);
+
+        // A family member is equally reachable from the host.
+        await writer.executeTool('threadSend', { thread: child.id, message: 'host note 2' });
+        await settleThread(writer, child.id);
+        expect(textOf(writer.threadMessages(child.id))).toEqual([
+            'from agent "writer":\nhost note 2',
+            'writer answers'
+        ]);
+    });
+
+    it('deleteThread reports every conversation it released, cascade included (B5)', () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({});
+
+        // The receipt is the state the caller CAUSED: the id it named, plus everything that
+        // actually went — the M2 cascade of settled descendants, in creation order. `parent`
+        // owns `child`, which owns `borrowed`, so one call releases three conversations and
+        // a reaping parent can PROVE what it freed.
+        expect(writer.deleteThread(parent.id)).toEqual({
+            deleted: parent.id,
+            removedThreadIds: [parent.id, child.id, borrowed.id],
+            // Nothing ran in this lineage, so the release took no lookups out of the listing —
+            // and the receipt says so with EMPTY arrays rather than omitting the fields (stress
+            // report #6).
+            removedInvocationIds: [],
+            removedBranchIds: []
+        });
+
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            sibling.id
+        ]);
+
+        // A leaf release reports exactly one id, and the host door is UNSCOPED: it may close
+        // a terminal conversation anywhere in the session, including a sibling — the very
+        // target a model turn would be refused.
+        expect(writer.deleteThread(sibling.id)).toEqual({
+            deleted: sibling.id,
+            removedThreadIds: [sibling.id],
+            removedInvocationIds: [],
+            removedBranchIds: []
+        });
+        expect(writer.threads().map((record) => record.id)).toEqual(['agent:writer', 'agent:scout']);
+
+        // The default conversations are not a delete door at all; that refusal predates B5
+        // and the receipt did not change it.
+        expect(() => writer.deleteThread('agent:writer')).toThrow(
+            `Thread "agent:writer" is the agent's own conversation and cannot be deleted; use reset() to clear the session.`
+        );
+    });
+
+    it('threadDelete is a descendant door: a parent reaps its child, and nothing else (B5)', async () => {
+        const { writer, parent, child, sibling, borrowed } = lineage({
+            'reap what is not mine': modelDoors(
+                [
+                    { name: 'threadDelete', args: () => ({ thread: parent.id }) },
+                    { name: 'threadDelete', args: () => ({ thread: sibling.id }) }
+                ],
+                'both refused'
+            ),
+            'reap what is mine': modelDoors(
+                [
+                    { name: 'threadDelete', args: () => ({ thread: borrowed.id }) },
+                    { name: 'threadDelete', args: () => ({ thread: child.id }) }
+                ],
+                'both reaped'
+            )
+        });
+
+        // UP and SIDEWAYS are refused, and the sentence names every address this door will
+        // not take. The lineage check runs BEFORE the running check, so a thread the caller
+        // could not delete anyway is never reported as "still running".
+        const lineageRefusal = (target: string): string =>
+            `Tool "threadDelete" failed: Thread "${target}" is not one of the conversations "${child.id}" created; ` +
+            'threadDelete releases your own descendants (see threadList) — never your current thread, an ' +
+            "ancestor, a sibling, or another agent's conversation.";
+
+        await writer.sendThreadInput(child.id, 'reap what is not mine');
+        expect(doorResults(writer, child.id)).toEqual([lineageRefusal(parent.id), lineageRefusal(sibling.id)]);
+        expect(writer.thread(sibling.id)).toBeDefined();
+
+        // DOWN is the caller's, however deep: a grandchild minted two levels away releases
+        // on its own, and the receipt shrinks to what is actually released — which is what
+        // makes a reaping loop auditable instead of a guess.
+        await writer.sendThreadInput(parent.id, 'reap what is mine');
+        expect(doorResults(writer, parent.id).map((content) => JSON.parse(content))).toEqual([
+            // The grandchild never ran a turn, so its release leaves no lookup unlisted; the child
+            // DID (it ran 'reap what is not mine', invocation `1`), and the receipt names the id
+            // the caller would otherwise only find missing from `agentManage` afterwards.
+            {
+                deleted: borrowed.id,
+                removedThreadIds: [borrowed.id],
+                removedInvocationIds: [],
+                removedBranchIds: []
+            },
+            {
+                deleted: child.id,
+                removedThreadIds: [child.id],
+                removedInvocationIds: ['1'],
+                removedBranchIds: []
+            }
+        ]);
+
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            parent.id,
+            sibling.id
+        ]);
+    });
+
+    it('a running descendant still refuses the delete, and a released one restates its receipt (B5)', async () => {
+        const held = gatedAnswer('child at work');
+
+        const { writer, parent, child, sibling, borrowed } = lineage({
+            'start work': held.stream,
+            // One door per HOST TURN (see `modelTurns`): the state under test changes
+            // between turns, so all three calls must land in three separate runs of the
+            // parent conversation.
+            'reap the worker': modelTurns(
+                [
+                    { name: 'threadDelete', args: () => ({ thread: child.id }) },
+                    { name: 'threadDelete', args: () => ({ thread: child.id }) },
+                    { name: 'threadDelete', args: () => ({ thread: child.id }) }
+                ],
+                'done reaping'
+            )
+        });
+
+        // The child is genuinely mid-run: its answer is behind the gate.
+        const running = writer.sendThreadInput(child.id, 'start work');
+        await flush();
+        expect(writer.thread(child.id)?.status).toBe('running');
+
+        // TURN 1, while the run is live. B2 made a FINISHED conversation deletable from
+        // inside its own `run.finished` hook; it did not loosen this. A live run still owns
+        // its thread, so the refusal is the running sentence and the receipt never claims a
+        // release that did not happen.
+        await writer.sendThreadInput(parent.id, 'reap the worker');
+        expect(doorResults(writer, parent.id)).toEqual([
+            `Tool "threadDelete" failed: Thread "${child.id}" is running; stop it before deleting it.`
+        ]);
+        expect(writer.thread(child.id)).toBeDefined();
+
+        held.ready.open();
+        await running;
+        expect(writer.thread(child.id)?.status).toBe('idle');
+
+        // TURN 2, the same conversation on a later turn of the same route: the release is
+        // accepted, and the receipt names the cascade this caller caused — `borrowed` is the
+        // child's own conversation, and a released parent never leaves a live child behind.
+        await writer.sendThreadInput(parent.id, 'reap the worker again');
+        expect(doorResults(writer, parent.id)[1]).toBeDefined();
+        expect(JSON.parse(doorResults(writer, parent.id)[1] ?? '{}')).toEqual({
+            deleted: child.id,
+            removedThreadIds: [child.id, borrowed.id],
+            // The child's own turn is the one lookup that goes; `borrowed` never ran, and the
+            // cascade adds nothing to the set.
+            removedInvocationIds: ['1'],
+            removedBranchIds: []
+        });
+
+        // TURN 3: A SECOND DELETE OF THE SAME id RESTATES the first receipt instead of refusing
+        // (IT19 R2). It used to be the canonical unknown-thread refusal — "a released conversation
+        // is indistinguishable from one that never existed, which is what makes a reaping retry
+        // safe". A soft delete keeps the row, so the retry is now safe because it is IDEMPOTENT:
+        // no second mark and no second `thread.deleted` hook.
+        //
+        // F-A Defect 3 (2026-11-15): THIS RECEIPT IS NOW BYTE-IDENTICAL TO TURN 2's. It used to
+        // carry three fields with three rules (`removedThreadIds` = newly marked, so `borrowed`
+        // was missing; `removedInvocationIds` = still hidden; `removedBranchIds` = newly
+        // unlisted), which made the two receipts a reaping loop compares disagree about the very
+        // fact the retry is reporting. The restated sets are the HIDDEN ones: `borrowed` is still
+        // marked inactive, so it is still in `removedThreadIds`, exactly as the first release
+        // named it. `removedBranchIds` stays the exception and stays empty — that ledger row
+        // really was dropped by the first release, and the entry text says so.
+        await writer.sendThreadInput(parent.id, 'reap the worker again');
+        expect(JSON.parse(doorResults(writer, parent.id)[2] ?? '{}')).toEqual({
+            deleted: child.id,
+            removedThreadIds: [child.id, borrowed.id],
+            removedInvocationIds: ['1'],
+            removedBranchIds: []
+        });
+        expect(doorResults(writer, parent.id)).toHaveLength(3);
+
+        // The retry mutated nothing: both released rows are still marked, the untouched ones still
+        // are not, and every row is still in the document. Hidden from the roster, durable underneath.
+        expect(
+            (writer.snapshot().threads ?? []).map((row) => [row.id, row.inactive ?? false])
+        ).toEqual([
+            [parent.id, false],
+            [child.id, true],
+            [sibling.id, false],
+            [borrowed.id, true]
+        ]);
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:writer',
+            'agent:scout',
+            parent.id,
+            sibling.id
+        ]);
+    });
+
+    // ---------------------------------------------------------------------------
+    // T5 (2026-11-14, stress report) — THE REPLY ROUTE A STARTED RUN NEEDS.
+    //
+    // A `threadSend` into a DORMANT DEFAULT conversation has no parent, so nothing ever
+    // writes an `ownerThreadId` for it: steps 2-4 of `threadFamilyOf` (src/harness.ts)
+    // compute a SINGLETON family, and the turn that was just woken could not answer the
+    // party that woke it — every `threadSend`/`threadRead` back at the sender's id was
+    // refused "outside your lineage", which is the one sentence that is wrong for the
+    // conversation that received the message. The fix is step 5: the run attached to a
+    // default conversation folds its own REPLY TARGET (`RunState.replyThreadId`, written
+    // only by `postThreadMessage`'s dormant-start branch) into that conversation's family
+    // — the SENDER'S ID ONLY, for the LIFE OF THE RUN.
+    //
+    // This group pins all four properties of that rule: the route exists (AC1/AC2), it is
+    // exactly one id and nothing else (AC2's roster), it reverts when the run releases
+    // (AC3), and nothing is persisted to make it work (AC4). A nested `describe` because
+    // the fixtures it needs (`modelDoors`, `doorResults`, `lineage`) are this group's.
+    // ---------------------------------------------------------------------------
+    describe('a started default conversation can answer the thread that woke it (T5)', () => {
+        // A door list that does not move until the test opens the gate. Determinism, not
+        // theatre: the started run must reach its tool calls only AFTER the sender's run
+        // has released, or the reply's `delivered` would race between 'started' (sender
+        // idle) and 'steered' (sender still running) and every exact pin below would be a
+        // coin flip.
+        const gatedDoors = (
+            ready: Gate,
+            calls: Array<{ name: string; args: () => Record<string, unknown> }>,
+            reply: string
+        ): HarnessStream => {
+            const doors = modelDoors(calls, reply);
+
+            return async function* stream(request) {
+                await ready.promise;
+                yield* doors(request);
+            };
+        };
+
+        // The fixture for the case: one writer HOST thread that wakes the scout DEFAULT
+        // conversation through a `threadSend`, and a scout door list that holds at its gate
+        // until the test opens it. The thread ids do not exist until the harness has built
+        // them, so every door argument is a THUNK (the same rule `modelDoors` follows).
+        const replyFixture = (
+            ready: Gate
+        ): { writer: Harness; parent: HarnessThreadRecord; scouted: HarnessThreadRecord } => {
+            const writer = harness({
+                agents: {
+                    writer: brain(
+                        routed(
+                            {
+                                'wake the scout': modelDoor(
+                                    'threadSend',
+                                    () => ({ thread: 'agent:scout', message: 'please report' }),
+                                    'writer done'
+                                )
+                            },
+                            scripted([answer('writer answers')])
+                        )
+                    ),
+                    // Three doors inside ONE run of the started turn: the roster (what may
+                    // this turn see), the read (may it see the sender's transcript), and the
+                    // reply (may it write back to the sender).
+                    scout: brain(
+                        gatedDoors(
+                            ready,
+                            [
+                                { name: 'threadList', args: () => ({}) },
+                                { name: 'threadRead', args: () => ({ thread: parent.id }) },
+                                {
+                                    name: 'threadSend',
+                                    args: () => ({ thread: parent.id, message: 'thanks for the wake' })
+                                }
+                            ],
+                            'scout done'
+                        )
+                    )
+                },
+                presets: false
+            });
+
+            const parent = writer.createThread('writer');
+
+            // A scout conversation INSIDE the sender's family: the family rule admits
+            // `agent:<name>` only when the family spans that agent (step 4), and this host
+            // thread is what makes the scout's default addressable from `parent` at all —
+            // exactly the shape the B4/C1 case above builds.
+            const scouted = writer.createThread('scout', { ownerThreadId: parent.id });
+
+            return { writer, parent, scouted };
+        };
+
+        it('the woken turn lists, reads and answers its sender, and the route reverts (T5 AC1-AC4)', async () => {
+            const ready = gate();
+            const { writer, parent, scouted } = replyFixture(ready);
+
+            // AC1 — the writer turn wakes the scout DEFAULT conversation. The receipt is
+            // 'started' (a dormant conversation is started, never queued and never
+            // refused), and it carries NO `note`: no scout conversation was in flight, so
+            // `agent:scout` is not an ambiguous address (that case is the C1 pin above).
+            await writer.sendThreadInput(parent.id, 'wake the scout');
+            expect(JSON.parse(firstResult(writer, parent.id))).toEqual({
+                threadId: 'agent:scout',
+                delivered: 'started',
+                sender: 'writer',
+                senderThreadId: parent.id
+            });
+
+            // The started run is in flight and holding at its gate; the sender's own run
+            // has released, which is what makes the reply below 'started' rather than a
+            // steer.
+            expect(writer.thread('agent:scout')?.status).toBe('running');
+
+            ready.open();
+            await settleThread(writer, 'agent:scout');
+
+            const results = doorResults(writer, 'agent:scout');
+
+            // AC2, part 1 — THE ROSTER. SESSION-WIDE ROWS (2026-11-15): the scout's own
+            // (default) conversation, the sender's thread, AND the two rows the old family rule
+            // kept out — `agent:writer` and `scouted`, the scout thread the sender created. What
+            // the transient reply route still decides alone is `actOn`: exactly the scout's own
+            // conversation plus the sender's id, for the life of this run. Step 4 computes the
+            // spanned AGENTS before step 5 folds the sender in, so the fold adds one id and
+            // nothing else — no pull of the sender's subtree.
+            const roster = pageOf(results[0] ?? '') as {
+                currentThreadId?: string;
+                actOn?: string[];
+                threads: unknown[];
+            };
+
+            expect(roster.currentThreadId).toBe('agent:scout');
+            expect(roster.actOn).toEqual(['agent:scout', parent.id]);
+            expect(roster.threads).toEqual([
+                {
+                    id: 'agent:writer',
+                    agent: 'writer',
+                    origin: 'agent',
+                    status: 'idle',
+                    sequence: 1
+                },
+                {
+                    id: 'agent:scout',
+                    agent: 'scout',
+                    origin: 'agent',
+                    status: 'running',
+                    sequence: 2,
+                    invocationId: '2'
+                },
+                {
+                    id: parent.id,
+                    agent: 'writer',
+                    origin: 'host',
+                    status: 'idle',
+                    sequence: 3,
+                    invocationId: '1'
+                },
+                {
+                    id: scouted.id,
+                    agent: 'scout',
+                    origin: 'host',
+                    status: 'idle',
+                    sequence: 4,
+                    ownerThreadId: parent.id
+                }
+            ]);
+
+            // AC2, part 2 — the read. The started turn reads the transcript of the thread
+            // that woke it: the sender's whole turn, including the recorded receipt of the
+            // very send that started this run. Projected to role+content because the paged
+            // view's offsets are not the subject.
+            const read = pageOf(results[1] ?? '') as { messages: { role: string; content: string }[] };
+
+            expect(read.messages.map(({ role, content }) => ({ role, content }))).toEqual([
+                { role: 'user', content: 'wake the scout' },
+                { role: 'assistant', content: '' },
+                {
+                    role: 'tool',
+                    content:
+                        `{"threadId":"agent:scout","delivered":"started","sender":"writer",` +
+                        `"senderThreadId":"${parent.id}"}`
+                },
+                { role: 'assistant', content: 'writer done' }
+            ]);
+
+            // AC1, part 2 — THE REPLY. Addressing the sender's id is accepted (this is the
+            // call the unfixed harness refused), and the target is idle, so the message
+            // STARTS a turn there.
+            expect(JSON.parse(results[2] ?? '')).toEqual({
+                threadId: parent.id,
+                delivered: 'started',
+                sender: 'scout',
+                senderThreadId: 'agent:scout'
+            });
+
+            await settleThread(writer, parent.id);
+            // The reply became the sender's new prompt, and that turn answered on the SAME
+            // route: `routed` dispatches on the conversation's FIRST user message, so a
+            // thread keeps its script across turns (the door list is spent, hence the
+            // answer-only frame set).
+            expect(textOf(writer.threadMessages(parent.id)).slice(-2)).toEqual([
+                `from agent "scout" (thread agent:scout):\nthanks for the wake`,
+                'writer done'
+            ]);
+
+            // AC3 — the route is TRANSIENT for the WRITE scope. Once the scout's run has
+            // released, its family is the singleton again, so `actOn` — the set `threadSend` and
+            // `threadDelete` will accept — shrinks back to the scout's own conversation, and the
+            // sender's id is gone from it. The READ, session-wide since 2026-11-15, keeps
+            // answering the same id it answered inside the run: the route exists to make the
+            // REPLY legal, not to make the transcript findable.
+            expect(writer.threadMessages(parent.id, 'agent:scout').length).toBeGreaterThan(0);
+            expect(writer.thread(parent.id, 'agent:scout')?.id).toBe(parent.id);
+            expect(writer.runtime.threadList('agent:scout').actOn).toEqual(['agent:scout']);
+
+            // AC4 — nothing was PERSISTED to buy the route. The default conversation never
+            // adopted the sender as its owner (the first-wins `ownerThreadId` link stays
+            // absent, so a later caller from another family is not silently locked out), and
+            // the sender never adopted the default either.
+            expect(writer.thread('agent:scout')?.ownerThreadId).toBeUndefined();
+            expect(writer.thread(parent.id)?.ownerThreadId).toBeUndefined();
+        });
+
+        it('the ambiguity note is withheld when the live conversation is out of reach (T5 AC5)', async () => {
+            const slow = gatedAnswer('slow writer turn');
+
+            const { writer, parent, borrowed } = lineage(
+                { 'slow work': slow.stream },
+                {
+                    'tell the writers': modelDoor(
+                        'threadSend',
+                        () => ({ thread: 'agent:writer', message: 'a scout thread is asking' }),
+                        'default told'
+                    )
+                }
+            );
+
+            // The live writer conversation is one an ANCESTOR of the sender created. The
+            // sender is `borrowed`, a scout thread under `child`, and `worker` is a writer
+            // thread under `parent` — a sibling's shape, and a sibling is deliberately NOT
+            // in the family (0027). So the caller may not address it.
+            const worker = writer.createThread('writer', { ownerThreadId: parent.id });
+            const running = writer.sendThreadInput(worker.id, 'slow work');
+            await flush();
+            expect(writer.thread(worker.id)?.status).toBe('running');
+
+            // The address IS still ambiguous — a writer turn is in flight somewhere — but
+            // naming `worker` would have said "address that id" and handed back a refusal.
+            // The receipt is the pre-C1 shape exactly: where the message went, nothing more.
+            await writer.sendThreadInput(borrowed.id, 'tell the writers');
+            expect(JSON.parse(firstResult(writer, borrowed.id))).toEqual({
+                threadId: 'agent:writer',
+                delivered: 'started',
+                sender: 'scout',
+                senderThreadId: borrowed.id
+            });
+
+            // Nothing about the delivery changed with the filter: the message landed in the
+            // default conversation and started a turn there.
+            await settleThread(writer, 'agent:writer');
+            expect(textOf(writer.threadMessages('agent:writer'))).toEqual([
+                `from agent "scout" (thread ${borrowed.id}):\na scout thread is asking`,
+                'writer answers'
+            ]);
+
+            slow.ready.open();
+            await running;
+            expect(writer.thread(worker.id)?.status).toBe('idle');
+        });
+
+        // The invocation ledger has no host read seam (`invocationRecords` is internal), so
+        // this pins the two OBSERVABLE consequences of the guard: the conversation comes
+        // back to 'idle', and its next turn is accepted. A run stranded by an escape would
+        // report `running` and refuse the follow-up. The failure-path commit inside the same
+        // `try` is pinned by the run-failure suites (e.g. src/harness.agent-results.test.ts).
+        it('a run-start hook failure strands neither the conversation nor its next turn (T5 AC7)', async () => {
+            const dropped: unknown[] = [];
+            const lifecycle: string[] = [];
+
+            const writer = harness({
+                agents: { writer: brain(scripted([answer('first turn'), answer('second turn')])) },
+                report: { diagnostic: (event) => void dropped.push(event) },
+                plugins: [
+                    {
+                        name: 'hostile',
+                        setup: (api) => {
+                            // A handler that THROWS is dropped by the fail-open bus, and the
+                            // widened settle guard must not change that: the run still starts,
+                            // answers, and settles. The guard's job is the case the bus does
+                            // NOT swallow, so what these assertions pin is the run coming back
+                            // to rest whichever way the round went.
+                            api.on('run.started', () => {
+                                throw new Error('policy unavailable');
+                            });
+                            api.on('run.finished', () => void lifecycle.push('run.finished'));
+                            api.on('run.failed', () => void lifecycle.push('run.failed'));
+                        }
+                    }
+                ],
+                presets: false
+            });
+
+            const thread = writer.createThread('writer');
+
+            expect((await writer.sendThreadInput(thread.id, 'work')).content).toBe('first turn');
+            expect(lifecycle).toEqual(['run.finished']);
+
+            // The drop is still VISIBLE to the host (fail-open WITH a reporter, hooks.ts rule
+            // 8), and it is the only diagnostic this run produced.
+            expect(dropped).toEqual([
+                {
+                    type: 'plugin_diagnostic',
+                    kind: 'handler-threw',
+                    event: 'run.started',
+                    owner: 'hostile',
+                    message: 'policy unavailable'
+                }
+            ]);
+
+            // AC7 — the conversation is RELEASED and its invocation settled: a stranded run
+            // would report `running` here and refuse the next turn. The follow-up send is
+            // the proof, and it also pins that the guard's `finally` released the actor.
+            expect(writer.thread(thread.id)?.status).toBe('idle');
+            expect((await writer.sendThreadInput(thread.id, 'again')).content).toBe('second turn');
+            expect(lifecycle).toEqual(['run.finished', 'run.finished']);
+            expect(writer.thread(thread.id)?.status).toBe('idle');
+        });
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A LABEL IS AN ADDRESS (2026-11-15)
+//
+// The server mints a session-unique name for every conversation — `IT14`, the owning
+// agent's code plus a monotonic per-agent ordinal — and a human quotes THAT name, because
+// it is the one in the UI. Until now the name lived only in `SessionRecord.threadLabels`
+// while `HarnessThreadRecord.label` was written by a single caller (`createThread({ label })`),
+// so a prompt saying "review the IT14 thread" was unanswerable: every thread door took an id,
+// and the id (`thread-32`) was nowhere the caller could see it.
+//
+// The rule, declared in `core/thread.ts` (`resolveThreadAddressOf`) and applied inside
+// `threadStateOf` so EVERY door inherits it:
+//   - an ID wins, matched verbatim first, so a label can never shadow an id;
+//   - a LABEL matches exactly after trimming — no case folding, no prefix, no fuzzy tier,
+//     because parameter values are never fuzzy-matched anywhere else in this system;
+//   - a label held by TWO conversations is REFUSED, not resolved to the first one;
+//   - an address that matches NOTHING passes through unchanged, so the caller's own
+//     not-found sentence names what was actually typed.
+//
+// The doors that REPORT an id (`threadSend`'s receipt, `deleteThread`'s receipt, the steer
+// receipt, `stopThread`'s owner cascade) canonicalize up front, so a label-addressed write
+// states its result in the id the caller can compare against its roster.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('a conversation label addresses it at every thread door', () => {
+    // One writer-brain harness, no presets, one idle answer — the label rule is about
+    // addressing, so no run needs to do anything interesting.
+    const session = () => quiet(brain(scripted([answer('labeled thread'), answer('late turn')])));
+
+    it('resolves a label for a read, a record, and a roster row', () => {
+        const writer = session();
+        const mine = writer.createThread('writer', { label: 'IT14' });
+
+        expect(writer.thread('IT14')?.id).toBe(mine.id);
+        expect(writer.threadMessages('IT14')).toEqual([]);
+
+        // Surrounding whitespace is trimmed, because every other string parameter of these
+        // tools is too — a model that pads the value gets the same conversation.
+        expect(writer.thread('  IT14  ')?.id).toBe(mine.id);
+
+        // The roster carries the label, which is what makes the name FINDABLE before it is
+        // usable: a caller that is handed `IT14` in a prompt can confirm it against a row.
+        const roster = writer.runtime.threadList(mine.id);
+
+        expect(roster.threads.find((record) => record.id === mine.id)?.label).toBe('IT14');
+        expect(roster.currentThreadId).toBe(mine.id);
+    });
+
+    it('prefers an id over a label that collides with one', () => {
+        const writer = session();
+        // A conversation LABELED with the shape of another's id. The id must win: labels are
+        // minted `CODE + ordinal` and ids are `thread-N`, so the shapes do not collide today,
+        // but the order is the contract — a label may never shadow an id.
+        const owner = writer.createThread('writer', { label: 'thread-2' });
+        const other = writer.createThread('writer', { label: 'named' });
+
+        expect(writer.thread('thread-2')?.id).toBe(other.id);
+        expect(writer.thread(owner.id)?.id).toBe(owner.id);
+    });
+
+    it('refuses a label held by two conversations instead of picking one', () => {
+        const writer = session();
+        const first = writer.createThread('writer', { label: 'IT14' });
+        const second = writer.createThread('writer', { label: 'IT14' });
+
+        // Nothing in the harness enforces label uniqueness — the SERVER does, through its
+        // monotonic per-agent high-water — so a duplicate can only arrive from a host that
+        // stamped labels itself (or from a restored document). Resolving it to the first match
+        // would silently read one conversation and write another, so the address is refused and
+        // the sentence names both ids.
+        const ambiguous =
+            `Thread label "IT14" is held by 2 conversations in this harness (${first.id}, ${second.id}); ` +
+            'address one by its id instead.';
+
+        expect(() => writer.threadMessages('IT14')).toThrow(ambiguous);
+        expect(() => writer.thread('IT14')).toThrow(ambiguous);
+        // The id of either one still works.
+        expect(writer.thread(first.id)?.id).toBe(first.id);
+        expect(writer.thread(second.id)?.id).toBe(second.id);
+    });
+
+    it('answers an unknown label with the canonical missing-thread sentence', () => {
+        const writer = session();
+        writer.createThread('writer', { label: 'IT14' });
+
+        // "No such id" and "no such label" are ONE fact to the harness — nothing carries that
+        // address — and the door that has the better claim to the sentence is the caller, which
+        // now states the label the caller actually typed rather than an id it never wrote.
+        expect(() => writer.threadMessages('IT15')).toThrow(
+            'Thread "IT15" is not available in this harness; it was never created, or it was deleted.'
+        );
+        expect(writer.thread('IT15')).toBeUndefined();
+    });
+
+    it('states a label-addressed write in the id it names', async () => {
+        const writer = session();
+        const parent = writer.createThread('writer', { label: 'PARENT' });
+        const child = writer.createThread('writer', { label: 'CHILD', ownerThreadId: parent.id });
+
+        // `threadSend` from inside `parent`, addressed by LABEL. The receipt's `threadId` is the
+        // conversation's id, not the name the caller typed: a receipt is a record of which
+        // conversation received the message, and every other fact in the transcript (the roster,
+        // a later `threadDelete`) is stated in ids.
+        const receipt = writer.runtime.threadSend(undefined, parent.id, {
+            thread: 'CHILD',
+            message: 'do the work'
+        });
+
+        expect(receipt).toEqual({
+            threadId: child.id,
+            delivered: 'started',
+            sender: 'writer',
+            senderThreadId: parent.id
+        });
+
+        await settleThread(writer, child.id);
+        expect(textOf(writer.threadMessages(child.id))).toEqual([
+            `from agent "writer" (thread ${parent.id}):\ndo the work`,
+            'labeled thread'
+        ]);
+
+        // A host release addressed by label reports the id, and the cascade it caused — the
+        // descendant walk matches on `record.id`, so a label-addressed delete must canonicalize
+        // before it walks or it would release one conversation and orphan the rest.
+        expect(writer.deleteThread('PARENT')).toEqual({
+            deleted: parent.id,
+            removedThreadIds: [parent.id, child.id],
+            removedInvocationIds: ['1'],
+            removedBranchIds: []
+        });
+    });
+
+    it('keeps the lineage rule on the write doors when the target arrives by label', () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('unused')])), scout: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+        const parent = writer.createThread('writer');
+        const child = writer.createThread('writer', { ownerThreadId: parent.id, label: 'MINE' });
+        // A scout thread with NO owner: a sibling of `parent`, so outside its family by design.
+        const stranger = writer.createThread('scout', { label: 'STRANGER' });
+
+        // READABLE (session-wide), NOT WRITABLE. The read resolves the label; the send refuses
+        // the conversation it names — and the refusal is stated in the ID, because that is the
+        // address the caller can act on next (its roster row, a later delete). A label widens
+        // NOTHING: it names a conversation, and the door's own rule then decides.
+        expect(writer.threadMessages('STRANGER', child.id)).toEqual([]);
+        expect(() => writer.runtime.threadSend(undefined, child.id, { thread: 'STRANGER', message: 'unsolicited' })).toThrow(
+            `Thread "${stranger.id}" is not one thread "${child.id}" can address: threadSend reaches your own `
+        );
+
+        // A label the caller DOES own resolves on the send door: the lineage check sees the
+        // family member the label names rather than failing on the string it was handed.
+        expect(
+            writer.runtime.threadSend(undefined, parent.id, { thread: 'MINE', message: 'do the work' }).delivered
+        ).toBe('started');
+    });
+
+    it('stamps and clears a label through setThreadLabel, and a snapshot keeps it', () => {
+        const writer = session();
+        const mine = writer.createThread('writer');
+
+        // The server's mirror seam (../server/sessions.ts `mirrorThreadLabel`): the record gains
+        // the name the store minted, and from then on the name is an address.
+        expect(writer.setThreadLabel(mine.id, 'IT14').label).toBe('IT14');
+        expect(writer.thread('IT14')?.id).toBe(mine.id);
+
+        // Durable: `snapshot()` writes `label` (core/snapshot.ts whitelists it), so a restart
+        // restores the name with no re-minting and no re-write.
+        const snapshot = writer.snapshot();
+
+        expect((snapshot.threads ?? []).find((record) => record.id === mine.id)?.label).toBe('IT14');
+
+        // `undefined` CLEARS the key rather than storing an empty string, so a session that
+        // never labels a conversation keeps its exact pre-label document. An explicit BLANK
+        // string is a caller mistake and is refused by the shared normalizer — it does not
+        // silently clear — and the refusal mutates nothing.
+        expect(() => writer.setThreadLabel(mine.id, '  ')).toThrow('A thread label must not be blank.');
+        expect(writer.thread(mine.id)?.label).toBe('IT14');
+        expect(writer.setThreadLabel(mine.id, undefined).label).toBeUndefined();
+        expect(writer.thread(mine.id)?.label).toBeUndefined();
+        expect(writer.threads().find((record) => record.id === mine.id)).not.toHaveProperty('label');
+
+        // And the address stops resolving, with the canonical sentence — not a stale hit.
+        expect(() => writer.threadMessages('IT14')).toThrow(
+            'Thread "IT14" is not available in this harness; it was never created, or it was deleted.'
+        );
+    });
+});
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// A HOST `threadSend` RECORDS THE HOST, NEVER A DEPARTED ENTRY AGENT (R70)
+//
+// `threadSend` derives its sender from the RUNTIME CONTEXT, never from a model
+// argument (`threadSendFor`, src/harness.ts:6824). A model call arrives with
+// `context.agent` — a real brain — so that door never had an identity problem. The door
+// pinned here is the HOST one: `runtime.threadSend(undefined, …)`, which carries NO
+// caller brain at all (a plugin outside any conversation, and the lane route at
+// ../server/workers/lane-authority.ts:898). Its fallback used to be `entryName`, the
+// CONFIGURED entry name — and `removeAgent(entryName)` is legal in this library ("THE
+// ENTRY AGENT IS REMOVABLE", src/harness.ts:16706), so after a detach that fallback
+// stamped the message `from agent "entry"` in a roster that had stopped naming `entry`:
+// the same ghost identity already removed at every other host door (`hostActor`, `:1669`,
+// the rank refusal at `:5654`, the `{ agent: 'host', rank: 'A' }` invocation record).
+//
+// THE RULE THIS PINS: a host send records `hostActor()`'s name. The byte-identical half
+// is why the normal case is asserted FIRST and in full: while the entry agent is
+// REGISTERED, `hostActor()` returns that agent, and its name IS `entryName`, because both
+// the construction loop and `addAgent` force `brain.name = key` (`:1488`, `:16645`). So
+// the receipt's `sender` and the transcript attribution line stay word for word what they
+// always were. Only after the detach does the record change — to `host`, the identity
+// `delegate` already records — and NOT to the effective-entry fallback the handle's
+// `name`/`agent` readers use (`effectiveEntryName`, `:16874`), which is why both are
+// asserted below: `scout` becomes the effective entry, `host` stays the sender.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('a host threadSend records the host identity, never the detached entry agent', () => {
+    it('records the entry agent while it is registered and `host` once it is detached', async () => {
+        // Two brains. `entry` is the configured ENTRY agent — the name the ghost fallback
+        // would stamp — and `scout` owns the conversations the host writes into, so it
+        // SURVIVES the detach (removing an agent is refused while a host thread still names
+        // it, src/harness.ts:16735-16741).
+        const session = harness({
+            agents: {
+                entry: brain(scripted([answer('entry turn')])),
+                scout: brain(scripted([answer('scout turn')]))
+            },
+            entry: 'entry',
+            presets: false
+        });
+
+        const before = session.createThread('scout');
+        const after = session.createThread('scout');
+
+        // THE NORMAL CASE, pinned byte for byte before anything moves: the entry agent is
+        // registered, the host sends AS it, and the receipt is exactly the shape this door
+        // has always answered. A `threadless` host caller (`threadId: undefined`) is
+        // unscoped, so the receipt carries no `senderThreadId` and the dormant target is
+        // STARTED (`delivered: 'started'`).
+        expect(
+            session.runtime.threadSend(undefined, undefined, {
+                thread: before.id,
+                message: 'host ping'
+            })
+        ).toEqual({
+            threadId: before.id,
+            delivered: 'started',
+            sender: 'entry'
+        });
+
+        await settleThread(session, before.id);
+
+        // The attributed transcript line is the other half of the same record — it is what
+        // the receiving model actually reads, and it is the value the fix must NOT touch here.
+        expect(textOf(session.threadMessages(before.id))).toEqual([
+            'from agent "entry":\nhost ping',
+            'scout turn'
+        ]);
+
+        // THE DETACH — legal in the library, and the roster stops naming `entry` (the server
+        // refuses the same call with a 409; that asymmetry is accepted and documented).
+        session.removeAgent('entry');
+        expect(session.agents.entry).toBeUndefined();
+
+        // The handle's routing readers follow the roster and land on the FIRST REGISTERED
+        // member; that fallback is the handle's answer, not an identity grant.
+        expect(session.name).toBe('scout');
+
+        // THE RECORD NOW NAMES THE HOST. Pre-fix this answered `sender: 'entry'` — an agent
+        // this roster no longer holds, attributed a message it can no longer send.
+        const receipt = session.runtime.threadSend(undefined, undefined, {
+            thread: after.id,
+            message: 'host ping again'
+        });
+
+        expect(receipt).toEqual({
+            threadId: after.id,
+            delivered: 'started',
+            sender: 'host'
+        });
+        expect(receipt.sender).not.toBe('entry');
+
+        await settleThread(session, after.id);
+
+        // And the line the receiving conversation reads is the host, not the departed agent
+        // and not the fallback entry (`scout`).
+        expect(textOf(session.threadMessages(after.id))).toEqual([
+            'from agent "host":\nhost ping again',
+            'scout turn'
+        ]);
+    });
+});
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// ONE FACT, ONE SENTENCE (issue 0034, F2)
+//
+// Three doors raise the missing-thread refusal: the core's `threadStateOf` (every inline
+// thread operation), `createLaneAuthority`'s `thread:read` answer (routed over a lane),
+// and the `threadRead` handler's record tail (the model-facing door). Before this fix each
+// had written its own head — "is not available in this harness", "has no record in this
+// session", "has no record in this harness" — so an operator comparing an inline answer
+// with a routed one reasonably concluded that two DIFFERENT things had happened. The head
+// is not cosmetic: on the routed door the refusal crosses the lane boundary as MESSAGE TEXT
+// alone (the worker answers a rejected route with `error: <message>`, nothing else), so the
+// sentence is the whole record of the fact on that side, and a log that reads differently
+// per door cannot be grepped for.
+//
+// The unified head is the core's, because it is the only one true in both execution modes:
+// in worker mode the answer comes from the CANONICAL harness object, in inline mode from
+// the harness the host is holding, and in both cases it is the harness that has no such
+// record. "Session" is not an object an inline caller has, and a lane holds none at all.
+//
+// Why this file, and why partly as source text: each individual door already had a pin of
+// its own (see src/harness.thread-read.test.ts, src/harness.thread-park-queue.test.ts and
+// src/tools/runtime/threadDelete.test.ts) — what was missing was a test that could see the
+// three together, which is exactly how they drifted. A behaviour test can only look through
+// one door at a time, so the parity itself is pinned against the files.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('the missing-thread refusal is one sentence, not three (issue 0034, F2)', () => {
+    /** The sentence's signature: head plus reason, present in every door that raises it. */
+    const SENTENCE = 'is not available in this harness; it was never created';
+
+    /** The whole refusal for one id, spelled the one legal way. */
+    const missingThread = (threadId: string): string =>
+        `Thread "${threadId}" is not available in this harness; it was never created, or it was deleted.`;
+
+    /** Runs a call (sync or async) that must refuse, and returns the refusal's words. */
+    const refusal = async (call: () => unknown): Promise<string> => {
+        try {
+            await call();
+        } catch (error) {
+            return (error as Error).message;
+        }
+        throw new Error('expected the call to refuse');
+    };
+
+    it('answers one unknown id with one sentence at every inline door that refuses', async () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+        // The thread trio registers with the FIRST thread of a harness (which is why
+        // src/harness.thread-read.test.ts:326 creates one before calling the reader), so this
+        // harness needs a thread before the two model-facing doors exist. The id handed to
+        // them below is still the unknown one.
+        writer.createThread('writer');
+        const missing = 'thread-99';
+
+        // The transcript door, the transcript WRITE door, and the two model-facing doors all
+        // fall through to the same guard by different routes: `threadMessages` resolves the id
+        // directly, `setThreadMessages` resolves it as step 1 of its order, and the tools reach
+        // it through `harness.thread(...)`'s missing record.
+        const doors: [string, Promise<string>][] = [
+            ['threadMessages', refusal(() => writer.threadMessages(missing))],
+            ['setThreadMessages', refusal(() => writer.setThreadMessages(missing, [{ role: 'user', content: 'x' }]))],
+            ['executeTool threadRead', refusal(() => writer.executeTool('threadRead', { thread: missing }))],
+            ['executeTool threadSend', refusal(() => writer.executeTool('threadSend', { thread: missing, message: 'ping' }))]
+        ];
+        expect(Object.fromEntries(await Promise.all(doors.map(async ([name, promise]) => [name, await promise])))).toEqual({
+            'executeTool threadRead': missingThread(missing),
+            'executeTool threadSend': missingThread(missing),
+            setThreadMessages: missingThread(missing),
+            threadMessages: missingThread(missing)
+        });
+
+        // The RECORD door is the one seam that answers nothing instead of refusing: its
+        // contract is "a record or undefined", and the pin here is that it does not grow a
+        // sentence of its own for the same fact (the caller that needs a reason reads
+        // `threadMessages`).
+        expect(writer.thread(missing)).toBeUndefined();
+    });
+
+    it('refuses an id that stopped existing, and an id from another harness, with the same words at every door that refuses', async () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+        const other = quiet(brain(scripted([answer('unused')])));
+        const deleted = writer.createThread('writer');
+        // Every harness mints its host ids from its own counter, so the FIRST thread of a second
+        // harness has the same id as the first thread of this one — `foreign.id` and `deleted.id`
+        // are the same string. `unknown.id` is the second thread of the other harness, an id this
+        // harness has never had.
+        const foreign = other.createThread('writer');
+        const unknown = other.createThread('writer');
+
+        // Give the doomed conversation real work, so the door below that KEEPS answering has a
+        // transcript worth reading (IT19 R1 retention) rather than an empty array that would prove
+        // nothing about durability.
+        await writer.sendThreadInput(deleted.id, 'a turn');
+
+        // "Never created" and "created in a DIFFERENT harness" are facts the caller tells apart
+        // from its own history, and one record-shaped absence to the harness. The foreign id is the
+        // realistic one: a host restoring a session and passing an id from the generation before.
+        // A DELETED id is the third fact, and since IT19 R2 it is no longer shaped like the other
+        // two: the record is retained, so it is `inactive`, not missing.
+        expect(() => other.threadMessages(foreign.id)).not.toThrow();
+        writer.deleteThread(deleted.id);
+        expect(writer.thread(deleted.id)).toBeUndefined();
+
+        // THE HOST DOOR STILL ANSWERS. `threadMessages` with no caller thread is the server's
+        // transcript reader, and the retained turns are the readability half of a soft delete —
+        // "deleted" no longer means "the bytes are gone".
+        expect(withoutIds(writer.threadMessages(deleted.id))).toEqual([
+            { role: 'user', content: 'a turn' },
+            { role: 'assistant', content: 'unused' }
+        ]);
+
+        // THE MODEL-FACING DOOR STILL REFUSES, with the same words it has always used: the tool
+        // resolves its address through the record seam, and a released conversation is not one a
+        // model can be handed. What the retained row changed is which doors still walk that path,
+        // not what the sentence says.
+        expect(await refusal(() => writer.executeTool('threadRead', { thread: deleted.id }))).toBe(
+            missingThread(deleted.id)
+        );
+
+        // THE COLLISION NOW RESOLVES. Because the released row keeps its id, an address that the
+        // other harness ALSO uses stops being "unknown here" and answers this harness's retained
+        // conversation — the durability promise seen from the other direction: an id a host hands
+        // back from the generation before is still the same conversation in this one. The answer is
+        // `writer`'s retained transcript, never the other harness's bytes: two harnesses have never
+        // shared a transcript, and retention does not change that.
+        expect(withoutIds(writer.threadMessages(foreign.id))).toEqual([
+            { role: 'user', content: 'a turn' },
+            { role: 'assistant', content: 'unused' }
+        ]);
+
+        // An id this harness has NEVER had is still refused, at both seams, in the canonical words.
+        expect(await refusal(() => writer.threadMessages(unknown.id))).toBe(missingThread(unknown.id));
+        expect(await refusal(() => writer.setThreadMessages(unknown.id, []))).toBe(missingThread(unknown.id));
+
+        // The two sentences differ only in the id: no door adds a clause about WHY the id is
+        // gone, which is what would make a grep for one case miss the other.
+        expect(missingThread(deleted.id).replace(deleted.id, 'X')).toBe(
+            missingThread(unknown.id).replace(unknown.id, 'X')
+        );
+    });
+});

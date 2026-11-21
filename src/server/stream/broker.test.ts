@@ -12,7 +12,7 @@
 // contract, asserted in the REST owner's suite, not here.
 
 import { describe, expect, it } from 'vitest';
-import type { TurnSummary, WsSubscriptionScope, WsRevisionRecord, WsServerMessage, WsUpdate } from '../../shared/harness-stream';
+import type { TurnSummary, WsSubscriptionScope, WsRevisionRecord, WsServerMessage, WsUpdate } from '../../engine/shared/harness-stream';
 import { createStreamBroker, type StreamEvent, type StreamSink } from './broker';
 import { decodeStreamCursor, encodeStreamCursor, HARNESS_WS_SCOPE_BASELINES } from './protocol';
 

@@ -26,8 +26,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
-import type { HarnessEvent } from '../harness';
-import type { DisplayProjectContext, TurnDisplay } from '../shared/turn-display';
+import type { HarnessEvent } from '../engine/harness';
+import type { DisplayProjectContext, TurnDisplay } from '../engine/shared/turn-display';
 import { HARNESS_JOURNAL_VERSION, HarnessJournal, journalLine } from './journal';
 import type { SessionTurn } from './protocol';
 import { projectTurn } from './turn-projector';

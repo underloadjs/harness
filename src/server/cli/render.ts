@@ -16,7 +16,7 @@
 // it as one dim line when the counters move — the same event the tile turns into
 // `composing N tool calls · M chars`.
 
-import type { HarnessAssistantMessage, HarnessEvent, HarnessPendingTool } from '../../harness';
+import type { HarnessAssistantMessage, HarnessEvent, HarnessPendingTool } from '../../engine/harness';
 
 // Validate the background-tool fields. The canonical shape is
 // `HarnessPendingTool` (src/types/index.ts); the CLI still validates entries

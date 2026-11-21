@@ -224,7 +224,7 @@ await check('the copy resolves its own editable source root', () => {
     const sourceRoot = path.join(packageRoot, EDITABLE_SOURCE_ROOT);
 
     assert(existsSync(path.join(sourceRoot, 'index.ts')), `${EDITABLE_SOURCE_ROOT}/index.ts is missing`);
-    assert(existsSync(path.join(sourceRoot, 'tools', 'runtime', 'toolRegistry.tool.ts')), 'the runtime tool sources are missing');
+    assert(existsSync(path.join(sourceRoot, 'engine', 'tools', 'runtime', 'toolRegistry.tool.ts')), 'the runtime tool sources are missing');
 
     return { source: EDITABLE_SOURCE_ROOT };
 });

@@ -11,7 +11,7 @@
 // hide behind a range check.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type {
     AgentRank,
     HarnessActionHandler,
@@ -19,7 +19,7 @@ import type {
     HarnessActionRequestContext,
     HarnessStream,
     HarnessStreamEvent
-} from '../harness';
+} from '../engine/harness';
 import type { HarnessPreset, HarnessPresetReport, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry, describeHarness } from './harnesses';
 import { createToolboxHarness } from './harnesses/toolbox';

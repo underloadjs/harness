@@ -40,9 +40,9 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT, createToolCatalogue } from './harnesses';
-import { WEB_SEARCH_METADATA } from '../harness';
+import { WEB_SEARCH_METADATA } from '../engine/harness';
 import { loadEnvironmentFile, startHarnessServer } from './index';
-import type { ToolCallResult, ToolDetailResponse, ToolSummaryPage } from '../shared/harness-api';
+import type { ToolCallResult, ToolDetailResponse, ToolSummaryPage } from '../engine/shared/harness-api';
 
 // R-boot: an omitted direct-call catalogue is EMPTY, so these cases state the production
 // catalogue explicitly. It must be built AFTER `.env` loading (search captures its provider

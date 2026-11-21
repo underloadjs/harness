@@ -44,7 +44,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type {
     Harness,
     HarnessStream,
@@ -52,9 +52,9 @@ import type {
     KnowledgeCreateResult,
     KnowledgeEngine,
     ToolTextEnvelope
-} from '../harness';
-import { createKnowledgeEngine } from '../core';
-import { knowledge as knowledgeTool } from '../tools/runtime/knowledge.tool';
+} from '../engine/harness';
+import { createKnowledgeEngine } from '../engine/core';
+import { knowledge as knowledgeTool } from '../engine/tools/runtime/knowledge.tool';
 import { createHarnessRegistry } from './harnesses';
 import { createToolboxHarness } from './harnesses/toolbox';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
@@ -68,7 +68,7 @@ import {
     loadKnowledgeFileStore
 } from './knowledge-file-store';
 import type { KnowledgeStore } from './knowledge-file-store';
-import { HARNESS_ROUTES } from '../shared/harness-api';
+import { HARNESS_ROUTES } from '../engine/shared/harness-api';
 
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, '../../..');

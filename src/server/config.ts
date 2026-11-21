@@ -36,7 +36,7 @@ import {
     PROVIDER_STREAM_CHUNK_TIMEOUT_ENV,
     PROVIDER_TIMEOUT_MAX_MS,
     resolveProviderTimeout
-} from '../transport/provider-timeouts';
+} from '../engine/transport/provider-timeouts';
 import type { HarnessIndex } from './protocol';
 
 // How a session's LOGICAL threads get CPU.

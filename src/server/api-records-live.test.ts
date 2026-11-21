@@ -39,10 +39,10 @@
 //   - ./api-live-events.test.ts   — the hub/broker/bridge fixture this reuses
 
 import { describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
-import { HARNESS_EPOCH_HEADER, HARNESS_REVISION_HEADER } from '../shared/harness-api';
+import { HARNESS_EPOCH_HEADER, HARNESS_REVISION_HEADER } from '../engine/shared/harness-api';
 import type { HarnessStreamEvent } from './api-events';
 import { createHarnessApi } from './api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
@@ -50,7 +50,7 @@ import { createHarnessEventHub } from './api-events';
 import { SessionStore } from './sessions';
 import { createStreamBroker } from './stream/broker';
 import { bridgeEventHub, hubStreamSources } from './stream/mount';
-import type { RecordStoreNotification } from '../types';
+import type { RecordStoreNotification } from '../engine/types';
 
 const DEFAULTS: RunnerSettings = {
     baseURL: 'http://scripted.invalid/v1',

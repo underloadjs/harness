@@ -46,15 +46,15 @@
 // stamp the same value onto run identity (../core/agent-limits.ts, and ../types/index.ts
 // `HarnessThread.epoch`). Importing the leaf — not `../core` — keeps this module's load cost
 // at one const and no cycle.
-import { HARNESS_PROCESS_EPOCH } from '../core/agent-limits';
-import { HARNESS_API_ROOT } from '../shared/harness-api';
+import { HARNESS_PROCESS_EPOCH } from '../engine/core/agent-limits';
+import { HARNESS_API_ROOT } from '../engine/shared/harness-api';
 import type {
     StreamResourceKind,
     TurnDisplayOp,
     WsResourceLink,
     WsRevisionRecord,
     WsUpdateKind
-} from '../shared/harness-stream';
+} from '../engine/shared/harness-stream';
 
 // ---------------------------------------------------------------------------
 // Epoch

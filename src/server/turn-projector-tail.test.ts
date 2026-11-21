@@ -26,13 +26,13 @@
 // Run: npx vitest run src/server/turn-projector-tail.test.ts
 
 import { describe, expect, it } from 'vitest';
-import type { HarnessEvent } from '../harness';
+import type { HarnessEvent } from '../engine/harness';
 import {
     DISPLAY_ARGS_PREVIEW_CHARS,
     DISPLAY_NODE_PREVIEW_CHARS,
     DISPLAY_PREVIEW_CHARS
-} from '../shared/turn-display';
-import type { DisplayProjectContext, DisplayTail, TurnDisplay, TurnDisplayOp, TurnSection } from '../shared/turn-display';
+} from '../engine/shared/turn-display';
+import type { DisplayProjectContext, DisplayTail, TurnDisplay, TurnDisplayOp, TurnSection } from '../engine/shared/turn-display';
 import type { SessionTurn } from './protocol';
 import { createTurnProjector, projectTurn } from './turn-projector';
 

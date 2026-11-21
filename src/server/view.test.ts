@@ -33,9 +33,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, afterAll, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
-import type { AgentRank, HarnessEvent, HarnessStream, HarnessStreamEvent } from '../harness';
+import type { AgentRank, HarnessEvent, HarnessStream, HarnessStreamEvent } from '../engine/harness';
 import { createHarnessRegistry } from './harnesses';
 import { SessionError, SessionStore } from './sessions';
 import { HarnessPersistence } from './persistence';
@@ -50,7 +50,7 @@ import { createHarnessApi } from './api';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 import { HARNESS_JOURNAL_FILE, HarnessJournal } from './journal';
 import type { SessionStreamItem, SessionTurn, SessionView } from './protocol';
-import { DISPLAY_NODE_PREVIEW_CHARS, DISPLAY_PREVIEW_CHARS } from '../shared/turn-display';
+import { DISPLAY_NODE_PREVIEW_CHARS, DISPLAY_PREVIEW_CHARS } from '../engine/shared/turn-display';
 
 const PACKAGE_ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const REPO_ROOT = path.resolve(PACKAGE_ROOT, '../../..');
@@ -931,7 +931,7 @@ describe('the canonical session surface (R3)', () => {
     });
 
     it('gives the canonical submit the attachment body bound and nothing else does', async () => {
-        const { MAX_SUBMIT_BODY_BYTES } = await import('../shared/attachments');
+        const { MAX_SUBMIT_BODY_BYTES } = await import('../engine/shared/attachments');
         const { MAX_API_BODY_BYTES, bodyLimitFor } = await import('./api');
 
         // The one submit route, on the one mount.

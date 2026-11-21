@@ -19,7 +19,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { prepareToolCandidate } from '../../core';
+import { prepareToolCandidate } from '../../engine/core';
 import { harnessTools } from './tools';
 import { SHARED_APP_TOOL_SOURCES } from './toolbox';
 import timeNow from '../tools/shared/timeNow.tool';
@@ -47,7 +47,7 @@ const SOURCES = {
 // the synchronous source compiler maps to the LIVE framework module. A type-only
 // import from `types` is also allowed and erased at runtime. Importing a sibling
 // tool source would make independent compilation a lie.
-const ALLOWED_IMPORTS = ['../../../core', '../../../types'];
+const ALLOWED_IMPORTS = ['../../../engine/core', '../../../engine/types'];
 
 const sourcePath = (folder: string, file: string): string =>
     fileURLToPath(new URL(`../tools/${folder}/${file}`, import.meta.url));

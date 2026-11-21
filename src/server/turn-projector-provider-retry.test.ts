@@ -36,8 +36,8 @@
 //   yarn vitest run --config src/frontend/vitest.config.ts src/frontend/ui/provider-tile-diagnostics.test.ts
 
 import { describe, expect, it } from 'vitest';
-import type { HarnessEvent } from '../harness';
-import type { DisplayNoticeNode, DisplayProjectContext } from '../shared/turn-display';
+import type { HarnessEvent } from '../engine/harness';
+import type { DisplayNoticeNode, DisplayProjectContext } from '../engine/shared/turn-display';
 import type { SessionTurn } from './protocol';
 import { createTurnProjector, projectTurn, refoldTurn, providerRetryNoticeText } from './turn-projector';
 

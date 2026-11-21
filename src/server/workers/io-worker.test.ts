@@ -51,7 +51,7 @@ import type { HarnessDatabase, HarnessIndexShardUnit, HarnessSessionShardUnit, H
 // loop and then reads them with a plain `HarnessPersistence.load()`, so its hand-built core
 // used to carry an arbitrary `version: 1`; the number is part of the read contract now, and
 // pinning the constant keeps the fixture honest the day the kernel bumps the snapshot.
-import { HARNESS_SNAPSHOT_VERSION } from '../../core/snapshot';
+import { HARNESS_SNAPSHOT_VERSION } from '../../engine/core/snapshot';
 import {
     configureIoWorker,
     executeIoCommand,

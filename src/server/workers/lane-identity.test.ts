@@ -15,7 +15,7 @@ import {
     PROFILES_COLLECTION,
     TASKS_COLLECTION,
     readRecordsStoreState
-} from '../../core';
+} from '../../engine/core';
 
 // The store validator the mint must satisfy (records-engine T3): ONE collection map
 // with the store-level counter, so a lane-minted id set has to leave `nextId` one past

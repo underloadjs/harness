@@ -25,7 +25,7 @@ import http from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { startHarnessServer } from './index';
 import type { HarnessServer } from './index';
-import type { ModelIndex } from '../shared/harness-api';
+import type { ModelIndex } from '../engine/shared/harness-api';
 
 type ProviderRequest = {
     method: string;

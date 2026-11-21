@@ -23,7 +23,7 @@
 //   - ../shared/harness-api.ts  — HARNESS_PAGE_LIMIT, PageMeta
 //   - ./api-events.ts           — HARNESS_RUNTIME_EPOCH (the epoch half of the token)
 
-import { HARNESS_PAGE_LIMIT } from '../shared/harness-api';
+import { HARNESS_PAGE_LIMIT } from '../engine/shared/harness-api';
 import { HARNESS_RUNTIME_EPOCH } from './api-events';
 import { HttpError } from './api-errors';
 

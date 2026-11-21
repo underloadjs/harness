@@ -29,9 +29,9 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
-import { agent, harness } from '../harness';
-import type { HarnessAttachment, HarnessMessage, HarnessStreamEvent } from '../harness';
-import { MAX_ATTACHMENT_BYTES, MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
+import { agent, harness } from '../engine/harness';
+import type { HarnessAttachment, HarnessMessage, HarnessStreamEvent } from '../engine/harness';
+import { MAX_ATTACHMENT_BYTES, MAX_SUBMIT_BODY_BYTES } from '../engine/shared/attachments';
 import { createHarnessHandler } from './handler';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
@@ -46,7 +46,7 @@ import { MAX_API_BODY_BYTES, bodyLimitFor } from './api';
 import type { SessionSnapshot } from './protocol';
 // T35: canonical transport — one mount, a 202 receipt for the submit, and one named read per
 // heavy member (turn metadata, attachment bytes). Composition lives in ./canonical-reads.
-import { HARNESS_ROUTES } from '../shared/harness-api';
+import { HARNESS_ROUTES } from '../engine/shared/harness-api';
 import {
     bindApiCall,
     readTurn,

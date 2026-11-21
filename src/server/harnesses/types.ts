@@ -18,12 +18,12 @@ import type {
     HarnessToolSettingsProvider,
     Tool,
     ToolVisibility
-} from '../../harness';
+} from '../../engine/harness';
 // THE RANK MODEL (B-series): a harness definition states an ENTRY agent (routing)
 // plus a RANK MAP (authority). `AgentRank` is the A–Z letter union owned by
 // ../types/index.ts (`AgentRank` / `AGENT_RANKS` / `rankIndexOf` / `isLowerRank`);
 // this layer only stores and projects it, never re-derives the ordering.
-import type { AgentRank } from '../../types';
+import type { AgentRank } from '../../engine/types';
 
 // The provider settings a caller can change per session.
 //

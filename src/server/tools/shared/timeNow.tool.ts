@@ -32,10 +32,10 @@
 // `core` import to the LIVE helper module, so a compiled revision shares the same
 // `tool()` identity. Importing the package root would capture a second copy of the
 // whole harness as editable source instead.
-import { tool, toolUi } from '../../../core';
+import { tool, toolUi } from '../../../engine/core';
 // Type-only import: erased at runtime, and mapped to the live `types` module by
 // the same compiler when present.
-import type { ToolUiEnvelope } from '../../../types';
+import type { ToolUiEnvelope } from '../../../engine/types';
 
 // Validation bound for the label (R8). The timezone is a LABEL only (it does not
 // change the clock); capping it keeps the demo panel from becoming an arbitrary

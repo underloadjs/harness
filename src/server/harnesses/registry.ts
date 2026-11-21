@@ -123,23 +123,23 @@
 //   - ../sessions.ts  — resolves a session's harness through find()
 //   - ../api.ts       — POST/PATCH /harnesses and GET /agents
 
-import { agentProfiles, isAgentProfileName } from '../../agents';
-import type { AgentProfile } from '../../agents';
+import { agentProfiles, isAgentProfileName } from '../../engine/agents';
+import type { AgentProfile } from '../../engine/agents';
 // THE RANK MODEL. `AgentRank` is the A–Z letter union, `AGENT_RANKS` the same union
 // as DATA (highest first, so a message can name the range honestly), and
 // `isAgentRank` the untrusted-input guard every boundary validator routes through
 // (../types/index.ts). This layer validates rank VALUES and their KEYS; the
 // ordering and the delegation predicate (`rankIndexOf`/`isLowerRank`) stay with the
 // kernel, which is the only place that decides who may hand work to whom.
-import { AGENT_RANKS, isAgentRank } from '../../types';
-import type { AgentRank } from '../../types';
+import { AGENT_RANKS, isAgentRank } from '../../engine/types';
+import type { AgentRank } from '../../engine/types';
 import type { HarnessPreset, HarnessPresetCreation, HarnessToolboxDefaults } from './types';
 import type { HarnessAgentRecord, HarnessPresetRecord } from '../persistence';
 import { attachDefaultAgentState, createAgentState } from './agent-state';
 import type { AgentProfilePatch, AgentState } from './agent-state';
 import { LEGACY_PRESET_DEFINITIONS, presets } from './presets';
 import type { LegacyPresetDefinition } from './presets';
-import { WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../harness';
+import { WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../engine/harness';
 import {
     SHARED_TOOL_NAMES,
     agentsFromProfiles,

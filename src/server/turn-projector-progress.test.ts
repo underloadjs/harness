@@ -41,12 +41,12 @@
 // Run: yarn vitest run src/server/turn-projector-progress.test.ts   (cwd packages/underload/harness)
 
 import { describe, expect, it } from 'vitest';
-import type { HarnessEvent } from '../harness';
-import type { DisplayProjectContext, TurnDisplay, TurnSection } from '../shared/turn-display';
+import type { HarnessEvent } from '../engine/harness';
+import type { DisplayProjectContext, TurnDisplay, TurnSection } from '../engine/shared/turn-display';
 // The generated wire spelling of the field (./harness.swagger.yaml `TurnToolProgress`,
 // emitted into ../shared/harness-api.ts). Asserting against IT, not against a local copy,
 // is what keeps a contract edit from passing a test that the browser can no longer read.
-import type { TurnToolProgress } from '../shared/harness-api';
+import type { TurnToolProgress } from '../engine/shared/harness-api';
 import type { SessionTurn } from './protocol';
 import { createTurnProjector, projectTurn } from './turn-projector';
 

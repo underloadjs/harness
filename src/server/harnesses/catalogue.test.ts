@@ -11,7 +11,7 @@
 // an injected environment, and the default-entry tests stub process.env.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { WEB_FETCH_METADATA, WEB_SEARCH_METADATA } from '../../harness';
+import { WEB_FETCH_METADATA, WEB_SEARCH_METADATA } from '../../engine/harness';
 import { createToolCatalogue, describeHarness, findPreset } from './index';
 import {
     createWebSearchCatalogueEntry,

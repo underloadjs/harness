@@ -33,9 +33,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
-import { agent, harness } from '../harness';
+import { agent, harness } from '../engine/harness';
 import type { HarnessPreset, HarnessPresetReport, RunnerSettings } from './harnesses/types';
-import type { HarnessStream, HarnessStreamEvent } from '../harness';
+import type { HarnessStream, HarnessStreamEvent } from '../engine/harness';
 import { createHarnessRegistry } from './harnesses';
 import { HarnessPersistence } from './persistence';
 // v2 layout readers (./persistence-test-helpers.ts): turns and the session title are stored in the

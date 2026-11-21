@@ -11,7 +11,7 @@
 // integration left to that owner: REST and WS must sit under the same root.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { HARNESS_WS_SUBPROTOCOL } from '../../shared/harness-api';
+import { HARNESS_WS_SUBPROTOCOL } from '../../engine/shared/harness-api';
 import { createHarnessRegistry } from '../harnesses';
 import { PRODUCTION_WITH_FIXTURES } from '../harnesses/fixture-presets.test-support';
 import { STANDALONE_MOUNT } from '../api';

@@ -26,14 +26,14 @@ const {
     FILE_READ_MAX_LINES,
     FILE_READ_MAX_BYTES,
     FILE_READ_WIRE_BUDGET
-} = await import('../src/tools/files/read.tool.ts');
-const { edit } = await import('../src/tools/files/edit.tool.ts');
-const { write } = await import('../src/tools/files/write.tool.ts');
-const { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult } = await import('../src/core/result-budget.ts');
+} = await import('../src/engine/tools/files/read.tool.ts');
+const { edit } = await import('../src/engine/tools/files/edit.tool.ts');
+const { write } = await import('../src/engine/tools/files/write.tool.ts');
+const { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult } = await import('../src/engine/core/result-budget.ts');
 // `read` returns a branded envelope (src/core/tool-text.ts): `content` is the machine
 // result, `__toolText` the prose a transcript gets. Every check here is about the
 // machine result, so the envelope is peeled exactly as the delivery boundary peels it.
-const { unwrapToolResult } = await import('../src/core/index.ts');
+const { unwrapToolResult } = await import('../src/engine/core/index.ts');
 
 // This script drives the real tools through their public entries, so the arguments are
 // the wire-shaped input arrays the tool schema accepts (`string` path or an options
