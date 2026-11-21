@@ -49,6 +49,7 @@ import {
     createHarnessRegistry,
     createToolCatalogue,
     createWebSearchCatalogueEntry,
+    presets,
     WEBSEARCH_UNCONFIGURED_HINT
 } from './harnesses';
 import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
@@ -435,7 +436,12 @@ const createRuntime = (
         settings,
         defaults,
         registry: createHarnessRegistry([...PRODUCTION_WITH_FIXTURES, ...extraPresets]),
-        loadEnvironment: false
+        loadEnvironment: false,
+        // R-boot: an omitted direct-call catalogue is EMPTY, and the descriptor filters a
+        // card's `environmentTools` against the catalogue it is described with. This host
+        // serves the production rows, so it states the production catalogue (keyless search
+        // stub above, keyless fetch enabled) — exactly like a real deployment.
+        catalogue: createToolCatalogue()
     });
 };
 
@@ -1868,14 +1874,35 @@ describe('harness catalogue reads', () => {
         expect(unconfigured.availability.hint).toBe(WEBSEARCH_UNCONFIGURED_HINT);
     });
 
-    it('ships only the production cards without an injected registry', async () => {
-        // No injected registry: exactly what `startHarnessServer` and the discovered service route
-        // build. The catalogue a user sees must contain no scripted card and no failing example.
+    it('starts with NO cards when the deployment supplies no catalogue (R-boot)', async () => {
+        // No injected registry and no `harness.presets`: exactly what `startHarnessServer` and
+        // the discovered service route build when a host configures nothing. The catalogue is
+        // EMPTY — the shipped cards are an explicit provisioning choice now, never a default.
         stubEmptySearchKeys();
         const runtime = createHarnessRuntime({
             settings: SETTINGS,
             defaults: DEFAULTS,
             loadEnvironment: false
+        });
+
+        const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+
+        expect(page.status).toBe(200);
+        expect(page.body.items).toEqual([]);
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'general' })).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "general".' } }
+        });
+    });
+
+    it('lists exactly the production cards when they are provisioned explicitly (R-boot)', async () => {
+        // The same catalogue the zero-default test above no longer gets: the host states it.
+        stubEmptySearchKeys();
+        const runtime = createHarnessRuntime({
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            loadEnvironment: false,
+            harness: { presets }
         });
 
         const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
@@ -1914,7 +1941,10 @@ describe('a zero-harness registry', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             registry: createHarnessRegistry([]),
-            loadEnvironment: false
+            loadEnvironment: false,
+            // Same production direct-call catalogue as `createRuntime` above: the descriptor
+            // lists a card's environment rows only when the catalogue can run them.
+            catalogue: createToolCatalogue()
         });
     };
 

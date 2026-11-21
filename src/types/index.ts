@@ -5035,6 +5035,21 @@ export type HarnessConfiguration = {
     // src/plugin/manifest.ts) are applied FIRST, so a name listed here REPLACES the
     // built-in of that name instead of colliding with it.
     plugins?: readonly HarnessPlugin[];
+    // THE BUILT-IN PLUGIN SET, made explicit so a HOST can state "none" (R-boot).
+    //
+    // Absent is the library default and changes nothing: the generated manifest
+    // (`BUILTIN_PLUGINS`) is applied first, exactly as before. `[]` opts out of every
+    // auto-discovered plugin, which is the only way `plugins: []` can mean "no plugins":
+    // without this field an empty host list still leaves the three shipped plugins
+    // loaded. `src/server/harnesses/toolbox.ts` passes `[]` here whenever a server boot
+    // has supplied the complete plugin set (its `HarnessPresetReport.plugins` member),
+    // so the server's boot contract never regains implicit built-ins the host omitted.
+    //
+    // It stays a LIBRARY field (not a server-only flag) because it is the plugin host's
+    // own `builtins` seam exposed at the public configuration edge
+    // (src/plugin/host.ts `resolvePluginList`); no default changes for any consumer that
+    // does not set it.
+    builtinPlugins?: readonly HarnessPlugin[];
     // Read-only view of the host's per-plugin settings (R2/R3 plugin settings UI).
     // The harness asks it for `<pluginName>.<key>` whenever a plugin reads
     // `api.settings.*`. Absent = an in-memory provider seeded from each plugin's

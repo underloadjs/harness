@@ -116,6 +116,77 @@ export const LANE_MAX_FRAME_BYTES = 4 * 1024 * 1024;
 // Shared fragments
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// B6 — THE SERIALIZABLE BOOT POSTURE A REPLICA REBUILDS FROM
+// ---------------------------------------------------------------------------
+//
+// THE GAP THIS CLOSES: `presetFromRecord(record)` alone reproduces the TEAM, but a
+// record carries no plugins, no toolbox booleans, no budget and no extra tool
+// sources/folders (harnesses/registry.ts `presetToRecord` lists its fields explicitly
+// and never serialises executable configuration). A replica rebuilt from the record
+// alone therefore runs the LIBRARY's defaults: the generated `BUILTIN_PLUGINS` come
+// back on a deployment that configured none, the shared toolbox comes back on a card
+// built tool-less, and `maxIterations` falls to `Infinity` on a card that set a
+// budget. That is a WIDENED harness executing a replica - the exact "silently
+// different posture" the coordinator refuses everywhere else.
+//
+// THE RULE: whatever the canonical session was BUILT with and can be expressed as
+// data crosses here; anything that cannot be expressed (a plugin `setup` closure, a
+// command handler, a constructed `Tool` definition) is refused at session creation
+// (./capability.ts `laneBootPosture`, raised as a 400 by ../sessions.ts). These fields
+// are the data half of that rule, and every one is structured-clone-safe by
+// construction.
+//
+// WHY `presetRebuild` IS OPTIONAL: a preset with no `creation` metadata (a hand-built
+// template-backed `HarnessPreset`, a fixture) has nothing more to say than its record,
+// so the field is omitted and the worker keeps the historical record-only rebuild.
+// An older coordinator / newer worker pair is harmless for the same reason: the
+// field is strictly additive (like `withheldTools`/`sync.tools`), and a bundle that
+// predates it cannot be reached by a coordinator from this checkout because the
+// hello version check runs first (./lane-host.ts `resolveEntry`).
+export type LaneToolboxPosture = {
+    // MATERIALIZED booleans (the `?? shared` rule already applied), so neither side
+    // has to re-derive "absent means shared".
+    sharedToolbox: boolean;
+    websearch: boolean;
+    webfetch: boolean;
+    // A finite budget, or `Infinity` when the card deliberately states it. Omitted
+    // means the card states none (the factory default).
+    maxIterations?: number;
+    // Package-relative editable sources. These are PATHS, so they compile in the
+    // worker from the same checkout, exactly like `SHARED_TOOL_SOURCES`.
+    extraToolSources?: Record<string, string>;
+    // Package-relative folders scanned at construction.
+    toolFolders?: string[];
+};
+
+// How the replica's preset factory may be reconstructed. Only the 'profiled' arm is
+// ever SENT: an 'advanced' host factory is refused before a blueprint exists
+// (`preset-not-rebuildable`, ./capability.ts), because a closure cannot cross a
+// thread. `extraTools` never appears here for the same reason - it is a map of
+// constructed `Tool` definitions, so a card that declares one is refused instead.
+export type LanePresetRebuild = {
+    factory: 'profiled';
+    toolbox: LaneToolboxPosture;
+};
+
+// The replica's complete plugin set, as data. Only the SHIPPED generated entries can
+// be reconstructed on the worker thread (their `setup` functions live in this same
+// checkout, imported through `../../plugin`), and the coordinator verifies ELEMENT
+// IDENTITY before it sends one - so a host lookalike that merely shares a built-in
+// name is refused rather than replaced by the library's entry.
+//
+//   - `{ kind: 'none' }`  - the deployment configured ZERO plugins (`plugins: []`,
+//                           the server narrow default); the replica passes `plugins: []`
+//                           and `createToolboxHarness` emits `builtinPlugins: []`, so
+//                           no optional built-in reappears;
+//   - `{ kind: 'builtin', names }` - exactly these generated built-ins, in this order;
+//   - absent - the host never configured plugins (a direct `new SessionStore`), so the
+//                           factory default (`BUILTIN_PLUGINS`) is what BOTH sides run.
+export type LanePluginPosture =
+    | { kind: 'none' }
+    | { kind: 'builtin'; names: string[] };
+
 // Everything the worker needs to rebuild THIS session's harness, and nothing else.
 // `record` is the durable preset projection; `presetFromRecord` turns it back into the
 // executable factory (harnesses/registry.ts ~638), which is the restart path the
@@ -200,6 +271,15 @@ export type LaneBlueprint = {
     // setting has ever been changed", the pre-R3 document) means the worker installs no
     // provider and the library's declared-default provider answers, byte for byte as before.
     pluginSettings?: HarnessPluginSettingsRecord;
+    // B6: the exact SERIALIZABLE toolbox posture the canonical preset was built with.
+    // The worker passes it to `presetFromRecord` (which a durable restore already does)
+    // and then VERIFIES the rebuilt card's materialized posture matches, so a record
+    // whose declaration cannot express the posture faults the hello instead of running
+    // a different harness. See `LaneToolboxPosture`/`LanePresetRebuild` above.
+    presetRebuild?: LanePresetRebuild;
+    // B6: the deployment's complete plugin set, as data. Absent means "the host never
+    // configured plugins"; `none` is a configured empty set. See `LanePluginPosture`.
+    plugins?: LanePluginPosture;
 };
 
 // What the worker could actually do once built. A non-empty `unsupported` list makes

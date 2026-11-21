@@ -260,7 +260,24 @@ const runtimeRoot = path.join(work, 'runtime-root');
 await check('createHarnessRuntime persists a session under the requested root', async () => {
     assert(path.isAbsolute(runtimeRoot), 'the test root must be absolute');
 
-    const runtime = server.createHarnessRuntime({ root: runtimeRoot, loadEnvironment: false });
+    // R-boot: the server seams no longer ship a catalogue, plugin set or toolbox implicitly,
+    // so this smoke states the PRODUCTION configuration it is checking: the shipped presets,
+    // the shipped plugins and the shared toolbox. Reading them from the PUBLISHED module (the
+    // same `server` namespace every member below comes from) is also what proves the new
+    // boot-configuration exports survive packing.
+    const runtime = server.createHarnessRuntime({
+        root: runtimeRoot,
+        loadEnvironment: false,
+        // The DIRECT-CALL catalogue is explicit for the same reason the harness
+        // configuration is: the server default is EMPTY (no optional direct-call row), so
+        // a production smoke states the catalogue it intends to serve.
+        catalogue: server.createToolCatalogue(),
+        harness: {
+            presets: server.presets,
+            plugins: server.BUILTIN_PLUGINS,
+            toolbox: { sharedToolbox: true }
+        }
+    });
     assert(runtime.root === path.resolve(runtimeRoot), 'runtime.root is not the requested root');
     assert(typeof runtime.persistence === 'object', 'no persistence bound');
 
@@ -318,7 +335,18 @@ try {
             host: '127.0.0.1',
             port: 0,
             staticRoot: null,
-            databaseRoot: serverRoot
+            databaseRoot: serverRoot,
+            // Same explicit production catalogue as the runtime check above: an omitted
+            // catalogue is EMPTY, so the smoke states the rows it intends to serve.
+            catalogue: server.createToolCatalogue(),
+            // R-boot: same explicit production configuration as the runtime check above; the
+            // cards this check lists (`general` included) exist because THIS line declares
+            // them, not because the boot falls back to the package catalogue.
+            harness: {
+                presets: server.presets,
+                plugins: server.BUILTIN_PLUGINS,
+                toolbox: { sharedToolbox: true }
+            }
         });
         handle = listener;
 
@@ -340,10 +368,11 @@ try {
         // The catalogue is a PAGED envelope (`items` + page meta + revision), so `items`
         // is the published shape; only `name` is read off each card.
         const names = index.items.map((entry: { name: string }) => entry.name);
-        // `general` is the shipped default card (../src/server/harnesses/presets.ts). The
-        // scripted `demo` and the `flaky` example presets are deleted, so the built index
-        // lists ONLY production cards — asserting one of those two names here would be the
-        // package check re-adding the example tier the product just removed.
+        // `general` is the shipped default card (../src/server/harnesses/presets.ts), and it
+        // is in this index because the `harness.presets` above provisioned the catalogue — the
+        // boot no longer ships one implicitly. The scripted `demo` and the `flaky` example
+        // presets are deleted, so the built index lists ONLY production cards; asserting one
+        // of those two names here would be the package check re-adding the removed tier.
         assert(names.includes('general'), 'the general preset is missing from the harness index');
 
         const session = await fetch(`${listener.url}${MOUNT}/sessions`, {

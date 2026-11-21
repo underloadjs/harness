@@ -169,6 +169,14 @@ export type {
     KnowledgeStoreReportEvent
 } from './knowledge-file-store';
 
+// The generated built-in plugin manifest, published from the SERVER barrel because the
+// boot contract makes "use the shipped plugins" an EXPLICIT host choice (R-boot):
+// `{ harness: { plugins: BUILTIN_PLUGINS } }`. Without this export a host that wanted the
+// historical plugin set would have to reach into the library's private manifest path.
+// The low-level default (`harness({})`) still applies them implicitly; only the server
+// boot no longer does.
+export { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin';
+
 // The catalogue the CLI and the server share (see ./harnesses/index.ts).
 export {
     AGENT_PROFILES,
@@ -176,6 +184,11 @@ export {
     // The production catalogue is `presets`, and it is the whole catalogue: the
     // offline/failure fixture presets are deleted, so there is no lookup superset and
     // no opt-in list left to export.
+    //
+    // R-boot: `EMPTY_TOOL_CATALOGUE` is the direct-call catalogue the server seams use
+    // when the host omits one (no shared/app/web row). Exported so a host can name the
+    // zero contract explicitly instead of passing `createToolCatalogue()`.
+    EMPTY_TOOL_CATALOGUE,
     CORE_ENVIRONMENT_TOOL_NAMES,
     CORE_PRESET_TOOL_NAMES,
     CORE_TOOL_GROUP,
@@ -200,6 +213,14 @@ export {
     createProfiledHarness,
     createToolboxHarness,
     createToolCatalogue,
+    // R-boot: the card projection of a `HarnessBootConfiguration.toolbox`.
+    declaredToolboxNames,
+    // R-boot: ONE boot contract for both server seams. `harness: <configuration>` on
+    // `startHarnessServer`/`createHarnessRuntime`, and `variables.harness` on the service
+    // routes/warm-up. Omitted members are EMPTY (no presets, plugins, plugins rows, shared
+    // toolbox or extra tools), which is the deliberate contract change.
+    harnessBootSignature,
+    resolveHarnessBootConfiguration,
     createWebSearchCatalogueEntry,
     // R9-R11: the fetch half of the environment-backed core pair.
     createWebFetchCatalogueEntry,
@@ -225,13 +246,21 @@ export type {
     AgentProfile,
     CatalogueEntry,
     DescriptorCatalogue,
+    HarnessBootConfiguration,
+    HarnessBootPresetConfiguration,
     HarnessPatch,
     HarnessPreset,
+    // B4: the in-memory rebuild metadata carried by `HarnessPreset.creation` (a factory
+    // kind plus its effective per-card toolbox). Exported so a host — or a worker task
+    // reading a registry entry — can name the shape it inspects.
+    HarnessPresetCreation,
     HarnessRegistration,
     HarnessRegistry,
     HarnessRegistryOptions,
     HarnessRegistrySnapshot,
+    HarnessToolboxDefaults,
     LegacyPresetDefinition,
+    ResolvedHarnessBootConfiguration,
     RunnerSettings,
     ToolAvailability,
     ToolCatalogue,

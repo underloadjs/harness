@@ -19,8 +19,14 @@
 // Omitted is the previous in-memory server (the default used by direct tests).
 
 import http from 'node:http';
-import { createHarnessRegistry, createToolCatalogue, describeHarness, restoreHarnessRegistry } from './harnesses';
-import type { HarnessRegistry, ToolCatalogue } from './harnesses';
+import {
+    EMPTY_TOOL_CATALOGUE,
+    createHarnessRegistry,
+    describeHarness,
+    resolveHarnessBootConfiguration,
+    restoreHarnessRegistry
+} from './harnesses';
+import type { HarnessBootConfiguration, HarnessRegistry, ToolCatalogue } from './harnesses';
 import { loadConfiguration, resolveRuntimeConfiguration } from './config';
 import type { ServerRuntimeConfiguration } from './config';
 import { loadEnvironmentFile } from './environment';
@@ -69,12 +75,26 @@ export type StartServerOptions = {
     // restart resumes them. The service host instead passes DATABASE_ROOT through
     // its endpoint `variables.root` (see ./service.ts).
     databaseRoot?: string | null;
-    // Direct-call catalogue. Omitted means "build it now, after `.env` loading".
-    // Tests inject one to pin a configured/unconfigured search without
-    // touching the test runner's environment.
+    // Direct-call catalogue (`GET /tools` / `POST /tools/{name}`). OMITTED IS EMPTY
+    // (`EMPTY_TOOL_CATALOGUE`), matching the rest of the boot contract: a bare listener
+    // exposes no optional direct-call row (no shared presets, no app tools, no web rows).
+    // The harness-owned CORE rows are still listed by the dispatcher and run through a
+    // session — they are not a direct-call mechanism.
+    //
+    // A host that wants the production rows passes `createToolCatalogue()` explicitly
+    // (./dev.ts and the release smoke do). Tests inject one to pin a
+    // configured/unconfigured search without touching the test runner's environment.
+    //
+    // A catalogue ALSO decides which environment-backed names a card DESCRIPTOR may list
+    // (./harnesses/descriptor.ts filters `environmentTools` against `catalogue.tools`), so
+    // a host that declares `environmentTools` on a preset and wants them shown must supply
+    // a catalogue carrying those entries.
     catalogue?: ToolCatalogue;
-    // The in-memory harness registry shared by the store and the API. Omitted
-    // means the shipped catalogue; tests inject one to add scripted harnesses.
+    // The in-memory harness registry shared by the store and the API. Omitted means the
+    // catalogue comes from `harness.presets` (empty by default — the shipped presets are no
+    // longer implicit); tests inject one to add scripted harnesses. An injected registry is
+    // authoritative, so `harness.presets` beside it throws and `harness.toolbox` beside it
+    // is refused (it owns its creation defaults).
     registry?: HarnessRegistry;
     // Server RUNTIME override (R3), merged over `HARNESS_THREAD_EXECUTION` and the
     // other `HARNESS_WORKER_*` variables and validated the same way. `worker` is
@@ -88,6 +108,19 @@ export type StartServerOptions = {
     // T15/T13: inject the epoch/revision hub (a host that already publishes domain changes into one).
     // Omitted means "create it", which is what mints the process epoch REST and WS both report.
     events?: HarnessEventHub;
+    // R-boot: THE HARNESS BOOT CONFIGURATION (./harnesses/boot.ts) — templates, preset
+    // agents/overrides, plugins, tools and tool sources in ONE explicit object. Omitted is
+    // the ZERO floor, deliberately: an EMPTY preset catalogue, NO plugins and no plugin
+    // rows, and a harness-owned core toolbox only. A host that wants the shipped behaviour
+    // states it: `{ presets: presets, plugins: BUILTIN_PLUGINS, toolbox: { sharedToolbox: true } }`
+    // (both values are exported from this barrel).
+    //
+    // An injected `registry` remains authoritative for the catalogue, so configuring a
+    // non-empty `presets` beside it throws. `plugins`/`commands` still apply (per-build
+    // facts), but a stated `toolbox` beside an injected registry is REFUSED (B5): this
+    // listener cannot change the creation defaults of a registry it did not build, and
+    // silently ignoring the posture would leave the host believing it configured one.
+    harness?: HarnessBootConfiguration;
 };
 
 export type HarnessServer = {
@@ -97,6 +130,10 @@ export type HarnessServer = {
     store: SessionStore;
     // The resolved, validated runtime this listener executes with (R3).
     runtime: ServerRuntimeConfiguration;
+    // R-boot: the harness configuration the listener was started with, as supplied. Absent
+    // when the caller configured nothing (the zero-default contract); reported so an
+    // embedder can prove which catalogue/plugins/toolbox it is serving.
+    harnessConfiguration?: HarnessBootConfiguration;
     // Present when a database root was supplied; the resolved root and file owner.
     persistence?: HarnessPersistence;
     // T7: the deployment's DURABLE knowledge base (`<root>/harness/knowledge/`), absent when the
@@ -159,21 +196,52 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
 
     const configuration = loadConfiguration();
 
+    // R-boot: resolve and VALIDATE the harness configuration before the registry, the store
+    // or the listener exists — a malformed preset/plugin/toolbox document must abort startup
+    // with its own sentence, not serve a half-configured catalogue.
+    const boot = resolveHarnessBootConfiguration(options.harness);
+
+    if (options.registry !== undefined && boot.presets.length > 0) {
+        throw new Error(
+            'startHarnessServer accepts either an injected registry or `harness.presets`, not both: two sources for the harness catalogue have no precedence order.'
+        );
+    }
+
+    // B5: THE INJECTED-REGISTRY TOOLBOX CONTRACT. An injected registry owns its creation
+    // defaults (`HarnessRegistryOptions.creation`), so a stated boot `toolbox` cannot be
+    // applied here and must not be silently dropped. Refusing keeps the explicit-injection
+    // path honest; a host that needs a posture builds the registry with it. Checked on the
+    // RAW configuration (an omitted toolbox never rejects an injected registry, which is
+    // the combination every existing custom-registry caller uses).
+    if (options.registry !== undefined && options.harness?.toolbox !== undefined) {
+        throw new Error(
+            'startHarnessServer cannot apply `harness.toolbox` to an injected registry: an injected registry owns its creation defaults. Pass the posture to `createHarnessRegistry(presets, { creation })` (or the `creation` defaults the registry already has) and omit `harness.toolbox`.'
+        );
+    }
+
     // R3: resolve and validate the runtime BEFORE any listener is created, so a bad
     // `HARNESS_WORKER_*` value or an unsupported execution mode aborts startup with
     // the variable name instead of serving a silently different model.
     const runtime = resolveRuntimeConfiguration(configuration.runtime, options.runtime);
     assertWorkerRuntimeReady(runtime);
 
-    // Built after loadEnvironmentFile() on purpose: search resolves its
-    // provider key here, once, and the handler keeps the snapshot for its whole
-    // lifetime. A keyless host still gets the entry, marked unconfigured.
-    const catalogue = options.catalogue ?? createToolCatalogue();
+    // OMITTED IS EMPTY (R-boot zero-default): the direct-call catalogue no longer falls back to the
+    // package's shared preset/web rows. A host that wants them passes
+    // `createToolCatalogue()` explicitly, built after `loadEnvironmentFile()` on purpose
+    // (search resolves its provider key there, once, and the handler keeps the snapshot
+    // for its whole lifetime; a keyless host still gets the entry, marked unconfigured).
+    const catalogue = options.catalogue ?? EMPTY_TOOL_CATALOGUE;
 
     // ONE registry: the store resolves a session through it and the API creates
     // and patches through it, so a harness created over HTTP is immediately
     // runnable and an override is visible to the next session.
-    const registry = options.registry ?? createHarnessRegistry();
+    //
+    // R-boot: an injected registry is authoritative; otherwise the catalogue is EXACTLY
+    // what the boot configuration declared (empty by default — the shipped presets are no
+    // longer implicit). The registry's creation defaults carry the same toolbox posture, so
+    // `POST /harnesses` and a restored row cannot regain tools the deployment did not choose.
+    const registry =
+        options.registry ?? createHarnessRegistry(boot.presets, { creation: boot.toolbox });
 
     // R3b: rebuild the registry from disk BEFORE any session is constructed, then
     // hand the validated session records to the store. A corrupt/unknown document
@@ -248,7 +316,15 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
             // engine across its sessions instead of giving each session a private base. The
             // accessor answers the store as soon as it exists and the shared engine until then;
             // both are the same object underneath (../runtime.ts `harnessKnowledgeOf`).
-            knowledge: () => harnessKnowledgeOf(root)
+            knowledge: () => harnessKnowledgeOf(root),
+            // R-boot: the per-BUILD half of the boot configuration, identical to the rule
+            // ./runtime.ts applies for the service host. Explicit arrays (including `[]`) are
+            // what make omission mean "none"; the descriptor list is derived from the
+            // executable plugins by the boot resolver, so `/plugins` rows and loaded plugins
+            // are one catalogue.
+            plugins: boot.plugins,
+            pluginDescriptors: boot.pluginDescriptors,
+            ...(boot.commands.length === 0 ? {} : { harnessCommands: boot.commands })
         }
     );
 
@@ -369,6 +445,7 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
         url: `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`,
         store,
         runtime,
+        ...(options.harness === undefined ? {} : { harnessConfiguration: options.harness }),
         stream,
         events,
         ...(persistence === undefined ? {} : { persistence }),

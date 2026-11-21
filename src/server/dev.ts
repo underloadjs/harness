@@ -32,7 +32,18 @@
 // harness construction.
 
 import { parseArgs } from 'node:util';
-import { startHarnessServer } from './index';
+// R-boot: the server boot no longer ships a catalogue/plugin set/toolbox implicitly. This
+// developer launcher is a HOST, so it states the production configuration it wants — the
+// shipped presets, the shipped plugins, the shared toolbox AND the production direct-call
+// catalogue — instead of relying on a default the framework deliberately removed (the
+// omitted catalogue is EMPTY: no shared preset/app tool and no web row over `/tools`).
+import {
+    BUILTIN_PLUGINS,
+    createToolCatalogue,
+    loadEnvironmentFile,
+    presets,
+    startHarnessServer
+} from './index';
 // The canonical root, from the generated contract module — not a string spelled twice here.
 import { HARNESS_API_ROOT } from '../shared/harness-api';
 
@@ -96,6 +107,13 @@ const main = async (): Promise<void> => {
     }
 
     try {
+        // The direct-call catalogue resolves the search provider key when it is BUILT, so
+        // the launcher loads the package `.env` first. `loadEnvironmentFile` is idempotent
+        // and `startHarnessServer` loads the same file again before its configuration.
+        loadEnvironmentFile();
+
+        const catalogue = createToolCatalogue();
+
         const server = await startHarnessServer({
             ...(port === undefined ? {} : { port }),
             ...(values.host === undefined ? {} : { host: values.host }),
@@ -103,7 +121,19 @@ const main = async (): Promise<void> => {
                 ? {}
                 : { databaseRoot: values['database-root'] }),
             // API only: never serve src/frontend/dist from this launcher.
-            staticRoot: null
+            staticRoot: null,
+            // THE EXPLICIT DIRECT-CALL CATALOGUE (`GET /tools` / `POST /tools/{name}`).
+            // The server default is EMPTY (no shared preset/app tool and no web row), so a
+            // developer launcher states the production one, exactly like the presets and
+            // plugins below.
+            catalogue,
+            // R-boot: the explicit production catalogue this launcher serves. A host that
+            // wants only its own teams/plugins/tools omits or replaces these three members.
+            harness: {
+                presets,
+                plugins: BUILTIN_PLUGINS,
+                toolbox: { sharedToolbox: true }
+            }
         });
 
         console.log(`Harness server listening at ${server.url}`);

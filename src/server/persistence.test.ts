@@ -31,7 +31,7 @@ import type {
 } from '../harness';
 import type { TaskChange, TaskItem, TaskResult } from '../types';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
-import { createHarnessRegistry } from './harnesses';
+import { createHarnessRegistry, presets } from './harnesses';
 import { createWebSearchCatalogueEntry, createToolCatalogue } from './harnesses';
 import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
 import { AGENT_PROFILES, agentInstruction } from '../agents';
@@ -953,7 +953,11 @@ describe('R3b durable harness database', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             catalogue: CATALOGUE,
-            loadEnvironment: false
+            loadEnvironment: false,
+            // R-boot: the server ships no catalogue implicitly. These deletion/restore cases
+            // are about the SHIPPED templates' durable behaviour, so they state the catalogue
+            // explicitly (the same declaration a production host makes).
+            harness: { presets }
         });
         const created = await first.store.create('instruct');
         const frozen = first.store.get(created.id).harnessDefinition;
@@ -973,7 +977,10 @@ describe('R3b durable harness database', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             catalogue: CATALOGUE,
-            loadEnvironment: false
+            loadEnvironment: false,
+            // R-boot: same explicit catalogue as the first boot above, so this restart is a
+            // real restart of the same deployment rather than a different (empty) one.
+            harness: { presets }
         });
 
         expect(second.registry.find('instruct')?.entry).toBe('workspace');
@@ -1816,7 +1823,11 @@ describe('T5 durable harness deletion', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             catalogue: CATALOGUE,
-            loadEnvironment: false
+            loadEnvironment: false,
+            // R-boot: the server ships no catalogue implicitly. These deletion/restore cases
+            // are about the SHIPPED templates' durable behaviour, so they state the catalogue
+            // explicitly (the same declaration a production host makes).
+            harness: { presets }
         });
 
         // A live session on the shipped default, created before the deletion.
@@ -1856,7 +1867,10 @@ describe('T5 durable harness deletion', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             catalogue: CATALOGUE,
-            loadEnvironment: false
+            loadEnvironment: false,
+            // R-boot: same explicit catalogue as the first boot above, so this restart is a
+            // real restart of the same deployment rather than a different (empty) one.
+            harness: { presets }
         });
 
         expect(second.registry.list().map((preset) => preset.name)).toEqual([
@@ -1920,7 +1934,10 @@ describe('T5 durable harness deletion', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             catalogue: CATALOGUE,
-            loadEnvironment: false
+            loadEnvironment: false,
+            // R-boot: same explicit catalogue as the first boot above, so this restart is a
+            // real restart of the same deployment rather than a different (empty) one.
+            harness: { presets }
         });
 
         expect(second.registry.find('demo')).toBeUndefined();
@@ -1960,7 +1977,11 @@ describe('T5 durable harness deletion', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             catalogue: CATALOGUE,
-            loadEnvironment: false
+            loadEnvironment: false,
+            // R-boot: the server ships no catalogue implicitly. These deletion/restore cases
+            // are about the SHIPPED templates' durable behaviour, so they state the catalogue
+            // explicitly (the same declaration a production host makes).
+            harness: { presets }
         });
 
         await first.store.mutateRegistry(() => {
@@ -1995,7 +2016,10 @@ describe('T5 durable harness deletion', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             catalogue: CATALOGUE,
-            loadEnvironment: false
+            loadEnvironment: false,
+            // R-boot: same explicit catalogue as the first boot above, so this restart is a
+            // real restart of the same deployment rather than a different (empty) one.
+            harness: { presets }
         });
 
         expect(second.registry.deletedBuiltins()).toEqual([]);
@@ -2113,7 +2137,11 @@ describe('T5 durable harness deletion', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             catalogue: CATALOGUE,
-            loadEnvironment: false
+            loadEnvironment: false,
+            // R-boot: the server ships no catalogue implicitly. These deletion/restore cases
+            // are about the SHIPPED templates' durable behaviour, so they state the catalogue
+            // explicitly (the same declaration a production host makes).
+            harness: { presets }
         });
         first.registry.update('instruct', { title: 'Edited default' });
         await first.store.persistRegistry();
@@ -2124,7 +2152,10 @@ describe('T5 durable harness deletion', () => {
             settings: SETTINGS,
             defaults: DEFAULTS,
             catalogue: CATALOGUE,
-            loadEnvironment: false
+            loadEnvironment: false,
+            // R-boot: same explicit catalogue as the first boot above, so this restart is a
+            // real restart of the same deployment rather than a different (empty) one.
+            harness: { presets }
         });
 
         expect(second.registry.find('instruct')?.title).toBe('Edited default');

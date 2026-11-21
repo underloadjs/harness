@@ -20,7 +20,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { tool } from '../harness';
 import type { Harness, Tool } from '../harness';
-import { createHarnessRegistry, createToolboxHarness, agentsFromProfiles, presets } from './harnesses';
+import {
+    agentsFromProfiles,
+    createHarnessRegistry,
+    createToolboxHarness,
+    createToolCatalogue,
+    presets
+} from './harnesses';
 import type { HarnessPreset } from './harnesses';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
@@ -104,7 +110,10 @@ const createRuntime = (captured: Harness[]): HarnessRuntime => {
         settings: SETTINGS,
         defaults: DEFAULTS,
         registry,
-        loadEnvironment: false
+        loadEnvironment: false,
+        // R-boot: an omitted direct-call catalogue is EMPTY. The replacement cases compare
+        // a session registry against the static catalogue, so the static one is explicit.
+        catalogue: createToolCatalogue()
     });
 };
 

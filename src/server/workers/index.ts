@@ -94,6 +94,13 @@ export {
     assertWorkerRuntimeReady,
     assessLaneWorkerCapability,
     assessWorkerToolSurface,
+    // B6: the boot posture a replica may rebuild from, and the three refusal codes for
+    // configuration that exists only as a coordinator-side closure. ../sessions.ts uses
+    // the SAME function to build the blueprint it approved.
+    laneBootPosture,
+    LANE_PLUGINS_NOT_REBUILDABLE_CODE,
+    LANE_COMMANDS_NOT_REBUILDABLE_CODE,
+    LANE_EXTRA_TOOLS_NOT_REBUILDABLE_CODE,
     isSharedStateTool,
     isAuthorityRuntimeMethod,
     laneWorkerEnvironment,
@@ -131,10 +138,26 @@ export {
     nestedRunRefusalMessage,
     nestedRunUnsupportedError
 } from './capability';
-export type { AuthorityRuntimeMethod, LaneWorkerCapability, LocalRuntimeMethod, NestedRunDoor, ToolPlacement, ToolSurface, WorkerToolPlan } from './capability';
+export type {
+    AuthorityRuntimeMethod,
+    // B6: `LaneBootPosture` is the approved blueprint half; the host configuration is
+    // the deployment facts the store passes in.
+    LaneBootPosture,
+    LaneWorkerCapability,
+    LaneWorkerHostConfiguration,
+    LocalRuntimeMethod,
+    NestedRunDoor,
+    ToolPlacement,
+    ToolSurface,
+    WorkerToolPlan
+} from './capability';
 // The worker-side helpers, exported for tests (the entry itself is only ever spawned).
 // `startLaneWorker` is the loop attach point; importing it has no side effects.
 // `refuseNestedRuns` is the replica-shaping step (S7), exported so a test can prove the
 // registry entries and the `runtime.delegate` route are both gone.
 export { deriveOperations, installAuthorityRuntime, nestedRunHandshakeLimitations, refuseNestedRuns, startLaneWorker } from './lane-worker-loop';
+// B6: the replica rebuild path, exported for the same reason `refuseNestedRuns` is —
+// a focused test can prove the REAL serialization + reconstruction without spawning a
+// thread, and a spawned lane runs exactly these functions.
+export { assertLaneRebuildPosture, lanePluginSetOf, laneReplicaPreset } from './lane-worker-loop';
 export type { LaneWorkerState } from './lane-worker-loop';

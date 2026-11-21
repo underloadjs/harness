@@ -102,7 +102,18 @@ export type LaneTarget = { kind: 'thread'; threadId: string } | { kind: 'root'; 
 // OTHER two fields, not to this one.
 export type LaneBlueprintSource = Pick<
     LaneBlueprint,
-    'record' | 'settings' | 'apiKey' | 'memoryKeys' | 'disabledTools' | 'withheldTools' | 'pluginSettings'
+    | 'record'
+    | 'settings'
+    | 'apiKey'
+    | 'memoryKeys'
+    | 'disabledTools'
+    | 'withheldTools'
+    | 'pluginSettings'
+    // B6: the serializable boot posture the store approved at create/restore. Optional
+    // on the blueprint, so a host that never configured either axis ships neither key
+    // and the replica keeps the historical record-only rebuild.
+    | 'presetRebuild'
+    | 'plugins'
 >;
 
 export type LaneTurnRequest = {

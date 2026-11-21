@@ -7,9 +7,11 @@
 
 import type {
     Harness,
+    HarnessCommandConfiguration,
     HarnessDiagnosticEvent,
     HarnessInteractionConfiguration,
     HarnessKnowledge,
+    HarnessPlugin,
     HarnessPluginSettingsProvider,
     HarnessProgress,
     HarnessStateChangeEvent,
@@ -57,6 +59,54 @@ export type RunnerSettings = {
     // whose gateway drops connections every few minutes can raise the ceiling for that one
     // provider, and a deployment that wants failures to stay visible can turn the loop off.
     networkResumeLimit?: number;
+};
+
+// THE TOOLBOX POSTURE A HOST APPLIES TO HARNESSES BUILT THROUGH ITS FACTORIES.
+//
+// This is the one shape shared by every place a boot-time toolbox decision is made,
+// so they cannot drift:
+//   - `HarnessBootConfiguration.toolbox` (./boot.ts) — the host's deployment default;
+//   - `HarnessRegistryOptions.creation` (./registry.ts) — what `POST /harnesses`
+//     creates and what a restored registry row rebuilds with;
+//   - `HarnessPreset.creation.toolbox` (below, `HarnessPresetCreation`) — the
+//     effective PER-CARD posture a compiled preset was built with, so an executable
+//     registry patch or a frozen-session restore rebuilds THAT card instead of the
+//     deployment-wide default.
+//
+// There is deliberately no `HarnessPresetReport.toolbox`: a per-build report is the
+// wrong seam for a posture (a factory states its own; the registry supplies the
+// defaults), and no code path ever reads one.
+//
+// PRECEDENCE, exactly: a factory's own field wins, then the registry/card default,
+// then the historical value (`createToolboxHarness` defaults `sharedToolbox` to
+// `true`). That is why the BOOT resolver must resolve `sharedToolbox` to an explicit
+// boolean: a bare boot is `.toolbox.sharedToolbox === false` (the harness-owned core
+// floor only), and an explicit `presets` list can opt a factory into the shared set by
+// stating `true`.
+//
+// SERIALIZABLE BY CONSTRUCTION except `extraTools`: every member is a boolean, number,
+// string, path map, or constructed `Tool` definition. That boundary is deliberate — a
+// lane worker can receive everything except the constructed definitions (see the
+// worker note in ../sessions.ts `blueprintFor`).
+export type HarnessToolboxDefaults = {
+    // Whether the shared toolbox (package presets + app tools + environment rows) is
+    // registered. Absent means the CALLER's default: `true` for direct factory callers
+    // and `false` at the server boot seam (./boot.ts resolves it there).
+    sharedToolbox?: boolean;
+    // The tool-loop budget; absent/Infinity means uncapped (the shipped posture).
+    maxIterations?: number;
+    // Explicit environment-row opt-ins. Each falls back to `sharedToolbox`, so a
+    // toolbox that keeps only the shared file tools can still disable `fetch`/`search`.
+    websearch?: boolean;
+    webfetch?: boolean;
+    // Extra EDITABLE tool sources, merged after the shared source map (or used alone
+    // with `sharedToolbox: false`). Keys are tool names, values package-relative paths.
+    extraToolSources?: Readonly<Record<string, string>>;
+    // Extra constructed definitions, registered last so they win over every source.
+    extraTools?: Readonly<Record<string, Tool>>;
+    // Extra package-relative folders scanned during construction (the live-authoring
+    // half of the tool set). Merged after the shared folder list.
+    toolFolders?: readonly string[];
 };
 
 // Persistence observer the server may attach at construction (R3a/R3b). Optional
@@ -118,6 +168,29 @@ export type HarnessPresetReport = {
     // through `createToolboxHarness` is free to ignore it, exactly like the other report
     // fields — nothing about that factory's behaviour changes.
     enableAllTools?: boolean;
+    // THE COMPLETE PLUGIN SET this deployment applies to every harness build (R-boot).
+    //
+    // `undefined` means "this host has no plugin configuration" and leaves the factory's
+    // own default (the generated `BUILTIN_PLUGINS`) in place — the historical behaviour for
+    // a direct factory caller. An ARRAY is authoritative: `[]` registers NO plugin at all,
+    // and a non-empty list registers exactly those entries, with NO implicit built-ins.
+    // `createToolboxHarness` expresses that by passing `builtinPlugins: []` alongside
+    // `plugins: report.plugins` into `HarnessConfiguration` (../../types, ./toolbox.ts), so
+    // "omitted at the boot seam" can never silently regain the shipped three plugins.
+    //
+    // WHY IT RIDES THE REPORT and not the preset: plugins are a DEPLOYMENT decision (the
+    // same list for every session of the process), while a preset is a reusable factory.
+    // A SessionStore therefore always passes its configured list — including `[]` — so a
+    // registry-created preset, a restored frozen preset and a shipped card all see one
+    // answer. A custom factory that ignores the report keeps the library default; that is
+    // the documented limit of every field here, and it is why the shipped factory path
+    // (`createToolboxHarness`) forwards it.
+    plugins?: readonly HarnessPlugin[];
+    // Slash commands this deployment registers on every harness it builds, in the same
+    // additive-report style. Absent means none. `createToolboxHarness` forwards the list
+    // into `HarnessConfiguration.commands`, AFTER the harness's own built-in commands, so
+    // a collision is construction's own duplicate-name error rather than a silent shadow.
+    commands?: readonly HarnessCommandConfiguration[];
     // Plugin diagnostics (pipeline T1.5's last mile). Same optional-third-argument discipline
     // as `stateChange`, `interaction` and `pluginSettings` above, so every existing factory
     // signature and caller keeps compiling and a factory that ignores it simply produces a
@@ -169,6 +242,36 @@ export type HarnessPresetReport = {
     // the knowledge engine who is writing. A host that builds harnesses outside
     // `SessionStore` may omit it, and every article it creates stays unowned.
     knowledgeOwner?: string;
+};
+
+// THE CARD'S IN-MEMORY REBUILD METADATA (R-boot, B4).
+//
+// WHY THIS EXISTS: a preset's `create` is a closure. Before this field, an executable
+// registry PATCH (`update()` on the roster/ranks/agent maps) and a frozen-session
+// restore both rebuilt the factory from the DEPLOYMENT-wide creation defaults, so a
+// card compiled with its own toolbox (a tool-less card, a per-card extra tool, an
+// advanced host factory) silently widened to the default toolbox on the first edit or
+// restart. Recording what the factory was BUILT with keeps the card's own declaration
+// authoritative without widening the durable record schema (which must stay free of
+// executable closures).
+//
+// This is INTERNAL state: it is never projected onto the wire (`presetToRecord` lists
+// its fields explicitly and omits this one).
+export type HarnessPresetCreation = {
+    // How `create` may be reconstructed.
+    //   - 'profiled' — `createProfiledHarness`/`createToolboxHarness` over `toolbox`
+    //                  below; the registry CAN rebuild it from a new roster/rank/map set.
+    //   - 'advanced' — a host-supplied factory (`HarnessBootPresetConfiguration.create`
+    //                  or an injected `HarnessPreset`). Nothing here can reconstruct it,
+    //                  so an executable patch is refused rather than silently replaced
+    //                  by a profiled harness, and a frozen-session restore reuses the
+    //                  still-available factory only when its executable fields match.
+    factory: 'profiled' | 'advanced';
+    // The EFFECTIVE per-card posture the profiled factory was compiled with. Every
+    // boolean is materialized (sharedToolbox/websearch/webfetch), and an explicit empty
+    // `extraToolSources`/`extraTools`/`toolFolders` stays empty — a card that cleared an
+    // inherited set must not regain it on the next rebuild. Absent on 'advanced'.
+    toolbox?: HarnessToolboxDefaults;
 };
 
 // One named harness in the catalogue.
@@ -289,6 +392,11 @@ export type HarnessPreset = {
     //                  factory; an executable patch rebuilds the live toolbox with
     //                  the TestFlaky extra retained.
     template?: 'live' | 'scripted' | 'flaky';
+    // THE FACTORY'S REBUILD METADATA (R-boot, B4). See `HarnessPresetCreation`. Present
+    // on boot-compiled presets and every registry-created entry; absent on a hand-built
+    // preset (the registry then falls back to its own creation defaults, exactly as
+    // before this field existed). Never on the wire and never durable.
+    creation?: HarnessPresetCreation;
     // Metadata a NON-LIVE template adopts when an executable patch upgrades it and
     // the current title/description are still the shipped ones. Without this, the
     // scripted demo would keep prose claiming no endpoint after it became a live

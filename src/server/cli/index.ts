@@ -26,6 +26,9 @@ import type { Harness, HarnessInteractionConfiguration } from '../../harness';
 import { createRenderer } from './render';
 import type { Renderer } from './render';
 import { DEFAULT_CLI_PRESET, parseCliOptions } from './options';
+// R-boot: the `--serve` branch states its production catalogue/plugins/tools explicitly
+// (see ./serve.ts) instead of relying on a server boot default that no longer exists.
+import { createCliServeOptions } from './serve';
 // Shared command layer: the REPL keeps only the commands that need a terminal, and
 // routes every other "/name" through the harness registry (see ./commands.ts).
 import { runCliCommand } from './commands';
@@ -377,16 +380,17 @@ const main = async (): Promise<void> => {
             return;
         }
 
-        const server = await startHarnessServer({
-            port,
-            host: values.host,
-            settings,
-            defaults: {
-                baseURL: settings.baseURL,
-                model: settings.model,
-                hasApiKey: settings.apiKey.trim().length > 0
-            }
-        });
+        // The CLI is a HOST, so ./serve.ts states the production harness boot (shipped
+        // presets/plugins/shared toolbox) and the direct-call catalogue outright. Bare
+        // boot would otherwise serve the zero floor, which is not what `harness --serve`
+        // has ever meant.
+        const server = await startHarnessServer(
+            createCliServeOptions({
+                port,
+                host: values.host,
+                settings
+            })
+        );
 
         console.log(`Harness server listening at ${server.url}`);
         console.log(`  API  ${server.url}/api`);

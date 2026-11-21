@@ -23,7 +23,7 @@
 
 import http from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { startHarnessServer } from './index';
+import { presets, startHarnessServer } from './index';
 import type { HarnessServer } from './index';
 // Canonical network vocabulary (T26): every DTO here comes from the generated contract,
 // not from the internal `protocol.ts` legacy models.
@@ -119,7 +119,11 @@ beforeAll(async () => {
         staticRoot: null,
         // The configured provider owns the server key.
         settings: { baseURL: `${authoritative.origin}/v1`, apiKey: SERVER_KEY, model: MODEL },
-        defaults: { baseURL: `${authoritative.origin}/v1`, model: MODEL, hasApiKey: true }
+        defaults: { baseURL: `${authoritative.origin}/v1`, model: MODEL, hasApiKey: true },
+        // R-boot: the server ships no catalogue implicitly. This suite is about the credential
+        // rule, not the catalogue, so it provisions the shipped cards it creates sessions
+        // from (`writer` is the documented alias of `instruct`).
+        harness: { presets }
     });
     base = server.url;
 });
@@ -359,7 +363,10 @@ describe('server credential containment', () => {
             port: 0,
             staticRoot: null,
             settings: { baseURL: `${authoritative.origin}/v1`, apiKey: '', model: MODEL },
-            defaults: { baseURL: `${authoritative.origin}/v1`, model: MODEL, hasApiKey: false }
+            defaults: { baseURL: `${authoritative.origin}/v1`, model: MODEL, hasApiKey: false },
+            // R-boot: same explicit catalogue as the listener above (discovery is what this
+            // case asserts; the catalogue is incidental).
+            harness: { presets }
         });
 
         try {

@@ -29,6 +29,7 @@ import * as path from 'node:path';
 import { agentInstruction, agentProfile } from '../agents';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
+import { presets } from './harnesses';
 import { HARNESS_AGENT_FILE, readHarnessAgentRecords } from './persistence';
 import type { HarnessApiRequest, HarnessApiResult } from './api';
 
@@ -57,7 +58,15 @@ const tempRoot = (label: string): string => {
 // memoized `getHarnessRuntime`), so a second call over the same root is a fresh process view
 // that can only know what the saved files say.
 const boot = (root: string): HarnessRuntime =>
-    createHarnessRuntime({ root, settings: SETTINGS, defaults: DEFAULTS, loadEnvironment: false });
+    createHarnessRuntime({
+        root,
+        settings: SETTINGS,
+        defaults: DEFAULTS,
+        loadEnvironment: false,
+        // R-boot: the suite creates sessions from the shipped cards to prove a NEW session
+        // resolves the operator's profile text, so it provisions that catalogue explicitly.
+        harness: { presets }
+    });
 
 const call = async (
     runtime: HarnessRuntime,

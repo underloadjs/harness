@@ -50,6 +50,23 @@
 //       'flaky'    → rebuild the live toolbox with the example extra retained.
 // A hand-built/injected preset without a `template` defaults to 'live'.
 //
+// PER-CARD REBUILD METADATA (B4)
+// ------------------------------
+// An executable rebuild must replay the posture the CARD was built with, never the
+// deployment-wide `HarnessRegistryOptions.creation` default: a boot preset may be
+// tool-less, carry its own `extraTools`/`extraToolSources`/`toolFolders`, or a finite
+// budget, and `presetFromRecord` must reproduce a frozen session on that same posture.
+// `HarnessPreset.creation` (./types.ts `HarnessPresetCreation`) records it in memory;
+// `rebuildToolboxOf` is the one rule `update()` and `presetFromRecord` share. Durable
+// records still carry no closures and no toolbox columns — the metadata is rebuilt from
+// the boot configuration (or the injected preset) on every process start.
+//
+// A card whose factory was supplied by the host (`creation.factory === 'advanced'`) is
+// NOT rebuildable from a roster/map patch. `update()` refuses such a patch with a 409
+// naming the boot configuration, and a frozen-session restore reuses the still-available
+// factory only when every executable field matches the record. Silently substituting a
+// `createProfiledHarness` would run a team/toolbox the host never declared.
+//
 // EVERY SHIPPED TEMPLATE IS 'live' NOW. 'scripted' and 'flaky' were the markers of the
 // `demo` and `flaky` example presets, which are deleted; the branches below stay because
 // the value is DURABLE — an installation may hold a saved row or a frozen session that
@@ -116,17 +133,19 @@ import type { AgentProfile } from '../../agents';
 // kernel, which is the only place that decides who may hand work to whom.
 import { AGENT_RANKS, isAgentRank } from '../../types';
 import type { AgentRank } from '../../types';
-import type { HarnessPreset } from './types';
+import type { HarnessPreset, HarnessPresetCreation, HarnessToolboxDefaults } from './types';
 import type { HarnessAgentRecord, HarnessPresetRecord } from '../persistence';
 import { attachDefaultAgentState, createAgentState } from './agent-state';
 import type { AgentProfilePatch, AgentState } from './agent-state';
 import { LEGACY_PRESET_DEFINITIONS, presets } from './presets';
 import type { LegacyPresetDefinition } from './presets';
+import { WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../harness';
 import {
     SHARED_TOOL_NAMES,
     agentsFromProfiles,
     createProfiledHarness,
     createToolboxHarness,
+    declaredToolboxNames,
     resolveRosterRanks
 } from './toolbox';
 
@@ -363,6 +382,13 @@ export type HarnessRegistry = {
     // Rollback support for the durable commit path (see HarnessRegistrySnapshot).
     snapshot: () => HarnessRegistrySnapshot;
     restore: (snapshot: HarnessRegistrySnapshot) => void;
+    // THE CREATION DEFAULTS this registry builds new/rebuilds restored harnesses with
+    // (R-boot). Exposed because the session store's restore path (`presetFromRecord`)
+    // must rebuild a frozen preset with the SAME toolbox posture the registry used —
+    // otherwise a boot that set the zero-toolbox floor would restore old sessions with
+    // the shared set. An injected registry keeps its own answer; the boot resolver
+    // passes the deployment's `HarnessBootConfiguration.toolbox` at construction.
+    creationDefaults: () => HarnessToolboxDefaults;
 };
 
 // A registry failure with an HTTP status, so the dispatcher maps it like
@@ -424,19 +450,26 @@ const normalizeDescription = (value: unknown): string => {
 // saved row deliberately passes no checker: a harness that already selects a profile the
 // operator retired stays replayable (its own sessions keep working), and the refusal
 // happens when someone tries to select it NEW.
+//
+// B2: `known` is THE REGISTRY'S OWN effective catalogue, not the frozen module array.
+// A registry over an injected `AgentState` (a different catalogue source, a host's own
+// profiles) must validate against exactly the profiles it will build agents from;
+// checking `isAgentProfileName` alone validated against a detached shipped snapshot and
+// could accept an id the registry's own layer cannot resolve. The default keeps every
+// existing caller (and `agentProfiles()` in the error) unchanged.
 const requireAgent = (
     value: unknown,
     field: string,
+    known: (name: string) => boolean = isAgentProfileName,
+    knownNames: () => readonly string[] = () => agentProfiles().map((profile) => profile.name),
     selectable?: (name: string) => boolean
 ): string => {
     const name = requireString(value, field);
 
-    if (!isAgentProfileName(name)) {
+    if (!known(name)) {
         throw new HarnessRegistryError(
             400,
-            `\`${field}\` names unknown agent "${name}". Known agents: ${agentProfiles()
-                .map((profile) => profile.name)
-                .join(', ')}.`
+            `\`${field}\` names unknown agent "${name}". Known agents: ${knownNames().join(', ')}.`
         );
     }
 
@@ -468,6 +501,8 @@ const requireAgent = (
 // is the routing default.
 const normalizeRoster = (
     value: unknown,
+    known?: (name: string) => boolean,
+    knownNames?: () => readonly string[],
     selectable?: (name: string) => boolean
 ): string[] => {
     if (!Array.isArray(value)) {
@@ -491,7 +526,7 @@ const normalizeRoster = (
     const resolved: string[] = [];
 
     for (const entry of value) {
-        const name = requireAgent(entry, 'agents', selectable);
+        const name = requireAgent(entry, 'agents', known, knownNames, selectable);
 
         if (resolved.includes(name)) {
             throw new HarnessRegistryError(400, `Agent "${name}" is listed in \`agents\` more than once.`);
@@ -820,6 +855,36 @@ const copyTemplate = (preset: HarnessPreset): HarnessPreset => ({
     // with the caller. Harness DEFINITIONS declare none — the create/PATCH surface has no field
     // for it — so in practice this key is absent on every registry entry.
     ...(preset.customAgents === undefined ? {} : { customAgents: { ...preset.customAgents } }),
+    // B4: the card's rebuild metadata travels with the registry entry. The toolbox half is
+    // copied like every other map/array, so neither the shipped template constant nor the
+    // caller's object can be reached (or mutated) through a registry entry.
+    ...(preset.creation === undefined
+        ? {}
+        : {
+              creation: {
+                  factory: preset.creation.factory,
+                  ...(preset.creation.toolbox === undefined
+                      ? {}
+                      : {
+                            toolbox: {
+                                ...preset.creation.toolbox,
+                                ...(preset.creation.toolbox.extraToolSources === undefined
+                                    ? {}
+                                    : {
+                                          extraToolSources: {
+                                              ...preset.creation.toolbox.extraToolSources
+                                          }
+                                      }),
+                                ...(preset.creation.toolbox.extraTools === undefined
+                                    ? {}
+                                    : { extraTools: { ...preset.creation.toolbox.extraTools } }),
+                                ...(preset.creation.toolbox.toolFolders === undefined
+                                    ? {}
+                                    : { toolFolders: [...preset.creation.toolbox.toolFolders] })
+                            }
+                        })
+              }
+          }),
     editable: true
 });
 
@@ -840,8 +905,20 @@ const liveFactory = (
     agentModels: Readonly<Record<string, string>>,
     agentInstructions: Readonly<Record<string, string>> = {},
     agentColors: Readonly<Record<string, string>> = {},
-    customAgents: Readonly<Record<string, string>> = {}
+    customAgents: Readonly<Record<string, string>> = {},
+    // THE REGISTRY'S CREATION DEFAULTS (R-boot). Captured by the new closure, exactly like
+    // the maps above: a harness created (or a saved row rebuilt) by this registry keeps the
+    // deployment's toolbox posture and extra sources. Absent = the historical shared
+    // toolbox, so every existing `createHarnessRegistry()` caller is unchanged.
+    toolbox?: HarnessToolboxDefaults
 ): HarnessPreset['create'] => {
+    // A registry-level posture that omits `sharedToolbox` keeps the historical shared set and
+    // SAYS SO, so the rebuilt factory states the same posture its card declares (see
+    // `create()`'s `profileToolbox`). A boot-created registry always passes the resolved
+    // boolean, so a zero-toolbox deployment cannot be widened by a rebuild.
+    const resolvedToolbox: HarnessToolboxDefaults | undefined =
+        toolbox === undefined ? undefined : { ...toolbox, sharedToolbox: toolbox.sharedToolbox ?? true };
+
     if (template === 'live') {
         return createProfiledHarness(
             entry,
@@ -850,7 +927,8 @@ const liveFactory = (
             agentModels,
             agentInstructions,
             agentColors,
-            customAgents
+            customAgents,
+            resolvedToolbox
         );
     }
 
@@ -880,13 +958,60 @@ const liveFactory = (
                 // createToolboxHarness path rather than createProfiledHarness. A saved
                 // 'flaky' session therefore restores and runs, minus a tool this build no
                 // longer ships — which is the same outcome as any other deleted tool.
-                extraToolSources: {}
+                //
+                // `toolbox` is spread FIRST and the extra-source map is restated from it,
+                // so the historical "no example tools" statement holds for a registry
+                // without creation defaults while a deployment's configured extras still
+                // reach the factory.
+                ...(resolvedToolbox ?? {}),
+                extraToolSources: { ...(resolvedToolbox?.extraToolSources ?? {}) }
             },
             settings,
             progress,
             report
         );
 };
+
+// THE REBUILD METADATA FOR A PROFILED FACTORY (B4). `sharedToolbox` is materialized on
+// the same historical rule `liveFactory` uses, so the recorded posture says what the
+// closure actually registers — and an executable patch or a frozen-session restore can
+// replay it instead of the deployment-wide default. The maps/arrays are copied so a
+// registry entry never aliases the caller's toolbox object.
+const profiledCreation = (toolbox?: HarnessToolboxDefaults): HarnessPresetCreation => ({
+    factory: 'profiled',
+    toolbox: {
+        ...(toolbox ?? {}),
+        sharedToolbox: toolbox?.sharedToolbox ?? true,
+        ...(toolbox?.extraToolSources === undefined
+            ? {}
+            : { extraToolSources: { ...toolbox.extraToolSources } }),
+        ...(toolbox?.extraTools === undefined ? {} : { extraTools: { ...toolbox.extraTools } }),
+        ...(toolbox?.toolFolders === undefined ? {} : { toolFolders: [...toolbox.toolFolders] })
+    }
+});
+
+// The posture an executable rebuild must use for ONE entry: the card's own recorded
+// posture when it has one, otherwise the registry's creation defaults (the historical
+// behaviour for a hand-injected preset). B4: this is the single rule `update()` and
+// `presetFromRecord` both follow, which is what keeps a per-card `extraTools` map from
+// being replaced by the deployment's on a title/agent edit or a restart.
+const rebuildToolboxOf = (
+    preset: HarnessPreset | undefined,
+    creation: HarnessToolboxDefaults
+): HarnessToolboxDefaults =>
+    preset?.creation?.factory === 'profiled' && preset.creation.toolbox !== undefined
+        ? preset.creation.toolbox
+        : creation;
+
+// The message an executable patch/restore produces for a card built by a host factory.
+// 409 (not 400): the request is well-formed, but THIS entry cannot express the change —
+// the host owns the factory, so the honest fix is to change the boot configuration and
+// restart, not to silently swap in a profiled harness the host never declared.
+const advancedFactoryError = (name: string): HarnessRegistryError =>
+    new HarnessRegistryError(
+        409,
+        `Harness "${name}" was configured with a custom \`create\` factory, which the registry cannot rebuild from a roster, rank or agent-map change. Update the host's boot configuration (the preset's \`create\` and its declared team) and restart instead of patching this entry.`
+    );
 
 // ---------------------------------------------------------------------------
 // Durable registry records (R3b)
@@ -1018,11 +1143,98 @@ const presetToRecordShape = (record: HarnessPresetRecord): HarnessPresetRecord =
 //   - absent     → an injected/custom preset. Its factory is not serializable, so
 //                  a caller must pass the still-available entry as `fallback`; a
 //                  mismatch is an error instead of a silently different harness.
+// THE FROZEN RECORD'S TOOLBOX POSTURE (R-boot). A durable record carries no `sharedToolbox`
+// boolean (widening the schema is out of scope), but it DOES carry the card's declared
+// `tools`/`environmentTools`, which is the projection the factory was built against. Inferring
+// the posture from that declaration is what keeps a rebuilt frozen session faithful:
+//   - a shipped card declares the shared set, so it rebuilds WITH the shared toolbox even when
+//     the deployment's creation default is the zero floor (the deletion/restore path);
+//   - a zero-toolbox boot preset declares `[]`, so it rebuilds with the floor;
+//   - the environment rows follow the record's `environmentTools`, because `fetch` in
+//     particular registers without a credential and a declaration that names it must be kept.
+// `creation` still supplies what the record cannot express (extra sources/tools/folders,
+// `maxIterations`), and the inferred booleans win over its deployment defaults — the frozen
+// card is the more specific statement.
+const recordToolbox = (
+    record: HarnessPresetRecord,
+    creation?: HarnessToolboxDefaults
+): HarnessToolboxDefaults => {
+    const declared = new Set(record.tools);
+    const environment = new Set(record.environmentTools ?? []);
+    const sharedToolbox = SHARED_TOOL_NAMES.some((name) => declared.has(name));
+
+    return {
+        ...(creation ?? {}),
+        sharedToolbox,
+        // STATED, not defaulted: the record's declaration decides the environment rows, so a
+        // deployment's creation default cannot add `search`/`fetch` to a frozen card that
+        // never declared them.
+        websearch: environment.has(WEB_SEARCH_TOOL_NAME),
+        webfetch: environment.has(WEB_FETCH_TOOL_NAME)
+    };
+};
+
+// THE INJECTED/ADVANCED FACTORY GUARD (B4). A durable record holds no closure, so a
+// record whose factory is host-supplied can only be restored by the STILL-AVAILABLE entry
+// for that name. Everything executable must match — a same-named entry whose team, ranks,
+// maps or session-defined agents moved is a different harness, and replaying a saved
+// transcript through it would be the silent substitution this guard prevents.
+//
+// Shared by the injected-preset branch and the advanced boot-factory branch (a boot
+// preset with `create` deliberately carries no `template`, and one that declared
+// `template: 'live'` through an injected `HarnessPreset` reaches the same rule when its
+// rebuild metadata says 'advanced').
+const assertFallbackMatchesRecord = (record: HarnessPresetRecord, fallback: HarnessPreset): void => {
+    const current = presetToRecord(fallback);
+
+    if (
+        current.entry !== record.entry ||
+        // The ROSTER is compared in order (it is the entry default), and the RANK MAP
+        // in sorted key order (the same canonical form `presetToRecord` writes), so an
+        // injected factory that really still describes this team is not rejected over
+        // JSON key order — and one that moved a member's rank IS rejected, because
+        // rank is executable authority, not decoration.
+        JSON.stringify(sortedRanks(current.ranks)) !== JSON.stringify(sortedRanks(record.ranks)) ||
+        JSON.stringify(current.agents) !== JSON.stringify(record.agents) ||
+        JSON.stringify(current.agentModels ?? {}) !== JSON.stringify(record.agentModels ?? {}) ||
+        // T3: a saved instruction override is part of the executable
+        // definition. An injected preset that no longer carries it would
+        // silently restore a different prompt, so the mismatch is an error.
+        JSON.stringify(current.agentInstructions ?? {}) !== JSON.stringify(record.agentInstructions ?? {}) ||
+        // R2: a saved color is part of the frozen definition too. An injected preset
+        // that no longer carries it would restore a differently painted harness, so
+        // the mismatch is an error rather than a silent repaint.
+        JSON.stringify(current.agentColors ?? {}) !== JSON.stringify(record.agentColors ?? {}) ||
+        // R7: a saved session-defined agent is part of the frozen roster in the strongest
+        // sense — an injected factory has no way to build a brain the catalogue does not
+        // know about, so a record that names one while the factory's preset does not would
+        // silently restore a team missing that member.
+        JSON.stringify(current.customAgents ?? {}) !== JSON.stringify(record.customAgents ?? {})
+    ) {
+        throw new Error(
+            `Harness "${record.name}" changed incompatibly while its session was saved; the frozen definition cannot be rebuilt.`
+        );
+    }
+};
+
 export const presetFromRecord = (
     record: HarnessPresetRecord,
-    fallback?: HarnessPreset
+    fallback?: HarnessPreset,
+    // THE CREATION DEFAULTS of the registry this preset belongs to (R-boot). A rebuilt
+    // 'live'/'flaky' factory must use the SAME toolbox posture and extras as the registry
+    // that created the entry, or a zero-toolbox boot would restore an old session with the
+    // shared set the deployment switched off. Absent keeps the historical shared toolbox —
+    // every existing caller (a worker replica, a hand-built preset) is unchanged.
+    creation?: HarnessToolboxDefaults
 ): HarnessPreset => {
+    // See `recordToolbox`: the frozen declaration decides the shared/environment posture, and
+    // the card's OWN recorded posture (B4) — not the deployment-wide default — supplies the
+    // extras/budget/folders a record cannot carry. `fallback` is the live registry entry for
+    // this name; a boot-compiled card carries `creation.toolbox`, so a frozen session keeps
+    // its per-card extra tools instead of widening to the deployment's.
+    const toolbox = recordToolbox(record, rebuildToolboxOf(fallback, creation ?? {}));
     let create: HarnessPreset['create'];
+    let resultCreation: HarnessPresetCreation | undefined;
 
     if (record.template === 'scripted') {
         // An injected scripted preset is the only way this build can still hold the
@@ -1032,11 +1244,25 @@ export const presetFromRecord = (
         // silent substitution the error below exists to prevent.
         if (fallback !== undefined && fallback.name === record.name && fallback.template === 'scripted') {
             create = fallback.create;
+            // A scripted factory is host-supplied in every build that still has one, so its
+            // rebuild metadata (if any) travels with it unchanged.
+            resultCreation = fallback.creation;
         } else {
             throw new Error(
                 `Scripted harness "${record.name}" is not shipped in this build; the session cannot be restored.`
             );
         }
+    } else if (
+        record.template === 'flaky' &&
+        fallback?.creation?.factory === 'advanced'
+    ) {
+        // B4: a durable 'flaky' record names a factory this build cannot reconstruct, and
+        // the only honest source is the host-supplied entry. Reuse it when its executable
+        // fields still describe the record; otherwise fail loudly (never silently replace
+        // the host's factory with a profiled one).
+        assertFallbackMatchesRecord(record, fallback);
+        create = fallback.create;
+        resultCreation = fallback.creation;
     } else if (record.template === 'flaky') {
         create = liveFactory(
             'flaky',
@@ -1048,8 +1274,15 @@ export const presetFromRecord = (
             // built from, so a rebuilt member runs the same prompt and model it was bound with.
             record.agentInstructions ?? {},
             record.agentColors ?? {},
-            record.customAgents ?? {}
+            record.customAgents ?? {},
+            toolbox
         );
+        resultCreation = profiledCreation(toolbox);
+    } else if (record.template === 'live' && fallback?.creation?.factory === 'advanced') {
+        // See the 'flaky' note above: the host's factory is the only rebuild source.
+        assertFallbackMatchesRecord(record, fallback);
+        create = fallback.create;
+        resultCreation = fallback.creation;
     } else if (record.template === 'live') {
         create = liveFactory(
             'live',
@@ -1059,8 +1292,10 @@ export const presetFromRecord = (
             record.agentModels ?? {},
             record.agentInstructions ?? {},
             record.agentColors ?? {},
-            record.customAgents ?? {}
+            record.customAgents ?? {},
+            toolbox
         );
+        resultCreation = profiledCreation(toolbox);
     } else {
         if (fallback === undefined) {
             throw new Error(
@@ -1068,39 +1303,10 @@ export const presetFromRecord = (
             );
         }
 
-        const current = presetToRecord(fallback);
-
-        if (
-            current.entry !== record.entry ||
-            // The ROSTER is compared in order (it is the entry default), and the RANK MAP
-            // in sorted key order (the same canonical form `presetToRecord` writes), so an
-            // injected factory that really still describes this team is not rejected over
-            // JSON key order — and one that moved a member's rank IS rejected, because
-            // rank is executable authority, not decoration.
-            JSON.stringify(sortedRanks(current.ranks)) !== JSON.stringify(sortedRanks(record.ranks)) ||
-            JSON.stringify(current.agents) !== JSON.stringify(record.agents) ||
-            JSON.stringify(current.agentModels ?? {}) !== JSON.stringify(record.agentModels ?? {}) ||
-            // T3: a saved instruction override is part of the executable
-            // definition. An injected preset that no longer carries it would
-            // silently restore a different prompt, so the mismatch is an error.
-            JSON.stringify(current.agentInstructions ?? {}) !==
-            JSON.stringify(record.agentInstructions ?? {}) ||
-            // R2: a saved color is part of the frozen definition too. An injected preset
-            // that no longer carries it would restore a differently painted harness, so
-            // the mismatch is an error rather than a silent repaint.
-            JSON.stringify(current.agentColors ?? {}) !== JSON.stringify(record.agentColors ?? {}) ||
-            // R7: a saved session-defined agent is part of the frozen roster in the strongest
-            // sense — an injected factory has no way to build a brain the catalogue does not
-            // know about, so a record that names one while the factory's preset does not would
-            // silently restore a team missing that member.
-            JSON.stringify(current.customAgents ?? {}) !== JSON.stringify(record.customAgents ?? {})
-        ) {
-            throw new Error(
-                `Harness "${record.name}" changed incompatibly while its session was saved; the frozen definition cannot be rebuilt.`
-            );
-        }
-
+        // The still-available entry is the ONLY source of a host factory (see the guard).
+        assertFallbackMatchesRecord(record, fallback);
         create = fallback.create;
+        resultCreation = fallback.creation;
     }
 
     // Metadata comes from the RECORD (the session's frozen view), the factory from
@@ -1133,6 +1339,10 @@ export const presetFromRecord = (
         editable: true,
         ...(record.template === undefined ? {} : { template: record.template }),
         ...(record.live === undefined ? {} : { live: { ...record.live } }),
+        // B4: the rebuilt card states what ITS factory was built with, so a further rebuild
+        // (another restore, a PATCH on the restored entry) cannot fall back to the
+        // deployment's defaults.
+        ...(resultCreation === undefined ? {} : { creation: resultCreation }),
         create
     };
 };
@@ -1353,6 +1563,24 @@ export type HarnessRegistryOptions = {
     // it, this registry's layer also becomes the PROCESS default that ./toolbox.ts
     // resolves profile text through — see the note in ./agent-state.ts.
     agentState?: AgentState;
+    // B2: whether this registry's agent layer also becomes the PROCESS default that
+    // `effectiveAgentProfile` resolves through (./agent-state.ts). Default true: a real
+    // server registry IS the process catalogue, and every captured factory needs it.
+    //
+    // A SHORT-LIVED VALIDATION REGISTRY MUST PASS false. `resolveHarnessBootConfiguration`
+    // compiles its declarations through a scratch registry (the HTTP validator), and before
+    // this option existed that scratch instance silently replaced the running server's
+    // layer with an EMPTY one — erasing every operator agent edit for the rest of the
+    // process (a Storyline resolution inside the shared service process did exactly that).
+    // Resolution is now side-effect free.
+    attachAgentState?: boolean;
+    // THE TOOLBOX POSTURE THIS REGISTRY CREATES/REBUILDS WITH (R-boot). Used by
+    // `create()` for the factory AND for the card's declared tool names, and by every
+    // executable rebuild (`update()`, a restored live row, `presetFromRecord` through
+    // `creationDefaults()`), so a deployment that booted with the zero-toolbox floor
+    // cannot regain the shared set through the generic HTTP path. Absent is the
+    // historical shared toolbox for every existing caller.
+    creation?: HarnessToolboxDefaults;
 };
 
 export const createHarnessRegistry = (
@@ -1371,12 +1599,29 @@ export const createHarnessRegistry = (
     // keeps several passes its own `agentState` and pins the default itself.
     const agentState = options.agentState ?? createAgentState(options.agentRecords ?? []);
 
-    attachDefaultAgentState(agentState);
+    // B2: only a registry that OWNS the process catalogue installs itself as the default.
+    // A validation-only registry (the boot resolver's scratch instance) must not clobber
+    // the live server's overlay; see `HarnessRegistryOptions.attachAgentState`.
+    if (options.attachAgentState !== false) attachDefaultAgentState(agentState);
+
+    // THE REGISTRY'S EFFECTIVE CATALOGUE, used for validation AND as the known-set message
+    // (B2). `shipped` is catalogue membership: an overlay can retire or reword a profile but
+    // cannot invent one, so the shipped set is exactly what a name may be. This is the
+    // authority a harness built by THIS registry resolves, never the frozen module array.
+    const knownAgent = (name: string): boolean => agentState.shipped(name) !== undefined;
+    const knownAgentNames = (): readonly string[] =>
+        agentState.profiles().map((profile) => profile.name);
 
     // Selectability gate for NEW selections only (see `requireAgent`): the id must be a
     // catalogue identity AND not retired. A name this harness already selects bypasses the
     // check, so a saved row that keeps a retired member stays replayable and patchable.
     const selectableAgent = (name: string): boolean => agentState.isKnown(name);
+
+    // THE CREATION DEFAULTS (R-boot): one object captured by every factory this registry
+    // builds and handed to every executable rebuild. Never mutated by this module, and
+    // returned by reference through `creationDefaults()` so a session restore can pass the
+    // SAME value into `presetFromRecord`.
+    const creation: HarnessToolboxDefaults = options.creation ?? {};
 
     // Deleted built-in tombstones (T5). An insertion-ordered Set, so
     // `deletedBuiltins()` — and therefore the saved document — does not reshuffle
@@ -1449,7 +1694,12 @@ export const createHarnessRegistry = (
         // be a member. `agents` was DERIVED here before ([primary, ...subagents]); it
         // is now the client's own explicit list, and its order is load-bearing (see
         // ./types.ts).
-        const roster = normalizeRoster(registration?.agents, selectableAgent);
+        const roster = normalizeRoster(
+            registration?.agents,
+            knownAgent,
+            knownAgentNames,
+            selectableAgent
+        );
 
         // THE ENTRY AGENT: optional, and the default is the first name of the roster.
         // It is a ROUTING default only — the rank map says authority, and nothing here
@@ -1502,6 +1752,23 @@ export const createHarnessRegistry = (
                 ? {}
                 : normalizeAgentColors(registration.agentColors, agents);
 
+        // THE CARD'S TOOL DECLARATION, DERIVED FROM THE FACTORY'S OWN POSTURE (R-boot).
+        // `declaredToolboxNames` is the same authority `createToolboxHarness` uses, so a
+        // registry booted with the zero-toolbox floor creates a card advertising NO
+        // catalogue tool (an empty `tools`, no environment rows) instead of the previous
+        // unconditional shared promise. With no creation defaults it returns exactly the
+        // old `SHARED_TOOL_NAMES` + `['search', 'fetch']`.
+        //
+        // `sharedToolbox` is MATERIALISED here: a registry that configures no posture keeps
+        // the historical shared set, and it states so to the factory as well, so its card and
+        // its executable harness can never disagree even when the deployment's per-build
+        // fallback says otherwise. A boot-created registry passes the resolved `false`.
+        const profileToolbox: HarnessToolboxDefaults = {
+            ...creation,
+            sharedToolbox: creation.sharedToolbox ?? true
+        };
+        const declared = declaredToolboxNames(profileToolbox);
+
         const preset: HarnessPreset = {
             name,
             title:
@@ -1520,14 +1787,15 @@ export const createHarnessRegistry = (
             entry,
             ranks,
             agents,
-            // One toolbox for every live harness, user-created included. The four
-            // core file tools are declared up front (R18); the searchable remainder
-            // waits for toolRequest. The factory is createToolboxHarness, which opts
-            // into BOTH web rows, and each is declared core when it registers
-            // (R9-R11) - so both belong in this declaration.
+            // One toolbox for every live harness, user-created included. The declared
+            // names come from the SAME creation posture as the factory (see `declared`
+            // above): the shared file tools up front (R18) and the searchable remainder
+            // waiting for toolRequest, or nothing at all on a zero-toolbox deployment.
             // Copied so no registry entry aliases the shared module array.
-            tools: [...SHARED_TOOL_NAMES],
-            environmentTools: ['search', 'fetch'],
+            tools: [...declared.tools],
+            ...(declared.environmentTools.length === 0
+                ? {}
+                : { environmentTools: [...declared.environmentTools] }),
             // Absent vs `{}` are the same thing: no overrides. Stored as a plain
             // object so update() has one shape to reason about.
             agentModels,
@@ -1543,10 +1811,24 @@ export const createHarnessRegistry = (
             // A created harness is a live profiled harness; later PATCHes treat
             // it like the live built-ins.
             template: 'live',
-            // The factory closure captures the rank map and the model/instruction/color
-            // maps, so a later PATCH builds a NEW closure: an existing session keeps the
-            // team, ranks and models it was created with.
-            create: createProfiledHarness(entry, agents, ranks, agentModels, agentInstructions, agentColors)
+            // B4: record the posture this factory is compiled with, so a later executable
+            // PATCH rebuilds THIS card's toolbox (the registry default here) rather than a
+            // wider one, and a frozen-session restore can find it again.
+            creation: profiledCreation(profileToolbox),
+            // The factory closure captures the rank map, the model/instruction/color maps
+            // AND the registry's creation toolbox, so a later PATCH builds a NEW closure:
+            // an existing session keeps the team, ranks, models and toolbox it was created
+            // with (R-boot).
+            create: createProfiledHarness(
+                entry,
+                agents,
+                ranks,
+                agentModels,
+                agentInstructions,
+                agentColors,
+                {},
+                profileToolbox
+            )
         };
 
         entries.set(name, preset);
@@ -1589,7 +1871,12 @@ export const createHarnessRegistry = (
         const roster =
             patch.agents === undefined
                 ? [...current.agents]
-                : normalizeRoster(patch.agents, selectableHere);
+                : normalizeRoster(
+                      patch.agents,
+                      knownAgent,
+                      knownAgentNames,
+                      selectableHere
+                  );
 
         // THE ENTRY AGENT. Stated: it must name a member of the FINAL roster (a 400
         // otherwise). Omitted: the current entry survives whenever the same patch left
@@ -1732,6 +2019,20 @@ export const createHarnessRegistry = (
                 ? current.live.description
                 : current.description;
 
+        // B4: AN EXECUTABLE PATCH REBUILDS THIS CARD, NOT THE DEPLOYMENT. `rebuildToolbox`
+        // is the posture the current factory was compiled with (a boot card's per-preset
+        // extras/tool-less floor, a created card's creation defaults), so a title-only edit
+        // keeps the closure and an executable one rebuilds the SAME toolbox instead of
+        // widening to the registry default.
+        const rebuildToolbox = rebuildToolboxOf(current, creation);
+
+        // AN ADVANCED HOST FACTORY CANNOT BE RECONSTRUCTED. Refuse the executable patch
+        // loudly: silently falling back to `createProfiledHarness` would hand the session a
+        // team/toolbox the host never declared. A metadata-only patch above is still fine.
+        if (executable && current.creation?.factory === 'advanced') {
+            throw advancedFactoryError(current.name);
+        }
+
         const create = executable
             ? liveFactory(
                   template === 'scripted' || template === 'live' ? 'live' : 'flaky',
@@ -1740,7 +2041,9 @@ export const createHarnessRegistry = (
                   ranks,
                   agentModels,
                   agentInstructions,
-                  agentColors
+                  agentColors,
+                  {},
+                  rebuildToolbox
               )
             : current.create;
 
@@ -1751,6 +2054,12 @@ export const createHarnessRegistry = (
         // call, so the declaration follows the factory — exactly the reasoning that already
         // rewrites `requiresEndpoint`/`tools` when a scripted entry goes live.
         const downgradedFlaky = executable && template === 'flaky';
+
+        // The declaration a TEMPLATE-CHANGING rebuild must carry. It is the SAME derivation
+        // `create()` uses, over the posture the rebuild actually runs with (`rebuildToolbox`,
+        // B4): a per-card extra tool stays declared, and an upgraded scripted card on a
+        // tool-less card must not promise a shared set its new factory does not register.
+        const rebuiltDeclaration = declaredToolboxNames(rebuildToolbox);
 
         // A new object: an existing session keeps the preset it captured, so it
         // continues to run (and report) the old configuration — including the old
@@ -1775,20 +2084,29 @@ export const createHarnessRegistry = (
             agentColors,
             ...(downgradedFlaky
                 ? {
-                      tools: [...SHARED_TOOL_NAMES],
-                      environmentTools: ['search', 'fetch']
+                      tools: [...rebuiltDeclaration.tools],
+                      ...(rebuiltDeclaration.environmentTools.length === 0
+                          ? {}
+                          : { environmentTools: [...rebuiltDeclaration.environmentTools] })
                   }
                 : {}),
             ...(upgradedScripted
                 ? {
-                      // The upgrade replaces the script with the live toolbox, which
-                      // registers search AND fetch; both are core declarations (R9-R11).
+                      // The upgrade replaces the script with the live toolbox, whose
+                      // declaration follows the SAME creation posture (R-boot). Its
+                      // environment rows are core when registered (R9-R11).
                       requiresEndpoint: true,
-                      tools: [...SHARED_TOOL_NAMES],
-                      environmentTools: ['search', 'fetch'],
+                      tools: [...rebuiltDeclaration.tools],
+                      ...(rebuiltDeclaration.environmentTools.length === 0
+                          ? {}
+                          : { environmentTools: [...rebuiltDeclaration.environmentTools] }),
                       template: 'live' as const
                   }
                 : {}),
+            // B4: an executable rebuild records the posture it used, so the NEXT rebuild of
+            // this entry (another patch, a restore) stays on the same toolbox. A
+            // metadata-only patch keeps the existing metadata through `...current`.
+            ...(executable ? { creation: profiledCreation(rebuildToolbox) } : {}),
             create
         };
 
@@ -1905,6 +2223,10 @@ export const createHarnessRegistry = (
         deletedBuiltins: () => [...deleted],
         restoreDeletedBuiltins,
         snapshot,
-        restore
+        restore,
+        // The exact object every factory this registry build captured. Read-only by
+        // convention: a mutation would change what a LATER build gets while the existing
+        // closures keep their copy, which is the drift this accessor exists to prevent.
+        creationDefaults: () => creation
     };
 };

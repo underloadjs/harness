@@ -87,7 +87,15 @@
 //   - ../api.ts  — descriptors resolved from the same preset metadata
 
 import { agent, harness, presetTools, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../harness';
-import type { Agent, AgentConfiguration, Harness, HarnessConfiguration, HarnessProgress, Tool } from '../../harness';
+import type {
+    Agent,
+    AgentConfiguration,
+    Harness,
+    HarnessCommandConfiguration,
+    HarnessConfiguration,
+    HarnessProgress,
+    Tool
+} from '../../harness';
 // The A–Z rank union (../types/index.ts). This layer STORES and PROJECTS ranks;
 // the ordering and the delegation predicate live with the kernel.
 import type { AgentRank } from '../../types';
@@ -108,8 +116,7 @@ import {
     SHARED_APP_TOOL_SOURCES,
     SHARED_APP_TOOLS
 } from './tools';
-import type { RunnerSettings } from './types';
-import type { HarnessPresetReport } from './types';
+import type { HarnessPresetReport, HarnessToolboxDefaults, RunnerSettings } from './types';
 
 // Tool-loop budget for live harnesses: NO BUDGET. A real session legitimately
 // needs dozens or hundreds of rounds — discovery, several reads/edits, a command,
@@ -320,6 +327,58 @@ export const coreToolNames = (
         ...CORE_PRESET_TOOL_NAMES.filter((name) => available.has(name)),
         ...CORE_ENVIRONMENT_TOOL_NAMES.filter((name) => available.has(name))
     ];
+};
+
+// THE DECLARED TOOLBOX FOR A HARNESS BUILT FROM `toolbox`. One authority for the
+// factory's registration posture AND the card/descriptor's `tools` lists, so a host
+// that boots with the zero-toolbox floor cannot ship a card advertising the shared set
+// (the contradiction ./presets.ts `chat` exists to avoid).
+//
+// The resolution is the SAME precedence `createToolboxHarness` applies: an explicit
+// `websearch`/`webfetch` opt-in wins, otherwise both follow `sharedToolbox`, which is
+// `true` only when the caller states it (the boot resolver states `false`; direct
+// factory callers leave it absent and keep the historical shared toolbox).
+//
+// The returned `environmentTools` names the environment-backed rows the harness WILL
+// register. The descriptor layer additionally filters `search` against the runtime
+// catalogue (a keyless host lists it unconfigured), so over-declaring here is still
+// impossible.
+//
+// EXTRA TOOLS AND EXTRA SOURCES ARE PART OF THE DECLARATION (B8). `createToolboxHarness`
+// registers both maps, so leaving them out of the card's `tools` made a host-supplied
+// tool invisible by construction: the harness could call it while `GET /harnesses` said
+// the card had nothing but the shared set.
+//
+// THE NAME IS THE MAP KEY for both halves. That is the registration identity the kernel
+// receives (`toolSources`/`tools` are keyed records; the map key is the name the tool is
+// registered under, which is why a host can alias a definition by key), so projecting
+// `Tool.name` instead would advertise a name the harness does not answer to.
+export const declaredToolboxNames = (
+    toolbox?: HarnessToolboxDefaults
+): { tools: string[]; environmentTools: string[] } => {
+    const shared = toolbox?.sharedToolbox !== false;
+    const websearch = toolbox?.websearch ?? shared;
+    const webfetch = toolbox?.webfetch ?? shared;
+
+    // Shared names first (catalogue order), then the card's own registrations in map
+    // order, deduplicated: an extra that overrides a shared name is already listed where
+    // the harness resolves it, and a tool may not be advertised twice.
+    const tools = shared ? [...SHARED_TOOL_NAMES] : [];
+
+    for (const name of [
+        ...Object.keys(toolbox?.extraToolSources ?? {}),
+        ...Object.keys(toolbox?.extraTools ?? {})
+    ]) {
+        if (!tools.includes(name)) tools.push(name);
+    }
+
+    return {
+        tools,
+        environmentTools: [
+            ...(websearch ? [WEB_SEARCH_TOOL_NAME] : []),
+            ...(webfetch ? [WEB_FETCH_TOOL_NAME] : [])
+        ]
+    };
 };
 
 // Provider settings are never used by construction; they only feed `agent(...)`.
@@ -595,22 +654,33 @@ export const createProfiledHarness =
                 ),
                 entry,
                 ranks: { ...ranks },
-                ...(toolbox === undefined ? {} : toolbox)
+                // A PROFILE PRESET THAT SAYS NOTHING KEEPS THE HISTORICAL SHARED TOOLBOX,
+                // and it says so explicitly (R-boot). This is not cosmetic: the SessionStore
+                // now forwards the deployment's boot toolbox as the per-build FALLBACK, so an
+                // omitted field would let a zero-toolbox boot strip the cards in an explicitly
+                // supplied `presets`/registry list. Stating `sharedToolbox: true` here makes
+                // "the factory was built with the shared set" part of the definition, which is
+                // the same rule `chat`'s explicit `false` follows. A host that wants a card on
+                // the boot posture builds it through `createToolboxHarness` with the resolved
+                // toolbox (./boot.ts does exactly that), not by passing `{}` here.
+                ...(toolbox === undefined ? { sharedToolbox: true } : toolbox)
             },
             settings,
             progress,
             report
         );
 
-// What a preset may say about the TOOLBOX half of its harness — the exception list, not a knob panel.
-// Exported because ./presets.ts is the only caller today and a future host must find it HERE rather
-// than inventing a third factory beside this one.
-export type ProfiledHarnessToolbox = {
-    // See `ToolboxHarnessConfiguration.sharedToolbox`.
-    sharedToolbox?: boolean;
-    // See `ToolboxHarnessConfiguration.maxIterations`.
-    maxIterations?: number;
-};
+// What a preset may say about the TOOLBOX half of its harness — the same shape the
+// server boot's `HarnessBootConfiguration.toolbox` and the registry's creation defaults
+// use (`HarnessToolboxDefaults`), so a host default, a registry-created harness and a
+// factory's own declaration are ONE vocabulary rather than three. Every member is
+// documented on `HarnessToolboxDefaults` (./types.ts) and resolved by
+// `createToolboxHarness`.
+//
+// It stays an alias rather than a re-declaration on purpose: `createProfiledHarness`
+// forwards it verbatim into `ToolboxHarnessConfiguration`, so a field added there can
+// never be silently dropped on the profiled path.
+export type ProfiledHarnessToolbox = HarnessToolboxDefaults;
 
 // What a live preset supplies: the agents, which one is the entry, and what each of
 // them is allowed to do. Everything else is the shared toolbox, so two presets
@@ -645,7 +715,18 @@ export type ToolboxHarnessConfiguration = {
     // budget at all (`PRESET_MAX_ITERATIONS`, i.e. Infinity — which is every shipped
     // card). A card that wants a hard stop passes a finite count; a run that hits it
     // is rolled back and rejected.
+    //
+    // The registry/card default (`HarnessRegistryOptions.creation.maxIterations`, carried
+    // per card through `HarnessPreset.creation.toolbox`) is the fallback when the factory
+    // states none; it never overrides a card that states one. There is no per-build
+    // report member for this: a budget is part of the card's creation posture.
     maxIterations?: number;
+    // Explicit environment-row opt-ins (R-boot). Each follows `sharedToolbox` when the
+    // factory does not state it — the historical behaviour — so a host can keep the
+    // shared file tools while turning `search`/`fetch` off, or enable `fetch` alone on a
+    // tool-less card. See `declaredToolboxNames` for the matching card projection.
+    websearch?: boolean;
+    webfetch?: boolean;
     // Extra SOURCE entries, by package-relative path. Merged after the shared source
     // map and before host `extraTools`, so an extra is still compiled from its editable
     // entry instead of a prebuilt definition, while a host definition can still override
@@ -655,6 +736,15 @@ export type ToolboxHarnessConfiguration = {
     // Host/example constructed DEFINITION overrides, registered last so they win
     // over both the shared and extra source maps.
     extraTools?: Readonly<Record<string, Tool>>;
+    // Extra package-relative folders scanned during construction. Missing folders are
+    // validated by the kernel itself (a bad path is a construction error), and an empty
+    // list is omitted so a host that configures none keeps the historical configuration
+    // object byte-for-byte.
+    toolFolders?: readonly string[];
+    // Slash commands applied to THIS harness (before any commands the report adds).
+    // Absent means none; the kernel registers its own built-ins first, so a collision is
+    // construction's duplicate-name error rather than a silent replacement.
+    commands?: readonly HarnessCommandConfiguration[];
 };
 
 // Build a live harness from agent configuration + the shared toolbox.
@@ -686,11 +776,23 @@ export const createToolboxHarness = (
     progress: HarnessProgress,
     observer?: HarnessPresetReport
 ): Harness => {
-    // Example-only sources are given as PATHS, exactly like the shared half: the
-    // kernel commits `toolSources` after the baseline and before `tools` overrides,
-    // which preserves the documented "source, then host definition" order. A host
-    // definition of the same name still wins.
-    const useSharedToolbox = configuration.sharedToolbox !== false;
+    // THE FACTORY'S OWN TOOLBOX IS THE AUTHORITY (R-boot). The deployment's boot posture is
+    // applied where templates are BUILT — boot-declared presets are compiled with it, and a
+    // registry-created/restored harness is created with `HarnessRegistryOptions.creation` —
+    // never as a per-build override of an explicitly supplied factory. That keeps the
+    // precedence honest: a host that hands over a `HarnessPreset` really gets the tools that
+    // factory declares (the shipped cards keep their shared toolbox), while a host that
+    // omits templates entirely has nothing to strip.
+    const useSharedToolbox = configuration.sharedToolbox ?? true;
+    const useWebsearch = configuration.websearch ?? useSharedToolbox;
+    const useWebfetch = configuration.webfetch ?? useSharedToolbox;
+    const extraToolSources = { ...(configuration.extraToolSources ?? {}) };
+    const extraTools = { ...(configuration.extraTools ?? {}) };
+    const toolFolders = [...(configuration.toolFolders ?? [])];
+    // Commands: the preset's own first, then the host's deployment-wide list. The kernel
+    // refuses a duplicate name across the merged list, which is the honest answer for a
+    // collision between a card and its host.
+    const commands = [...(configuration.commands ?? []), ...(observer?.commands ?? [])];
 
     const liveConfiguration: HarnessConfiguration = {
         agents: configuration.agents,
@@ -719,11 +821,19 @@ export const createToolboxHarness = (
         // the caller's own `extraToolSources` — a card that declares no catalogue tools must register
         // none, or the descriptor would advertise an empty list while the harness still declares core
         // file tools to every request.
+        // The factory's extra map, merged after the shared half (or used alone with the
+        // shared half off — then these ARE the toolbox).
         toolSources: useSharedToolbox
-            ? { ...SHARED_TOOL_SOURCES, ...configuration.extraToolSources }
-            : { ...configuration.extraToolSources },
+            ? { ...SHARED_TOOL_SOURCES, ...extraToolSources }
+            : { ...extraToolSources },
         // Host/example DEFINITIONS override sources by being registered last.
-        tools: { ...configuration.extraTools },
+        tools: { ...extraTools },
+        // Empty means "nothing configured", so the field is omitted rather than sent as
+        // `[]`: a preset built without folders keeps the exact historical configuration.
+        ...(toolFolders.length === 0 ? {} : { toolFolders: [...toolFolders] }),
+        // Same absent-when-empty rule. These are the HOST's commands (the kernel adds its
+        // own `/help`, `/tools`, ... before any configured entry).
+        ...(commands.length === 0 ? {} : { commands }),
         presets: false,
         // Tool-loop budget: no shipped card sets one, so live sessions get `PRESET_MAX_ITERATIONS`
         // (Infinity — the guard is off). It survives as a per-card opt-in, and the library
@@ -733,17 +843,25 @@ export const createToolboxHarness = (
         // and the harness is unchanged. Keys are resolved at construction, after
         // `.env` is loaded by the CLI/server. The CONFIGURATION field keeps its
         // name (`websearch`); the core tool it registers is search (R18).
-        // Both environment rows follow the shared-toolbox flag: a tool-less card declares no catalogue
-        // tool, and `fetch` in particular registers WITHOUT a credential, so it would otherwise sneak
-        // a core declaration onto a card whose descriptor promises none.
-        websearch: useSharedToolbox,
+        // Both environment rows follow the shared-toolbox flag unless the card or the
+        // host states them: a tool-less card declares no catalogue tool, and `fetch` in
+        // particular registers WITHOUT a credential, so it would otherwise sneak a core
+        // declaration onto a card whose descriptor promises none.
+        websearch: useWebsearch,
         // Page fetch (W4) must be opted into as well, or `fetch` never enters
         // this harness's tool map and `toolRequest` has nothing to surface under
         // the `web`/`fetch`/`url` tags — the agent then legitimately reports
         // "search only". `native` needs no credential, so this is safe on a
         // keyless host; the tool stays SEARCHABLE (see src/harness.ts), so it
         // costs no request schema until the model asks for it.
-        webfetch: useSharedToolbox,
+        webfetch: useWebfetch,
+        // THE PLUGIN SET (R-boot). An absent report leaves the library default
+        // (`BUILTIN_PLUGINS`); a reported ARRAY is the whole set, so `builtinPlugins: []`
+        // is what makes "the host configured no plugins" mean none instead of the shipped
+        // three. See `HarnessPresetReport.plugins` in ./types.ts.
+        ...(observer?.plugins === undefined
+            ? {}
+            : { builtinPlugins: [], plugins: observer.plugins }),
         // The server's persistence observer rides along with progress; either may
         // be absent (CLI, direct preset creation).
         report: {

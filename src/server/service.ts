@@ -97,6 +97,10 @@ import type { HarnessApi, HarnessApiEmit, HarnessApiStream } from './api';
 import { isLoopbackHostname, isPagesOrigin } from '../shared/origin';
 import type { HarnessRuntime } from './runtime';
 import { getHarnessRuntime, prepareHarnessKnowledge } from './runtime';
+// R-boot: the ONE boot configuration contract the direct listener also consumes. The
+// endpoint modules are built with no options, so the service forwards the host's value
+// through the loader's `variables.harness` (see `harnessFor` below).
+import type { HarnessBootConfiguration } from './harnesses';
 // T15: the update stream rides the same mount; this import is types + the route string only, so
 // the HTTP adapter does not depend on the transport implementation.
 import { HARNESS_WS_STREAM_PATH, rejectUpgrade } from './stream';
@@ -328,6 +332,17 @@ export type HarnessServiceHandlerOptions = {
     // ServerRuntimeError for a bad value) rather than approximated. Only consulted when no
     // `runtime` is injected: an injected store already carries its own execution model.
     execution?: Partial<ServerRuntimeConfiguration>;
+    // R-boot: THE HARNESS BOOT CONFIGURATION for the runtime this service creates —
+    // templates/preset agents, plugins, tools and toolbox posture (./harnesses/boot.ts).
+    // When omitted, the loader's `variables.harness` is used, which is how the statically
+    // built endpoint modules (they call `createHarnessServiceHandler()` with no options)
+    // receive the host's configuration. An explicit option wins over the variable.
+    //
+    // The first caller for a root decides the runtime, so the warm-up must forward the
+    // SAME value (`warmHarnessRuntime({ variables })` reads this member too); a later,
+    // different configuration is an explicit error in `getHarnessRuntime`, never a silent
+    // reuse of the unconfigured runtime.
+    harness?: HarnessBootConfiguration;
 };
 
 // Read the service loader's storage boundary. `variables.root` is the explicit
@@ -436,6 +451,29 @@ const rootForRuntime = (
 ): string | null | undefined =>
     options.root === undefined ? rootFromVariables(variables) : normalizeHarnessDatabaseRoot(options.root);
 
+// R-boot: the harness configuration for THIS request's runtime. The handler's explicit
+// option wins; otherwise the loader's `variables.harness`. Reading it here — rather than in
+// the endpoint modules — is what lets the three STATIC route modules share one wiring: they
+// call `createHarnessServiceHandler()` with no options, and the loader supplies `variables`
+// to every invocation. The shape is validated by `resolveHarnessBootConfiguration` inside
+// `getHarnessRuntime`; an invalid object throws there with a boot-configuration sentence.
+//
+// The SAME value must reach the warm-up (`warmHarnessRuntime({ variables })`), because the
+// first caller for a root decides the runtime; `getHarnessRuntime` refuses a later,
+// different configuration instead of silently reusing the unconfigured one.
+const harnessForRuntime = (
+    options: HarnessServiceHandlerOptions,
+    variables: Record<string, unknown> | undefined
+): HarnessBootConfiguration | undefined => {
+    if (options.harness !== undefined) return options.harness;
+
+    if (variables === undefined || !Object.prototype.hasOwnProperty.call(variables, 'harness')) {
+        return undefined;
+    }
+
+    return variables.harness as HarnessBootConfiguration | undefined;
+};
+
 // Resolve the root-keyed runtime once, so the HTTP handler and the stream upgrade below can never
 // land on different stores (and therefore different epochs) for the same DATABASE_ROOT.
 const resolveRuntime = (
@@ -447,11 +485,17 @@ const resolveRuntime = (
     // T5 (R1/R3): `execution` forwards a host-configured server RUNTIME (notably
     // `threadExecution`) into the root-keyed runtime, which resolves it over
     // HARNESS_THREAD_EXECUTION / HARNESS_WORKER_* and hands it to the SessionStore.
+    // R-boot: forwarded on EVERY resolution (including `[]`/`{}` from the host), so the
+    // request path and the service warm-up configure one runtime. Omitted stays omitted:
+    // the handler default is the zero floor, not an implicit catalogue (./harnesses/boot.ts).
+    const harness = harnessForRuntime(options, variables);
+
     return (
         options.runtime ??
         getHarnessRuntime({
             root,
-            ...(options.execution === undefined ? {} : { runtime: options.execution })
+            ...(options.execution === undefined ? {} : { runtime: options.execution }),
+            ...(harness === undefined ? {} : { harness })
         })
     );
 };

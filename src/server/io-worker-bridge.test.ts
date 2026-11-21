@@ -37,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { agent, harness } from '../harness';
 import type { HarnessPreset, HarnessProgress, HarnessStream, HarnessStreamEvent, RunnerSettings } from './harnesses/types';
-import { createHarnessRegistry } from './harnesses';
+import { createHarnessRegistry, presets } from './harnesses';
 import { HARNESS_JOURNAL_DIRECTORY, HarnessJournal } from './journal';
 import {
     HARNESS_DATABASE_VERSION,
@@ -340,7 +340,10 @@ describe('startup and readiness', () => {
             databaseRoot: root,
             // `ioExecution` is a resolved-runtime field, so the standalone entry point honours it
             // exactly like `HARNESS_IO_EXECUTION=worker` would.
-            runtime: { ioExecution: 'worker', ioEntry: entry }
+            runtime: { ioExecution: 'worker', ioEntry: entry },
+            // R-boot: this case is about the worker IO handshake and the durable shard write,
+            // not the catalogue, so it provisions the shipped card it creates a session from.
+            harness: { presets }
         });
 
         expect(started.runtime.ioExecution).toBe('worker');
@@ -411,7 +414,10 @@ describe('service host (the gateway has no startup hook)', () => {
 
         const handler = createHarnessServiceHandler({
             root,
-            execution: { ioExecution: 'worker', ioEntry: entry }
+            execution: { ioExecution: 'worker', ioEntry: entry },
+            // R-boot: the handler's explicit option is the service seam this case exercises;
+            // the shipped card is provisioned because the assertion is the worker write.
+            harness: { presets }
         });
 
         const created = await handler(context('/v1/harness/sessions'), { body: { harness: 'instruct' } });
@@ -425,8 +431,9 @@ describe('service host (the gateway has no startup hook)', () => {
         expect(new HarnessPersistence(root).load()?.sessions.map((stored) => stored.id)).toEqual([session.id]);
 
         // The runtime this handler created is a root-keyed singleton; register its store so the
-        // shared teardown disposes it and drains (and releases) its worker thread.
-        stores.push(getHarnessRuntime({ root }).store);
+        // shared teardown disposes it and drains (and releases) its worker thread. The read
+        // states the SAME boot configuration the handler did (R-boot cache guard).
+        stores.push(getHarnessRuntime({ root, harness: { presets } }).store);
     });
 
     it('answers 500 naming the entry when a worker-mode service runtime cannot start', async () => {

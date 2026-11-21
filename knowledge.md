@@ -732,17 +732,21 @@ src/shared/
   *.test.ts             colocated contract/validation tests
 src/server/
   index.ts              server barrel -> @underload/harness/server
-  start.ts              startHarnessServer: standalone node:http server (explicit) — loads the
-                        knowledge base BEFORE the `SessionStore` exists (a failure aborts
-                        startup), hands every session the same store through an accessor, and
-                        flushes + disposes it exactly once in `close()`
+  start.ts              startHarnessServer: standalone node:http server (explicit) — takes the
+                        explicit `harness` boot configuration (R-boot: omitted = no presets,
+                        plugins or shared toolbox) and loads the knowledge base BEFORE the
+                        `SessionStore` exists (a failure aborts startup), hands every session
+                        the same store through an accessor, and flushes + disposes it exactly
+                        once in `close()`
   api.ts                transport-neutral dispatcher: routes, body policy, bootstrap
   handler.ts            Node adapter on /v1/harness; no header gate (T15); SSE by bridging
                         `runHarnessSseStream` onto the ONE exported writer
                         `createHarnessSseResponse` (./service.ts, issue 0006)
   service.ts            @underload/service adapter: /v1/harness, Origin gate, raw SSE
-  runtime.ts            lazy shared store/catalogue for the service routes, keyed by root —
-                        and the owner of the ONE knowledge base per resolved root
+  runtime.ts            lazy shared store/catalogue for the service routes, keyed by root
+                        (and guarded by the boot-configuration signature: the first caller
+                        decides, a different later one throws) — and the owner of the ONE
+                        knowledge base per resolved root
                         (`getHarnessKnowledgeEngine` / `prepareHarnessKnowledge` /
                         `harnessKnowledgeOf` / `flushHarnessKnowledge` /
                         `disposeHarnessKnowledge`: engine created sync, load AND failure
@@ -6752,6 +6756,109 @@ The app is split so the harness has **no UI dependency**. The library
 (`src/server`, `src/frontend`, `src/shared`) are consumers of it and are published
 as their own entries.
 
+### Harness boot configuration (R-boot)
+
+**One contract, two seams, zero defaults.** `HarnessBootConfiguration`
+(`src/server/harnesses/boot.ts`, exported from `@underload/harness/server` together with
+`resolveHarnessBootConfiguration` and `HarnessToolboxDefaults`) is the object both server
+boot seams take:
+
+```ts
+startHarnessServer({ harness: configuration })        // direct listener
+createHarnessRuntime({ harness: configuration })     // service-owned runtime
+getHarnessRuntime({ root, harness: variables.harness })
+```
+
+An OMITTED member means NONE, deliberately:
+
+| member | omitted means |
+|---|---|
+| `presets` | the registry starts with an EMPTY catalogue — no shipped card |
+| `plugins` | no plugin is applied AND `GET /plugins` lists no row |
+| `toolbox` | `sharedToolbox: false`, no web rows, no extra tools → the harness-owned core floor only |
+| `commands` | no host command is registered |
+
+A host that wants the shipped product states it explicitly:
+
+```ts
+import { BUILTIN_PLUGINS, presets } from '@underload/harness/server';
+
+startHarnessServer({
+    harness: { presets, plugins: BUILTIN_PLUGINS, toolbox: { sharedToolbox: true } }
+});
+```
+
+`HarnessBootPresetConfiguration` declares a template without building a factory: `name`,
+`agents` (trusted profile ids, in order), optional `entry`/`ranks`/`agentModels`/
+`agentInstructions`/`agentColors`, the declared `tools`/`environmentTools`, and per-preset
+`sharedToolbox`/`maxIterations`/`websearch`/`webfetch`/`extraToolSources`/`extraTools`/
+`toolFolders`. The boot resolver compiles each entry through a scratch
+`createHarnessRegistry([], { creation }).create(...)`, i.e. the SAME validator as
+`POST /harnesses`, so a declaration the wire would reject aborts startup with that
+validator's sentence. `presets`/`registry` together are refused (two catalogue sources),
+as are `harness` + an injected `store`; a stated `harness.toolbox` beside an injected
+`registry` is refused too (B5), because an injected registry owns its CREATION DEFAULTS
+and this seam cannot reach into a closure it did not build — the error names the fix:
+state the posture where the registry is built,
+`createHarnessRegistry(presets, { creation: toolbox })`, and omit `harness.toolbox`.
+`plugins` and `commands` DO combine with an injected registry: those are per-build facts
+the store forwards through `HarnessPresetReport`, not catalogue construction.
+
+**Toolbox precedence, exactly:** the boot posture is applied where templates are BUILT,
+not as a per-build override of an explicitly supplied factory:
+
+- a boot-DECLARED preset is compiled with `HarnessBootConfiguration.toolbox` (its own
+  per-preset fields win);
+- a registry-created harness (`POST /harnesses`) and a restored registry row are built
+  with `HarnessRegistryOptions.creation`, which the boot seams set to the same posture;
+- an explicitly supplied `HarnessPreset`/registry keeps what its factory states.
+  `createProfiledHarness` states `sharedToolbox: true` when its caller configured no
+  toolbox, so the shipped cards passed through `harness.presets` keep their tools.
+
+**Stated means stated; empty means empty.** A per-preset `environmentTools` array is the
+AUTHORITATIVE row set for both the card and the factory: the compiler derives the card's
+`websearch`/`webfetch` from it, so `[]` clears rows inherited from
+`HarnessBootConfiguration.toolbox` and `['fetch']` registers exactly `fetch`. Omitting the
+array inherits the deployment posture. A stated `websearch`/`webfetch` that contradicts
+the list is a startup error. The same stated-vs-omitted rule applies to a per-preset
+`extraToolSources`/`extraTools`/`toolFolders` map or list: a stated (even empty) value
+REPLACES the deployment's, an omitted one inherits it. `tools` is declaration-only and
+an explicit `[]` stays empty.
+
+`declaredToolboxNames` is the ONE projection behind a card's `tools`/`environmentTools`,
+used by `registry.create()` and the boot compiler, so a zero-toolbox deployment cannot
+ship a card that advertises tools it does not register.
+
+`harness.toolbox`/`harness.commands` are SESSION-harness configuration. The
+DIRECT-CALL catalogue (`GET /tools`, `POST /tools/{name}`) remains the separate
+`catalogue`/`createToolCatalogue()` seam (`startHarnessServer`'s `catalogue` option), so
+configuring a tool for sessions never makes it callable with no session — the security
+boundary the catalogue has always kept.
+
+**Service startup ordering.** The routes are static modules that call
+`createHarnessServiceHandler()` with no options, so they read `variables.harness`; the
+gateway's `warmHarnessRuntime({ root, variables })` reads the SAME record before
+`listen()`. `getHarnessRuntime` caches one runtime per database root and the FIRST caller
+decides its configuration, so a later, structurally different configuration throws
+(`harnessBootSignature` is the comparison) rather than silently reusing the unconfigured
+runtime. `@underload/service/server.ts` therefore builds ONE `endpointVariables` object
+and hands it to both calls. The shipped gateway currently configures none, so it serves
+the zero-default harness until a host (e.g. create-storyline) supplies one.
+
+**Worker boundary: the boot posture crosses as data, or the session is refused (B6).**
+A lane worker rebuilds its replica from the durable `HarnessPresetRecord`, which
+serialises the TEAM but no plugin/toolbox/budget/extra-source data, so the hello blueprint
+carries the serializable half: `LaneBlueprint.presetRebuild` (the per-card declarative
+toolbox — materialized `sharedToolbox`/`websearch`/`webfetch`, budget, extra tool sources
+and folders) and `LaneBlueprint.plugins` (`{ kind: 'none' }` for a configured-empty set,
+`{ kind: 'builtin', names }` for generated entries). `laneBootPosture` is the ONE rule the
+creation gate and the blueprint share, so custom plugin lists, boot commands and
+executable `extraTools` are refused at `POST /sessions` BEFORE a lane exists, while
+advanced closures remain inline-only. The authoritative per-axis matrix, the verified
+rebuild path and the `preset-not-rebuildable` handshake rule are in
+[Lane workers](#lane-workers-threadexecution-worker) below (B6) and in README's
+"Per-thread CPU isolation" section.
+
 - **CLI (`src/server/cli/`)** runs a preset in-process: one-shot from argv/stdin, or an
   interactive session on a TTY. It renders `HarnessEvent`s directly with
   `src/server/cli/render.ts`, or emits one JSON object per line with `--json`. With
@@ -8353,6 +8460,31 @@ The three load-bearing decisions:
   `threadId` while the CALLER travels inside `identity`, so the authority scopes the
   release to the lane caller's own descendants and `applySync` rebases the lane's
   mirror of every conversation the cascade removed.
+- **The boot posture crosses as data or the session is refused (B6).** A durable record
+  reproduces the TEAM, not the per-build facts (`src/server/harnesses/registry.ts`
+  `presetToRecord` serialises no plugin/toolbox/budget/extra-source data), so a replica
+  rebuilt from it alone silently regained the library defaults: `async-ping` /
+  `context-compaction` / `context-trimmer` on a zero-plugin deployment, the shared
+  toolbox on a tool-less card, and `Infinity` on a card with a budget. `sessions.ts`
+  `blueprintFor` now ships `LaneBlueprint.presetRebuild` (the per-card
+  `creation.toolbox`: materialized `sharedToolbox`/`websearch`/`webfetch`,
+  `maxIterations`, `extraToolSources`, `toolFolders`) and `LaneBlueprint.plugins`
+  (`{ kind: 'none' }` for a configured-empty set, `{ kind: 'builtin', names }` for the
+  generated entries, absent for a host that never configured the axis).
+  `lane-worker-loop.ts` rebuilds with `presetFromRecord(record, undefined, toolbox)` and
+  passes `plugins: []` for `none` (which `createToolboxHarness` turns into
+  `builtinPlugins: []`), then verifies the rebuilt card's materialized posture
+  (`assertLaneRebuildPosture`) — a record whose declaration cannot express the approved
+  posture faults the hello with `preset-not-rebuildable` instead of running a wider or
+  narrower harness. `capability.ts` `laneBootPosture` is the single rule the creation
+  gate (`assessLaneWorkerCapability`, a 400 through `laneWorkerUnsupportedMessage`) and
+  the payload share, so "approved" and "sent" cannot drift: a custom plugin list
+  (`plugins-not-rebuildable`), a boot command list (`commands-not-rebuildable`) and a
+  constructed `extraTools` map (`extra-tools-not-rebuildable`) are refused BEFORE a lane
+  exists, while `extraToolSources`/`toolFolders` (paths) and the booleans/budget cross.
+  Pinned by `src/server/workers/lane-boot-posture.test.ts` at three levels: the matrix,
+  the real `blueprintFor`→`structuredClone`→`laneReplicaPreset` path (exact replica
+  toolbox/plugin list), and one spawned zero-plugin zero-toolbox lane.
 - **A commit is applied through targeted core seams, never `restore()` per commit.**
   `restore()` rebuilds every created tool and thread agent and zeroes each thread's
   generation, i.e. it spends coordinator CPU and disturbs live handles. The four seams
@@ -8719,7 +8851,11 @@ that never rewrites the trusted profile. The registry is **in memory only unless
 supplied**: with one, registry metadata is saved in the document header
 `<root>/harness/index.json` and
 replayed on restart (see the Persistence section in README.md); without one, a
-restart returns to the shipped catalogue.
+restart returns to the catalogue the registry was CREATED with. `createHarnessRegistry()`
+still defaults to the shipped `presets`; the server boot passes its own
+(`harness.presets`, empty when omitted — R-boot), so a restart of a zero-configured
+server comes back empty and its saved rows are skipped as built-ins this build no longer
+declares.
 
 Sessions capture the resolved preset AND a `describeHarness()` snapshot at
 creation. **Team membership, the ENTRY agent, the resolved RANK MAP, and that descriptor

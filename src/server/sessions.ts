@@ -154,6 +154,10 @@ import type {
     HarnessActionRequest,
     HarnessActionRequestContext,
     HarnessAttachment,
+    // R-boot: the per-build carriers the store forwards to every preset factory. Plugin
+    // metadata is included because the plugin-settings store seeds its catalogue from the
+    // CONFIGURED descriptors, not the generated manifest, when the boot configured a set.
+    HarnessCommandConfiguration,
     HarnessCommandResult,
     HarnessDiagnosticEvent,
     HarnessEvent,
@@ -161,6 +165,8 @@ import type {
     HarnessKnowledge,
     HarnessKnowledgeStore,
     HarnessMessage,
+    HarnessPlugin,
+    HarnessPluginMetadata,
     HarnessSnapshot,
     HarnessStateChangeEvent,
     HarnessThreadRecord,
@@ -264,6 +270,10 @@ import {
     assessLaneWorkerCapability,
     createLaneAuthority,
     createLaneHost,
+    // B6: the ONE rule for the boot posture a replica may rebuild from. It is used
+    // twice on purpose — the creation/restore gate reads its `reasons`, and
+    // `blueprintFor` ships its fields — so "approved" and "sent" cannot drift.
+    laneBootPosture,
     laneWorkerEnvironment,
     laneWorkerUnsupportedMessage,
     planWorkerToolSurfaces,
@@ -272,7 +282,15 @@ import {
     // scan. Without it `memoryKeysFor` saw `undefined` for every shipped core tool.
     toolScanTextOf
 } from './workers';
-import type { LaneAuthority, LaneBlueprintSource, LaneHost, LaneTarget, LaneTurnResult } from './workers';
+import type {
+    LaneAuthority,
+    LaneBlueprintSource,
+    LaneHost,
+    LaneTarget,
+    LaneTurnResult,
+    // B6: the deployment facts the capability gate and `blueprintFor` hand the same rule.
+    LaneWorkerHostConfiguration
+} from './workers';
 // D4 (R1/R2/R4): the IO worker client, through the same subsystem barrel. `openHarnessIoClient`
 // is the SYNCHRONOUS opener: the store constructor cannot await, and the client registers
 // every operation issued before the handshake and releases it in call order once the worker
@@ -1020,6 +1038,35 @@ export type SessionStoreOptions = {
     // Absent (an in-memory store, a test, a library host) means each harness gets its own
     // in-memory engine: knowledge still works, and the member carries no durability verbs.
     knowledge?: HarnessKnowledge | (() => HarnessKnowledge | undefined);
+    // -------------------------------------------------------------------
+    // R-boot — THE DEPLOYMENT'S HARNESS CONFIGURATION
+    // -------------------------------------------------------------------
+    //
+    // These three are the per-BUILD half of `HarnessBootConfiguration` (./harnesses/boot.ts).
+    // They live on the store because it is the ONE place every harness is constructed
+    // (`buildHarness`, fresh and restored), so a configured plugin set/toolbox reaches a
+    // shipped preset, an HTTP-created preset and a frozen record alike — no factory has to
+    // know about the deployment.
+    //
+    // THE `undefined` vs `[]` DISTINCTION IS THE CONTRACT:
+    //   - `undefined` = "this host did not configure this axis" (a direct `new SessionStore`,
+    //     a test, the CLI), so the factory/library default stays byte-identical;
+    //   - `[]` = "this deployment configured ZERO", which is what both server boot seams
+    //     always pass, because the boot contract makes omission mean none.
+    //
+    // The COMPLETE plugin set applied to every harness build. `undefined` keeps each
+    // factory's own default (the generated `BUILTIN_PLUGINS`); `[]` applies none; an array
+    // applies exactly those entries. Forwarded through `HarnessPresetReport.plugins`, which
+    // `createToolboxHarness` turns into `builtinPlugins: []` + `plugins: <list>`.
+    plugins?: readonly HarnessPlugin[];
+    // The catalogue `GET/PATCH /plugins` reads and validates against. `undefined` keeps the
+    // generated manifest; `[]` lists no plugin at all. A boot seam derives this from
+    // `plugins` so a row can never describe a plugin the harnesses do not load, or the
+    // reverse.
+    pluginDescriptors?: readonly HarnessPluginMetadata[];
+    // Slash commands this deployment registers on every harness build (after the kernel's).
+    // `undefined` = none configured; an empty list is equivalent.
+    harnessCommands?: readonly HarnessCommandConfiguration[];
 };
 
 // Recovery wording used when a turn was running at save time. The policy is
@@ -2099,6 +2146,17 @@ export class SessionStore {
     // (./runtime.ts owns it), which is why deleting a session cannot delete an article.
     private readonly knowledgeOf: () => HarnessKnowledge | undefined;
 
+    // R-boot: the deployment's harness configuration, read by `buildHarness` (every path)
+    // and by `blueprintFor` (so a lane replica's factory gets the same toolbox posture).
+    // `undefined` on each means "not configured" and is deliberately distinguishable from
+    // the empty values the boot seams pass (see `SessionStoreOptions`).
+    private readonly harnessPlugins: readonly HarnessPlugin[] | undefined;
+    private readonly harnessCommands: readonly HarnessCommandConfiguration[] | undefined;
+    // The descriptor list the plugin-settings store seeds from. Kept beside the executable
+    // list so a host can inject a catalogue without a matching runtime plugin (a fixture),
+    // and so the boot seams can derive it once (./harnesses/boot.ts) instead of twice.
+    private readonly pluginDescriptors: readonly HarnessPluginMetadata[] | undefined;
+
     private host?: LaneHost;
 
     // D4 (R1/R2/R4): the IO worker client that performs this store's checkpoint and journal
@@ -2162,6 +2220,13 @@ export class SessionStore {
         // T1.5 last mile: the sink `buildHarness` installs on every harness this store creates.
         this.onPluginDiagnostic = options.onPluginDiagnostic;
 
+        // R-boot: captured ONCE, by reference (the lists are deployment constants the host
+        // owns and does not mutate). `undefined` stays undefined so a direct store keeps the
+        // factory defaults; the boot seams always pass an explicit (possibly empty) value.
+        this.harnessPlugins = options.plugins;
+        this.harnessCommands = options.harnessCommands;
+        this.pluginDescriptors = options.pluginDescriptors;
+
         // T16: the operator's saved GLOBAL provider defaults (base URL + model). Read straight
         // from the document the host already loaded, so a `PATCH /config` survives a restart
         // instead of silently reverting to the environment. The credential is never in here.
@@ -2174,7 +2239,14 @@ export class SessionStore {
         //
         // R4: this is the TEMPLATE scope. Every session created later copies these overrides
         // down into its own store; nothing here is read by a session's harness any more.
+        //
+        // R-boot: the CATALOGUE is the deployment's configured descriptor list when it
+        // supplied one (`[]` = no rows), and the generated manifest otherwise. The two must
+        // be the same set as the executable `plugins` list, or `GET /plugins` would describe
+        // a plugin no harness loads — which is exactly what a server boot with zero plugins
+        // must not do.
         this.plugins = createPluginSettingsStore({
+            ...(this.pluginDescriptors === undefined ? {} : { descriptors: this.pluginDescriptors }),
             ...(options.database === undefined ? {} : { values: options.database.pluginSettings })
         });
 
@@ -3019,6 +3091,17 @@ export class SessionStore {
             // engine's owner simply dies with the process. A preset factory that does not
             // forward the report produces an unowned build; the shipped toolbox factory does.
             knowledgeOwner: preset.name,
+            // R-boot: THE DEPLOYMENT'S HARNESS CONFIGURATION, on every build (fresh, restored,
+            // registry-created, or a frozen record). The values are captured by the store at
+            // construction, so all sessions see one answer and no factory has to know where
+            // the harness came from.
+            //
+            // The `undefined` spread is the documented "not configured" case: a direct
+            // `new SessionStore`/CLI caller keeps the library/factory defaults, while both
+            // server boot seams pass an explicit (possibly empty) value — `plugins: []` is
+            // how "no plugins" reaches `createToolboxHarness`.
+            ...(this.harnessPlugins === undefined ? {} : { plugins: this.harnessPlugins }),
+            ...(this.harnessCommands === undefined ? {} : { commands: this.harnessCommands }),
             // R1: the per-build toolbox seed, forwarded verbatim so a preset factory never has
             // to guess whether ITS session is new. Absent (every restore, and every caller that
             // does not ask) means the library default: an empty enabled set.
@@ -3097,12 +3180,34 @@ export class SessionStore {
         return this.host;
     }
 
+    // B6: the deployment half of the boot posture a replica must rebuild — the plugin
+    // set and the boot command list. `undefined` vs `[]` is the documented contract
+    // (`SessionStoreOptions.plugins`): a direct store leaves the factory default, while
+    // both server boot seams always state the configured list, `[]` included. ONE
+    // accessor so the capability gate and `blueprintFor` can never approve one thing
+    // and ship another.
+    private laneHostConfiguration(): LaneWorkerHostConfiguration {
+        return {
+            ...(this.harnessPlugins === undefined ? {} : { plugins: this.harnessPlugins }),
+            ...(this.harnessCommands === undefined ? {} : { commands: this.harnessCommands })
+        };
+    }
+
     // The session's own capability decision, taken where the session is BUILT (create and
     // restore), because that is the last moment a refusal costs nobody any work.
+    //
+    // B6: the deployment's plugin/command configuration is part of the decision now. A
+    // custom plugin set or a boot command handler is a closure a lane cannot rebuild, so
+    // the session is refused HERE (400 with a code per reason) instead of running a lane
+    // with the library defaults or without the commands.
     private assertWorkerCapable(preset: HarnessPreset): void {
         if (!this.workerExecution) return;
 
-        const capability = assessLaneWorkerCapability(preset, laneWorkerEnvironment());
+        const capability = assessLaneWorkerCapability(
+            preset,
+            laneWorkerEnvironment(),
+            this.laneHostConfiguration()
+        );
 
         if (!capability.supported) {
             throw new SessionError(400, laneWorkerUnsupportedMessage(capability));
@@ -3299,6 +3404,19 @@ export class SessionStore {
     // deliberately keeps reading the PROCESS store — the tool deny list is deployment-wide by
     // its own contract (./tool-settings.ts), and only plugin settings moved per session.
     private blueprintFor(session: Session): LaneBlueprintSource {
+        // B6: the boot posture this lane may rebuild. Same rule as the create/restore
+        // gate, so this call normally returns fields and no reasons; a reason here would
+        // mean the configuration moved under a session that was already accepted, which
+        // is reported instead of shipping a blueprint a lane would rebuild differently.
+        const posture = laneBootPosture(session.preset, this.laneHostConfiguration());
+
+        if (posture.reasons.length > 0) {
+            throw new SessionError(
+                400,
+                laneWorkerUnsupportedMessage({ supported: false, reasons: posture.reasons, notes: [] })
+            );
+        }
+
         return {
             record: presetToRecord(session.preset),
             settings: session.settings,
@@ -3315,7 +3433,16 @@ export class SessionStore {
             // frame. The spread is also an explicit ownership boundary — the lane cannot mutate a
             // array that is really this live handle's own state.
             withheldTools: [...session.harness.withheldTools],
-            pluginSettings: session.plugins.snapshot()
+            pluginSettings: session.plugins.snapshot(),
+            // B6: the serializable boot posture. Both fields are ALREADY structured-clone
+            // safe by construction (paths, booleans, numbers, names — never a closure),
+            // and both are omitted when there is nothing to state:
+            //   - `presetRebuild` absent = the preset carries no `creation` metadata, so the
+            //     historical record-only rebuild is the honest answer;
+            //   - `plugins` absent = the host never configured plugins, so the factory
+            //     default (the generated `BUILTIN_PLUGINS`) is what BOTH sides run.
+            ...(posture.presetRebuild === undefined ? {} : { presetRebuild: posture.presetRebuild }),
+            ...(posture.plugins === undefined ? {} : { plugins: posture.plugins })
         };
     }
 
@@ -4645,7 +4772,10 @@ export class SessionStore {
             const preset =
                 current !== undefined && presetRecordEquals(presetToRecord(current), record.preset)
                     ? current
-                    : presetFromRecord(record.preset, current);
+                    // R-boot: a rebuilt frozen factory must use the SAME toolbox posture as the
+                    // registry that owns the catalogue, or a deployment booted with the zero
+                    // floor would restore an old session with the shared set it switched off.
+                    : presetFromRecord(record.preset, current, this.registry.creationDefaults());
 
             // No API key is read from disk. mergeSettings re-attaches the server
             // key only when the stored base URL is the configured provider; a

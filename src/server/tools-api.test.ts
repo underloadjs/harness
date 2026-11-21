@@ -44,7 +44,7 @@ import { fileURLToPath } from 'node:url';
 import { agent, harness, tool } from '../harness';
 import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '../harness';
 import { createHookBus } from '../plugin/hooks';
-import { createHarnessRegistry } from './harnesses';
+import { createHarnessRegistry, createToolCatalogue } from './harnesses';
 import type { HarnessPreset, HarnessPresetReport, RunnerSettings } from './harnesses/types';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime, HarnessRuntimeOptions } from './runtime';
@@ -229,6 +229,10 @@ const createRuntime = (options: Partial<HarnessRuntimeOptions> = {}): HarnessRun
         defaults: DEFAULTS,
         registry: createHarnessRegistry([probePreset()]),
         loadEnvironment: false,
+        // R-boot: an omitted direct-call catalogue is EMPTY. These cases exercise the
+        // enablement/execution columns of the PACKAGE rows, so this host states the
+        // production catalogue.
+        catalogue: createToolCatalogue(),
         ...options
     });
 };

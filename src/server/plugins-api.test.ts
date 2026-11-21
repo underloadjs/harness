@@ -51,7 +51,7 @@ import { fileURLToPath } from 'node:url';
 
 import { agent, harness } from '../harness';
 import type { HarnessStream, HarnessStreamEvent } from '../harness';
-import { BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
+import { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
 // The prompt constant, so the projected value below is a real string rather than
 // `COMPACTION.systemPrompt`: read from the descriptor, a MISSING field would become
 // `system_prompt: undefined`, which `toEqual` treats as absent and the assertion would
@@ -291,6 +291,10 @@ const createRuntime = (options: Partial<HarnessRuntimeOptions> = {}): HarnessRun
         settings: SETTINGS,
         defaults: DEFAULTS,
         registry: createHarnessRegistry([probePreset()]),
+        // R-boot: the server boot no longer applies the shipped plugins (or their `/plugins`
+        // rows) implicitly. This suite is ABOUT those rows and the live settings gate, so it
+        // provisions the exact shipped executable set — the same explicit choice a host makes.
+        harness: { plugins: BUILTIN_PLUGINS },
         loadEnvironment: false,
         ...options
     });

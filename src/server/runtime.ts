@@ -28,8 +28,15 @@
 //   - ./environment.ts  — the .env loader (Node entry points only)
 //   - ./config.ts       — HARNESS_* defaults and the mergeSettings credential rule
 
-import { createHarnessRegistry, createToolCatalogue, describeHarness, restoreHarnessRegistry } from './harnesses';
-import type { HarnessRegistry, ToolCatalogue } from './harnesses';
+import {
+    EMPTY_TOOL_CATALOGUE,
+    createHarnessRegistry,
+    describeHarness,
+    harnessBootSignature,
+    resolveHarnessBootConfiguration,
+    restoreHarnessRegistry
+} from './harnesses';
+import type { HarnessBootConfiguration, HarnessRegistry, ToolCatalogue } from './harnesses';
 import type { RunnerSettings } from './harnesses/types';
 import { createHarnessApi } from './api';
 import type { HarnessApi } from './api';
@@ -130,6 +137,15 @@ export type HarnessRuntime = {
     events: HarnessEventHub;
     // Detach the hub -> stream listener (a disposable runtime; production lives with the process).
     detachStreamBridge: () => void;
+    // R-boot: the harness configuration this runtime was built with, as the host supplied it
+    // (`undefined` for a bare runtime). Reported so an embedder can prove which templates/
+    // plugins/toolbox the process is serving without reading private state.
+    harnessConfiguration?: HarnessBootConfiguration;
+    // R-boot: the stable identity of that configuration (`harnessBootSignature`). It is what
+    // `getHarnessRuntime` compares for an already-cached root: the first caller decides the
+    // runtime, so a later, DIFFERENT boot configuration is an explicit error rather than a
+    // silent reuse of the first one (a warm-up must not erase what the request path asked for).
+    bootSignature: string;
 };
 
 export type HarnessRuntimeOptions = {
@@ -153,12 +169,26 @@ export type HarnessRuntimeOptions = {
     // own settings; the dispatcher only uses it for sessions and health. An
     // injected store cannot be combined with `root` (it is already constructed and
     // not bound to that database).
+    //
+    // The DIRECT-CALL catalogue (`GET /tools` / `POST /tools/{name}`). OMITTED IS EMPTY
+    // (`EMPTY_TOOL_CATALOGUE`), the same zero-default the rest of this option object
+    // follows: a bare runtime exposes no optional direct-call row (no shared presets, no
+    // app tools, no web rows). The harness-owned CORE rows are still listed by the
+    // dispatcher and run through a session — they are not a direct-call mechanism.
+    // `createToolCatalogue()` remains available for a host that wants the production rows.
+    //
+    // A catalogue ALSO decides which environment-backed names a card DESCRIPTOR may list
+    // (./harnesses/descriptor.ts filters `environmentTools` against `catalogue.tools`), so
+    // a host that declares `environmentTools` on a preset and wants them shown must supply
+    // a catalogue carrying those entries.
     catalogue?: ToolCatalogue;
     store?: SessionStore;
-    // Inject a registry (tests). When omitted a fresh one is created and shared by
-    // the store and the dispatcher; an injected store must have been built with
-    // the same registry, or a created harness would not resolve. On restore the
-    // saved registry metadata is replayed ONTO this registry.
+    // Inject a registry (tests). When omitted a fresh one is created from
+    // `harness.presets` (empty by default) and shared by the store and the dispatcher; an
+    // injected store must have been built with the same registry, or a created harness
+    // would not resolve. On restore the saved registry metadata is replayed ONTO this
+    // registry. An injected registry is authoritative, so `harness.presets` beside it
+    // throws and `harness.toolbox` beside it is refused (it owns its creation defaults).
     registry?: HarnessRegistry;
     // Skip the .env load. Tests that inject every dependency use this to avoid
     // mutating process environment; production always loads.
@@ -170,6 +200,21 @@ export type HarnessRuntimeOptions = {
     // T15/T13: inject the epoch/revision hub (an embedder that already publishes domain changes).
     // Omitted means "create the process hub", which is what mints the epoch everything reports.
     events?: HarnessEventHub;
+    // R-boot: THE HARNESS BOOT CONFIGURATION (./harnesses/boot.ts). Omitted is the ZERO
+    // floor — an EMPTY preset catalogue, NO plugins (and no plugin rows), and no shared
+    // toolbox or extra tools. That is the deliberate server seam: a host provisions its
+    // templates/agents/plugins/tools explicitly, and `@underload/service` forwards the same
+    // object from `variables.harness` (or the handler's own `harness` option).
+    //
+    // PRECEDENCE with the advanced injections above:
+    //   - an injected `store` owns its registry, plugins and toolbox: `harness` may not be
+    //     configured beside it (throws — there is nothing left for it to configure);
+    //   - an injected `registry` is authoritative for the CATALOGUE, so a non-empty
+    //     `harness.presets` beside it throws. `plugins`/`commands` still apply (per-build
+    //     facts the store forwards), while a stated `harness.toolbox` beside an injected
+    //     registry is REFUSED: the registry owns its creation defaults and this seam
+    //     cannot change them, so accepting the posture would be a silent no-op.
+    harness?: HarnessBootConfiguration;
 };
 
 export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): HarnessRuntime => {
@@ -178,6 +223,37 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
     if (options.loadEnvironment !== false) loadEnvironmentFile();
 
     const configuration = loadConfiguration();
+
+    // R-boot: resolve the harness configuration BEFORE anything is constructed, so a
+    // malformed preset/plugin/toolbox document aborts startup with its own sentence rather
+    // than letting an empty or partial catalogue serve traffic. The signature is taken from
+    // the RAW value (see `harnessBootSignature`), so two calls that state the same thing
+    // compare equal even though each resolution compiles fresh factories.
+    if (options.store !== undefined && options.harness !== undefined) {
+        throw new Error(
+            'createHarnessRuntime accepts either an injected store or a `harness` boot configuration, not both: an injected store already owns its registry, plugins and toolbox.'
+        );
+    }
+
+    const boot = resolveHarnessBootConfiguration(options.harness);
+    const bootSignature = harnessBootSignature(options.harness);
+
+    if (options.registry !== undefined && boot.presets.length > 0) {
+        throw new Error(
+            'createHarnessRuntime accepts either an injected registry or `harness.presets`, not both: two sources for the harness catalogue have no precedence order.'
+        );
+    }
+
+    // B5: THE INJECTED-REGISTRY TOOLBOX CONTRACT — identical to ./start.ts. An injected
+    // registry owns its creation defaults, so a stated `harness.toolbox` cannot be applied
+    // here and must not be silently ignored. Checked on the RAW configuration, so an
+    // injected registry WITHOUT a toolbox (every existing caller) is untouched; the boot
+    // resolver's `{sharedToolbox:false}` normalization must not reject those registries.
+    if (options.registry !== undefined && options.harness?.toolbox !== undefined) {
+        throw new Error(
+            'createHarnessRuntime cannot apply `harness.toolbox` to an injected registry: an injected registry owns its creation defaults. Pass the posture to `createHarnessRegistry(presets, { creation })` (or the `creation` defaults the registry already has) and omit `harness.toolbox`.'
+        );
+    }
 
     // R3: resolve and VALIDATE the runtime before anything is built, then assert
     // that a configured worker mode can really be honoured by this build. A worker
@@ -188,7 +264,13 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
 
     // Catalogue first: the describer below needs it, and it is the runtime
     // snapshot of which credential-backed tools this host can run.
-    const catalogue = options.catalogue ?? createToolCatalogue();
+    //
+    // OMITTED IS EMPTY (zero-default). Falling back to `createToolCatalogue()` exposed the
+    // package's shared preset/app/web rows over `/tools` on a bare runtime, contradicting
+    // "no additional tools beyond core". A host states the production catalogue explicitly
+    // (`createToolCatalogue()`); an empty catalogue still lets the dispatcher list the
+    // harness-owned CORE rows, which are session-bound rather than direct-call.
+    const catalogue = options.catalogue ?? EMPTY_TOOL_CATALOGUE;
 
     // R3b: one durable database per resolved root. Read BEFORE sessions exist so
     // the registry is rebuilt first; a session's harness is then rebuilt from its
@@ -231,7 +313,13 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
     // database load, so a host that owns its registry is not second-class.
     const agentRecords = readHarnessAgentRecords(root);
 
-    const registry = options.registry ?? createHarnessRegistry(undefined, { agentRecords });
+    // R-boot: an injected registry is authoritative; otherwise the catalogue is EXACTLY
+    // what the boot configuration declared (empty when it declared nothing), and the
+    // registry's creation defaults carry the same toolbox posture so an HTTP-created card
+    // and a restored row cannot regain the shared set the deployment did not ask for.
+    const registry =
+        options.registry ??
+        createHarnessRegistry(boot.presets, { agentRecords, creation: boot.toolbox });
 
     if (options.store !== undefined && root !== undefined) {
         throw new Error(
@@ -301,7 +389,15 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
                 // where the answer is the shared engine costs nothing (that engine is what the
                 // store adopts on load). An injected store keeps its own knowledge, exactly like
                 // its own settings and registry — there is nothing to wire here.
-                knowledge: () => harnessKnowledgeOf(root)
+                knowledge: () => harnessKnowledgeOf(root),
+                // R-boot: the per-BUILD half of the boot configuration. Explicit arrays
+                // (including `[]`) are what make omission mean "none"; the store forwards
+                // them to every preset factory through `HarnessPresetReport`. The descriptor
+                // list is derived from the executable plugins by the boot resolver, so the
+                // `/plugins` rows and the loaded set are one catalogue.
+                plugins: boot.plugins,
+                pluginDescriptors: boot.pluginDescriptors,
+                ...(boot.commands.length === 0 ? {} : { harnessCommands: boot.commands })
             }
         );
 
@@ -364,6 +460,10 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
         streamBridge: createStreamBridge(stream.broker),
         events,
         detachStreamBridge,
+        // R-boot: what this runtime was configured with, and its stable identity for the
+        // per-root cache guard below.
+        ...(options.harness === undefined ? {} : { harnessConfiguration: options.harness }),
+        bootSignature,
         // T7: live reads of the knowledge seam (see the `HarnessRuntime` members above). The
         // getter is what keeps `runtime.knowledge` true from the moment the load settles,
         // instead of freezing the answer this synchronous function happened to have.
@@ -392,7 +492,28 @@ export const getHarnessRuntime = (options: HarnessRuntimeOptions = {}): HarnessR
     const key = runtimeKey(options.root);
     const existing = runtimes.get(key);
 
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+        // R-boot: THE CACHE GUARD. The first caller for a root decides the templates,
+        // plugins and toolbox, and the runtime cannot be rebuilt without a second writer on
+        // the database. A later caller that states a DIFFERENT configuration must therefore
+        // fail loudly: silently returning the first runtime is exactly how an unconfigured
+        // warm-up would erase what the request path (or a host) configured.
+        //
+        // The comparison is the SIGNATURE of the raw configuration, not object identity:
+        // the service entry hands the same `variables.harness` object to the warm-up and to
+        // every route, but a test (or a host composing twice) may hand a structurally equal
+        // fresh object and must not be treated as a conflict.
+        const signature = harnessBootSignature(options.harness);
+
+        if ((existing.bootSignature ?? harnessBootSignature(undefined)) !== signature) {
+            throw new Error(
+                `The harness runtime for "${key === '' ? '<in-memory>' : key}" was already created with a DIFFERENT boot configuration. ` +
+                    'The first caller decides the runtime for a database root, so configure the harness before the warm-up/first request (pass the SAME `harness`/`variables.harness` value to both) instead of relying on a later call to reconfigure it.'
+            );
+        }
+
+        return existing;
+    }
 
     const created = createHarnessRuntime(options);
     runtimes.set(key, created);

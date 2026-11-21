@@ -284,11 +284,13 @@ The application layers are barrelled the same way as the library:
 src/server/
   index.ts              the server surface (startHarnessServer, runtime, dispatcher,
                         SessionStore, protocol, presets) -> @underload/harness/server
-  start.ts              startHarnessServer: the ONLY listener, created when called
+  start.ts              startHarnessServer: the ONLY listener, created when called; takes the
+                        explicit `harness` boot configuration (templates/agents/plugins/tools)
   api.ts                transport-neutral dispatcher: routes, body policy, bootstrap
   handler.ts            Node adapter: the /v1/harness mount, no header gate, plain HTTP (no CORS)
   service.ts            @underload/service adapter: /v1/harness, Origin gate, CORS, the stream upgrade
-  runtime.ts            lazy shared store/catalogue for the discovered service routes
+  runtime.ts            lazy shared store/catalogue for the discovered service routes, one per
+                        database root and guarded by the boot-configuration signature
   persistence.ts        durable database: versioned JSON, atomic write, DTO validation
   sessions.ts           authoritative turns + FIFO queue; restore + write-through
   environment.ts        package-root .env loader (Node entry points only)
@@ -3216,8 +3218,13 @@ first binds the wildcard address), and close the terminal when finished.
 (`src/server/dev.ts`): it binds the Node server on `127.0.0.1:5181` with static
 serving disabled and starts no Vite or UI. It accepts `--port`, `--host`, and
 `--database-root <path>` (the same option as
-`startHarnessServer({ databaseRoot })`). Normal hosting is still owned by
-`@underload/service`; there is deliberately no generic `serve`/`start` alias.
+`startHarnessServer({ databaseRoot })`). It is itself a HOST, so it states the
+production catalogue explicitly (`harness: { presets, plugins: BUILTIN_PLUGINS,
+toolbox: { sharedToolbox: true } }`); the server boot contract itself has NO implicit
+presets, plugins or toolbox, and `@underload/service` forwards its host's configuration
+through `variables.harness` (see `knowledge.md`, "Harness boot configuration (R-boot)").
+Normal hosting is still owned by `@underload/service`; there is deliberately no generic
+`serve`/`start` alias.
 
 To run the UI against that standalone API instead of the service, point Vite's
 proxy mount at it (a shell variable, read by `src/frontend/vite.config.ts` through
@@ -3878,6 +3885,32 @@ name and a fix — never a quiet inline fallback:
   than answered from a private copy.
 - no worker entry on disk is a `ServerRuntimeError` naming both candidate paths, and
   a handshake that times out fails the turn.
+
+**The boot posture crosses as data, or the session is refused (B6).** A durable record
+carries the team and the declared tool names, but not what the harness was BUILT with —
+so a replica rebuilt from the record alone used to run the library defaults: the three
+generated plugins came back on a deployment that configured none, the shared toolbox
+came back on a tool-less card, and a finite budget became `Infinity`. Every lane now
+carries the serializable half of the boot configuration in its `hello` blueprint
+(`LaneBlueprint.presetRebuild` / `.plugins`, `src/server/workers/protocol.ts`) and
+rebuilds with it. `laneBootPosture` (`src/server/workers/capability.ts`) is the ONE rule
+the creation gate and `blueprintFor` share:
+
+| Boot configuration | Lane behaviour |
+|---|---|
+| per-card/deployment `sharedToolbox`, `websearch`, `webfetch`, `maxIterations`, `extraToolSources`, `toolFolders` | carried in `presetRebuild.toolbox`, passed to `presetFromRecord(record, undefined, toolbox)`; the rebuilt card's materialized posture is verified before hello, and a mismatch faults the handshake (`preset-not-rebuildable`) rather than running a different harness |
+| `harness.plugins: []` (a server seam's zero default) | `plugins: { kind: 'none' }` → the replica passes `plugins: []`, so no generated built-in reappears |
+| `harness.plugins: BUILTIN_PLUGINS` (or a subset, accepted only by element identity) | `plugins: { kind: 'builtin', names }` → the replica registers exactly those generated entries, in the same order |
+| any other plugin list (`setup` is a closure) | refused at `POST /sessions` (400, `plugins-not-rebuildable`) |
+| `harness.commands` (one handler closure per command) | refused at `POST /sessions` (400, `commands-not-rebuildable`) |
+| `extraTools` (a constructed `Tool` definition) | refused at `POST /sessions` (400, `extra-tools-not-rebuildable`) |
+| a host-supplied `create` factory | refused at `POST /sessions` (400, `preset-not-rebuildable`, unchanged) |
+
+A direct `new SessionStore` that never configures plugins omits the blueprint field and
+keeps the factory default (the generated set) on both sides — the same omission the
+canonical harness makes. The end-to-end matrix is pinned by
+`src/server/workers/lane-boot-posture.test.ts` (the rule, the real
+blueprint→`structuredClone`→rebuild path, and one spawned zero-plugin lane).
 
 Guidance for a live run is honest in the same way. A focused submit into a running lane is
 answered from the lane's own `steer.result` receipt, never from the frame the coordinator

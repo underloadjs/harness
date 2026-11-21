@@ -79,7 +79,7 @@ const DRIVER = `// Scratch integration driver written by src/server/service-star
 // Scans the harness package for endpoint modules and serves them on port 0.
 import http from 'node:http';
 import { startServer } from '../../packages/underload/service/src/server/start';
-import { createHarnessRegistry } from '../../packages/underload/harness/src/server/harnesses';
+import { createHarnessRegistry, createToolCatalogue } from '../../packages/underload/harness/src/server/harnesses';
 import { PRODUCTION_WITH_FIXTURES } from '../../packages/underload/harness/src/server/harnesses/fixture-presets.test-support';
 import { createHarnessRuntime, setHarnessRuntime } from '../../packages/underload/harness/src/server/runtime';
 
@@ -111,11 +111,22 @@ target.listen = function (this: http.Server, ...args: unknown[]) {
 // explicit fixtures. getHarnessRuntime keeps one runtime per resolved root, so the
 // discovered route reuses this one instead of building the default: everything else
 // (loader -> endpoint -> handler -> <root>/harness: index.json + session shards) is the real path.
+//
+// R-boot zero-default: createHarnessRuntime treats an OMITTED catalogue as
+// EMPTY_TOOL_CATALOGUE (packages/underload/harness/src/server/runtime.ts:265-273), so the
+// harness-owned core rows are all GET /tools would list and POST /tools/{name}/executions
+// could only reach a core name. The end-to-end assertions in service-start.test.ts pin the
+// SHIPPED production catalogue (PRESET_NAMES/TOOL_NAMES and the timeNow direct calls), so
+// this host - like src/server/start.ts and the CLI - provisions createToolCatalogue()
+// explicitly at the boot seam. This is not a fallback: it is the same explicit production
+// wiring the real service/CLI perform, and the tests that pin the zero contract live beside
+// the resolver (src/server/harnesses/boot.test.ts) instead.
 const serviceRoot = process.env.HARNESS_SERVICE_DATABASE_ROOT;
 setHarnessRuntime(
     createHarnessRuntime({
         ...(serviceRoot === undefined ? {} : { root: serviceRoot }),
-        registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES)
+        registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES),
+        catalogue: createToolCatalogue()
     }),
     serviceRoot
 );
@@ -166,7 +177,10 @@ const PRESET_NAMES = [
 // Core tools lead the catalogue (R8) in every listing surface, including the
 // bootstrap document the service loader serves at GET /v1/harness. R9-R11 changed
 // DECLARATION (visibility), not the catalogue: every session-bound runtime row is
-// still listed here, in kernel registration order.
+// still listed here, in kernel registration order. Everything from `syntax` on is a
+// row of the createToolCatalogue() the driver provisions explicitly (see the
+// setHarnessRuntime block above); an omitted catalogue would end this list at
+// `threadFork` (./harnesses/core.ts) and make both `timeNow` calls 404.
 const TOOL_NAMES = [
     'toolRegistry',
     'toolRequest',

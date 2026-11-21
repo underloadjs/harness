@@ -55,15 +55,30 @@ import type {
     HarnessEvent,
     HarnessIdentityReservation,
     HarnessMessage,
+    HarnessPlugin,
     HarnessPluginSettingsProvider,
     HarnessToolSettingsProvider,
     ToolContext
 } from '../../types';
+// B6: the generated built-in plugin entries are the only plugin set a worker can
+// reconstruct (their `setup` functions live in this checkout). `lanePluginSetOf` below
+// maps the blueprint's names back onto THESE objects.
+import { BUILTIN_PLUGINS } from '../../plugin';
 import type { HarnessPluginSettingsRecord } from '../persistence';
-import type { HarnessPreset } from '../harnesses/types';
+import type { HarnessPreset, HarnessToolboxDefaults } from '../harnesses/types';
 import { presetFromRecord } from '../harnesses';
 import type { LaneAuthorityRequest } from './lane-authority';
-import type { LaneBlueprint, LaneCommand, LaneRegistryChange, LaneReply, LaneRequestReplyValue, LaneToolStateSync } from './protocol';
+import type {
+    LaneBlueprint,
+    LaneCommand,
+    LanePluginPosture,
+    LanePresetRebuild,
+    LaneRegistryChange,
+    LaneReply,
+    LaneRequestReplyValue,
+    LaneToolStateSync,
+    LaneToolboxPosture
+} from './protocol';
 import {
     LANE_EVENT_WINDOW,
     LANE_MAX_FRAME_BYTES,
@@ -1555,6 +1570,113 @@ export const lanePluginSettingsProvider = (
     };
 };
 
+// ---------------------------------------------------------------------------
+// B6 — rebuild the CANONICAL boot posture, or fault the handshake
+// ---------------------------------------------------------------------------
+//
+// WHY THIS IS NOT `presetFromRecord(record)` ANY MORE: a record carries the team and
+// the declared tool NAMES, but not what the canonical factory was BUILT with. Without
+// the blueprint's posture a replica silently widened to the library defaults (the
+// generated built-in plugins on a zero-plugin deployment, the shared toolbox on a
+// tool-less card, no `maxIterations`). The coordinator refuses what cannot cross
+// (./capability.ts `laneBootPosture`); these helpers apply what can, and VERIFY the
+// result instead of assuming it.
+
+// The blueprint's plugin names → the generated entries, in the host's order. `undefined`
+// means the host never configured the axis, so the factory's own default applies; `[]`
+// is the configured-zero statement and MUST stay an empty array (the factory turns that
+// into `builtinPlugins: []`, which is what keeps the optional built-ins away).
+export const lanePluginSetOf = (posture: LanePluginPosture | undefined): readonly HarnessPlugin[] | undefined => {
+    if (posture === undefined) return undefined;
+    if (posture.kind === 'none') return [];
+
+    return posture.names.map((name) => {
+        const plugin = BUILTIN_PLUGINS.find((candidate) => candidate.name === name);
+
+        // A frame naming a plugin this build does not ship: the coordinator verified
+        // element identity before sending it, so this is a mixed-checkout bug rather
+        // than a host configuration. Faulting the hello is the honest outcome — running
+        // without the plugin would be the silent widening B6 exists to prevent.
+        if (plugin === undefined) {
+            throw new Error(
+                `preset-not-rebuildable: this lane worker was told to rebuild the built-in plugin "${name}", which this build does not ship. The worker entry and the server must come from the same checkout.`
+            );
+        }
+
+        return plugin;
+    });
+};
+
+// The comparable form of a toolbox posture: every boolean materialized with the same
+// rule `createToolboxHarness` applies, maps key-sorted, and the budget stringified so
+// `Infinity` compares as itself. Used only to prove the rebuilt card matches.
+const toolboxPostureShape = (toolbox: HarnessToolboxDefaults): string => {
+    const shared = toolbox.sharedToolbox !== false;
+
+    return JSON.stringify([
+        shared,
+        toolbox.websearch ?? shared,
+        toolbox.webfetch ?? shared,
+        toolbox.maxIterations === undefined ? null : String(toolbox.maxIterations),
+        Object.entries(toolbox.extraToolSources ?? {}).sort(([left], [right]) =>
+            left < right ? -1 : left > right ? 1 : 0
+        ),
+        [...(toolbox.toolFolders ?? [])]
+    ]);
+};
+
+// The rebuilt preset must state EXACTLY the posture the blueprint approved. It usually
+// will: `presetFromRecord` infers `sharedToolbox`/`websearch`/`webfetch` from the
+// record's declared names and takes the rest from the posture passed in. The check
+// exists for the case where the record's declaration CANNOT express the card's posture
+// (a boot card that stated a `tools` list inconsistent with its factory, or an extra
+// source that reuses a shared name), because then the "rebuild" would run a different
+// harness. Faulting the hello is the only honest answer: the alternatives are a silent
+// widening/narrowing or an inline fallback, and worker mode promises neither.
+export const assertLaneRebuildPosture = (
+    preset: HarnessPreset,
+    posture: LaneToolboxPosture
+): void => {
+    const rebuilt = preset.creation?.toolbox;
+
+    if (rebuilt === undefined || toolboxPostureShape(rebuilt) !== toolboxPostureShape(posture)) {
+        throw new Error(
+            `preset-not-rebuildable: the lane replica of harness "${preset.name}" would be built with a different toolbox posture than this session (${toolboxPostureShape(
+                posture
+            )} expected, ${rebuilt === undefined ? 'no recorded posture' : toolboxPostureShape(rebuilt)} rebuilt). The frozen record's tool declaration cannot express the boot posture, so running the turn on a lane would execute a different harness. Run this session with threadExecution "inline", or state the card's tools consistently with its toolbox in the boot configuration.`
+        );
+    }
+};
+
+// Rebuild the replica's preset from the blueprint. `presetRebuild` absent = the
+// historical record-only rebuild (a preset with no `creation` metadata), which is the
+// pre-B6 behaviour byte for byte. An `advanced` factory can never appear here (the
+// coordinator refuses it), but a runtime guard keeps a hand-built frame honest.
+export const laneReplicaPreset = (
+    blueprint: Pick<LaneBlueprint, 'record'> & { presetRebuild?: LanePresetRebuild }
+): HarnessPreset => {
+    const rebuild = blueprint.presetRebuild;
+
+    if (rebuild === undefined) return presetFromRecord(blueprint.record);
+
+    if ((rebuild as { factory?: unknown }).factory !== 'profiled') {
+        throw new Error(
+            `preset-not-rebuildable: this lane worker received a preset blueprint of kind "${String(
+                (rebuild as { factory?: unknown }).factory
+            )}"; only a profiled factory can be rebuilt from a durable record. Run this session with threadExecution "inline".`
+        );
+    }
+
+    // THE SAME CALL A DURABLE RESTORE MAKES (registry.ts `presetFromRecord` with the
+    // card's creation defaults), so a lane and a restart cannot disagree about the
+    // toolbox. `fallback` stays undefined: a host closure cannot cross the thread.
+    const preset = presetFromRecord(blueprint.record, undefined, rebuild.toolbox);
+
+    assertLaneRebuildPosture(preset, rebuild.toolbox);
+
+    return preset;
+};
+
 const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise<void> => {
     const blueprint: LaneBlueprint = frame.blueprint;
 
@@ -1563,7 +1685,12 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
 
     // The preset record is the only way a worker can own a harness: a factory closure from
     // the coordinator's process cannot cross (./capability.ts refuses such a preset).
-    const preset = presetFromRecord(blueprint.record);
+    // B6: the blueprint's serializable posture rides along, and a rebuild that cannot
+    // honour it throws here (the message loop turns that into a hello `fault`).
+    const preset = laneReplicaPreset(blueprint);
+    // B6: the plugin set, as data. `undefined` = the host never configured plugins (the
+    // factory default), `[]` = configured zero (the shipped three stay away).
+    const plugins = lanePluginSetOf(blueprint.plugins);
 
     // R3: the replica's global tool provider, built ONCE here so the presence test below and
     // the value it installs can never disagree.
@@ -1602,6 +1729,13 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
             // kept its shipped value. With it, the replica's gate reads the operator's value,
             // and an override-less key still falls through to its declared default.
             ...(pluginSettings === undefined ? {} : { pluginSettings }),
+            // B6: the COMPLETE plugin set, as the coordinator configured it. An ARRAY is
+            // authoritative in `createToolboxHarness` (`builtinPlugins: []` + the list), so
+            // `plugins: []` here is what stops the generated built-ins from reappearing on
+            // a deployment that configured none. Absent keeps the library default, exactly
+            // like the canonical factory built by a direct `SessionStore` with no plugins
+            // option.
+            ...(plugins === undefined ? {} : { plugins }),
             // T1.5's last mile, stated rather than left implied: the HOST has a diagnostic sink
             // now (../sessions.ts `notePluginDiagnostic`), and this replica does not forward one,
             // because a report fired inside a hook has no frame to travel on — a closure cannot

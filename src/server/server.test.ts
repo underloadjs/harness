@@ -7,7 +7,7 @@
 // beforeAll); the un-injected production catalogue is pinned elsewhere.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createHarnessRegistry } from './harnesses';
+import { createHarnessRegistry, createToolCatalogue } from './harnesses';
 import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
 // The mount is the REST owner's constant, imported rather than spelled: the standalone listener now
 // serves the canonical `/v1/harness` root (there is no `/api` any more), and a test that hard-coded
@@ -61,7 +61,10 @@ beforeAll(async () => {
     server = await startHarnessServer({
         port: 0,
         staticRoot: null,
-        registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES)
+        registry: createHarnessRegistry(PRODUCTION_WITH_FIXTURES),
+        // R-boot: an omitted direct-call catalogue is EMPTY. This host serves the package's
+        // direct-call rows (timeNow/read/…), so it states the production catalogue.
+        catalogue: createToolCatalogue()
     });
     base = server.url;
 });

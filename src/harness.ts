@@ -16400,8 +16400,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // runPlugins adds the per-plugin `on` (bound to THIS bus, so a subscription cannot
     // leak between writers) and the settings view scoped to that plugin's own name and
     // declared defaults.
+    //
+    // R-boot: `configuration.builtinPlugins` is the explicit built-in SET. Absent keeps the
+    // generated manifest (the library default, byte-identical), and `[]` is the only way a
+    // host can state "no built-ins at all" — see the field's note in ../types/index.ts.
     const pluginHost: HarnessPluginHostResult = runPlugins({
-        builtins: BUILTIN_PLUGINS,
+        builtins: configuration.builtinPlugins ?? BUILTIN_PLUGINS,
         plugins: configuration.plugins ?? [],
         hooks: hookBus,
         settings: pluginSettings,

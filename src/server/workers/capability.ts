@@ -29,11 +29,27 @@
 // process can serialize them, so the record itself says "cannot be rebuilt from
 // disk" (registry.ts ~678). Worker mode therefore refuses such a session.
 //
+// B6 — THE REST OF THE BOOT POSTURE (the record alone is not enough)
+// ------------------------------------------------------------------
+// A template-backed record reproduces the TEAM, not everything the canonical session
+// was built with. The deployment's plugin set, the boot slash commands, a constructed
+// `extraTools` definition and the per-card toolbox posture (`sharedToolbox`,
+// `websearch`, `webfetch`, `maxIterations`, `extraToolSources`, `toolFolders`) are all
+// per-BUILD facts (`HarnessPresetReport`, `HarnessPreset.creation`), and a replica
+// that does not receive them runs the LIBRARY defaults: the generated built-ins come
+// back on a zero-plugin deployment, the shared toolbox comes back on a tool-less card,
+// and a finite budget becomes `Infinity`. `laneBootPosture` below is the ONE rule
+// that decides, for one preset and one host configuration, which of those facts can
+// cross a thread as DATA (and therefore becomes `LaneBlueprint.presetRebuild` /
+// `.plugins`) and which cannot (and therefore refuses the session with a named reason
+// instead of running a different harness).
+//
 // Cross-references:
 //   - ../harnesses/registry.ts  presetFromRecord + the injected-factory error
 //   - ../harnesses/toolbox.ts   source-path registration (the reason 'live' works)
-//   - ./protocol.ts             LaneBlueprint (what a worker actually receives)
-//   - ../sessions.ts            where this decision gates create/restore (a 400)
+//   - ./protocol.ts             LaneBlueprint / LaneToolboxPosture / LanePluginPosture
+//   - ../sessions.ts            where this decision gates create/restore (a 400), and
+//                               `blueprintFor`, which ships the posture it approved
 //   - ./lane-host.ts            where a worker's own report fails the hello
 
 import { Worker } from 'node:worker_threads';
@@ -41,7 +57,14 @@ import type { ServerRuntimeConfiguration } from '../config';
 // Runtime CONFIGURATION errors come from the server config layer; this module owns
 // only the readiness decision, so the two never disagree about the error type.
 import { ServerRuntimeError } from '../config';
-import type { HarnessPreset } from '../harnesses/types';
+import type { HarnessCommandConfiguration, HarnessPlugin } from '../../harness';
+import type { HarnessPreset, HarnessToolboxDefaults } from '../harnesses/types';
+// THE GENERATED BUILT-IN SET is the only plugin list a lane can reconstruct: its
+// `setup` functions live in this checkout and are importable on the worker thread.
+// The coordinator compares ELEMENT IDENTITY against this array, so "the host passed
+// the shipped three" is a fact rather than a name match (`laneBootPosture`).
+import { BUILTIN_PLUGINS } from '../../plugin';
+import type { LanePluginPosture, LanePresetRebuild, LaneToolboxPosture } from './protocol';
 
 export type LaneWorkerCapability = {
     // True only when every turn of this preset can run on a lane worker.
@@ -85,11 +108,181 @@ const WORKER_MODE_NOTES: readonly string[] = [
 
 const reason = (code: string, message: string): { code: string; message: string } => ({ code, message });
 
+// ---------------------------------------------------------------------------
+// B6 — the boot posture a replica rebuilds from (supported vs refused)
+// ---------------------------------------------------------------------------
+//
+// The three codes below are the refusals for configuration that exists only as a
+// closure in the coordinator process. `preset-not-rebuildable` is reused (not
+// re-spelled) for a host factory/opaque posture, because it is already the code an
+// operator knows from the injected-preset refusal.
+export const LANE_PLUGINS_NOT_REBUILDABLE_CODE = 'plugins-not-rebuildable';
+export const LANE_COMMANDS_NOT_REBUILDABLE_CODE = 'commands-not-rebuildable';
+export const LANE_EXTRA_TOOLS_NOT_REBUILDABLE_CODE = 'extra-tools-not-rebuildable';
+
+// What the STORE knows about the deployment that a preset does not: the complete
+// plugin set and the boot slash commands. `undefined` is the direct-`SessionStore`
+// "host never configured this axis" case and is NOT the same as `[]` (configured
+// zero), exactly like `SessionStoreOptions.plugins` documents.
+export type LaneWorkerHostConfiguration = {
+    plugins?: readonly HarnessPlugin[];
+    commands?: readonly HarnessCommandConfiguration[];
+};
+
+// The decision for ONE preset + ONE host configuration: the data that may cross in a
+// blueprint, plus every reason it may not. `sessions.ts` uses BOTH halves — the gate
+// (`assertWorkerCapable`) reads `reasons`, and `blueprintFor` ships the fields. One
+// function, so "what was approved" and "what is sent" cannot drift.
+export type LaneBootPosture = {
+    // Absent for a preset with no `creation` metadata: the record-only rebuild is the
+    // historical behaviour and has nothing more to state.
+    presetRebuild?: LanePresetRebuild;
+    // Absent when the host never configured plugins (the factory default applies).
+    plugins?: LanePluginPosture;
+    reasons: { code: string; message: string }[];
+};
+
+// `HarnessToolboxDefaults` → the wire posture. Every boolean is MATERIALIZED with the
+// same `?? shared` rule `createToolboxHarness` applies, so the worker's verification
+// can compare values instead of re-deriving "absent means shared".
+const laneToolboxPostureOf = (toolbox: HarnessToolboxDefaults): LaneToolboxPosture => {
+    const shared = toolbox.sharedToolbox !== false;
+
+    return {
+        sharedToolbox: shared,
+        websearch: toolbox.websearch ?? shared,
+        webfetch: toolbox.webfetch ?? shared,
+        ...(toolbox.maxIterations === undefined ? {} : { maxIterations: toolbox.maxIterations }),
+        // COPIED, so a later mutation of the registry's object cannot move a live
+        // lane's blueprint (the snapshot rule every other blueprint field follows).
+        ...(toolbox.extraToolSources === undefined
+            ? {}
+            : { extraToolSources: { ...toolbox.extraToolSources } }),
+        ...(toolbox.toolFolders === undefined ? {} : { toolFolders: [...toolbox.toolFolders] })
+    };
+};
+
+// THE RULE. Called by `assessLaneWorkerCapability` (the gate) and by ../sessions.ts
+// `blueprintFor` (the payload), so a session can only be sent the posture it passed.
+export const laneBootPosture = (
+    preset: HarnessPreset,
+    host: LaneWorkerHostConfiguration = {}
+): LaneBootPosture => {
+    const reasons: LaneBootPosture['reasons'] = [];
+    const creation = preset.creation;
+    let presetRebuild: LanePresetRebuild | undefined;
+
+    if (creation?.factory === 'advanced' && preset.template !== undefined) {
+        // A template-TAGGED preset whose factory is a host closure: the durable record
+        // is rebuildable in shape but the FACTORY is not. Rebuilding it as a profiled
+        // harness would run a team/toolbox the host never declared — the same silent
+        // substitution `update()` refuses with a 409 (registry.ts `rebuildToolboxOf`
+        // / the advanced-factory guard). A template-LESS advanced preset is already
+        // refused by the injected-factory rule above; `laneBootPosture` does not repeat
+        // that sentence when the caller folds these reasons in.
+        reasons.push(
+            reason(
+                'preset-not-rebuildable',
+                `Harness "${preset.name}" was injected as a host factory closure, so a lane worker cannot rebuild it from its durable record. Register it as a profiled template-backed harness ("live"), or run this session with threadExecution "inline".`
+            )
+        );
+    } else if (creation?.factory === 'profiled' && creation.toolbox !== undefined) {
+        // CONSTRUCTED `Tool` DEFINITIONS are closures (a `Tool` is callable and carries
+        // `execute`), so they cannot cross a thread and no source path reconstructs
+        // them. Refused by NAME, before anything executes: the alternative is a replica
+        // that silently omits a tool the canonical harness declares.
+        const extraTools = Object.keys(creation.toolbox.extraTools ?? {});
+
+        if (extraTools.length > 0) {
+            reasons.push(
+                reason(
+                    LANE_EXTRA_TOOLS_NOT_REBUILDABLE_CODE,
+                    `Harness "${preset.name}" was configured with ${extraTools.length} constructed extra tool${
+                        extraTools.length === 1 ? '' : 's'
+                    } (${extraTools.join(', ')}). A \`Tool\` definition is a closure and cannot cross into a lane worker, so the replica would run a smaller toolbox than this session. Register those tools as editable source paths (\`extraToolSources\`) or run this session with threadExecution "inline".`
+                )
+            );
+        } else {
+            // PATHS, BOOLEANS AND NUMBERS are data: they cross, and the worker rebuilds
+            // the SAME factory with them (`presetFromRecord(record, undefined, toolbox)`).
+            presetRebuild = { factory: 'profiled', toolbox: laneToolboxPostureOf(creation.toolbox) };
+        }
+    }
+
+    // PLUGINS. Only the generated manifest can be reconstructed in the worker; the
+    // coordinator accepts a host list only when EVERY element is the very object from
+    // `BUILTIN_PLUGINS` (ELEMENT IDENTITY, not a name match), so the replica registers
+    // the same setup functions. A subset is accepted and the host's order is preserved
+    // (the names are what cross). Anything else - a host plugin, a lookalike with a
+    // built-in name, a duplicate - is refused rather than dropped or replaced.
+    let plugins: LanePluginPosture | undefined;
+
+    if (host.plugins !== undefined) {
+        const names = host.plugins.map((plugin) => plugin.name);
+        // Named, so the fix is obvious: the entries that are not the generated ones
+        // (element identity), not the whole host list.
+        const unknown = host.plugins
+            .filter((plugin) => !BUILTIN_PLUGINS.includes(plugin))
+            .map((plugin) => plugin.name);
+        const unique = new Set(names).size === names.length;
+
+        if (host.plugins.length === 0) {
+            plugins = { kind: 'none' };
+        } else if (unknown.length === 0 && unique) {
+            plugins = { kind: 'builtin', names: [...names] };
+        } else {
+            reasons.push(
+                reason(
+                    LANE_PLUGINS_NOT_REBUILDABLE_CODE,
+                    `This deployment applies ${names.length} configured plugin${
+                        names.length === 1 ? '' : 's'
+                    } (${names.join(', ')}) that a lane worker cannot rebuild: a plugin's \`setup\` is a closure, and only the generated built-in set (${BUILTIN_PLUGINS.map(
+                        (plugin) => plugin.name
+                    ).join(', ')}) can be reconstructed in a worker. ${
+                        unknown.length > 0
+                            ? `Not reconstructable: ${unknown.join(', ')}.`
+                            : 'The list repeats a built-in name.'
+                    } Configure the generated \`BUILTIN_PLUGINS\` (optionally a subset, by identity), configure none, or run this session with threadExecution "inline".`
+                )
+            );
+        }
+    }
+
+    // COMMANDS. A boot slash command carries an `execute` closure (`HarnessCommand`), so a
+    // replica cannot register it. Refused when any are configured: a lane that silently
+    // lacked them would answer "/name" as an unknown command while inline sessions run
+    // it, and a replica that executed a different handler would be worse.
+    if (host.commands !== undefined && host.commands.length > 0) {
+        const names = host.commands.map((command) => command.name ?? '(unnamed)');
+
+        reasons.push(
+            reason(
+                LANE_COMMANDS_NOT_REBUILDABLE_CODE,
+                `This deployment registers ${host.commands.length} boot slash command${
+                    host.commands.length === 1 ? '' : 's'
+                } (${names.join(', ')}) whose handler${
+                    host.commands.length === 1 ? ' is a closure' : 's are closures'
+                } and cannot be rebuilt in a lane worker. Register no boot commands, or run this session with threadExecution "inline" (where the canonical harness owns the handlers).`
+            )
+        );
+    }
+
+    return {
+        ...(presetRebuild === undefined ? {} : { presetRebuild }),
+        ...(plugins === undefined ? {} : { plugins }),
+        reasons
+    };
+};
+
 // Assess ONE preset. Called at session creation and again at restore, because a
 // registry patch may replace a rebuilt entry with an injected one.
 export const assessLaneWorkerCapability = (
     preset: HarnessPreset,
-    environment: { workersAvailable: boolean; message?: string } = { workersAvailable: true }
+    environment: { workersAvailable: boolean; message?: string } = { workersAvailable: true },
+    // B6: the deployment half of the boot posture (plugins/commands). OPTIONAL so every
+    // two-argument caller (a test, a host helper) keeps the pre-B6 answer; the store
+    // always passes it.
+    host: LaneWorkerHostConfiguration = {}
 ): LaneWorkerCapability => {
     const reasons: LaneWorkerCapability['reasons'] = [];
 
@@ -116,6 +309,14 @@ export const assessLaneWorkerCapability = (
                 `Harness "${preset.name}" was injected as a factory closure, so a lane worker cannot rebuild it. Register it as a template-backed harness ("live"), or run this session with threadExecution "inline".`
             )
         );
+    }
+
+    // B6: the REST of the boot posture, through the SAME rule `blueprintFor` uses to
+    // build the payload. A code already reported above (the injected-factory sentence)
+    // is not repeated; every other refusal names its own fact (a host factory, a
+    // constructed extra tool, a custom plugin set, a boot command handler).
+    for (const entry of laneBootPosture(preset, host).reasons) {
+        if (!reasons.some((existing) => existing.code === entry.code)) reasons.push(entry);
     }
 
     return {

@@ -67,6 +67,9 @@ export {
     coreToolNames,
     createProfiledHarness,
     createToolboxHarness,
+    // R-boot: the card/descriptor projection of a toolbox posture, so a host that computes
+    // its own declaration uses the SAME rule the factory registers with.
+    declaredToolboxNames,
     providerOf,
     ranksDeclareDelegation,
     // The rank FILL (R1): exported so a test and any host can see the exact map a sparse
@@ -114,7 +117,26 @@ export type { WebSearchCatalogueEntry, WebSearchCatalogueOptions } from './webse
 // entry through `createToolCatalogue({ webfetch })` exactly like websearch.
 export { createWebFetchCatalogueEntry, WEBFETCH_ENVIRONMENT, WEBFETCH_UNCONFIGURED_HINT } from './webfetch';
 export type { WebFetchCatalogueEntry, WebFetchCatalogueOptions } from './webfetch';
-export type { CatalogueEntry, HarnessPreset, RunnerSettings, ToolAvailability, ToolGroup } from './types';
+export type {
+    CatalogueEntry,
+    HarnessPreset,
+    // B4: the in-memory rebuild metadata a card carries (`factory` + effective toolbox).
+    // Exported because it is a field of the public `HarnessPreset` shape, so a host or a
+    // worker-facing task can read/construct it.
+    HarnessPresetCreation,
+    HarnessToolboxDefaults,
+    RunnerSettings,
+    ToolAvailability,
+    ToolGroup
+} from './types';
+// R-boot: THE SHARED BOOT CONTRACT. Both server seams consume it (../start.ts,
+// ../runtime.ts) and the service adapter forwards it from `variables.harness`.
+export { harnessBootSignature, resolveHarnessBootConfiguration } from './boot';
+export type {
+    HarnessBootConfiguration,
+    HarnessBootPresetConfiguration,
+    ResolvedHarnessBootConfiguration
+} from './boot';
 
 // The trusted agent registry is re-exported through the app barrel because the
 // server and the CLI both need the same ids when they validate a harness request
@@ -137,6 +159,22 @@ export type ToolCatalogue = {
     tools: Readonly<Record<string, Tool>>;
     find: (name: string) => CatalogueEntry | undefined;
 };
+
+// THE SMALLEST DIRECT-CALL CATALOGUE: no entries, no callable tools. This is the
+// zero-default the SERVER BOOT SEAMS (`startHarnessServer`/`createHarnessRuntime`) use
+// when the host supplies no `catalogue`, so an omitted catalogue cannot expose the
+// package's shared preset/web rows over `/tools` (R-boot's "no additional tools" rule).
+// The harness-owned CORE entries are NOT part of this shape: the dispatcher adds them from
+// `createCoreToolEntries()` and routes calls through a session, which is a different
+// mechanism from a direct-call row.
+//
+// `createToolCatalogue()` itself is unchanged: a production host (or the CLI) that wants
+// the shared rows passes it explicitly.
+export const EMPTY_TOOL_CATALOGUE: ToolCatalogue = Object.freeze({
+    entries: Object.freeze([]) as readonly CatalogueEntry[],
+    tools: Object.freeze({}) as Readonly<Record<string, Tool>>,
+    find: () => undefined
+});
 
 export type ToolCatalogueOptions = {
     // Inject the credential-dependent entry. Defaults to a fresh entry built from

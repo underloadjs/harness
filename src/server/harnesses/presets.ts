@@ -433,10 +433,11 @@ const debuggerPreset: HarnessPreset = {
 // for `toolRequest` to surface here.
 //
 // WHAT AN EXECUTABLE PATCH DOES. The registry rebuilds a 'live' template through
-// `createProfiledHarness(entry, roster, ranks, …)` (./registry.ts), which passes no toolbox argument, so
-// PATCHing this card's TEAM or RANKS gives the shared toolbox back. That is deliberate: the tool-less
-// posture is a property of the shipped TEMPLATE, not a durable field — `HarnessPresetRecord` carries no
-// tool column, and widening the durable schema is out of scope for this issue. A metadata-only patch
+// `createProfiledHarness(entry, roster, ranks, …)` (./registry.ts), and since B4 that rebuild uses THIS
+// card's recorded `creation.toolbox` — so PATCHing the team or ranks keeps the tool-less posture instead
+// of silently handing the shared toolbox back. The metadata is IN MEMORY only: a durable
+// `HarnessPresetRecord` carries no toolbox column and never will, so it is re-attached from this
+// declaration (or from the host's boot configuration) on every process start. A metadata-only patch
 // (title/description) keeps this factory exactly like every other template.
 const chat: HarnessPreset = {
     name: 'chat',
@@ -458,6 +459,11 @@ const chat: HarnessPreset = {
     builtin: true,
     editable: true,
     template: 'live',
+    // B4: the posture this factory is built with, recorded so a registry PATCH (team/ranks/maps)
+    // and a frozen-session restore rebuild the SAME tool-less card. Without it, the registry's
+    // deployment-wide creation default applied and `chat` regained the shared toolbox on any
+    // executable edit — the exact widening this card exists to prevent.
+    creation: { factory: 'profiled', toolbox: { sharedToolbox: false, websearch: false, webfetch: false } },
     create: createProfiledHarness('general', ['general'], { general: ENTRY_RANK }, {}, {}, {}, {}, {
         sharedToolbox: false
     })

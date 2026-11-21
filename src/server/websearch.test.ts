@@ -39,10 +39,24 @@
 // ---------------------------------------------------------------------------
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT } from './harnesses';
+import { WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT, createToolCatalogue } from './harnesses';
 import { WEB_SEARCH_METADATA } from '../harness';
-import { startHarnessServer } from './index';
+import { loadEnvironmentFile, startHarnessServer } from './index';
 import type { ToolCallResult, ToolDetailResponse, ToolSummaryPage } from '../shared/harness-api';
+
+// R-boot: an omitted direct-call catalogue is EMPTY, so these cases state the production
+// catalogue explicitly. It must be built AFTER `.env` loading (search captures its provider
+// key at construction) and AFTER the test's `vi.stubEnv`, which dotenv does not override —
+// the same ordering the server itself used before the catalogue became the host's statement.
+const startCatalogueServer = () => {
+    loadEnvironmentFile();
+
+    return startHarnessServer({
+        port: 0,
+        staticRoot: null,
+        catalogue: createToolCatalogue()
+    });
+};
 
 // The one canonical API root (see the header above).
 const API = '/v1/harness';
@@ -98,7 +112,7 @@ describe('search catalogue', () => {
         vi.stubEnv('TAVILY_API_KEY', '');
         vi.stubEnv('LINKUP_API_KEY', '');
 
-        const server = await startHarnessServer({ port: 0, staticRoot: null });
+        const server = await startCatalogueServer();
 
         try {
             // A catalogue ROW: identity plus the honest availability block. `parameters`
@@ -195,7 +209,7 @@ describe('search catalogue', () => {
             return realFetch(input, init);
         });
 
-        const server = await startHarnessServer({ port: 0, staticRoot: null });
+        const server = await startCatalogueServer();
 
         try {
             // Fetch the raw body as text so the assertion covers the *entire*
@@ -293,7 +307,7 @@ describe('search catalogue', () => {
             return realFetch(input, init);
         });
 
-        const server = await startHarnessServer({ port: 0, staticRoot: null });
+        const server = await startCatalogueServer();
 
         try {
             const toolsResponse = await fetch(`${server.url}${API}/tools?limit=100`);

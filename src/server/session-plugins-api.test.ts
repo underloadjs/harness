@@ -71,7 +71,7 @@ import { fileURLToPath } from 'node:url';
 
 import { agent, harness } from '../harness';
 import type { HarnessStream, HarnessStreamEvent } from '../harness';
-import { BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
+import { BUILTIN_PLUGINS, BUILTIN_PLUGIN_DESCRIPTORS } from '../plugin/manifest';
 import type { HarnessPluginApi, HarnessPluginMetadata } from '../types';
 import { createHarnessRegistry } from './harnesses';
 import type { HarnessPreset, HarnessPresetReport, RunnerSettings } from './harnesses/types';
@@ -260,6 +260,9 @@ const createRuntime = (options: Partial<HarnessRuntimeOptions> = {}): HarnessRun
         settings: SETTINGS,
         defaults: DEFAULTS,
         registry: createHarnessRegistry([probePreset()]),
+        // R-boot: see the companion note in ./plugins-api.test.ts — the shipped plugin set is
+        // an explicit host choice now, and this suite pins its session-scoped settings rows.
+        harness: { plugins: BUILTIN_PLUGINS },
         loadEnvironment: false,
         ...options
     });
