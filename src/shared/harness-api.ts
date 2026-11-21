@@ -882,7 +882,12 @@ export interface HarnessInstructionTextResponse {
 /**
  * Receipt of a definition removal. Deliberately minimal: the authoritative record is that the entry is gone
  * (and, for a built-in, that its name is tombstoned so a restart does not re-ship it), not a second copy of the
- * definition on this route.
+ * definition on this route. The route answers 200 with exactly this shape; 404 for an unknown name, a repeat
+ * delete or an alias-only delete (an alias is a read redirect, not a deletable identity); 409 while any live or
+ * restored session belongs to this canonical harness OR while one of its session removals is still in flight -
+ * the message names the count, nothing is removed and no session is cascaded; and 500 when the durable registry
+ * write fails (nothing removed, registry rolled back) or when the owner-based knowledge cleanup fails AFTER the
+ * registry commit (the harness is already gone; a repeat DELETE is 404 and does not retry the cleanup).
  * Closed object: the server sends no property outside this set (additionalProperties: false).
  */
 export interface DeleteHarnessResult {

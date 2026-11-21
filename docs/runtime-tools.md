@@ -121,6 +121,13 @@ needs no closure and no configuration: its state arrives through the `harness.kn
 on the `ToolContext` (`src/types/index.ts:4935`), passed by reference from the host, which is
 why its compiled source keeps `dependencies: []` while still writing a durable base
 (`src/tools/runtime/knowledge.tool.ts:953-1004`).
+Ownership is an OPTIONAL article field, not a second store: `create` stamps the trusted
+`harness.knowledgeOwner` (the canonical preset name `SessionStore.buildHarness` supplies) as
+`KnowledgeArticle.harness`, so `DELETE /v1/harness/harnesses/{name}` can later remove all and
+only that harness's articles. The base stays deployment-scoped and shared — read visibility is
+unchanged, deleting a session still changes nothing, and unowned/legacy articles plus every
+other consumer's articles survive a harness delete. A model operation can neither set nor
+change the owner, and the cleanup never resets the engine or deletes the knowledge directory.
 
 The policy flags are bound to the published **definition object**, not the wire
 name, so replacing a tool publishes an ordinary tool that inherits nothing:

@@ -1066,10 +1066,12 @@ export const execute = (context: ToolContext) => {
     // default tool mode is (src/core/tool.ts:85).
     //
     // The CONTEXT travels with the operation: `execute(operation, context?)` accepts a ToolContext
-    // and documents this entry as its caller (src/core/knowledge.ts:2398-2403). It is UNREAD today
-    // because the knowledge types carry no attribution fields — an article records WHEN it
-    // changed, not WHO did — and passing it is what lets that later revision read the caller here
-    // instead of changing the tool's call signature.
+    // and documents this entry as its caller (src/core/knowledge.ts). ONE trusted field is read:
+    // `harness.knowledgeOwner` (the host-supplied canonical build identity) is stamped as
+    // `KnowledgeArticle.harness` by `create`. `modify` edits a stored copy, so it PRESERVES the
+    // original owner; every other verb ignores the context. This is attribution, not a model
+    // input: `harness` is neither an operation key nor on the published schema, so the model can
+    // neither forge an owner nor reassign an article.
     //
     // No try/catch: an engine refusal is a coded HarnessError whose `details` carry the recovery
     // payload — the current article for EKNOWLEDGE_REV (src/core/knowledge.ts:1305-1320), bounded

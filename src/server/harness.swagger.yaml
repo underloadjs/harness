@@ -559,12 +559,29 @@ paths:
       summary: Remove a harness definition from the catalogue
       description: >-
         Removes the definition so it can no longer be selected for a NEW session. A built-in is removed
-        exactly like a created one, and its name is tombstoned so a restart does not re-ship it. This
-        never cascades: every existing session runs, and a saved session restores from, the definition
-        it captured, so deleting a definition with live or saved conversations is not an error. A repeat
-        delete is 404 because the second call removed nothing, and nothing here answers 403 - no
-        definition is read-only. `restored_by_restart` is always false: the tombstone is part of the
-        durable document, so no host restart brings the removed entry back, and there is no HTTP undo.
+        exactly like a created one, and its name is tombstoned so a restart does not re-ship it. A harness
+        OWNS its sessions: while any session still belongs to this exact harness - or while one of its
+        session removals is still in flight - the route answers 409, names how many sessions block the
+        removal, and removes nothing - delete every session of the
+        harness first (`DELETE /v1/harness/sessions/{session_id}`, one at a time; there is deliberately no
+        bulk delete), then repeat this call. The refusal is the point rather than an inconvenience: a
+        session keeps running, and a saved session restores from, the definition it captured, so a removal
+        with sessions left behind would orphan conversations no harness card could reach them through, and
+        there is equally no cascade that deletes them. A session of ANOTHER harness never blocks the
+        removal. A repeat delete is 404 because the second call removed nothing, and nothing here answers
+        403 - no definition is read-only. `restored_by_restart` is always false: the tombstone is part of
+        the durable document, so no host restart brings the removed entry back, and there is no HTTP undo.
+        AFTER the registry write succeeds, the route removes every knowledge article ATTRIBUTED to this
+        canonical harness (the `harness` field the engine stamps at creation) from the deployment's shared
+        knowledge base and flushes it before answering; articles of other harnesses, unowned/legacy
+        articles and Storyline-tagged records are preserved, read visibility is unchanged, and the base is
+        never reset. The registry document and the knowledge store are separate stores with no shared
+        transaction, so a cleanup or flush failure after the committed removal answers 500 naming the
+        partial outcome (the harness is already gone); a repeat DELETE is 404 and does not retry the
+        cleanup. A failed flush can leave the removed articles' FILES on disk even though the engine
+        dropped them from memory; the next load treats the files as authoritative and may RE-ADOPT those
+        owned articles, so recovery is an operator repair of the knowledge store, not another DELETE. The
+        receipt shape is unchanged.
       responses:
         '200':
           description: Removal receipt.
@@ -574,6 +591,10 @@ paths:
                 $ref: '#/components/schemas/DeleteHarnessResult'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
   /v1/harness/harnesses/{harness_name}/instructions:
     parameters:
       - $ref: '#/components/parameters/HarnessName'
@@ -3995,7 +4016,9 @@ components:
         RETIRED agent profile - as a harness member, as a session binding, or as a session instruction
         edit; a session-agent write on a harness whose entry is scripted or was injected in memory, where
         the change could not survive a restart; removing the entry agent, or an agent that still owns
-        conversations; deleting or steering a conversation that still has live work; a tool or agent write
+        conversations; deleting or steering a conversation that still has live work; deleting a harness
+        while a session still belongs to it (the message names the count and the sessions must be deleted
+        first, one at a time - there is no bulk session delete and no cascade); a tool or agent write
         that needs the session idle while a run or queued work holds it; a busy session being reset; a
         transcript write whose `if_revision` is stale or whose session has no replaceable transcript; and
         an action request that was already answered or has expired. Two things are NOT conflicts in this
@@ -4022,6 +4045,12 @@ components:
                   message: >-
                     Agent "summarizer" is retired and can no longer be selected. Existing harnesses and
                     sessions that already select it are unaffected.
+            harness-owns-sessions:
+              value:
+                error:
+                  message: >-
+                    Harness "demo" still owns 1 session. Delete it first; a harness can only be deleted
+                    after all of its sessions are deleted.
     PayloadTooLarge:
       description: >-
         The body exceeds the route's declared byte budget: 1,000,000 bytes for an ordinary request, or
@@ -4948,7 +4977,13 @@ components:
       description: >-
         Receipt of a definition removal. Deliberately minimal: the authoritative record is that the entry is
         gone (and, for a built-in, that its name is tombstoned so a restart does not re-ship it), not a second
-        copy of the definition on this route.
+        copy of the definition on this route. The route answers 200 with exactly this shape; 404 for an
+        unknown name, a repeat delete or an alias-only delete (an alias is a read redirect, not a deletable
+        identity); 409 while any live or restored session belongs to this canonical harness OR while one of
+        its session removals is still in flight - the message names the count, nothing is removed and no
+        session is cascaded; and 500 when the durable registry write fails (nothing removed, registry rolled
+        back) or when the owner-based knowledge cleanup fails AFTER the registry commit (the harness is
+        already gone; a repeat DELETE is 404 and does not retry the cleanup).
       required: [deleted, harness_name, tombstoned, restored_by_restart]
       additionalProperties: false
       properties:

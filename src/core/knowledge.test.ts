@@ -357,7 +357,7 @@ describe('knowledge engine — routing and argument discipline', () => {
         );
     });
 
-    it('accepts the tool context and never reads it, so an article carries no attribution', () => {
+    it('stamps NO attribution when the tool context names no harness owner', () => {
         const engine = createKnowledgeEngine();
         const withContext = engine.execute(
             { verb: 'create', title: 'Attribution', content: ['No author is stored.'] },
@@ -367,11 +367,114 @@ describe('knowledge engine — routing and argument discipline', () => {
         const same = createArticle(plain, 'Attribution', 'No author is stored.');
 
         // Same seams (both engines default), so the two results are comparable field for
-        // field EXCEPT the ids/timestamps, which come from the default seams. What the context
-        // must not do is add a key.
+        // field EXCEPT the ids/timestamps, which come from the default seams. A context with
+        // no `harness.knowledgeOwner` must not add a key: absent is the unowned spelling.
         expect(Object.keys(withContext)).toStrictEqual(Object.keys(same));
         expect(Object.keys(withContext.article)).toStrictEqual(Object.keys(same.article));
+        expect('harness' in withContext.article).toBe(false);
         expect(withContext.article.title).toBe('Attribution');
+    });
+
+    it('stamps the trusted harness owner on create, and only create can set it', () => {
+        const rig = makeRig();
+        const asOwner = (owner: unknown) => ({ parameters: {}, harness: { knowledgeOwner: owner } }) as never;
+
+        const created = rig.engine.execute(
+            { verb: 'create', title: 'Owned runbook', content: ['Written by alpha.'] },
+            asOwner('alpha')
+        ) as KnowledgeCreateResult;
+
+        expect(created.article.harness).toBe('alpha');
+        // The engine's read projections echo provenance, so a host can tell who contributed an
+        // article without a second bookkeeping store (the tool's prose projection has its own
+        // whitelist and does not echo it).
+        expect(read(rig.engine, { id: created.article.id }).harness).toBe('alpha');
+        expect(list(rig.engine).articles.map((row) => row.harness)).toStrictEqual(['alpha']);
+
+        // `modify` edits a copy of the STORED article — even when the calling build is a
+        // different harness. Attribution is creation-time only; an update can never move it.
+        const modified = rig.engine.execute(
+            { verb: 'modify', id: created.article.id, title: 'Owned runbook v2' },
+            asOwner('beta')
+        ) as KnowledgeModifyResult;
+
+        expect(modified.article.harness).toBe('alpha');
+        expect(read(rig.engine, { id: created.article.id }).harness).toBe('alpha');
+
+        // Snapshot/restore carries it, and `readKnowledgeStoreState` accepts the optional key.
+        const snapshot = rig.engine.snapshot();
+        const restored = createKnowledgeEngine();
+
+        restored.restore(snapshot);
+
+        expect(restored.snapshot().articles[0].harness).toBe('alpha');
+        expect(read(restored, { id: created.article.id }).harness).toBe('alpha');
+
+        // A blank or non-string owner means "no identity" rather than an empty-string owner:
+        // a hand-built context cannot corrupt the store, and the article stays unowned.
+        const blank = rig.engine.execute(
+            { verb: 'create', title: 'Blank attribution', content: ['x'] },
+            asOwner('   ')
+        ) as KnowledgeCreateResult;
+        const wrongType = rig.engine.execute(
+            { verb: 'create', title: 'Typed attribution', content: ['x'] },
+            asOwner(7)
+        ) as KnowledgeCreateResult;
+
+        expect('harness' in blank.article).toBe(false);
+        expect('harness' in wrongType.article).toBe(false);
+    });
+
+    it('rejects an over-limit direct-context owner before minting, and normalizes a valid one', () => {
+        const rig = makeRig();
+        const asOwner = (owner: unknown) => ({ parameters: {}, harness: { knowledgeOwner: owner } }) as never;
+        const tooLong = 'x'.repeat(65);
+
+        // T11: a public engine can be handed a hand-built context. A 65-character owner used to
+        // be stored (and snapshotted), and the durable reader refuses it on the next load — a
+        // write that could prevent startup. It is refused BEFORE the clock/id seams run.
+        expect(
+            expectCode(
+                () =>
+                    rig.engine.execute(
+                        { verb: 'create', title: 'Too long', content: ['x'] },
+                        asOwner(tooLong)
+                    ),
+                'EKNOWLEDGE_INPUT'
+            ).message
+        ).toBe(
+            'knowledge "create" refused: the trusted harness owner is 65 characters, over the 64-character harness name limit. An article owner is written by the host (HarnessConfiguration.knowledgeOwner), never by an operation; shorten the name or leave it unset.'
+        );
+
+        // Nothing was minted or stored, and the snapshot a durable layer would write is readable.
+        expect(rig.engine.articles()).toStrictEqual([]);
+        expect(rig.engine.snapshot()).toStrictEqual({ storeRev: 0, articles: [] });
+        expect(readKnowledgeStoreState(rig.engine.snapshot())).toStrictEqual({ storeRev: 0, articles: [] });
+
+        // 64 characters is accepted, and surrounding whitespace is normalized BEFORE the bound,
+        // so the stored value is the exact name the persisted reader can accept.
+        const accepted = rig.engine.execute(
+            { verb: 'create', title: 'At the limit', content: ['x'] },
+            asOwner(`  ${'y'.repeat(64)}  `)
+        ) as KnowledgeCreateResult;
+
+        expect(accepted.article.harness).toBe('y'.repeat(64));
+        expect(readKnowledgeStoreState(rig.engine.snapshot()).articles[0].harness).toBe('y'.repeat(64));
+
+        // Whitespace cannot smuggle an over-limit name past the trimmed length check.
+        expect(
+            expectCode(
+                () =>
+                    rig.engine.execute(
+                        { verb: 'create', title: 'Still too long', content: ['x'] },
+                        asOwner(`  ${tooLong}  `)
+                    ),
+                'EKNOWLEDGE_INPUT'
+            ).message
+        ).toContain('is 65 characters');
+
+        // The rejected call left the one accepted article alone.
+        expect(rig.engine.articles().map((article) => article.title)).toStrictEqual(['At the limit']);
     });
 
     it('exposes search() and read() without the verb key, answering exactly as the routed door does', () => {
@@ -2555,6 +2658,25 @@ describe('knowledge engine — snapshot, restore and reset', () => {
             expectCode(() => readKnowledgeStoreState({ storeRev: 0, articles: [article({ title: '   ' })] }), 'EKNOWLEDGE_INPUT')
                 .message
         ).toBe('knowledge state.articles[0].title is blank; a knowledge article is found by its title.');
+        // T6: the optional owner is validated when present. Absent needs no check (the article
+        // is unowned); a wrong type or an oversized value is the shared reader's wording, and a
+        // blank owner is refused instead of being stored as "owned by nobody".
+        expectMessage(
+            () => readKnowledgeStoreState({ storeRev: 0, articles: [article({ harness: 7 })] }),
+            'knowledge state.articles[0].harness must be a string.'
+        );
+        expectMessage(
+            () => readKnowledgeStoreState({ storeRev: 0, articles: [article({ harness: 'x'.repeat(65) })] }),
+            'knowledge state.articles[0].harness must be at most 64 characters.'
+        );
+        expect(
+            expectCode(
+                () => readKnowledgeStoreState({ storeRev: 0, articles: [article({ harness: '   ' })] }),
+                'EKNOWLEDGE_INPUT'
+            ).message
+        ).toBe(
+            'knowledge state.articles[0].harness is blank; an article either names the harness that created it or omits the field (unowned).'
+        );
         expect(
             expectCode(
                 () => readKnowledgeStoreState({ storeRev: 0, articles: [article({ content: [{ id: idAt(1), text: '   ', rev: 1, createdAt: stampAt(0), updatedAt: stampAt(0) }] })] }),

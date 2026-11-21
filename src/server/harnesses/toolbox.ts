@@ -792,6 +792,13 @@ export const createToolboxHarness = (
         // one session's article is another's to read and why deleting a session changes nothing
         // about the base.
         ...(observer?.knowledge === undefined ? {} : { knowledge: observer.knowledge }),
+        // T6: the canonical harness name this build's knowledge writes are attributed to, on the
+        // identical top-level rule as `knowledge` above (it is a `HarnessConfiguration` field,
+        // ../types `HarnessConfiguration.knowledgeOwner`). Presence is what makes delete-by-owner
+        // possible: the engine stamps it on `create`, and the server's harness-delete flow later
+        // removes exactly the articles carrying this name. Absence (a direct preset caller, a
+        // lane worker, a library consumer) means unowned articles, which every cleanup preserves.
+        ...(observer?.knowledgeOwner === undefined ? {} : { knowledgeOwner: observer.knowledgeOwner }),
         // R1: the host's per-build "start with the whole switchable toolbox enabled" seed,
         // forwarded verbatim into `HarnessConfiguration.enableAllTools` (src/types/index.ts).
         // Absent means the library default — an empty enabled set — which is what a library

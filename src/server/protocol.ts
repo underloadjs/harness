@@ -521,11 +521,20 @@ export type UpdateHarnessRequest = {
 // kept in `deleted` so a restart does not re-ship it), not a second copy of the
 // harness on this route. The UI already holds the list it needs to repaint.
 //
-// Status contract: 200 `{ deleted: true }`; 404 for an unknown name AND for a name
-// that is already deleted (a repeat delete did not remove anything). Existing
-// sessions are untouched — each one runs, and a saved one restores from, the
-// definition it captured — so deleting a harness with live or saved conversations is
-// not an error.
+// LEGACY declaration of the deletion receipt. The CANONICAL shape is
+// `DeleteHarnessResult` in ../shared/harness-api.ts
+// (`{ deleted, harness_name, tombstoned, restored_by_restart }`); this minimal type is kept
+// only for older importers, so do not read its `{ deleted: true }` as the wire contract.
+//
+// Current status contract: 200 removal receipt; 404 for an unknown name, a repeat delete,
+// or an alias-only delete (an alias is a read redirect, not a deletable identity); 409 while
+// any live or restored session belongs to this canonical harness OR while one of its session
+// removals is still in flight — the message names the count, nothing is removed, no session is
+// cascaded, and each owned session must be deleted individually (there is no bulk delete).
+// 500 when the durable registry write fails (nothing removed, registry rolled back) or when
+// owner-based knowledge cleanup fails AFTER the registry commit: in that second case the harness
+// IS gone, a repeat DELETE is 404, and the error names the partial outcome because the registry
+// document and the knowledge store share no transaction.
 export type DeleteHarnessResult = {
     deleted: true;
 };

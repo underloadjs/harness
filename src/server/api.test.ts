@@ -4690,6 +4690,13 @@ describe('harness registry writes over HTTP', () => {
 // `DELETE /harnesses/{name}` takes any harness out of the catalogue - a shipped default exactly
 // like a user-created one - and answers the minimal delete receipt. The authoritative record is the
 // database, not a second copy of the harness.
+//
+// R1: the route also owns the HARNESS/SESSION ownership rule. A harness may not be deleted while a
+// live or restored session still belongs to it: the answer is 409 naming the count, nothing is
+// removed, and no session is cascaded - the operator deletes each owned session individually (there
+// is deliberately no bulk delete) and then repeats the harness DELETE. Sessions of OTHER harnesses
+// never block. Unknown / repeat / alias-only deletes stay 404 even when the alias target has
+// sessions, because the guard only runs for a DIRECTLY registered name.
 describe('deleting a harness over HTTP', () => {
     it('deletes a user harness and drops it from every listing', async () => {
         const runtime = createRuntime();
@@ -4720,36 +4727,38 @@ describe('deleting a harness over HTTP', () => {
         });
     });
 
-    it('tombstones a shipped built-in and leaves the conversation that used it', async () => {
+    it('refuses a harness that still owns sessions, then tombstones it once they are gone', async () => {
         const runtime = createRuntime();
         const call_ = canonicalCall(runtime);
 
-        // A real recorded conversation on the shipped fixture, created FIRST.
+        // Two conversations, one with a recorded turn and one idle: the guard counts BOTH, and
+        // clearing one is not enough. The recorded conversation is created FIRST.
         const session = await createDemo(runtime);
+        const sibling = await createDemo(runtime);
         const receipt = await submitTask(call_, session.id, { input: 'What time is it?' });
         await waitForTurnStatus(call_, session.id, receipt.turn_id, ['done']);
 
-        const removed = await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('demo'));
-        // An in-memory deployment has no database to record the removal in, so the receipt says the
-        // built-in WOULD come back on restart - honestly, rather than claiming durability.
-        expect(removed).toEqual({
-            status: 200,
-            body: { deleted: true, harness_name: 'demo', tombstoned: true, restored_by_restart: false }
+        // R1: the harness still owns two sessions, so the DELETE is refused with an actionable,
+        // count-based 409 that names the harness and never leaks a session id.
+        expect(await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('demo'))).toEqual({
+            status: 409,
+            body: {
+                error: {
+                    message:
+                        'Harness "demo" still owns 2 sessions. Delete them first; a harness can only be deleted after all of its sessions are deleted.'
+                }
+            }
         });
 
+        // The refusal removed nothing: the card is still listed and its identified read still answers.
         const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
-        expect(page.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES.filter((name) => name !== 'demo'));
+        expect(page.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES);
+        expect((await call(runtime, 'GET', HARNESS_ROUTES.harnessesByHarnessName('demo'))).status).toBe(200);
 
-        // A NEW session on the deleted card is a 404 ...
-        expect(await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'demo' })).toEqual({
-            status: 404,
-            body: { error: { message: 'Unknown harness "demo".' } }
-        });
-
-        // ... while the existing conversation is untouched: it still lists, still reports the
-        // harness it captured, and its turns are intact.
+        // ... and no session was cascaded: both conversations still list, the recorded one still
+        // reports the harness it captured, and its recorded turn is intact.
         const listed = await readOk<Record<string, any>>(call_, 'GET', HARNESS_ROUTES.sessions(), 200);
-        expect(listed.items.map((row: any) => row.id)).toEqual([session.id]);
+        expect(listed.items.map((row: any) => row.id)).toEqual([session.id, sibling.id]);
 
         const after = await readOk<{ session: Record<string, any> }>(
             call_,
@@ -4772,27 +4781,94 @@ describe('deleting a harness over HTTP', () => {
         const turns = await listTurns(call_, session.id);
         expect(turns.items.map((row: any) => [row.promptPreview, row.status])).toEqual([['What time is it?', 'done']]);
 
-        // The live session is still usable: its frozen harness runs the next turn, offline, exactly
-        // as before the deletion. (The old version of this assertion read the SSE frames.)
-        const next = await submitTask(call_, session.id, { input: 'And again?' });
-        const settled = await waitForTurnStatus(call_, session.id, next.turn_id, ['done']);
-        expect(settled.status).toBe('done');
+        // Sessions are deleted INDIVIDUALLY - the only way the guard is cleared, because this
+        // server has no bulk session delete. The idle sibling goes first, and the harness is still
+        // blocked by the remaining one, with the singular wording and the lower count.
+        expect(await call(runtime, 'DELETE', HARNESS_ROUTES.sessionsBySessionId(sibling.id))).toEqual({
+            status: 200,
+            body: { deleted: true, session_id: sibling.id, aborted_turns: 0, dropped_queued_tasks: 0 }
+        });
+        expect(await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('demo'))).toEqual({
+            status: 409,
+            body: {
+                error: {
+                    message:
+                        'Harness "demo" still owns 1 session. Delete it first; a harness can only be deleted after all of its sessions are deleted.'
+                }
+            }
+        });
 
-        const history = await listTurns(call_, session.id);
-        expect(history.items.map((row: any) => row.promptPreview)).toEqual(['What time is it?', 'And again?']);
+        // The last owned session goes the same way; the rail is empty and the id now answers 404.
+        expect(await call(runtime, 'DELETE', HARNESS_ROUTES.sessionsBySessionId(session.id))).toEqual({
+            status: 200,
+            body: { deleted: true, session_id: session.id, aborted_turns: 0, dropped_queued_tasks: 0 }
+        });
+        expect(await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionId(session.id))).toEqual({
+            status: 404,
+            body: { error: { message: `Unknown session "${session.id}".` } }
+        });
+        const empty = await readOk<Record<string, any>>(call_, 'GET', HARNESS_ROUTES.sessions(), 200);
+        expect(empty.items).toEqual([]);
+
+        // With no session left, the SAME DELETE now succeeds with the unchanged receipt. An
+        // in-memory deployment has no database to record the removal in, so the receipt says the
+        // built-in WOULD come back on restart - honestly, rather than claiming durability.
+        expect(await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('demo'))).toEqual({
+            status: 200,
+            body: { deleted: true, harness_name: 'demo', tombstoned: true, restored_by_restart: false }
+        });
+
+        const afterPage = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
+        expect(afterPage.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES.filter((name) => name !== 'demo'));
+
+        // A NEW session on the deleted card is a 404, and the second DELETE removed nothing.
+        expect(await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'demo' })).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "demo".' } }
+        });
+        expect(await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('demo'))).toEqual({
+            status: 404,
+            body: { error: { message: 'Harness "demo" has already been deleted.' } }
+        });
+    });
+
+    it('only counts sessions of the harness being deleted', async () => {
+        const runtime = createRuntime();
+
+        // Two sessions on TWO other cards: neither belongs to `flaky`, the card being removed.
+        const demo = await createDemo(runtime);
+        const instruct = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'instruct' });
+        expect(instruct.status).toBe(201);
+
+        // So the unrelated sessions do not block the removal.
+        expect(await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('flaky'))).toEqual({
+            status: 200,
+            body: { deleted: true, harness_name: 'flaky', tombstoned: true, restored_by_restart: false }
+        });
+
+        // Both conversations are untouched and still list in creation order.
+        const listed = await readOk<Record<string, any>>(canonicalCall(runtime), 'GET', HARNESS_ROUTES.sessions(), 200);
+        expect(listed.items.map((row: any) => row.id)).toEqual([demo.id, instruct.body.session.id]);
     });
 
     it('refuses to delete through a legacy alias, which is not an identity', async () => {
         const runtime = createRuntime();
+
+        // The alias target OWNS a session, so this also pins that the ownership guard never turns
+        // an alias DELETE into a 409: direct-name existence is checked before any session count,
+        // and `remove()` is direct-only anyway.
+        const session = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'instruct' });
+        expect(session.status).toBe(201);
 
         expect(await call(runtime, 'DELETE', HARNESS_ROUTES.harnessesByHarnessName('writer'))).toEqual({
             status: 404,
             body: { error: { message: 'Unknown harness "writer".' } }
         });
 
-        // The target survived the attempt.
+        // The target survived the attempt, and so did the session that blocks its real name.
         const page = await call(runtime, 'GET', HARNESS_ROUTES.harnesses());
         expect(page.body.items.map((card: any) => card.name)).toEqual(CARD_NAMES);
+        expect((await call(runtime, 'GET', HARNESS_ROUTES.sessionsBySessionId(session.body.session.id))).status).toBe(200);
     });
 
     it('answers 500 when the durable write fails', async () => {

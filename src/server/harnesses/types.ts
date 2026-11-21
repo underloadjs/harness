@@ -153,6 +153,22 @@ export type HarnessPresetReport = {
     // is plumbed (the blueprint would carry the ROOT and the worker would load it, exactly as
     // `laneToolSettingsProvider` rebuilds the provider from the shipped NAME LIST).
     knowledge?: HarnessKnowledge;
+    // T6: THE CANONICAL HARNESS NAME this build attributes new knowledge articles to, forwarded
+    // verbatim into `HarnessConfiguration.knowledgeOwner` by the shared toolbox factory (the
+    // same optional-third-argument rule as every field above, so a preset that ignores it simply
+    // produces an UNOWNED build rather than failing).
+    //
+    // WHY IT RIDES THE REPORT: the value is chosen by the host that owns the catalogue
+    // (../sessions.ts `buildHarness` passes `preset.name`, the exact identity the HTTP deletion
+    // guard counts sessions by), and a preset is a reusable factory with no reason to know its
+    // deployment identity. A closure or preset-baked name would let two registry entries (an
+    // alias, a copy) disagree about who owns what; this field has ONE source, the frozen preset
+    // name, so the create-time stamp and the delete-time filter name the same harness.
+    //
+    // The article field remains `KnowledgeArticle.harness`; this is only the carrier that tells
+    // the knowledge engine who is writing. A host that builds harnesses outside
+    // `SessionStore` may omit it, and every article it creates stays unowned.
+    knowledgeOwner?: string;
 };
 
 // One named harness in the catalogue.

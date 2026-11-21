@@ -159,12 +159,14 @@ import type {
     HarnessEvent,
     HarnessInteractionConfiguration,
     HarnessKnowledge,
+    HarnessKnowledgeStore,
     HarnessMessage,
     HarnessSnapshot,
     HarnessStateChangeEvent,
     HarnessThreadRecord,
     HarnessThreadSnapshot,
-    HarnessThreadSteerReceipt
+    HarnessThreadSteerReceipt,
+    KnowledgeEngine
 } from '../harness';
 // The rank vocabulary, from the type module (../types/index.ts), which is where the contract puts
 // it. `AGENT_RANKS` is imported as a VALUE for two reasons: it is the ordered authority list
@@ -2003,6 +2005,34 @@ export const validateAttachmentsForSubmit = (value: unknown): HarnessAttachment[
 export class SessionStore {
     private readonly sessions = new Map<string, Session>();
 
+    // IN-FLIGHT SESSION REMOVALS, keyed by session id → canonical harness owner (T11/R1).
+    //
+    // WHY THIS EXISTS. `remove()` must take the session out of the live map BEFORE its
+    // durable deletion is awaited (otherwise a failed write could not roll back cleanly),
+    // which leaves a window where `liveSessions()` answers zero for that harness while the
+    // session's harness object — and its in-flight teardown — still exists. `DELETE
+    // /harnesses/{name}` used to count only the live map, so a harness could be removed (and
+    // its knowledge cleaned up) inside that window; if the session's document write then
+    // failed, the session was restored under a harness that no longer exists, and on success
+    // the cleanup could run while the old harness was still tearing down.
+    //
+    // The marker is set SYNCHRONOUSLY before the map delete and cleared only when `remove()`
+    // has fully settled — after the rollback on a failed write, and after `disposeSession`'s
+    // aborts/dispose plus the journal removal on success. It is deliberately NOT part of
+    // `liveSessions()`: a deleting session must not reappear in ordinary list/read output.
+    // `harnessDeletionBlockers()` is the ONE query that counts it, and only the harness
+    // deletion route uses that.
+    //
+    // THE BOUNDARY IS `disposeSession`, NOT "every tool body has stopped". `harness.dispose()`
+    // is explicitly not an abort fence (src/harness.ts): it aborts nothing and defers its event
+    // until the last live run settles. The server issues the run/lane aborts first and then
+    // disposes, so this marker covers all of the teardown the STORE can observe. A tool body
+    // that ignores its abort signal can still write after the marker clears; fencing that would
+    // require a run-settlement contract the harness does not provide today, and keeping the
+    // marker forever would make the harness permanently undeletable. The residual is reported,
+    // not hidden.
+    private readonly pendingSessionRemovals = new Map<string, string>();
+
     // Per-run async context (R1-R6). One harness has one progress callback, so
     // this is what attributes a concurrent thread run's events (and the background
     // deliveries it schedules) to the right SessionTurn. See buildHarness/progress.
@@ -2350,6 +2380,36 @@ export class SessionStore {
     /** Every live record, insertion order. Identity and counters only - no turn is copied. */
     liveSessions(): SessionRecord[] {
         return [...this.sessions.values()];
+    }
+
+    /**
+     * How many sessions BLOCK deleting this canonical harness (T11/R1): live records whose
+     * frozen `preset.name` is `harness`, PLUS sessions whose removal is already in flight and
+     * whose harness owner is the same name.
+     *
+     * This is the harness-deletion guard's query, deliberately separate from `liveSessions()`:
+     * a session being removed must stay deletable from the operator's point of view while it
+     * still owns a live harness object, but it must NOT reappear in session list/read output.
+     * Deduped by session id, because a failed removal puts the record back in the map while
+     * its marker is still held for the rollback's synchronous tail — one session is one
+     * blocker, never two.
+     *
+     * The count is synchronous on purpose: `deleteHarness` reads it and removes the registry
+     * entry in one event-loop turn, so no session creation or removal can slip between them
+     * (server/api.ts).
+     */
+    harnessDeletionBlockers(harness: string): number {
+        const blocking = new Set<string>();
+
+        for (const [id, session] of this.sessions) {
+            if (session.preset.name === harness) blocking.add(id);
+        }
+
+        for (const [id, owner] of this.pendingSessionRemovals) {
+            if (owner === harness) blocking.add(id);
+        }
+
+        return blocking.size;
     }
 
     /** The live record when it exists, without throwing (for reads that answer 404 themselves). */
@@ -2948,6 +3008,17 @@ export class SessionStore {
             // touch the store's directory (`remove()` erases `sessions/<id>/` and the journal,
             // and nothing else — ./knowledge-session.test.ts pins it byte-for-byte).
             ...(knowledge === undefined ? {} : { knowledge }),
+            // T6: THE CANONICAL OWNER. `preset` here is the frozen preset this session was
+            // built from (`session.preset` on a restore), so `preset.name` is exactly the
+            // identity `DELETE /harnesses/{name}` counts sessions by and exactly what the
+            // knowledge engine stamps on articles this build creates. One source, two uses —
+            // create-time attribution and delete-time filtering cannot drift apart.
+            //
+            // Passed on EVERY build, including a deployment with no durable knowledge store:
+            // attribution is a fact about the harness, not about durability, and an ephemeral
+            // engine's owner simply dies with the process. A preset factory that does not
+            // forward the report produces an unowned build; the shipped toolbox factory does.
+            knowledgeOwner: preset.name,
             // R1: the per-build toolbox seed, forwarded verbatim so a preset factory never has
             // to guess whether ITS session is new. Absent (every restore, and every caller that
             // does not ask) means the library default: an empty enabled set.
@@ -3722,6 +3793,80 @@ export class SessionStore {
         return result;
     }
 
+    // T6: OWNER-BASED KNOWLEDGE CLEANUP, the second half of a harness deletion.
+    //
+    // WHAT IT DOES: removes every article whose persisted `harness` field is exactly `harness`
+    // from the deployment's SHARED knowledge base, through the engine's own `remove` operation.
+    // That is deliberate and load-bearing:
+    //   - the shared engine (./runtime.ts, one per database root) is NOT reset, and the
+    //     `<databaseRoot>/harness/knowledge/` directory is NOT deleted — other harnesses,
+    //     unowned articles, and every Storyline-tagged record live in the same store;
+    //   - `remove` fires the normal store notification, so the file subscriber erases each
+    //     article's file and rewrites `index.json` last. A hand-rolled rmSync would bypass the
+    //     index and leave the accelerator describing files that no longer exist.
+    //
+    // ORDER IS THE CALLER'S CONTRACT. `DELETE /harnesses/{name}` calls this AFTER the registry
+    // mutation is durably committed, so a 409 ownership refusal or a failed harness-document
+    // write leaves every article untouched. There is NO cross-store transaction: if this method
+    // throws after that commit, the harness is already gone and the caller must report the
+    // partial outcome instead of inventing a rollback (server/api.ts does exactly that).
+    //
+    // DURABILITY: `flush` is the contract's durability signal (`HarnessKnowledge`); when the
+    // seam carries one it is awaited so a 200 does not precede the erased files. A store whose
+    // flush reports a per-file `failure` resolved rather than rejected (the file layer keeps the
+    // work dirty for its next pass), so that report is checked and surfaced as an error here —
+    // otherwise a successful HTTP answer would claim a cleanup that never reached disk.
+    //
+    // ATTRIBUTION NUANCE: `flush()` is STORE-WIDE. Its `failure` may belong to any dirty write
+    // in the shared base — including one that predates this cleanup — not necessarily to one of
+    // the removals above. It is still surfaced (the caller must not claim durability while the
+    // store reports a failure), but the message says "the store's flush reported a failure",
+    // never "this article's erase failed". This method adds no per-article commit API.
+    //
+    // Returns the ids it removed, in the engine's projection order (newest change first). An
+    // empty list — including "no knowledge seam at all" — is a real answer: nothing was owned.
+    async removeKnowledgeOwnedBy(harness: string): Promise<string[]> {
+        const knowledge = this.knowledgeOf();
+
+        if (knowledge === undefined) return [];
+
+        // A store-shaped seam carries its engine; a bare engine IS the engine. The same shape
+        // discriminator the knowledge tool uses (../tools/runtime/knowledge.tool.ts), so the two
+        // cannot disagree about what a seam is.
+        const engine: KnowledgeEngine = 'engine' in knowledge ? knowledge.engine : knowledge;
+
+        // `articles()` is the summary projection, so this scan pays for metadata only. `harness`
+        // is an exact string compare on purpose: canonical direct names are the only deletable
+        // identities, and an article with no owner (undefined) never matches.
+        const owned = engine
+            .articles()
+            .filter((article) => article.harness === harness)
+            .map((article) => article.id);
+
+        if (owned.length === 0) return [];
+
+        for (const id of owned) {
+            // No `expects` token: this is a host-side removal of an article nobody is editing
+            // (a harness with a live session cannot reach this path — the deletion guard
+            // refuses it first). A refusal here is a real error and propagates.
+            engine.execute({ verb: 'remove', id });
+        }
+
+        const flush = (knowledge as HarnessKnowledgeStore).flush;
+
+        if (typeof flush === 'function') {
+            const report = (await flush()) as { failure?: string } | undefined;
+
+            if (report?.failure !== undefined) {
+                throw new Error(
+                    `Knowledge articles owned by harness "${harness}" were removed from the engine, but the shared knowledge store's flush reported a failure (it may concern any pending knowledge write, not only this cleanup): ${report.failure}`
+                );
+            }
+        }
+
+        return owned;
+    }
+
     // -----------------------------------------------------------------------
     // R3b: durable database (read: constructor; write: every mutation)
     // -----------------------------------------------------------------------
@@ -4483,14 +4628,19 @@ export class SessionStore {
             // changed entry falls back to rebuilding from the SESSION's frozen
             // record, which is why a PATCH after creation does not break restart.
             //
-            // T5: a DELETED harness lands in the fallback for the same reason. The
-            // registry no longer resolves the name (`current === undefined`), so the
-            // frozen record's `template` rebuilds the factory — a 'live'/'flaky'
-            // record from its saved team and models, a 'scripted' record from the
-            // shipped-template lookup. Deleting a card therefore never drops or
-            // rewrites a saved conversation. (An injected factory-less preset is the
-            // one case that cannot rebuild without its entry; R6 drops such a session
-            // with a named restore error.)
+            // T5: a name the registry no longer resolves lands in the fallback for the same
+            // reason. `current === undefined`, so the frozen record's `template` rebuilds the
+            // factory — a 'live'/'flaky' record from its saved team and models, a 'scripted'
+            // record from the shipped-template lookup. This remains the recovery path for
+            // LEGACY or OUT-OF-BAND removals only: an old document written before the ownership
+            // guard, a registry file edited outside this store, or a host that removed a preset
+            // before restoring. The HTTP route does NOT create that state any more —
+            // `deleteHarness` answers 409 while a live or restored session, or a session removal
+            // still in flight, belongs to the harness (`harnessDeletionBlockers`), so a card
+            // removed through the API never leaves a session behind. The fallback is a
+            // compatibility net, not a licence for the route to cascade or orphan.
+            // (An injected factory-less preset is the one case that cannot rebuild without its
+            // entry; R6 drops such a session with a named restore error.)
             const current = this.registry.find(record.harness);
             const preset =
                 current !== undefined && presetRecordEquals(presetToRecord(current), record.preset)
@@ -12865,32 +13015,52 @@ export class SessionStore {
         const session = this.sessions.get(id);
         if (!session) return false;
 
+        // T11/R1: OWNERSHIP MARKER FIRST, before the live-map delete and before any await.
+        // From this instant the harness-deletion guard sees this session even though ordinary
+        // list/read output does not. The marker lives until the whole removal has settled: the
+        // finally below covers BOTH the rollback path (the record is put back on a failed
+        // write) and the success path (abort/dispose plus journal removal have completed).
+        this.pendingSessionRemovals.set(id, session.preset.name);
+
         // Persist the deletion BEFORE tearing the session down, so a failed write
         // rolls back cleanly (the in-memory session is still fully usable) and the
         // server never reports a delete it could not make durable.
         this.sessions.delete(id);
 
         try {
-            await this.persistOrThrow();
-        } catch (error) {
-            this.sessions.set(id, session);
-            throw error;
+            try {
+                await this.persistOrThrow();
+            } catch (error) {
+                // Restore the record BEFORE the finally clears the marker, so there is no
+                // observable turn where neither the live map nor the marker names this id.
+                this.sessions.set(id, session);
+                throw error;
+            }
+
+            // The per-step log is part of this session's durable footprint: a deleted
+            // session must not leave events behind that a restart could replay as ghost
+            // turns. Captured BEFORE `disposeSession` (which closes and clears the handle).
+            const journal = session.journal;
+
+            // `disposeSession` is synchronous and total (it swallows a throwing harness
+            // dispose); its aborts and the harness's dispose/emit are the teardown work the
+            // marker keeps guarded. No await may be introduced between the durable delete and
+            // this point, or the guard would reopen.
+            this.disposeSession(session);
+
+            // D4: same order as inline (close, then remove), because the worker's `remove` also
+            // drops its cached handle - and in worker mode the coordinator may never have held one
+            // at all, so the queue op is issued by session id, not by handle.
+            if (this.io === undefined) journal?.remove();
+            else this.io.queueJournalRemove(id);
+
+            return true;
+        } finally {
+            // Clear LAST, after rollback or after teardown. `finally` also covers an unexpected
+            // throw from teardown: the session is already out of the live map at that point, so
+            // keeping an invisible marker forever would make the harness permanently undeletable.
+            this.pendingSessionRemovals.delete(id);
         }
-
-        // The per-step log is part of this session's durable footprint: a deleted
-        // session must not leave events behind that a restart could replay as ghost
-        // turns. Captured BEFORE `disposeSession` (which closes and clears the handle).
-        const journal = session.journal;
-
-        this.disposeSession(session);
-
-        // D4: same order as inline (close, then remove), because the worker's `remove` also
-        // drops its cached handle - and in worker mode the coordinator may never have held one
-        // at all, so the queue op is issued by session id, not by handle.
-        if (this.io === undefined) journal?.remove();
-        else this.io.queueJournalRemove(id);
-
-        return true;
     }
 
     dispose(): void {

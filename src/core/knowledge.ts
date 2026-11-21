@@ -973,6 +973,10 @@ const copyParagraph = (paragraph: KnowledgeParagraph): KnowledgeParagraph => ({
     ...(paragraph.refs === undefined ? {} : { refs: paragraph.refs.map(copyRef) })
 });
 
+// Both projections carry the optional owner CONDITIONALLY: an unowned article must serialize
+// to exactly the pre-T6 shape (every existing stored file and every existing test row), while
+// an owned one keeps the attribution through copy/snapshot/persist/modify. `harness` is a
+// string, so no defensive copy is needed.
 const copyArticle = (article: KnowledgeArticle): KnowledgeArticle => ({
     id: article.id,
     title: article.title,
@@ -980,16 +984,20 @@ const copyArticle = (article: KnowledgeArticle): KnowledgeArticle => ({
     updatedAt: article.updatedAt,
     tags: [...article.tags],
     content: article.content.map(copyParagraph),
-    rev: article.rev
+    rev: article.rev,
+    ...(article.harness === undefined ? {} : { harness: article.harness })
 });
 
+// The read projections expose ownership as provenance (see `KnowledgeArticleMeta.harness`), but
+// only when there is an owner: a pre-T6 article's row is byte-identical to what it was.
 const metaOf = (article: KnowledgeArticle): KnowledgeArticleMeta => ({
     id: article.id,
     title: article.title,
     tags: [...article.tags],
     createdAt: article.createdAt,
     updatedAt: article.updatedAt,
-    rev: article.rev
+    rev: article.rev,
+    ...(article.harness === undefined ? {} : { harness: article.harness })
 });
 
 // A page row: metadata + paragraph count, and NOTHING else. This is the drill-in step, so
@@ -1108,6 +1116,25 @@ const readStoredTags = (value: unknown, label: string): string[] => {
     });
 };
 
+// The owner token on a stored article (T6). It is the canonical harness NAME, so it is bounded
+// by the registry's own 64-character name cap (`../server/harnesses/registry.ts` `NAME_PATTERN`)
+// rather than by a second grammar: this reader validates SIZE only, because a future registry
+// may admit a name today's pattern does not, and a stored article must stay readable across
+// that change. Blank and whitespace-only values are refused — absent is the unowned spelling,
+// and "owned by nothing" would make the cleanup filter silently wrong.
+const readStoredHarness = (value: unknown, label: string): string => {
+    const owner = readSnapshotString(value, label, { min: 1, max: KNOWLEDGE_MAX_TAG }).trim();
+
+    if (owner.length === 0) {
+        throw knowledgeError(
+            'EKNOWLEDGE_INPUT',
+            `${label} is blank; an article either names the harness that created it or omits the field (unowned).`
+        );
+    }
+
+    return owner;
+};
+
 const readStoredRefs = (value: unknown, label: string): KnowledgeReference[] => {
     const list = readSnapshotArray(value, label);
 
@@ -1191,7 +1218,17 @@ const readStoredArticle = (
 ): KnowledgeArticle => {
     const record = readSnapshotRecord(value, label);
 
-    readSnapshotKeys(record, ['id', 'title', 'createdAt', 'updatedAt', 'tags', 'content', 'rev'], label);
+    // `harness` is the one MAY-BE-ABSENT article field (see `KnowledgeArticle.harness`): absent
+    // is the unowned spelling, and requiring it would make every pre-T6 file unreadable. Passing
+    // it in the fourth argument is what keeps it out of the "unknown field" refusal; leaving it
+    // out of the permitted list entirely would do the same for a NEW file, which is the failure
+    // this reader exists to prevent.
+    readSnapshotKeys(
+        record,
+        ['id', 'title', 'createdAt', 'updatedAt', 'tags', 'content', 'rev', 'harness'],
+        label,
+        ['harness']
+    );
 
     const id = readStoredId(record.id, `${label}.id`, articleIds);
     const title = readSnapshotString(record.title, `${label}.title`, { min: 1 }).trim();
@@ -1225,7 +1262,8 @@ const readStoredArticle = (
         content: content.map((entry, index) =>
             readStoredParagraph(entry, `${label}.content[${index}]`, id, paragraphIds)
         ),
-        rev: readSnapshotInteger(record.rev, `${label}.rev`, { min: 1, max: Number.MAX_SAFE_INTEGER })
+        rev: readSnapshotInteger(record.rev, `${label}.rev`, { min: 1, max: Number.MAX_SAFE_INTEGER }),
+        ...(record.harness === undefined ? {} : { harness: readStoredHarness(record.harness, `${label}.harness`) })
     };
 };
 
@@ -1319,6 +1357,48 @@ const staleArticleError = (label: Label, article: KnowledgeArticle, expected: nu
             article: payload.value
         }
     );
+};
+
+// The trusted owner carrier (T6/T11), read from the LIVE harness handle the tool context
+// carries. `harness.knowledgeOwner` is a constructor-time, host-supplied identity (../harness.ts
+// builds it from `HarnessConfiguration.knowledgeOwner`); nothing in an operation or model message
+// can reach it. A hand-built context can still hold anything, so the guard here is total:
+// non-string and whitespace-only values mean "no identity", i.e. an unowned article. That is the
+// safe reading — an unowned article is preserved by owner-based cleanup, while guessing an owner
+// could delete somebody else's knowledge.
+//
+// NORMALIZATION HAPPENS HERE, ONCE: trimming before any length check is what stops surrounding
+// whitespace from smuggling an over-limit name past the create boundary below. The MAX bound is
+// enforced at that boundary rather than here, because `ownerOfContext` runs for every verb and a
+// malformed host token must not make reads fail.
+const ownerOfContext = (context: ToolContext | undefined): string | undefined => {
+    const candidate = context?.harness?.knowledgeOwner;
+
+    if (typeof candidate !== 'string') return undefined;
+
+    const owner = candidate.trim();
+
+    return owner.length === 0 ? undefined : owner;
+};
+
+// The CREATE boundary for the trusted owner (T11). `harness.ts` validates a configured owner and
+// `readStoredHarness` validates a stored one, but `KnowledgeEngine.execute` is public and can be
+// handed a hand-built ToolContext. Without this check such a context could stamp a 65+ character
+// owner into the live store and its SNAPSHOT, which the durable reader then rejects on the next
+// load — a write that can prevent startup. Refuse instead, before the clock is read or an id is
+// minted, so a rejected input leaves the store byte-identical. The model cannot reach this path:
+// `knowledgeOwner` is host configuration, not an operation key.
+const readCreationOwner = (owner: string | undefined, label: Label): string | undefined => {
+    if (owner === undefined) return undefined;
+
+    if (owner.length > KNOWLEDGE_MAX_TAG) {
+        throw knowledgeError(
+            'EKNOWLEDGE_INPUT',
+            `${label} refused: the trusted harness owner is ${owner.length} characters, over the ${KNOWLEDGE_MAX_TAG}-character harness name limit. An article owner is written by the host (HarnessConfiguration.knowledgeOwner), never by an operation; shorten the name or leave it unset.`
+        );
+    }
+
+    return owner;
 };
 
 // ---------------------------------------------------------------------------
@@ -1929,10 +2009,20 @@ export const createKnowledgeEngine = (options: KnowledgeEngineOptions = {}): Kno
         return buildPage(matchArticles(term, tags), offset, limit, search);
     };
 
-    const createArticle = (record: Record<string, unknown>): KnowledgeCreateResult => {
+    // `owner` is the trusted attribution the router read from `ToolContext.harness`
+    // (`knowledgeOwner`), never an operation field (see `OPERATION_KEYS.create` — `harness` is
+    // not among the accepted keys, so a model-supplied one is refused as unknown). It is
+    // captured once per call and stamped on the article this call commits; a caller with no
+    // harness identity creates an UNOWNED article, exactly like every pre-T6 article.
+    const createArticle = (record: Record<string, unknown>, owner: string | undefined): KnowledgeCreateResult => {
         const label: Label = 'knowledge "create"';
 
         readItemKeys(record, OPERATION_KEYS.create, label);
+
+        // Validate/normalize the trusted owner BEFORE any clock read or id mint: a refused
+        // over-limit token must leave the store exactly as it was (and must never reach a
+        // snapshot the durable reader would reject on the next load).
+        const acceptedOwner = readCreationOwner(owner, label);
 
         const title = readTitle(label, record.title);
         const tags = readTags(label, 'tags', record.tags);
@@ -2001,7 +2091,10 @@ export const createKnowledgeEngine = (options: KnowledgeEngineOptions = {}): Kno
             updatedAt: at,
             tags: [...tags],
             content,
-            rev: 1
+            rev: 1,
+            // Present ONLY when this create ran through an attributed harness build; the
+            // conditional spread is what keeps an unscoped create's article shape unchanged.
+            ...(acceptedOwner === undefined ? {} : { harness: acceptedOwner })
         };
 
         // Validate before the store changes (and refs may point inside this very article,
@@ -2400,14 +2493,21 @@ export const createKnowledgeEngine = (options: KnowledgeEngineOptions = {}): Kno
         // `dispatch`'s exhaustive switch then checks.
         const knownVerb = verb as KnowledgeVerb;
 
-        // `context` is accepted for the tool seam (`execute(op, context)` from
-        // ../tools/runtime/knowledge.tool.ts) and is deliberately UNREAD: the knowledge types
-        // carry no attribution fields (an article records when it changed, not who changed it),
-        // so there is nothing to read from a ToolContext and nothing to forge. A later revision
-        // that adds `updatedBy` reads it here, the way ../core/records.ts does.
-        void context;
+        // The ONE trusted field read from `context` (T6): the canonical harness name the host
+        // attached to this build (`Harness.knowledgeOwner` — set by ../server/sessions.ts
+        // `buildHarness` from the frozen preset name and forwarded through the preset report).
+        // It is read HERE, never from `record`, so the model has no input that can set or
+        // overwrite an article's owner. Every other attribution question stays out of this
+        // engine (an article records when it changed, not who changed it beyond its creator).
+        //
+        // The runtime guard is deliberate: `execute` is public and a hand-built ToolContext is
+        // allowed to be arbitrary, so a non-string or blank value is treated as "no identity"
+        // rather than being written into the store as a bogus owner. `harness()` itself refuses
+        // a malformed `knowledgeOwner` at construction, so this only covers a hand-built
+        // context and keeps a bad host value from corrupting persisted articles.
+        const owner = ownerOfContext(context);
 
-        const result: KnowledgeResult = dispatch(knownVerb, record);
+        const result: KnowledgeResult = dispatch(knownVerb, record, owner);
 
         // The cast is the router's, not a hole: `dispatch` returns the result of exactly the
         // handler `verb` selects, and the union in ../types maps each verb to one result
@@ -2415,7 +2515,7 @@ export const createKnowledgeEngine = (options: KnowledgeEngineOptions = {}): Kno
         return result as KnowledgeResultFor<TOperation>;
     };
 
-    const dispatch = (verb: KnowledgeVerb, record: Record<string, unknown>): KnowledgeResult => {
+    const dispatch = (verb: KnowledgeVerb, record: Record<string, unknown>, owner: string | undefined): KnowledgeResult => {
         switch (verb) {
             case 'list':
                 return listArticles(record, false);
@@ -2424,7 +2524,7 @@ export const createKnowledgeEngine = (options: KnowledgeEngineOptions = {}): Kno
             case 'read':
                 return readArticle(record);
             case 'create':
-                return createArticle(record);
+                return createArticle(record, owner);
             case 'modify':
                 return modifyArticle(record);
             case 'remove':

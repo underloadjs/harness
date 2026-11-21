@@ -97,10 +97,12 @@ Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harn
 > confirmed rather than changed: the out-of-band duplicate-file abort stays fail-closed (its remedy
 > is one `rm`, now written down), and an un-awaited background commit's failure still reaches nobody
 > by default — the durable base can silently stop being durable, and the hook a host must wire
-> (`report`, or `diagnostics()`) is named in "Not built yet". Pinned by the five knowledge suites —
-> `src/core/knowledge.test.ts` (78), `src/tools/runtime/knowledge.test.ts` (45),
-> `src/server/knowledge-file-store.test.ts` (29), `src/harness.knowledge.test.ts` (9) and
-> `src/server/knowledge-session.test.ts` (6) — 167 tests, all green on 2026-11-18.
+> (`report`, or `diagnostics()`) is named in "Not built yet". Pinned by the knowledge suites —
+> `src/core/knowledge.test.ts` (80), `src/tools/runtime/knowledge.test.ts` (45),
+> `src/server/knowledge-file-store.test.ts` (29), `src/harness.knowledge.test.ts` (9),
+> `src/server/knowledge-session.test.ts` (6) and `src/server/harness-delete-knowledge.test.ts` (12)
+> — 181 tests, all green on 2026-11-21 (T6 owner attribution + T11 pending-removal race and
+> owner-length cases).
 > Then 2026-11-17 (X2, the context-compaction correctness pass) for SIX behaviour
 > fixes on the summarize path, each pinned where it is observable. THE FLOOR IS ONE CURRENCY:
 > `measureRequestFloor` adds the projection's media term back onto the harness figure before
@@ -2395,6 +2397,42 @@ const store = await loadKnowledgeFileStore({ root, engine });  // src/server/kno
 harness({ knowledge: store });                                 // HarnessConfiguration.knowledge, src/types/index.ts:4847
 ```
 
+**Owner attribution and harness deletion (T6).** An article carries an OPTIONAL `harness`
+field naming the canonical preset that CREATED it. The engine stamps it in `createArticle`
+from the trusted `ToolContext.harness.knowledgeOwner` — a host field
+(`HarnessConfiguration.knowledgeOwner`) that `SessionStore.buildHarness` sets to
+`preset.name` and the shared toolbox forwards through the preset report. No operation accepts
+it: the strict `create`/`modify` key readers refuse `harness` as an unknown field, so a model
+can neither forge an owner nor move an article to another one, and `modify` retains the
+original because it edits a `copyArticle` clone. Articles created directly through an engine,
+by a library consumer, or before this field existed have NO owner; absent is the unowned
+spelling and it means deployment-wide.
+
+`DELETE /v1/harness/harnesses/{name}` therefore removes all and only the articles whose
+persisted owner is exactly `{name}`. The cleanup runs AFTER the registry mutation is durable
+(so a `409` ownership refusal — which counts live/restored sessions AND session removals still
+in flight — or a failed harness-document write leaves every article
+untouched), goes through the engine's own `remove` so the file subscriber erases each file and
+rewrites `index.json` last, and awaits the store's `flush` before answering `200`. It never
+calls `engine.reset()` and never deletes `<root>/harness/knowledge/`: articles of OTHER
+harnesses, unowned rows (including the Storyline-tagged ones) and the shared read visibility
+all survive, and deleting a SESSION still touches nothing. The two stores are not one
+transaction: if cleanup or its flush fails after the harness document committed, the route
+answers `500` naming the partial outcome instead of claiming success, and a retry of the DELETE
+is a `404` that does not re-run the cleanup. The failure is not merely cosmetic: the engine has
+already dropped the owned articles from memory, but their FILES may still be on disk, and the
+next load treats the files as authoritative (files win per article), so those owned articles can
+be RE-ADOPTED after a restart. There is no retry route and no rollback that could un-delete the
+harness; an operator has to repair the store (or erase the leftover files) directly, then let a
+reload reconcile.
+
+The persisted article envelope stays **version 1**. This build reads an absent owner as
+unowned, so every pre-T6 file remains valid. The reverse direction is NOT compatible: an older
+strict build reads an owned version-1 file, sees `harness` as an unknown article field, and
+aborts that load — `startHarnessServer` fails startup, while the service handler reports the
+failure and keeps serving an in-memory base. No dual-version reader or migration is added; a
+downgrade requires removing or ignoring the field out of band.
+
 Six verbs, ONE operation object per call. The schema carries exactly one object-valued
 property (`operation`), which is what makes the harness deliver the UNWRAPPED operation to
 `execute` (`toolParameterKey`, `src/core/tool.ts:65-73`; `src/core/schema-validation.ts:383-386`),
@@ -2759,30 +2797,35 @@ call a model can make.
   release gate's startup-record list (`STARTUP_SOURCE_ENTRIES.knowledge`,
   `scripts/check-package-tools.ts:174-179`) — without that row, the one startup registration the
   gate never looks at would be this one.
-- **NOT wired, deliberately.** NO snapshot field and no HTTP route: `snapshot()` is per-session
-  state, and folding the base in would let one session's restart rewrite the base every other
-  session is reading while a session deleted with its directory took the articles with it
-  (`src/harness.ts:4380-4385`). NO `reset()` — a reset clears the conversation and the SESSION
-  record stores, and the knowledge base outlives the conversation by design (`:4386-4388`). NO
-  `dispose` hook, because whatever is here was created by the HOST (which owns the one disposal
-  path) or is the in-memory fallback, which holds no timer, subscription or file handle
-  (`:4389-4395`). NO panel, no `toolUi()`, and no swagger surface. And a CPU-isolated LANE WORKER
-  gets the replica `harness()` built for it — an in-memory engine, not the host's live store —
-  because a live object cannot cross `worker_threads` (the `pluginSettings`/`toolSettings`
-  posture, `src/types/index.ts:4925-4927`); that is why nothing under `src/server/workers/`
-  touches the durable store, and why the engine's `execute(operation, context)` takes the
-  `ToolContext` even though the types carry no attribution fields yet — an article records WHEN
-  it changed, not WHO did, and the context is what lets that later revision read the caller
-  without changing the tool's signature (`knowledge.tool.ts:1062-1066`).
+- **NOT wired, deliberately.** NO snapshot field and no knowledge-specific HTTP route:
+  `snapshot()` is per-session state, and folding the base in would let one session's restart
+  rewrite the base every other session is reading while a session deleted with its directory
+  took the articles with it (`src/harness.ts:4380-4385`). NO `reset()` — a reset clears the
+  conversation and the SESSION record stores, and the knowledge base outlives the conversation
+  by design (`:4386-4388`). NO `dispose` hook, because whatever is here was created by the HOST
+  (which owns the one disposal path) or is the in-memory fallback, which holds no timer,
+  subscription or file handle (`:4389-4395`). NO panel, no `toolUi()`, and no swagger surface.
+  The ONE server write that reaches the base is the owner cleanup behind
+  `DELETE /harnesses/{name}` (see the section above); it is not a knowledge route and it never
+  resets the shared store. And a CPU-isolated LANE WORKER gets the replica `harness()` built for
+  it — an in-memory engine, not the host's live store — because a live object cannot cross
+  `worker_threads` (the `pluginSettings`/`toolSettings` posture, `src/types/index.ts:4925-4927`);
+  that is why nothing under `src/server/workers/` touches the durable store.
+  `execute(operation, context)` DOES read one field from `ToolContext` — the trusted
+  `harness.knowledgeOwner` — but only `create` consumes it, to stamp
+  `KnowledgeArticle.harness` (`src/core/knowledge.ts` `ownerOfContext`/`createArticle`,
+  `knowledge.tool.ts:1062-1066`). It is never a model input, and an unowned harness writes
+  articles without the field.
 
 ### Pinned by
 
 ```bash
 yarn vitest run src/core/knowledge.test.ts src/server/knowledge-file-store.test.ts \
-  src/tools/runtime/knowledge.test.ts src/harness.knowledge.test.ts src/server/knowledge-session.test.ts
+  src/tools/runtime/knowledge.test.ts src/harness.knowledge.test.ts \
+  src/server/knowledge-session.test.ts src/server/harness-delete-knowledge.test.ts
 ```
 
-167 tests, 5 files, all green at the last run of this pass (2026-11-18). The engine suite (78)
+181 tests, 6 files, all green at the last run of this pass (2026-11-21). The engine suite (80)
 is the authority for bounds, codes, verbs, ranking, budgets, the feed and every projection —
 including that the rank-50 ceiling belongs to `search` alone ("caps a search at the
 KNOWLEDGE_MAX_SEARCH rank it can actually deliver, and leaves list uncapped",
@@ -7121,7 +7164,7 @@ table.
 | `POST /v1/harness/harnesses` | `{ name, title?, description?, agents, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }` (`agents` is the ONLY roster field, in declaration order, and is REQUIRED beside `name`; `entry` defaults to its first name and `ranks` may cover fewer members than the roster. CORRECTED IN PLACE 2026-11-11: these fields are snake_case on the wire, not the old camelCase `agentModels`/`agentInstructions`, `src/shared/harness-api.ts:643-652`; CORRECTED AGAIN 2026-11-18: `primary`/`subagents` are gone from the contract — the row is `entry` + `ranks`, and `AgentRank` is the 26-letter enum at `src/server/harness.swagger.yaml:4587-4593`) |
 | `PATCH /v1/harness/harnesses/:name` | `{ title?, description?, agents?, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `{ harness }`; every template is patchable, `entry` re-targets routing ALONE (an omitted `entry` keeps the current one while it stays a member and otherwise falls back to the new roster's first agent), `ranks` REPLACES the authority map (`{}` clears every rank, an omitted map keeps the ranks of the surviving members), and each other map field REPLACES the map it names |
 | `GET /v1/harness/harnesses/:name` | `200 { harness }` — one definition with the IDENTIFIED read's own projection, `agent_instructions` included when the card overrides any; the paged listing omits that map, so the configuration dialog reads the single card it opens. A legacy NAME alias (`writer` → `instruct`) resolves to its target; unknown is `404` |
-| `DELETE /v1/harness/harnesses/:name` | `200 { deleted: true, harness_name, tombstoned, restored_by_restart: false }`; `404` unknown name or repeat delete (name aliases are not deletable identities). Removes a user harness or a shipped built-in; a built-in's name is persisted in the database's additive `deleted` list so a restart keeps it removed. Existing and saved sessions keep the definition they captured, so deleting a harness never loses a conversation |
+| `DELETE /v1/harness/harnesses/:name` | `200 { deleted: true, harness_name, tombstoned, restored_by_restart: false }`; `404` unknown name or repeat delete (name aliases are not deletable identities); `409` while a live or restored session belongs to that exact canonical harness — the message names the count, nothing is removed, and no session is cascaded, so each owned session must be deleted individually (`DELETE /v1/harness/sessions/:id`; there is deliberately no bulk delete) before the retry answers `200`. Removes a user harness or a shipped built-in; a built-in's name is persisted in the database's additive `deleted` list so a restart keeps it removed. A session still keeps the frozen definition it captured, which is exactly why the route refuses while any remain: a conversation must never outlive its harness card as an orphan the UI cannot reach. **T6:** after the registry write succeeds, the route also removes every knowledge article ATTRIBUTED to this canonical harness (`KnowledgeArticle.harness`) from the shared base and awaits the store's flush before the `200`; other harnesses' articles, unowned/legacy rows and Storyline records survive, and the base is never reset. The two stores are not transactional: a cleanup/flush failure after the committed harness delete answers `500` naming the partial outcome (the harness is gone; a repeat DELETE is `404` and does not retry the cleanup) |
 | `GET /v1/harness/agents` | Trusted agent registry (`AgentDescriptor[]` rows), **paged** |
 | `GET /v1/harness/tools` | The host-wide catalogue, **paged**: session-bound core entries (`group: 'Core tools'`, `sessionBound: true`) plus every directly callable tool (including the core file tools); `search` always present with `availability` |
 | `GET /v1/harness/tools/:id` | One catalogue entry with its argument schema. CORRECTED IN PLACE 2026-11-11: this row replaces the deleted `GET /api/tools/bootstrap` alias ("the list the root bootstrap document carries") — the boot document carries no catalogue any more |
@@ -7216,7 +7259,11 @@ session-level rows are not two views of one store, and the difference is a contr
   `deleteSessionTool`).
 - **A harness template** is a third scope again: `GET/PATCH/DELETE /v1/harness/harnesses/:name`
   edit the definition, and an existing session keeps the definition and the agent-model map
-  it froze at creation, so a template write never reaches a live conversation either.
+  it froze at creation, so a template write never reaches a live conversation either. The
+  DELETE is the one harness write that consults sessions at all: it answers `409` while any
+  live or restored session's `preset.name` still equals the direct name being deleted (delete
+  those sessions first, one at a time), because the frozen copy a session keeps is precisely
+  the orphan state that guard removes.
 
 CORRECTED IN PLACE 2026-11-13: this paragraph is new, and it retires the sentence in
 `docs/plugins.md` ("an accepted PATCH changes what every existing session and thread does
@@ -8617,8 +8664,19 @@ the dispatcher:
   path one rollback for create/patch/delete: `SessionStore.mutateRegistry` writes the
   document and restores the snapshot (entries, listing order, tombstones) when the write
   fails, so `DELETE` never answers `{ deleted: true }` for a harness the next restart
-  brings back. Sessions are untouched either way - each one restores from its own frozen
-  preset record;
+  brings back. The REGISTRY primitive is session-unaware on purpose: `remove()` never
+  counts, deletes, or refuses over sessions, and an existing session keeps running (and a
+  saved one restores) from its own frozen preset record. Ownership is enforced at the
+  SERVER boundary instead - `deleteHarness` in `src/server/api.ts` answers `409` while any
+  live or restored session's `preset.name` still equals the DIRECT name being removed - so
+  the reusable registry stays free of store knowledge while the operator-facing route
+  cannot create an orphaned conversation. The SAME direct name is the knowledge owner:
+  `SessionStore.buildHarness` stamps `preset.name` onto the report
+  (`knowledgeOwner`), the engine writes it to each article it creates, and after a successful
+  registry commit `deleteHarness` calls `SessionStore.removeKnowledgeOwnedBy(name)` so exactly
+  that harness's articles leave the shared base (T6 - see "Cross-session knowledge"; a
+  cleanup failure is a `500`, because the registry and the base are two stores with no shared
+  transaction);
 - `agentModels` (R9) is a map of selected agent id → model id on create/patch. Keys
   are validated against the FINAL roster set (unknown key = 400
   naming the members), values are trimmed, non-empty, ≤200 characters, and free of

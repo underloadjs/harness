@@ -2429,8 +2429,11 @@ export const createHarnessApi = ({
             throw new HttpError(400, 'A patch must change at least one field.');
         }
 
-        // An existing session keeps its frozen copy, so this affects FUTURE sessions only -
-        // which is why a saved conversation survives the deletion of its harness.
+        // An existing session keeps its frozen copy, so a PATCH affects FUTURE sessions only.
+        // That is NOT the DELETE rule: a harness may not be deleted while any live or restored
+        // session (or an in-flight session removal) belongs to it — DELETE answers 409 and names
+        // the count, because a session must not outlive the card it is reachable through. See
+        // `deleteHarness` below and `SessionStore.harnessDeletionBlockers`.
         //
         // `ranks` REPLACES the authority map (./harnesses/registry.ts `normalizeRanks`): a key naming
         // an agent outside the resulting roster is a 400 rather than a silent drop, a member this
@@ -2465,6 +2468,57 @@ export const createHarnessApi = ({
     const deleteHarness: Handler = async (ctx) => {
         const name = ctx.params.harness_name;
 
+        // OWNERSHIP GUARD (R1): a harness may not be deleted while a live/restored session
+        // belongs to it, because a session keeps running the preset it captured and would
+        // become an orphan no harness card in the UI can reach it through. The operator has
+        // to delete every owned session first (individually - there is deliberately no
+        // bulk-delete route), then repeat this DELETE.
+        //
+        // DIRECT-NAME EXISTENCE FIRST, and not `find(name) !== undefined`: `find` is
+        // alias-aware while `remove` below is direct-only, and the three existing 404 cases
+        // must keep answering 404 even when an alias TARGET has sessions - an unknown name,
+        // a repeat delete, and an alias-only delete (e.g. `writer` for `instruct`). A
+        // direct hit is the only deletable identity, and `presets` are keyed by canonical
+        // name, so `preset.name === name` is exactly "the name is directly registered".
+        // Checking existence BEFORE counting sessions also means an unknown/repeat delete
+        // never pays for the scan and never turns into a 409.
+        const direct = registry.find(name);
+
+        if (direct !== undefined && direct.name === name) {
+            // THE ONE GUARD QUERY (T11/R1): `harnessDeletionBlockers` counts live records whose
+            // canonical `preset.name` matches AND sessions whose removal is still in flight.
+            // The second half closes the race this route used to have: `SessionStore.remove`
+            // deletes from the live map before awaiting its durable write, so a plain
+            // `liveSessions()` count answered zero while the session's harness was still alive.
+            // The marker is separate from the list read, so an ordinary session page never
+            // temporarily shows a deleting session again.
+            //
+            // The canonical owner is the frozen preset's name (`Session.preset.name`), the
+            // same field the sessions page filters on (see `getSessions` above), so an
+            // alias-built or restored session reports (and blocks) the canonical harness it
+            // resolves to. Session ids are deliberately NOT returned: the count is actionable
+            // enough and the ids are already reachable through `GET /sessions?harness=`.
+            const owned = store.harnessDeletionBlockers(name);
+
+            if (owned > 0) {
+                const sessions = owned === 1 ? 'session' : 'sessions';
+                const pronoun = owned === 1 ? 'it' : 'them';
+
+                throw new HttpError(
+                    409,
+                    `Harness "${name}" still owns ${owned} ${sessions}. Delete ${pronoun} first; a harness can only be deleted after all of its sessions are deleted.`
+                );
+            }
+        }
+
+        // ATOMICITY: no `await` may sit between the blocking read above and this call.
+        // `mutateRegistry` runs its callback synchronously before awaiting the durable
+        // commit, so the check and the removal share one event-loop turn: a session created
+        // OR a session removal beginning in between cannot slip past the guard. The removal
+        // marker itself is set synchronously before its first await (sessions.ts `remove`),
+        // which is what makes "beginning" observable here rather than after the live-map
+        // delete.
+        //
         // `registry.remove` throws 404 for an unknown or already-deleted name; a deleted
         // BUILT-IN leaves a tombstone so a restart does not re-ship it.
         const removed = await store.mutateRegistry(() => registry.remove(name));
@@ -2474,6 +2528,33 @@ export const createHarnessApi = ({
         events.bumpRevision('harnesses');
         events.bumpRevision('definition', name);
         publish('catalogue.updated', [{ resource: 'harnesses' }]);
+
+        // T6: OWNER-BASED KNOWLEDGE CLEANUP. A harness owns the articles IT created (the
+        // `harness` field the engine stamps from the trusted build identity), and deleting it
+        // removes exactly those from the deployment's SHARED base. Articles of other harnesses,
+        // UNOWNED articles (legacy rows and every article created outside a harness) and the
+        // Storyline-tagged records survive: this is cleanup, not a reset and not read isolation.
+        //
+        // WHERE THIS RUNS MATTERS. It is AFTER `mutateRegistry` (the registry change and its
+        // document write are already durable) and AFTER the revision/publish calls (the
+        // catalogue really did change, so a client must see that even when this fails). The
+        // 409 ownership guard above and a failed registry commit both return before this line,
+        // which is what keeps their knowledge byte-identical. The await is before the 200: a
+        // successful answer never outruns the erase/flush.
+        //
+        // NO CROSS-STORE TRANSACTION. The harness document and the knowledge files are two
+        // stores; there is no rollback that could un-delete the harness if this fails, so a
+        // failure is surfaced as an honest 500 naming the partial outcome instead of a fake
+        // success. A retry of this DELETE is a 404 and does NOT re-run the cleanup — the
+        // operator-facing limit of doing this without a distributed transaction.
+        try {
+            await store.removeKnowledgeOwnedBy(name);
+        } catch (error) {
+            throw new HttpError(
+                500,
+                `Harness "${name}" was deleted, but removing the knowledge articles it owned did not complete: ${messageOf(error)}`
+            );
+        }
 
         const result: DeleteHarnessResult = {
             deleted: true,

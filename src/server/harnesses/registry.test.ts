@@ -1084,9 +1084,12 @@ describe('updating a harness', () => {
 // stays removed only because the registry records a TOMBSTONE the persistence layer
 // can replay — `list()` alone cannot express "this shipped default is gone", because
 // every registry seeds itself from ./presets.ts. Sessions are deliberately outside
-// this contract: an existing session holds the preset it captured (pinned by
-// ../sessions.test.ts) and a saved one rebuilds from its own record
-// (../persistence.test.ts).
+// this contract: the registry itself stays session-unaware and never counts, deletes,
+// or refuses over them (an existing session holds the preset it captured, pinned by
+// ../sessions.test.ts, and a saved one rebuilds from its own record,
+// ../persistence.test.ts). The ownership guard lives one layer up instead: the HTTP
+// `deleteHarness` route (`../api.ts`) answers 409 while a live or restored session
+// still belongs to the harness and only calls `remove()` once none do.
 describe('deleting a harness', () => {
     it('removes a user harness without tombstoning it', () => {
         const registry = createHarnessRegistry();

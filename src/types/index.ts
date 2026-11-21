@@ -2619,6 +2619,19 @@ export interface KnowledgeArticle {
     /** Ordered content array: index 0 first. Entries are KnowledgeParagraph. */
     content: KnowledgeParagraph[];
     rev: number;
+    // THE CANONICAL HARNESS THAT CREATED THIS ARTICLE (T6) — provenance for owner-based
+    // cleanup, never model input. The engine stamps it from `ToolContext.harness.knowledgeOwner`
+    // (`../core/knowledge.ts` `createArticle`), a field the host sets from the canonical preset
+    // name (`./server/sessions.ts` `buildHarness`). It is absent for every article created
+    // outside a harness (a library consumer, a direct engine call) and for every article
+    // written before this field existed; absent therefore means UNOWNED and deployment-wide,
+    // which is why a harness deletion must leave those articles alone.
+    //
+    // No knowledge operation accepts it: `create`/`modify` key readers refuse `harness` by
+    // name (the strict `OPERATION_KEYS` sets), so a model can neither forge an owner nor move
+    // an existing article to another one. An update retains the value because `modify` edits a
+    // `copyArticle` clone, which carries it.
+    harness?: string;
 }
 
 // One compare-and-swap precondition, ARTICLE grain (a paragraph-level guard is expressed
@@ -2682,6 +2695,12 @@ export type KnowledgeArticleMeta = {
     createdAt: string;
     updatedAt: string;
     rev: number;
+    // The article's owner, when it has one (see `KnowledgeArticle.harness`). It is a read-only
+    // PROVENANCE projection: it rides the list/search/read RESULT rows (the machine view), so a
+    // host can tell which harness contributed an article, and it is still never accepted on the
+    // way in. The knowledge tool's model-facing prose projection keeps its own whitelist and does
+    // not echo this field. Absent for unowned articles, so every pre-T6 row keeps its exact shape.
+    harness?: string;
 };
 
 // What a page row is: metadata + the paragraph count, so the caller can size the drill
@@ -5064,6 +5083,21 @@ export type HarnessConfiguration = {
     // after it) hands the engine over, and the store adopts it when it lands, so no article
     // written in that window is lost.
     knowledge?: HarnessKnowledge;
+    // THE CANONICAL HARNESS NAME THIS BUILD ATTRIBUTES NEW ARTICLES TO (T6). A TRUSTED host
+    // field, never model input: `../core/knowledge.ts` reads it from
+    // `ToolContext.harness.knowledgeOwner` and stamps it on `create` only, so deleting the
+    // harness can later remove exactly the articles it contributed.
+    //
+    // The server sets it to the frozen preset's canonical name in
+    // ../server/sessions.ts `buildHarness`, which is also the identity the HTTP deletion guard
+    // counts sessions by, so the two sides of the cleanup rule cannot disagree. A library
+    // consumer leaves it unset and its articles stay unowned — the deliberate "no harness
+    // identity, no attribution" rule. Absent (or blank) means unowned, never "owned by ''".
+    //
+    // It is NOT part of the knowledge base itself: the article field remains
+    // `KnowledgeArticle.harness`, which survives copy/snapshot/persistence and is what the
+    // cleanup filters on. This member is only the carrier that tells the engine who is writing.
+    knowledgeOwner?: string;
 };
 
 // The callable harness. `await writer('...')` runs the entry agent to
@@ -5157,6 +5191,16 @@ export type Harness = {
     // assigned through the handle; `reset()`, `snapshot()` and `restore()` deliberately leave
     // it alone, and a session deletion never touches the store's directory.
     readonly knowledge: HarnessKnowledge;
+    // THE CANONICAL HARNESS NAME THIS BUILD STAMPS ON NEW KNOWLEDGE ARTICLES (T6), or absent
+    // for a harness the host did not attribute (every library consumer and `harness({})`).
+    //
+    // A getter with no setter, exactly like `knowledge`: the value is the TRUSTED identity the
+    // host supplied through `HarnessConfiguration.knowledgeOwner`, not state a caller may move.
+    // `../core/knowledge.ts` reads it off `ToolContext.harness` on `create` only — never from an
+    // operation field — so a model cannot set or rewrite an article's owner. The frozen value
+    // also survives `reset()` (only the conversation restarts), which is right: the same
+    // harness handle continues to own what it creates.
+    readonly knowledgeOwner?: string;
     // Execute one registered tool by name, outside the model's discovery gate
     // (R8). This is the server/host path for an EXPLICIT user action — the CLI or
     // the UI's Tools tab — and it runs the SAME session-bound implementation the

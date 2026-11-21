@@ -302,6 +302,10 @@ import {
     // library state (no fs, no timers) while durability is a SUBSCRIBER the host attaches
     // (core/knowledge.ts header, server/knowledge-file-store.ts header).
     createKnowledgeEngine,
+    // T6: the 64-character bound the knowledge article reader applies to a stored owner. The
+    // harness validates `knowledgeOwner` against the SAME constant, so an owner this
+    // constructor accepts is always one the file layer can read back.
+    KNOWLEDGE_MAX_TAG,
     HARNESS_SNAPSHOT_VERSION,
     cloneToolCreation,
     readHarnessMessages,
@@ -1385,6 +1389,37 @@ const knowledgeSourceOf = (provided: HarnessConfiguration['knowledge']): Harness
         'HarnessConfiguration.knowledge is neither a knowledge store (it answers no `engine` with ' +
             'an `execute`) nor a knowledge engine (it answers no `execute` of its own).'
     );
+};
+
+// The TRUSTED attribution token (T6), validated once at construction. It is a harness NAME,
+// so it is trimmed and bounded to the registry's 64-character ceiling; absent/blank means
+// UNOWNED (the pre-T6 posture and every library consumer), never the empty-string owner.
+//
+// A non-string is a configuration error and fails construction loudly: silently treating it as
+// unowned would make an operator's typo look like "cleanup not applicable" instead of telling
+// them the field they set is wrong. The bound matters on the READ side — ../core/knowledge.ts
+// `readStoredHarness` refuses a longer value, so an accepted owner must round-trip through the
+// file layer.
+const knowledgeOwnerOf = (provided: HarnessConfiguration['knowledgeOwner']): string | undefined => {
+    if (provided === undefined || provided === null) return undefined;
+
+    if (typeof provided !== 'string') {
+        throw new HarnessError(
+            `HarnessConfiguration.knowledgeOwner must be a harness name string; received ${typeof provided}.`
+        );
+    }
+
+    const owner = provided.trim();
+
+    if (owner.length === 0) return undefined;
+
+    if (owner.length > KNOWLEDGE_MAX_TAG) {
+        throw new HarnessError(
+            `HarnessConfiguration.knowledgeOwner is ${owner.length} characters, over the ${KNOWLEDGE_MAX_TAG}-character harness name limit.`
+        );
+    }
+
+    return owner;
 };
 
 export const harness = (configuration: HarnessConfiguration): Harness => {
@@ -4394,6 +4429,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //     nothing to release and dies with the harness). `harness.dispose` therefore touches
     //     knowledge in neither case; `HarnessKnowledgeStore.dispose` stays a host verb.
     const knowledge = knowledgeSourceOf(configuration.knowledge);
+
+    // T6: the trusted attribution this build's knowledge writes carry. Resolved ONCE, exactly
+    // like the base above, so every tool call of this harness sees one stable owner even if the
+    // configuration object it was built from is mutated later. Absent means the harness creates
+    // UNOWNED articles — the deliberate library-consumer posture, and what keeps legacy
+    // articles out of any harness deletion's reach.
+    const knowledgeOwner = knowledgeOwnerOf(configuration.knowledgeOwner);
 
     // Per-harness network closures. They are populated during startup from the
     // `websearch`/`webfetch` configuration and carry the credentials; the compiled
@@ -17525,6 +17567,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         enumerable: true,
         configurable: true
     });
+
+    // THE attribution carrier (`Harness.knowledgeOwner`, T6). A getter for the same reason as
+    // `knowledge`: the identity is the host's, and a caller must not be able to point the same
+    // handle at a different owner mid-run. It is defined ONLY when the host supplied one, so
+    // `knowledgeOwner` in a handle is an exact answer to "does this build attribute?" rather
+    // than a key that is always present and sometimes undefined — and an unowned harness
+    // serializes no owner into an article (`../core/knowledge.ts` `ownerOfContext`).
+    if (knowledgeOwner !== undefined) {
+        Object.defineProperty(handle, 'knowledgeOwner', {
+            get: () => knowledgeOwner,
+            enumerable: true,
+            configurable: true
+        });
+    }
 
     return handle;
 };

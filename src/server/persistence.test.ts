@@ -1731,10 +1731,17 @@ describe('R3b durable harness database', () => {
 // T5: deleting a harness has to be DURABLE, and `registry` alone cannot say "this
 // shipped built-in is gone" (a fresh registry always re-seeds the shipped templates).
 // The document therefore carries the deleted names in the additive `deleted` list,
-// which restore replays BEFORE the rows. The invariant under test is the saved
-// conversation: a session freezes its own preset record, so removing a card must
-// never lose, drop, or change a transcript — including the scripted fixture, whose
-// factory the restore looks up in the shipped-template superset.
+// which restore replays BEFORE the rows.
+//
+// THESE ARE STORE-LEVEL LEGACY/OUT-OF-BAND TESTS, not the HTTP contract. They call
+// `store.mutateRegistry(() => registry.remove(...))` directly, which is how an old
+// document or an externally edited registry can still arrive; the restore fallback then
+// rebuilds a session from its frozen preset record, so such a removal must never lose,
+// drop, or change a transcript — including the scripted fixture, whose factory the
+// restore looks up in the shipped-template superset. The HTTP route (T4/T11) does NOT
+// create this state: `DELETE /harnesses/{name}` answers 409 while any live or restored
+// session, or an in-flight session removal, belongs to the harness. These tests do not
+// weaken that guard and must not be read as "the API may delete a harness with sessions".
 describe('T5 durable harness deletion', () => {
     type Document = {
         version: number;
@@ -1867,8 +1874,9 @@ describe('T5 durable harness deletion', () => {
         expect(second.registry.find('writer')).toBeUndefined();
         expect(second.registry.deletedBuiltins()).toEqual(['instruct']);
 
-        // The conversation survives the deletion untouched, and the restore dropped
-        // nothing: the frozen 'live' record rebuilds without a registry entry.
+        // The conversation survives the OUT-OF-BAND deletion untouched, and the restore
+        // dropped nothing: the frozen 'live' record rebuilds without a registry entry.
+        // (The HTTP route would have answered 409 while this session still exists.)
         expect(second.store.restoreErrors).toEqual([]);
         const restored = second.store.get(id);
         expect(restored.harness).toBe('instruct');
@@ -1880,7 +1888,9 @@ describe('T5 durable harness deletion', () => {
         const root = tempRoot('delete-fixture-session');
 
         // A host that injected the offline fixture records a real conversation, then
-        // deletes the card (it is a built-in in that registry, so it tombstones).
+        // removes the card OUT-OF-BAND at the store level (it is a built-in in that
+        // registry, so it tombstones). The HTTP route refuses this while the session
+        // exists; the store-level path pins the legacy restore fallback.
         const first = createHarnessRuntime({
             root,
             settings: SETTINGS,

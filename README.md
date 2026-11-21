@@ -3448,7 +3448,7 @@ were deleted rather than kept behind a flag. See
 | `GET /v1/harness/harnesses` | Harness definitions, paged (`q` matches name/title/description). Every entry is an editable application copy |
 | `POST /v1/harness/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, agents, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }`. `agents` is the ONLY roster field and is REQUIRED beside `name`; it keeps DECLARATION order (the display/cycle order), which is presentation only. `entry` is optional, must be a member, defaults to the first name, and grants no authority. `ranks` may cover fewer members than the roster and is RESOLVED into the map the harness runs with (an omitted map = entry `'A'`, every other member `'B'`; a stated map is filled one rank below the lowest letter it names). A duplicate name, a roster over 16 members, an `entry` outside the roster, a `ranks` key outside the roster, and a bad rank letter are each a `400` naming the members. `primary`/`subagents` are not accepted at all |
 | `PATCH /v1/harness/harnesses/:name` | Change a harness definition. The EXECUTABLE fields are `agents`/`entry`/`ranks`/`agent_models`/`agent_instructions`/`agent_colors` — stating any of them rebuilds the harness's factory, so the change reaches the NEXT session, never a running one; an omitted `entry` survives whenever the patch left it a member, and an omitted `ranks` keeps the current ranks restricted to the surviving members (a member the patch added takes the filled value, so a newcomer never lands at `'A'` by accident) |
-| `DELETE /v1/harness/harnesses/:name` | Remove one — `{ deleted: true, harness_name, tombstoned, restored_by_restart: false }`; a deleted built-in stays deleted across a restart. Existing and saved sessions are untouched: each runs and restores from the definition it captured |
+| `DELETE /v1/harness/harnesses/:name` | Remove one — `{ deleted: true, harness_name, tombstoned, restored_by_restart: false }`; a deleted built-in stays deleted across a restart. `404` unknown/repeat/alias-only delete. `409` while ANY live or restored session belongs to this canonical harness, or while one of its session removals is still in flight: nothing is removed, no session is cascaded, and each owned session must be deleted individually (there is deliberately no bulk delete). After the registry write succeeds the route removes the knowledge articles attributed to this harness and flushes before the `200`; other harnesses', unowned/legacy and Storyline articles survive. A cleanup/flush failure after that commit is a `500` naming the partial outcome (the harness is already gone; a repeat DELETE is `404` and does not retry cleanup) |
 | `GET /v1/harness/harnesses/:name` | Read ONE definition — the identified read carries what a card omits (the per-agent model map, instruction text, resolved core-tool set); `404` for an unknown name |
 | `GET /v1/harness/harnesses/:name/instructions` | Which members carry an instruction override (not paged: membership is bounded by the definition) |
 | `GET /v1/harness/harnesses/:name/instructions/:agentId` | One member's effective instruction text |
@@ -3603,14 +3603,22 @@ yet still counts as executable: the map is captured by the factory closure and r
 `Agent` built from it, so a stated color must rebuild the factory rather than be stored as a
 swatch no agent carries.
 `builtin: true` still marks provenance. `DELETE /v1/harness/harnesses/:name` removes one
-and answers `{ deleted: true, harness_name, tombstoned, restored_by_restore }`:
-`tombstoned` is `true` when a SHIPPED name was removed, because its template still exists
-and a later restore can bring it back. Re-creating a name that is tombstoned answers
-`restored_by_restore: true`. With a database root
+(or tombstones a shipped name) and answers
+`{ deleted: true, harness_name, tombstoned, restored_by_restart: false }`:
+`tombstoned` is `true` when a SHIPPED name was removed, and `restored_by_restart` is always
+false because the tombstone is part of the durable document — no host restart re-ships it;
+only a new release or an explicit re-create (which clears the tombstone) brings the name back.
+The route is REFUSED with `409` while any live or restored session belongs to this canonical
+harness, or while one of its session removals is still in flight, so sessions must be deleted
+individually first (`DELETE /v1/harness/sessions/:id`; there is deliberately no bulk delete and
+no cascade). After the registry write is durable the route removes the knowledge articles
+attributed to this harness and flushes before answering; a cleanup/flush failure then answers
+`500` naming the partial outcome (the harness is already gone, and a repeat DELETE is `404`).
+With a database root
 the registry is restored from `<root>/harness/index.json` (see Persistence), and
-without one it is in memory only. Registry edits affect FUTURE sessions only,
-because a session freezes its captured preset and descriptor at creation. Both
-routes validate the request — a REQUIRED `agents` roster of known ids with no duplicates
+without one it is in memory only. `PATCH` and every other registry edit affect FUTURE sessions
+only, because a session freezes its captured preset and descriptor at creation; DELETE is not an
+edit and is guarded as above. Both routes validate the request — a REQUIRED `agents` roster of known ids with no duplicates
 (at most 16), an optional `entry` that must name a member, an optional `ranks` map whose keys
 are members and whose values are single rank letters, reserved aliases
 (`writer`/`assistant`/`researcher`) and existing names rejected, bounded
