@@ -6842,8 +6842,11 @@ gateway's `warmHarnessRuntime({ root, variables })` reads the SAME record before
 decides its configuration, so a later, structurally different configuration throws
 (`harnessBootSignature` is the comparison) rather than silently reusing the unconfigured
 runtime. `@underload/service/server.ts` therefore builds ONE `endpointVariables` object
-and hands it to both calls. The shipped gateway currently configures none, so it serves
-the zero-default harness until a host (e.g. create-storyline) supplies one.
+and hands it to both calls. The shipped gateway states the production configuration
+explicitly — `harness: { presets, plugins: BUILTIN_PLUGINS, toolbox: { sharedToolbox: true } }`
+— so it serves the eight shipped cards and registers the full shared toolbox for every
+session. A different host that omits `variables.harness` still gets the zero-default
+contract.
 
 **Worker boundary: the boot posture crosses as data, or the session is refused (B6).**
 A lane worker rebuilds its replica from the durable `HarnessPresetRecord`, which
