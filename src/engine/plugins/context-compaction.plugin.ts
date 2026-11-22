@@ -1663,8 +1663,27 @@ export const planCompactionRequest = (
     const split = full.length - tailSize;
 
     // ── Pass A: clip the head's payload, keep every entry ───────────────────────────────
+    //
+    // A LEADING `system` ENTRY IS NEVER CLIPPED (2026-11-23). Pass B and
+    // `planCompactionRetention` already refuse to DROP one — "a host that seeded one stated a
+    // standing instruction" — and clipping is strictly worse than dropping: the entry survives
+    // with 240 characters plus the marker, so the instruction is silently REPLACED rather than
+    // withheld, and the host has no way to notice. The measured case: Storyline's brief IS its
+    // system entry, so a delivery-relief pass over a Reader transcript clipped it to 267
+    // characters before Pass B ever ran, and the host's next request could no longer be
+    // attributed to its thread ("a request whose brief names no Storyline Run").
+    //
+    // The leading run is computed from the UNCLIPPED array, and only entries after it are
+    // eligible: an agent's own instruction block is the first thing in every seeded transcript,
+    // so "leading" is exactly the host's standing instruction.
+    let keepLeading = 0;
+
+    while (keepLeading < split && full[keepLeading].role === 'system') keepLeading += 1;
+
     let clipped = 0;
-    const head = full.slice(0, split).map((entry) => {
+    const head = full.slice(0, split).map((entry, index) => {
+        if (index < keepLeading) return entry;
+
         const next = clipShrinkEntry(entry, SHRINK_CLIP_CHARS);
 
         // Counted only when the rewrite actually removed characters, so "clipped: 0" means the

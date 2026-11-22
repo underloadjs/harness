@@ -835,6 +835,57 @@ describe('a spawner is relieved of the payload it just received (T6 D-3)', () =>
         ).toEqual(fedResults(parentSeen[1]));
     });
 
+    it('keeps a host-seeded leading system entry verbatim in the relieved request', async () => {
+        // THE STANDING INSTRUCTION IS NOT RELIEF. A host that seeds a `system` entry stated an
+        // instruction the model must hold on every turn — a brief, a contract, a routing rule — and
+        // relief is about the payload that just ARRIVED, never about it. The planner used to clip
+        // that entry with everything else in Pass A, which replaced the instruction with 240
+        // characters and the truncation note while leaving the request "attributable" nothing: the
+        // measured case (2026-11-23) is Storyline, whose whole brief IS its leading system entry —
+        // five Reader threads died on the request after the clip.
+        const { lead, parentSeen } = fanout(3, 7900);
+        const brief = `SEEDED BRIEF ${'b'.repeat(1_200)}`;
+        const thread = lead.createThread('lead');
+
+        // The same two entries a host briefs a conversation with: the standing instruction, then the
+        // run's own opening prompt (which IS reliefable — it is content the run owns).
+        lead.setThreadMessages(thread.id, [
+            { role: 'system', content: brief },
+            { role: 'user', content: PROMPT }
+        ]);
+
+        const result = await lead.sendThreadInput(thread.id, 'go');
+
+        expect(result.content).toBe('ALL SETTLED');
+        expect(parentSeen.length).toBe(2);
+
+        const second = entriesOf(parentSeen[1]);
+
+        // THE PIN (1): the instruction travels byte-for-byte. A clip here is not a shorter
+        // instruction, it is a DIFFERENT one, and nothing in the request says so.
+        expect(roleOf(second[0])).toBe('system');
+        expect(contentOf(second[0])).toBe(brief);
+
+        // THE PIN (2): the relief still happened around it — the oversized prompt is clipped exactly
+        // as the planner clips every non-leading entry.
+        expect(
+            second
+                .filter((message) => roleOf(message) === 'user')
+                .map(contentOf)
+                .filter((text) => text !== 'go')
+        ).toEqual([`${'P'.repeat(CLIP_PREFIX)}${TRUNCATION_NOTE}`]);
+
+        // THE PIN (3): request-only, so the durable conversation still holds the brief and the whole
+        // prompt, and no inclusion flag moved.
+        const durable = lead.threadMessages(thread.id) as unknown[];
+
+        expect(durable.filter((message) => roleOf(message) === 'system').map(contentOf)).toEqual([brief]);
+        expect(durable.filter((message) => roleOf(message) === 'user').map(contentOf)).toEqual([PROMPT, 'go']);
+        expect(durable.map((message) => (message as { included?: boolean }).included === false)).toEqual(
+            durable.map(() => false)
+        );
+    });
+
     it('sends the request byte-identical while the round stays inside the allowance', async () => {
         // The other side of the same boundary: the measurement runs, the excess is <= 0, and the
         // request that goes out IS the projection — prompt whole. Without this control the test above

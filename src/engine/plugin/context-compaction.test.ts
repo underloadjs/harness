@@ -1390,6 +1390,29 @@ describe('context-compaction shrink plan (planCompactionRequest)', () => {
         expect(plan.dropped).toBe(2);
     });
 
+    it('never CLIPS a leading system entry, even when Pass A alone meets the budget', () => {
+        // Clipping is strictly worse than dropping: the entry survives with 240 characters plus
+        // the marker, so a host's standing instruction is silently REPLACED instead of withheld
+        // and nothing in the request says it happened. The measured case (2026-11-23): a
+        // delivery-relief pass over a Reader transcript clipped Storyline's brief — the run's
+        // whole system entry — to 267 characters before Pass B ever ran, and the host could no
+        // longer attribute its own next request to the thread.
+        const SYSTEM = 's'.repeat(900);
+        const messages: HarnessMessage[] = [{ role: 'system', content: SYSTEM }, ...headOf(), ...tailOf()];
+
+        // 900 + 3,443 payload bytes → 1,086 tokens, over a 900 budget: Pass A alone answers it, so
+        // this is the rung that used to hand back the clipped instruction.
+        const plan = planCompactionRequest(messages, 900);
+
+        expect(plan.messages[0]).toEqual({ role: 'system', content: SYSTEM });
+        expect(plan.dropped).toBe(0);
+        // The three head entries behind the instruction ARE clipped, and counted as such: the
+        // exemption is the leading system run only.
+        expect(plan.clipped).toBe(3);
+        // 900 (system) + 269 + 276 + 273 (the clipped head) + 20 (tail) = 1,738 → 435 tokens.
+        expect(plan.tokens).toBe(435);
+    });
+
     it('stops at the verbatim tail rather than breaking the request it is answering', () => {
         // `keepTail` is not a suggestion: with a budget of 1 the loop removes every head entry
         // and then STOPS, because the last two entries are the turn being answered and the
