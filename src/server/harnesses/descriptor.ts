@@ -120,6 +120,26 @@ export const describeHarness = (
         ...(Object.keys(preset.agentColors ?? {}).length > 0
             ? { agentColors: { ...preset.agentColors } }
             : {}),
+        // U6: the per-agent PRESET-HISTORY map, emitted under the same non-empty rule as the
+        // three maps above — a definition that seeds nothing keeps its exact pre-U6 shape. The
+        // outer rule has ONE exception, and it is the contract's `[]`: a member keyed with an
+        // empty band is a NON-empty map ("this member seeds no history"), so that statement
+        // survives the projection instead of collapsing into "unconfigured".
+        //
+        // The copy is turn-by-turn, not a one-level spread: `{ ...map }` still shares every turn
+        // object with the shipped template constant (or the request body a registry entry was
+        // created from), and a descriptor handed to a client could then be rewritten through a
+        // reference nobody expects. Same discipline as ./harnesses/registry.ts `copyPrefixMap`.
+        ...(Object.keys(preset.agentPrefixes ?? {}).length > 0
+            ? {
+                  agentPrefixes: Object.fromEntries(
+                      Object.entries(preset.agentPrefixes ?? {}).map(([agent, turns]) => [
+                          agent,
+                          turns.map((turn) => ({ role: turn.role, content: turn.content }))
+                      ])
+                  )
+              }
+            : {}),
         builtin: preset.builtin,
         editable: preset.editable
     };

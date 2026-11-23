@@ -132,7 +132,7 @@ import type { AgentProfile } from '../../engine/agents';
 // ordering and the delegation predicate (`rankIndexOf`/`isLowerRank`) stay with the
 // kernel, which is the only place that decides who may hand work to whom.
 import { AGENT_RANKS, isAgentRank } from '../../engine/types';
-import type { AgentRank } from '../../engine/types';
+import type { AgentRank, HarnessPrefixTurn } from '../../engine/types';
 import type { HarnessPreset, HarnessPresetCreation, HarnessToolboxDefaults } from './types';
 import type { HarnessAgentRecord, HarnessPresetRecord } from '../persistence';
 import { attachDefaultAgentState, createAgentState } from './agent-state';
@@ -268,6 +268,13 @@ export type HarnessRegistration = {
     // must be a hex color (`#rgb`, `#rgba`, `#rrggbb`, `#rrggbbaa`) and keys must name
     // a member, exactly like the two maps above.
     agentColors?: Readonly<Record<string, string>>;
+    // Per-agent PRESET HISTORY (U6): agent id → that member's complete ordered band of seeded
+    // `system` / `user` / `assistant` turns. Optional, and the fourth map of the same shape:
+    // keys must name a member, and a supplied band REPLACES the whole history rather than
+    // appending to one. An EMPTY array is a value, not an omission — it states "this member
+    // starts with no preset history" — so the map is normalized key-by-key rather than by
+    // emptiness (see `normalizeAgentPrefixes`).
+    agentPrefixes?: Readonly<Record<string, readonly HarnessPrefixTurn[]>>;
 };
 
 // What a client may change on an existing harness. `name` is immutable: a rename
@@ -303,6 +310,14 @@ export type HarnessPatch = {
     // factory closure, so a stated map rebuilds the factory (see `update`) and an
     // existing session keeps the colors it was built with.
     agentColors?: Readonly<Record<string, string>>;
+    // Same REPLACE semantics as the three maps above (U6): the stated map is what the harness
+    // has afterwards, `{}` clears every band, and a band for a member this patch removed is
+    // dropped rather than rejected. An explicit `[]` on a surviving member is a valid band
+    // meaning "no preset history", which is why clearing ONE member's history keeps its key.
+    // A prefix change is EXECUTABLE in the same sense a color change is: the map is captured by
+    // the factory closure, so a stated map rebuilds the factory and an existing session keeps
+    // the history it was seeded with.
+    agentPrefixes?: Readonly<Record<string, readonly HarnessPrefixTurn[]>>;
 };
 
 // A synchronous capture of everything a registry mutation can change: the entries
@@ -826,6 +841,151 @@ export const normalizeAgentColors = (
     return resolved;
 };
 
+// THE PRESET-HISTORY BOUNDS (U6). Stated once here because a band crosses four layers — the
+// wire request, the durable registry/session record, the factory closure, and the engine's
+// seeded transcript — and every one of them needs the same answer to "how big is too big".
+// 64 turns per member matches the roster-sized arrays the contract already bounds
+// (`agent_prefixes` maxItems, `SessionPrefixTurnsResponse.prefix`), and 32 000 characters per
+// turn is the spec's own `HarnessPrefixTurn.content` ceiling — deliberately larger than an
+// instruction's 8 000, because a band is many short transcript entries rather than one prompt.
+const MAX_PREFIX_TURNS = 64;
+const MAX_PREFIX_TURN_CHARS = 32_000;
+
+// THE ONE ROLE SET a preset history admits. It is the contract's `HarnessPrefixTurn.role` enum
+// spelled as a value, and it deliberately excludes `tool`/`toolResult`: a tool turn is the
+// record of a call that actually ran, so a preset that seeded one would promise the model an
+// exchange whose tool execution never happened (the engine refuses the same roles on
+// construction and on `setAgentPrefix`, see ../../engine/core/agent.ts).
+const PREFIX_TURN_ROLES: readonly string[] = ['system', 'user', 'assistant'];
+
+// Validate one band and return DETACHED text-only turns (U6).
+//
+// `path` names the field in a message (`agentPrefixes.writer` on a definition, `prefix` on a
+// session request) so every refusal points at the exact element a client sent; `member` is the
+// agent the band belongs to, used only for that label.
+//
+// WHY THIS COPIES rather than passing the input through: a wire value arrives as untyped JSON
+// and the band is captured by a FACTORY CLOSURE that runs on every session build for the life
+// of a registry entry. Holding the caller's array (and its objects) would let a later mutation
+// of a parsed request body rewrite what a saved definition seeds, so each turn becomes a fresh
+// `{ role, content }` and the array becomes a plain one. This is also the single place the
+// "only a role and its text" rule is enforced: `toolCalls`, `attachments`, `id`, and an unknown
+// key are dropped or refused here, so nothing below this function has to re-check them.
+export const requirePrefixTurns = (value: unknown, path: string, member = ''): HarnessPrefixTurn[] => {
+    const label = member.length === 0 ? `\`${path}\`` : `\`${path}.${member}\``;
+
+    if (!Array.isArray(value)) {
+        throw new HarnessRegistryError(
+            400,
+            `${label} must be an ARRAY of preset-history turns ({ role, content }).`
+        );
+    }
+
+    if (value.length > MAX_PREFIX_TURNS) {
+        throw new HarnessRegistryError(
+            400,
+            `${label} cannot hold more than ${MAX_PREFIX_TURNS} turns. Received ${value.length}.`
+        );
+    }
+
+    return value.map((entry, index) => {
+        const at = `${label}[${String(index)}]`;
+
+        if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+            throw new HarnessRegistryError(
+                400,
+                `${at} must be an object with a "role" and a "content" string.`
+            );
+        }
+
+        const turn = entry as Record<string, unknown>;
+
+        // The role check is deliberately an ALLOW-list rather than "not a tool role": an
+        // unknown role string is a typo the client should see, and the engine would refuse it
+        // at construction anyway.
+        if (typeof turn.role !== 'string' || !PREFIX_TURN_ROLES.includes(turn.role)) {
+            throw new HarnessRegistryError(
+                400,
+                `${at} has role ${JSON.stringify(turn.role)}. A preset history turn is "system", "user", or "assistant" — a tool turn belongs to a conversation, not to a preset.`
+            );
+        }
+
+        // Content is VERBATIM: no trim, because the bytes a client saved are the bytes the
+        // model reads. An empty string is a real transcript entry and stays legal; a non-string
+        // (a content-block array, a number, null) is refused, because narrowing content to text
+        // is what keeps one band shape across every layer that stores it.
+        if (typeof turn.content !== 'string') {
+            throw new HarnessRegistryError(
+                400,
+                `${at} needs a string "content". Received ${JSON.stringify(turn.content)}.`
+            );
+        }
+
+        if (turn.content.length > MAX_PREFIX_TURN_CHARS) {
+            throw new HarnessRegistryError(
+                400,
+                `${at} content cannot exceed ${MAX_PREFIX_TURN_CHARS} characters.`
+            );
+        }
+
+        return { role: turn.role as HarnessPrefixTurn['role'], content: turn.content };
+    });
+};
+
+// Validate a per-agent preset-history map against the FINAL member set (U6).
+//
+// The fourth map of the same shape, and it follows the same all-or-nothing key-membership rule
+// as `normalizeAgentModels`/`normalizeAgentInstructions`/`normalizeAgentColors`: a band for an
+// agent this harness does not select can never be seeded, so it is a visible 400 rather than a
+// stored no-op.
+//
+// THE ONE DIFFERENCE, and the reason this function does not just map values: an EMPTY array is a
+// meaningful band ("this member seeds no history"), so an empty VALUE must not be treated as an
+// empty MAP. `{ writer: [] }` therefore keeps its key — the read echoes the client's own choice
+// back — while `{}` still clears every band.
+export const normalizeAgentPrefixes = (
+    value: unknown,
+    members: readonly string[]
+): Record<string, HarnessPrefixTurn[]> => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        throw new HarnessRegistryError(
+            400,
+            '`agentPrefixes` must be an object mapping agent ids to arrays of preset-history turns.'
+        );
+    }
+
+    const resolved: Record<string, HarnessPrefixTurn[]> = {};
+
+    for (const [agent, turns] of Object.entries(value as Record<string, unknown>)) {
+        if (!members.includes(agent)) {
+            throw new HarnessRegistryError(
+                400,
+                `\`agentPrefixes\` names "${agent}", which is not a member of this harness. Members: ${members.join(', ')}.`
+            );
+        }
+
+        resolved[agent] = requirePrefixTurns(turns, 'agentPrefixes', agent);
+    }
+
+    return resolved;
+};
+
+// Detached copy of a preset-history map (U6). Every caller that stores one — a registry entry
+// copied out of a template, a durable record, a factory closure — needs this instead of a
+// one-level spread, because a band is an ARRAY OF OBJECTS: `{ ...map }` still shares each turn
+// with the object it came from, and a saved definition whose turns alias a request body (or a
+// shipped template constant) can be rewritten through a reference nobody expects. Turns become
+// fresh text-only objects, so what a registry holds can never change underneath it.
+const copyPrefixMap = (
+    map: Readonly<Record<string, readonly HarnessPrefixTurn[]>>
+): Record<string, HarnessPrefixTurn[]> =>
+    Object.fromEntries(
+        Object.entries(map).map(([agent, turns]) => [
+            agent,
+            turns.map((turn) => ({ role: turn.role, content: turn.content })),
+        ])
+    );
+
 // Copy one template into an independent registry entry. Arrays and the model map
 // are copied so nothing a registry (or a caller holding list()[i]) does can reach
 // the shipped module constants. The factory is shared: it is immutable (a closure
@@ -850,6 +1010,12 @@ const copyTemplate = (preset: HarnessPreset): HarnessPreset => ({
         ? {}
         : { agentInstructions: { ...preset.agentInstructions } }),
     ...(preset.agentColors === undefined ? {} : { agentColors: { ...preset.agentColors } }),
+    // U6: copied DEEPLY, not with a one-level spread — a band is an array of objects, and a
+    // registry entry that shared its turns with the shipped template constant (or with a parsed
+    // request body) could have one rewritten through a reference nobody owns.
+    ...(preset.agentPrefixes === undefined
+        ? {}
+        : { agentPrefixes: copyPrefixMap(preset.agentPrefixes) }),
     // R7: a session template's invented agents are copied like the three maps above, so a
     // registry entry (or an injected preset) that carries them never shares one mutable object
     // with the caller. Harness DEFINITIONS declare none — the create/PATCH surface has no field
@@ -906,6 +1072,11 @@ const liveFactory = (
     agentInstructions: Readonly<Record<string, string>> = {},
     agentColors: Readonly<Record<string, string>> = {},
     customAgents: Readonly<Record<string, string>> = {},
+    // THE PRESET HISTORY MAP (U6). Another agent map, captured by the rebuilt closure like the
+    // four above, so an executable PATCH or a restored record rebuilds a factory that seeds the
+    // SAME history the card states. It is inserted before `toolbox`, which is the argument
+    // order `createProfiledHarness` now takes.
+    agentPrefixes: Readonly<Record<string, readonly HarnessPrefixTurn[]>> = {},
     // THE REGISTRY'S CREATION DEFAULTS (R-boot). Captured by the new closure, exactly like
     // the maps above: a harness created (or a saved row rebuilt) by this registry keeps the
     // deployment's toolbox posture and extra sources. Absent = the historical shared
@@ -928,6 +1099,7 @@ const liveFactory = (
             agentInstructions,
             agentColors,
             customAgents,
+            agentPrefixes,
             resolvedToolbox
         );
     }
@@ -945,7 +1117,8 @@ const liveFactory = (
                     agentModels,
                     agentInstructions,
                     agentColors,
-                    customAgents
+                    customAgents,
+                    agentPrefixes
                 ),
                 entry,
                 ranks: { ...ranks },
@@ -1069,6 +1242,14 @@ export const presetToRecord = (preset: HarnessPreset): HarnessPresetRecord => ({
     ...(preset.customAgents === undefined || Object.keys(preset.customAgents).length === 0
         ? {}
         : { customAgents: { ...preset.customAgents } }),
+    // U6: the preset-history map, with the same absent/empty equivalence on the OUTER map — a
+    // harness that seeds no history writes no field, so every document saved before U6 stays
+    // byte-identical. Note which emptiness is the test: `{ writer: [] }` is a statement a client
+    // made ("no history for writer") and is written out WITH its key, because a band the
+    // operator chose to clear has to come back the way it went in.
+    ...(preset.agentPrefixes === undefined || Object.keys(preset.agentPrefixes).length === 0
+        ? {}
+        : { agentPrefixes: copyPrefixMap(preset.agentPrefixes) }),
     builtin: preset.builtin,
     editable: preset.editable,
     ...(preset.template === undefined ? {} : { template: preset.template }),
@@ -1116,6 +1297,15 @@ const presetToRecordShape = (record: HarnessPresetRecord): HarnessPresetRecord =
     ...(record.customAgents === undefined || Object.keys(record.customAgents).length === 0
         ? {}
         : { customAgents: { ...record.customAgents } }),
+    // U6: part of the fixed key order like the maps above. Two consequences matter: a saved row
+    // that carries a band compares EQUAL to the entry rebuilt from it (so a restore is not
+    // pinned by key order), and a frozen session whose record names a band the current entry no
+    // longer holds compares UNEQUAL — which is the outcome that routes the restore through
+    // `presetFromRecord` and rebuilds a factory that seeds the saved history instead of replaying
+    // one that would seed something else.
+    ...(record.agentPrefixes === undefined || Object.keys(record.agentPrefixes).length === 0
+        ? {}
+        : { agentPrefixes: copyPrefixMap(record.agentPrefixes) }),
     builtin: record.builtin,
     editable: record.editable,
     ...(record.template === undefined ? {} : { template: record.template }),
@@ -1209,7 +1399,12 @@ const assertFallbackMatchesRecord = (record: HarnessPresetRecord, fallback: Harn
         // sense — an injected factory has no way to build a brain the catalogue does not
         // know about, so a record that names one while the factory's preset does not would
         // silently restore a team missing that member.
-        JSON.stringify(current.customAgents ?? {}) !== JSON.stringify(record.customAgents ?? {})
+        JSON.stringify(current.customAgents ?? {}) !== JSON.stringify(record.customAgents ?? {}) ||
+        // U6: a saved band is part of the executable definition exactly like a saved instruction —
+        // it is transcript the next session's agents are seeded with — so a host factory that no
+        // longer seeds the same history is a DIFFERENT harness, and replaying a saved transcript
+        // through it would silently change what the model reads.
+        JSON.stringify(current.agentPrefixes ?? {}) !== JSON.stringify(record.agentPrefixes ?? {})
     ) {
         throw new Error(
             `Harness "${record.name}" changed incompatibly while its session was saved; the frozen definition cannot be rebuilt.`
@@ -1275,6 +1470,10 @@ export const presetFromRecord = (
             record.agentInstructions ?? {},
             record.agentColors ?? {},
             record.customAgents ?? {},
+            // U6: the saved bands go back into the same closure the roster is built from, so a
+            // rebuilt factory seeds the history the record states rather than the one the current
+            // registry entry happens to hold.
+            record.agentPrefixes ?? {},
             toolbox
         );
         resultCreation = profiledCreation(toolbox);
@@ -1293,6 +1492,7 @@ export const presetFromRecord = (
             record.agentInstructions ?? {},
             record.agentColors ?? {},
             record.customAgents ?? {},
+            record.agentPrefixes ?? {},
             toolbox
         );
         resultCreation = profiledCreation(toolbox);
@@ -1335,6 +1535,13 @@ export const presetFromRecord = (
         // lose the member. Absent stays absent, so a pre-R7 record produces a preset with no
         // key at all — the exact shape it had before this field existed.
         ...(record.customAgents === undefined ? {} : { customAgents: { ...record.customAgents } }),
+        // U6: absent stays absent, so a record saved before preset history exists rebuilds a
+        // preset with no key at all — the exact shape it had before this field. A record that
+        // DOES carry bands rebuilds with them, which is what keeps the rebuilt card, the rebuilt
+        // factory, and the session's frozen transcript stating the same history.
+        ...(record.agentPrefixes === undefined
+            ? {}
+            : { agentPrefixes: copyPrefixMap(record.agentPrefixes) }),
         builtin: record.builtin,
         editable: true,
         ...(record.template === undefined ? {} : { template: record.template }),
@@ -1404,6 +1611,10 @@ export const isLegacyShippedDefinition = (
         // drop the row's map (the refresh replays prose only), so an operator who colored
         // one member of a built-in keeps that decision instead of losing it to an upgrade.
         Object.keys(record.agentColors ?? {}).length === 0 &&
+        // U6: so is a saved preset history. No shipped template seeds one, and a row that
+        // states a band — even an empty one — records an executable decision about what the
+        // next session's transcript starts with, so it is replayed rather than refreshed.
+        Object.keys(record.agentPrefixes ?? {}).length === 0 &&
         // R7: and so is a saved session-defined agent (a registry row never has one, so this
         // only ever fires on a document a foreign writer produced — where dropping the custom
         // roster on a prose refresh would be a silent roster change).
@@ -1752,6 +1963,16 @@ export const createHarnessRegistry = (
                 ? {}
                 : normalizeAgentColors(registration.agentColors, agents);
 
+        // Preset history (U6) is validated against the same final member set for the same
+        // reason: a band for an unselected agent could never be seeded. Note the asymmetry this
+        // creates with the three maps above — an EMPTY band is a value, so `agentPrefixes: { x:
+        // [] }` is a stored key, not an empty map, and a definition that clears one member keeps
+        // stating that member (see `normalizeAgentPrefixes`).
+        const agentPrefixes =
+            registration.agentPrefixes === undefined
+                ? {}
+                : normalizeAgentPrefixes(registration.agentPrefixes, agents);
+
         // THE CARD'S TOOL DECLARATION, DERIVED FROM THE FACTORY'S OWN POSTURE (R-boot).
         // `declaredToolboxNames` is the same authority `createToolboxHarness` uses, so a
         // registry booted with the zero-toolbox floor creates a card advertising NO
@@ -1806,6 +2027,11 @@ export const createHarnessRegistry = (
             // R2: same absent-vs-empty equivalence, and captured by the same factory
             // closure, so an existing session keeps the colors its agents were built with.
             agentColors,
+            // U6: stored like the maps above, with one difference worth stating — an EMPTY band a
+            // client supplied keeps its key (`{ writer: [] }`), because "this member seeds no
+            // history" is a choice the read must echo back rather than a key to drop. Only an
+            // entirely empty MAP is equivalent to absence.
+            agentPrefixes,
             builtin: false,
             editable: true,
             // A created harness is a live profiled harness; later PATCHes treat
@@ -1827,6 +2053,9 @@ export const createHarnessRegistry = (
                 agentInstructions,
                 agentColors,
                 {},
+                // U6: the created card's factory seeds the bands the request stated, captured in
+                // the same closure as the models, instructions, and colors.
+                agentPrefixes,
                 profileToolbox
             )
         };
@@ -1975,6 +2204,21 @@ export const createHarnessRegistry = (
                 ? retainedColors
                 : normalizeAgentColors(patch.agentColors, agents);
 
+        // Preset history (U6) follows the identical drop-or-replace rule, with the one
+        // asymmetry `normalizeAgentPrefixes` documents: an empty BAND survives as a key
+        // (`{ x: [] }` means "no history for x"), while an empty MAP clears every band. Both
+        // are the client's stated choice, so neither is collapsed away here.
+        const retainedPrefixes = Object.fromEntries(
+            Object.entries(current.agentPrefixes ?? {}).filter(([agent]) =>
+                agents.includes(agent)
+            )
+        );
+
+        const agentPrefixes =
+            patch.agentPrefixes === undefined
+                ? retainedPrefixes
+                : normalizeAgentPrefixes(patch.agentPrefixes, agents);
+
         // R20.1 template handling. A metadata-only patch keeps the exact factory
         // the entry already captured (demo's script, flaky's testFlaky, a live
         // closure). An executable patch rebuilds from the template:
@@ -2001,7 +2245,11 @@ export const createHarnessRegistry = (
             // it, so a stated color must rebuild the factory (and, on the scripted demo,
             // upgrade it to a live harness exactly like an instruction edit does). Keeping
             // it metadata-only would store a swatch that no agent ever carries.
-            patch.agentColors !== undefined;
+            patch.agentColors !== undefined ||
+            // U6: a preset band is executable for the same reason and then some — it is not
+            // display data, it is transcript the next session's agents are seeded with, so a
+            // stated map must rebuild the factory or the new band would never run.
+            patch.agentPrefixes !== undefined;
 
         const upgradedScripted = executable && template === 'scripted';
 
@@ -2043,6 +2291,10 @@ export const createHarnessRegistry = (
                   agentInstructions,
                   agentColors,
                   {},
+                  // U6: the rebuilt factory seeds the bands this patch stated (or the retained
+                  // ones it did not touch) — passing nothing here would silently drop every
+                  // preset history the card had.
+                  agentPrefixes,
                   rebuildToolbox
               )
             : current.create;
@@ -2082,6 +2334,10 @@ export const createHarnessRegistry = (
             // R2: same explicit statement — `{}` from a patch means "no colors", which
             // `...current` would not produce on its own.
             agentColors,
+            // U6: same explicit statement, and the same reason — `{}` from a patch means "no
+            // bands at all", and a patch naming one member with `[]` must land as that exact
+            // map. `...current` would keep the old key either way.
+            agentPrefixes,
             ...(downgradedFlaky
                 ? {
                       tools: [...rebuiltDeclaration.tools],

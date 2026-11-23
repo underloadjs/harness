@@ -1689,6 +1689,32 @@ export const harnessDefinitionOf = (
     // internal model, `agent_colors` on the wire); a member it omits is uncolored and
     // the host applies its own derivation.
     ...(Object.keys(preset.agentColors ?? {}).length === 0 ? {} : { agent_colors: { ...preset.agentColors } }),
+    // U6 + F2: the per-agent PRESET-HISTORY bands this definition seeds (`agent_prefixes` on the
+    // wire, `HarnessPreset.agentPrefixes` in the domain model). This field is the ONE map that is
+    // ALWAYS stated by the identified read, `{}` included, and the reason is capability
+    // negotiation rather than data: the harness PATCH REPLACES `agent_prefixes` and a present `{}`
+    // is the explicit clear of every stored band, so a client may only send the map it has SEEN.
+    // A pre-U6 backend answers this route 200 with no such property, and a client that read "the
+    // GET worked" as "prefixes exist" would then show an editor whose save is a 400 ("Unknown field
+    // agent_prefixes"). Presence is therefore the flag: ABSENT = a server with no preset editor,
+    // `{}` = a server whose editor exists and seeds nothing. That negotiation only holds while an
+    // empty map really is emitted, which is why the two text maps keep their non-empty omission
+    // rule above (restating an empty TEXT map costs a client nothing) and the durable record keeps
+    // the non-empty rule too (./harnesses/descriptor.ts `describeHarness` — a pre-U6 registry row
+    // stays byte-identical through a restart round trip).
+    //
+    // A member keyed with `[]` still makes the map NON-empty (the contract's "this member seeds no
+    // history"), so an explicit clear is echoed back rather than collapsing into "unconfigured".
+    // The copy is turn-by-turn for the same reason ./harnesses/descriptor.ts projects a deep copy:
+    // a band is an array of objects, and a response must not hand out the registry's own turn
+    // references. A LIST card omits the field entirely (`harnessCardOf` is the card, and this read
+    // is its only publisher), so the card row keeps its pre-U6 shape.
+    agent_prefixes: Object.fromEntries(
+        Object.entries(preset.agentPrefixes ?? {}).map(([agent, turns]) => [
+            agent,
+            turns.map((turn) => ({ role: turn.role, content: turn.content }))
+        ])
+    ),
     instruction_summary: summary
 });
 
@@ -1874,10 +1900,13 @@ export const agentProfileOf = (
  * The frozen definition copy one session runs, with its source/current bookkeeping.
  *
  * The per-agent override maps it emits are the FROZEN ones, read off `record.definition`
- * (the `HarnessDescriptor` captured at creation): `agent_models` (R9) and `agent_colors`
- * (R2) appear only when the definition actually configured something, which is the same
- * non-empty rule `harnessDefinitionOf` and `describeHarness` follow. That is what lets the
- * saved-session UI paint the swatches this conversation was built with, rather than whatever
+ * (the `HarnessDescriptor` captured at creation): `agent_models` (R9), `agent_colors`
+ * (R2) and `agent_prefixes` (U6/F1) appear only when the definition actually configured
+ * something — the same non-empty rule `describeHarness` follows, and (unlike
+ * `harnessDefinitionOf`, which states `agent_prefixes` even when it is empty to advertise the
+ * template capability) the rule the SESSION read keeps, because a session client negotiates the
+ * prefix feature from its own route instead. That is what lets the saved-session UI paint the
+ * swatches and the seeded history this conversation was built with, rather than whatever
  * the live registry entry says after a later recolor.
  */
 export const sessionDefinitionOf = (
@@ -1927,6 +1956,36 @@ export const sessionDefinitionOf = (
         ...(definition.agentColors === undefined || Object.keys(definition.agentColors).length === 0
             ? {}
             : { agent_colors: { ...definition.agentColors } }),
+        // U6/F1: the frozen definition's per-agent PRESET-HISTORY bands, so a saved-session UI can
+        // show the history this conversation actually seeds and the preset editor can paint its
+        // rows from the same bytes the factory re-seeds. `record.definition.agentPrefixes` is the
+        // copy the registry wrote at creation (./harnesses/descriptor.ts `describeHarness`), and no
+        // session write touches it — a band this conversation re-wrote lives in
+        // `record.preset.agentPrefixes`, which is what `GET …/agents/{id}/prefix` reads.
+        //
+        // THE PRESENCE RULE DIFFERS FROM THE IDENTIFIED HARNESS READ ON PURPOSE. `api-reads.ts
+        // harnessDefinitionOf` above always states `agent_prefixes` (`{}` included) because a
+        // template client negotiates the capability from that property. A session client does not
+        // need the property to answer the question: the session half of the feature is a ROUTE
+        // (`GET /sessions/{id}/agents/{agentId}/prefix`), and a pre-U6 backend answers THAT with a
+        // 404/405, which is what every session client already treats as "no preset editor". So the
+        // map keeps the non-empty omission rule `agent_models`/`agent_colors` use here — with the
+        // contract's one exception, a member keyed `[]` makes the map NON-empty and is echoed — and
+        // a session frozen on a definition that seeds nothing keeps the exact pre-U6 wire row
+        // (additive-compatible: an old client never sees a key it does not understand).
+        ...(definition.agentPrefixes === undefined || Object.keys(definition.agentPrefixes).length === 0
+            ? {}
+            : {
+                  // Turn-by-turn copy, same discipline as `harnessDefinitionOf`: the frozen
+                  // descriptor is the durable authority for this session, and a response must not
+                  // hand out its turn objects for a caller to rewrite.
+                  agent_prefixes: Object.fromEntries(
+                      Object.entries(definition.agentPrefixes).map(([agent, turns]) => [
+                          agent,
+                          turns.map((turn) => ({ role: turn.role, content: turn.content }))
+                      ])
+                  )
+              }),
         ...(definition.agentInstructions === undefined && !definesCustomAgent
             ? {}
             : {

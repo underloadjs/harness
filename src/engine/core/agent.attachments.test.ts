@@ -172,6 +172,34 @@ describe('agent user attachments', () => {
         expect(seed).toEqual(before);
     });
 
+    it('validates and copies attachments seeded through configuration.prefix', () => {
+        // `prefix` (preset agentic history) feeds the SAME seed loop as
+        // `configuration.messages`, so the user-media branch of that loop validates
+        // and detaches a prefix attachment with the identical rules and the identical
+        // failure: a bad prefix is a construction error, never a transport payload.
+        const brain = agent({
+            model: 'm',
+            stream: fakeStream([]),
+            prefix: [
+                { role: 'system', content: 'Recalled scene.' },
+                { role: 'user', content: 'seed [Image 1]', attachments: [image()] }
+            ]
+        });
+
+        expect(withoutIds(brain.messages)).toEqual([
+            { role: 'system', content: 'Recalled scene.' },
+            { role: 'user', content: 'seed [Image 1]', attachments: [expectedAttachment] }
+        ]);
+
+        expect(() =>
+            agent({
+                model: 'm',
+                stream: fakeStream([]),
+                prefix: [{ role: 'user', content: 'bad', attachments: [image({ size: 99 })] }]
+            })
+        ).toThrow('attachments[0].size is 99, but its data decodes to 12 bytes.');
+    });
+
     it('keeps the committed transcript when reset revalidation fails', () => {
         // The caller owns `configuration.messages`; mutating it after
         // construction is the documented way a later reset can see a bad seed.

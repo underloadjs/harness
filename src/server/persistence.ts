@@ -173,7 +173,7 @@ import type {
 // document carries rank letters, so this store validates them with the SAME predicate
 // the kernel and the registry use rather than re-spelling the letter set here.
 import { isAgentRank } from '../engine/types';
-import type { AgentRank } from '../engine/types';
+import type { AgentRank, HarnessPrefixTurn } from '../engine/types';
 // THE SNAPSHOT VERSION GATE (`requireCoreSnapshotVersion` below). This value is IMPORTED
 // rather than re-spelled — unlike `HARNESS_THREAD_ID_PATTERN` further down, which copies a
 // grammar: a copied letter set only has to keep up with a grammar, while a copied VERSION
@@ -317,6 +317,21 @@ export type HarnessPresetRecord = {
     // custom-agent input — so in practice it appears only inside a saved session's own
     // `preset` copy (see ./sessions.ts `applyBindingMaps`).
     customAgents?: Record<string, string>;
+    // PER-AGENT PRESET HISTORY (U6): agent id → that member's complete ordered band of seeded
+    // `system` / `user` / `assistant` turns. Optional and additive: a document without the field
+    // restores exactly as before, with no `agentPrefixes` key at all, so every registry row and
+    // every frozen session saved before U6 comes back byte-identically.
+    //
+    // It is EXECUTABLE state in the same sense the four maps above are: the factory closure
+    // captures the map and `agentsFromProfiles` hands it to `agent({ prefix })`, so
+    // `presetFromRecord` needs it to rebuild the harness the row described — a band that did not
+    // survive the restart would silently change the transcript the model reads on turn one.
+    //
+    // One shape difference the reader has to honour: a band is an ARRAY OF OBJECTS, not text, so
+    // it gets its own validator (`readPrefixMap`) rather than `readStringMap`, and an EMPTY band
+    // keeps its key — `{ writer: [] }` is the statement "this member seeds no history", which is
+    // a decision the document must be able to make.
+    agentPrefixes?: Record<string, HarnessPrefixTurn[]>;
     builtin: boolean;
     editable: boolean;
     template?: 'live' | 'scripted' | 'flaky';
@@ -830,6 +845,17 @@ const readDescriptor = (value: unknown, label: string): HarnessDescriptor => {
     const agentColors =
         record.agentColors === undefined ? undefined : readStringMap(record.agentColors, `${label}.agentColors`);
 
+    // U6: the preset-history bands this session's FROZEN definition seeds. Same optional,
+    // additive field it is on a registry row: a definition saved before U6 restores with no
+    // `agentPrefixes` key at all, and one that seeds bands comes back turn-for-turn. This copy is
+    // what a `null` prefix patch restores from (./sessions.ts `setSessionAgentPrefix`), so a
+    // restart has to be able to answer that question — losing the field here would make the
+    // restore silently mean "no history" instead.
+    const agentPrefixes =
+        record.agentPrefixes === undefined
+            ? undefined
+            : readPrefixMap(record.agentPrefixes, `${label}.agentPrefixes`);
+
     return {
         name: requireString(record.name, `${label}.name`),
         title: requireString(record.title, `${label}.title`),
@@ -847,6 +873,8 @@ const readDescriptor = (value: unknown, label: string): HarnessDescriptor => {
         ...(agentModels === undefined ? {} : { agentModels }),
         ...(agentInstructions === undefined ? {} : { agentInstructions }),
         ...(agentColors === undefined ? {} : { agentColors }),
+        // U6: absent stays absent, so a pre-U6 frozen definition round-trips byte-identically.
+        ...(agentPrefixes === undefined ? {} : { agentPrefixes }),
         builtin: requireBoolean(record.builtin, `${label}.builtin`),
         editable: requireBoolean(record.editable, `${label}.editable`)
     };
@@ -951,6 +979,16 @@ const readPresetRecord = (value: unknown, label: string): HarnessPresetRecord =>
     const customAgents =
         record.customAgents === undefined ? undefined : readStringMap(record.customAgents, `${label}.customAgents`);
 
+    // U6: a saved preset-history map is executable state exactly like the four text maps — the
+    // factory closure captures it, and `presetFromRecord` has to hand it back or the rebuilt
+    // harness seeds a different transcript than the one the row describes. Optional and additive:
+    // a document without the field restores with no `agentPrefixes` key, so every row and every
+    // frozen session saved before U6 comes back byte-identically.
+    const agentPrefixes =
+        record.agentPrefixes === undefined
+            ? undefined
+            : readPrefixMap(record.agentPrefixes, `${label}.agentPrefixes`);
+
     return {
         name: requireString(record.name, `${label}.name`),
         title: requireString(record.title, `${label}.title`),
@@ -971,6 +1009,7 @@ const readPresetRecord = (value: unknown, label: string): HarnessPresetRecord =>
         ...(agentInstructions === undefined ? {} : { agentInstructions }),
         ...(agentColors === undefined ? {} : { agentColors }),
         ...(customAgents === undefined ? {} : { customAgents }),
+        ...(agentPrefixes === undefined ? {} : { agentPrefixes }),
         builtin: requireBoolean(record.builtin, `${label}.builtin`),
         editable: requireBoolean(record.editable, `${label}.editable`),
         ...(template === undefined ? {} : { template }),
@@ -1263,6 +1302,53 @@ const readStringMap = (value: unknown, label: string): Record<string, string> =>
 
     for (const [key, entry] of Object.entries(record)) {
         mapped[key] = requireString(entry, `${label}.${key}`);
+    }
+
+    return mapped;
+};
+
+// THE PRESET-HISTORY ROLES (U6), spelled as a value so the loader refuses exactly the roles the
+// rest of the stack refuses: `system` / `user` / `assistant`, and never a tool role. This is the
+// same allow-list `./harnesses/registry.ts` applies when a band is AUTHORED and the same set the
+// engine admits on construction and on `setAgentPrefix`; a document that names anything else was
+// written by a build whose vocabulary this one cannot replay.
+const PERSISTED_PREFIX_ROLES: readonly string[] = ['system', 'user', 'assistant'];
+
+// Optional `{ agentId: [{ role, content }] }` map (U6, the preset-history band of a saved
+// preset). The shape `readStringMap` cannot express, because the value is an ARRAY OF OBJECTS.
+//
+// WHAT THE LOADER REFUSES, and why each choice is the honest one for a durable document:
+//   - a non-array band, a non-object turn, a role outside the three text roles, or a `content`
+//     that is not a string — a corrupt row is a LOAD failure like every other broken field
+//     here, never a silent repair, because a band is transcript the model reads on turn one;
+//   - an EXTRA turn field (`toolCalls`, `attachments`, `id`) — dropped rather than refused, and
+//     never carried forward: the stored contract is text-only, and a document a human or an
+//     older writer enriched must still restore as the bytes the engine seeds;
+//   - an EMPTY band — kept as a key. `{ writer: [] }` states "this member seeds no history",
+//     which is a decision, and dropping it would turn an explicit clear back into an omission.
+const readPrefixMap = (value: unknown, label: string): Record<string, HarnessPrefixTurn[]> => {
+    const record = requireRecord(value, label);
+    const mapped: Record<string, HarnessPrefixTurn[]> = {};
+
+    for (const [key, entry] of Object.entries(record)) {
+        const itemLabel = `${label}.${key}`;
+
+        if (!Array.isArray(entry)) {
+            throw new TypeError(`${itemLabel} must be an ARRAY of preset-history turns.`);
+        }
+
+        mapped[key] = entry.map((item, index) => {
+            const at = `${itemLabel}[${String(index)}]`;
+            const turn = requireRecord(item, at);
+
+            if (typeof turn.role !== 'string' || !PERSISTED_PREFIX_ROLES.includes(turn.role)) {
+                throw new TypeError(
+                    `${at}.role must be "system", "user", or "assistant". Received ${JSON.stringify(turn.role)}.`
+                );
+            }
+
+            return { role: turn.role as HarnessPrefixTurn['role'], content: requireString(turn.content, `${at}.content`) };
+        });
     }
 
     return mapped;

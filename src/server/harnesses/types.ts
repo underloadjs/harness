@@ -23,7 +23,7 @@ import type {
 // plus a RANK MAP (authority). `AgentRank` is the A–Z letter union owned by
 // ../types/index.ts (`AgentRank` / `AGENT_RANKS` / `rankIndexOf` / `isLowerRank`);
 // this layer only stores and projects it, never re-derives the ordering.
-import type { AgentRank } from '../../engine/types';
+import type { AgentRank, HarnessPrefixTurn } from '../../engine/types';
 
 // The provider settings a caller can change per session.
 //
@@ -355,6 +355,28 @@ export type HarnessPreset = {
     // derivation; the value is validated against the hex shape at both the registry
     // edge and `agent()` construction, so a stored color is always paintable.
     agentColors?: Readonly<Record<string, string>>;
+    // PER-AGENT PRESET HISTORY (U6): agent id → that member's complete ordered band of seeded
+    // `system` / `user` / `assistant` turns, placed after the instruction block and before any
+    // conversation. Same replace/key-membership/capture rules as the three maps above — the
+    // factory closure holds it, so a later PATCH changes only what a NEW session seeds.
+    //
+    // WHY IT IS A MAP OF ARRAYS and still lives on the definition read: an instruction is one
+    // unbounded string per member, which is why its text is a named subresource; a band is a
+    // bounded array over a bounded roster, so the identified read inlines it (`agent_prefixes`)
+    // and no definition subresource exists.
+    //
+    // `[]` is a DISTINCT, meaningful value here — "this member seeds no history" — and the map
+    // keeps the key for it, so a client that cleared one band reads its own choice back rather
+    // than a dropped key. Absent member means the same thing structurally at this layer (no
+    // profile supplies a band), which is why the difference only becomes observable on a SESSION
+    // override, where `[]` suppresses a band the frozen definition would otherwise seed.
+    //
+    // Turn shape is `HarnessPrefixTurn` (../../engine/types), the same closed three-role union the
+    // wire and the session override use, so a stored band, a wire band, and the engine's seeded
+    // band are one vocabulary. ./registry.ts validates and normalizes at the edge
+    // (`normalizeAgentPrefixes`); `agentsFromProfiles` then hands the band to `agent({ prefix })`,
+    // which is where the engine places it.
+    agentPrefixes?: Readonly<Record<string, HarnessPrefixTurn[]>>;
     // SESSION-DEFINED agents (R7): agent id → the BASE instruction that agent runs. Absent /
     // empty means "this template declares no custom agent", which is every harness DEFINITION
     // and every session saved before R7.

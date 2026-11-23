@@ -1209,7 +1209,15 @@ const brain = agent({ model, instruction, provider });   // name optional
 ```
 
 - `instruction` accepts a string or an array; each entry becomes its own system
-  message, in order. Seed `messages` follow the instructions.
+  message, in order. Seed `messages` follow the instructions, and `prefix` (preset
+  agentic history — `system | user | assistant` turns only) sits between them:
+  every instruction, then `prefix`, then `messages`, then the conversation. A `tool`
+  role is refused by the TYPE, not by a runtime rule, because an unpaired result
+  would reach a provider as an invalid request. `prefix` gets the same hygiene as
+  `messages` (one seed loop: `included` normalization, detached copy, attachment
+  validation, runtime id minting), reseeds on `reset()`, and a new host thread reseeds
+  it — a fork does NOT re-inject it, because its baseline is the source's materialized
+  transcript, which already carries those turns.
 - `structured: schema` (issue 0001) — "send the schema AND hand me a validated
   value". It rides into the built-in transport as `provider.responseFormat`
   (`json_schema`, name derived from the agent name) unless the host set
@@ -1300,7 +1308,8 @@ const brain = agent({ model, instruction, provider });   // name optional
   executes them; standalone callers do.
 - `messages` is the live array (not a copy).
 - `model()` reads, `model('x')` writes. `system`/`user`/`assistant` append and
-  chain. `reset()` restores instructions + seed messages.
+  chain. `reset()` restores instructions + `prefix` + seed messages (see the
+  `instruction` bullet for the order and for what a fork does instead).
 - `fork({ label? })` returns a private branch of this agent's entire committed
   history, current model, and instruction snapshot. `core/branch.ts` materializes
   a detached copy: every tool call gets a deterministic provider-safe id and every
@@ -4455,9 +4464,12 @@ executable fields still match `LEGACY_PRESET_DEFINITIONS` (the previous shipped
 defaults) is refreshed to the current template instead of pinning the old one. It is
 the provable case: any executable difference (`entry`, the `ranks` map, `agents`, tools,
 environment tools, template, a non-empty `agentModels`/`agentInstructions`/`agentColors`/
-`customAgents` map) means the operator customised the row, and a customised row is
-replayed verbatim. `isLegacyShippedDefinition` (`src/server/harnesses/registry.ts:1163-1200`)
-compares the rank map CANONICALISED (`sortedRanks`, `:912-914`) because rank is executable
+`agentPrefixes`/`customAgents` map) means the operator customised the row, and a customised row is
+replayed verbatim. A preset-history band counts EVEN WHEN IT IS EMPTY — `{ writer: [] }` states
+"this member seeds no history", an executable decision about the next session's transcript — which
+is why the test is a key check, not a content comparison (U6).
+`isLegacyShippedDefinition` (`src/server/harnesses/registry.ts:1580-1623`)
+compares the rank map CANONICALISED (`sortedRanks`, `:1210`) because rank is executable
 authority: a row whose planner sits at Rank B instead of Rank A is a real customisation and
 must not be refreshed away. The legacy table itself is written in the CURRENT `entry`/`ranks`
 vocabulary, so it can prove "the operator never customised this row" only for a row that
@@ -7271,9 +7283,9 @@ table.
 |---|---|
 | `GET /v1/harness/health` | Liveness and session count (`{ ok, sessions, epoch }`, `src/server/api.ts:1675-1680`) |
 | `GET /v1/harness/harnesses` | Harness definitions, **paged** (`q` matches name/title/description); every entry is an editable application copy and `editable` is always `true`. CORRECTED IN PLACE 2026-11-11: this row also used to promise "provider defaults, and `agents`" in the same answer — defaults are `GET /config` now and the registry is `GET /agents`, each its own bounded page |
-| `POST /v1/harness/harnesses` | `{ name, title?, description?, agents, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }` (`agents` is the ONLY roster field, in declaration order, and is REQUIRED beside `name`; `entry` defaults to its first name and `ranks` may cover fewer members than the roster. CORRECTED IN PLACE 2026-11-11: these fields are snake_case on the wire, not the old camelCase `agentModels`/`agentInstructions`, `src/shared/harness-api.ts:643-652`; CORRECTED AGAIN 2026-11-18: `primary`/`subagents` are gone from the contract — the row is `entry` + `ranks`, and `AgentRank` is the 26-letter enum at `src/harness-server.swagger.yaml:4587-4593`) |
-| `PATCH /v1/harness/harnesses/:name` | `{ title?, description?, agents?, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `{ harness }`; every template is patchable, `entry` re-targets routing ALONE (an omitted `entry` keeps the current one while it stays a member and otherwise falls back to the new roster's first agent), `ranks` REPLACES the authority map (`{}` clears every rank, an omitted map keeps the ranks of the surviving members), and each other map field REPLACES the map it names |
-| `GET /v1/harness/harnesses/:name` | `200 { harness }` — one definition with the IDENTIFIED read's own projection, `agent_instructions` included when the card overrides any; the paged listing omits that map, so the configuration dialog reads the single card it opens. A legacy NAME alias (`writer` → `instruct`) resolves to its target; unknown is `404` |
+| `POST /v1/harness/harnesses` | `{ name, title?, description?, agents, entry?, ranks?, agent_models?, agent_instructions?, agent_prefixes?, agent_colors? }` → `201 { harness }` (`agents` is the ONLY roster field, in declaration order, and is REQUIRED beside `name`; `entry` defaults to its first name and `ranks` may cover fewer members than the roster. CORRECTED IN PLACE 2026-11-11: these fields are snake_case on the wire, not the old camelCase `agentModels`/`agentInstructions`, `src/shared/harness-api.ts:643-652`; CORRECTED AGAIN 2026-11-18: `primary`/`subagents` are gone from the contract — the row is `entry` + `ranks`, and `AgentRank` is the 26-letter enum at `src/harness-server.swagger.yaml:4587-4593`) |
+| `PATCH /v1/harness/harnesses/:name` | `{ title?, description?, agents?, entry?, ranks?, agent_models?, agent_instructions?, agent_prefixes?, agent_colors? }` → `{ harness }`; every template is patchable, `entry` re-targets routing ALONE (an omitted `entry` keeps the current one while it stays a member and otherwise falls back to the new roster's first agent), `ranks` REPLACES the authority map (`{}` clears every rank, an omitted map keeps the ranks of the surviving members), and each other map field REPLACES the map it names — `agent_prefixes` included, where a member's `[]` is a VALID band that seeds no history (U6) |
+| `GET /v1/harness/harnesses/:name` | `200 { harness }` — one definition with the IDENTIFIED read's own projection: the card plus `core_tools`, the `agent_models`/`agent_colors`/`agent_prefixes` maps (`agent_models` and `agent_colors` ONLY when non-empty, while `agent_prefixes` is stated on EVERY answer — `{}` when nothing is seeded — `src/server/api-reads.ts:1676-1720`), and `instruction_summary` (one row per member with provenance and length — never the text). CORRECTED IN PLACE 2026-11-23: the row used to claim `agent_instructions` was inlined here; the identified read carries the SUMMARY, and the one band text a client can read is `agent_prefixes`, because a band is an array of turns per member and the roster is bounded (U6). CORRECTED AGAIN 2026-11-24 (F2): that row also claimed all three maps were emitted only when non-empty, and `agent_prefixes` no longer follows that rule — always stating it is the CAPABILITY flag a client negotiates the preset editor from, because the PATCH field is a whole-map REPLACE whose `{}` clears every band, so only a map the client actually READ may be sent back; a pre-U6 backend omits the property and its PATCH refuses the field, which is why folding "the GET answered" into `{}` was a bug (`agent_prefixes` absent = no editor, `{}` = editor with nothing seeded). The paged listing carries none of these maps, so the configuration dialog reads the single card it opens. A member absent from `agent_prefixes` seeds no history, and a member keyed `[]` is echoed back — an explicit "no preset history" is a stated choice, not an omission. A legacy NAME alias (`writer` → `instruct`) resolves to its target; unknown is `404` |
 | `DELETE /v1/harness/harnesses/:name` | `200 { deleted: true, harness_name, tombstoned, restored_by_restart: false }`; `404` unknown name or repeat delete (name aliases are not deletable identities); `409` while a live or restored session belongs to that exact canonical harness — the message names the count, nothing is removed, and no session is cascaded, so each owned session must be deleted individually (`DELETE /v1/harness/sessions/:id`; there is deliberately no bulk delete) before the retry answers `200`. Removes a user harness or a shipped built-in; a built-in's name is persisted in the database's additive `deleted` list so a restart keeps it removed. A session still keeps the frozen definition it captured, which is exactly why the route refuses while any remain: a conversation must never outlive its harness card as an orphan the UI cannot reach. **T6:** after the registry write succeeds, the route also removes every knowledge article ATTRIBUTED to this canonical harness (`KnowledgeArticle.harness`) from the shared base and awaits the store's flush before the `200`; other harnesses' articles, unowned/legacy rows and Storyline records survive, and the base is never reset. The two stores are not transactional: a cleanup/flush failure after the committed harness delete answers `500` naming the partial outcome (the harness is gone; a repeat DELETE is `404` and does not retry the cleanup) |
 | `GET /v1/harness/agents` | Trusted agent registry (`AgentDescriptor[]` rows), **paged** |
 | `GET /v1/harness/tools` | The host-wide catalogue, **paged**: session-bound core entries (`group: 'Core tools'`, `sessionBound: true`) plus every directly callable tool (including the core file tools); `search` always present with `availability` |
@@ -8760,7 +8772,7 @@ the dispatcher:
   **every** entry (there is no 403/read-only branch; `editable` is a compatibility
   wire field, always true). It **replaces** the preset object instead of mutating
   it. A metadata-only patch keeps the captured factory. An executable patch
-  (`entry`/`ranks`/`agents`/`agentModels`/`agentInstructions`/`agentColors`) rebuilds
+  (`entry`/`ranks`/`agents`/`agentModels`/`agentInstructions`/`agentPrefixes`/`agentColors`) rebuilds
   from the `template`:
   `live` uses `createProfiledHarness`, and `flaky` — the marker the deleted example
   preset carried, still rebuildable for a saved row or an injected preset — goes
@@ -8818,7 +8830,7 @@ the dispatcher:
   control characters. `update()` REPLACES the map when one is stated — `{}` clears
   every override — and otherwise keeps only the entries whose agent is still
   selected. `createProfiledHarness(entry, roster, ranks, agentModels, agentInstructions,
-  agentColors, customAgents, toolbox?)` (`src/server/harnesses/toolbox.ts:558-575`) captures the
+  agentColors, customAgents, agentPrefixes, toolbox?)` (`src/server/harnesses/toolbox.ts:655-671`) captures the
   map in the factory closure, so `update()` builds a NEW closure and a harness edit
   never reaches an existing session; that session's models change only through
   `PATCH /sessions/:id`. Only ids are overridable: provider, base URL, and key
@@ -8842,6 +8854,29 @@ the dispatcher:
   conversation's system messages are already seeded, so `PATCH /sessions/:id` still
   accepts `agentModels` only and the frozen `harnessDefinition` records the overrides
   the conversation was built with;
+- `agentPrefixes` (U6 preset history) is the parallel map of selected agent id → that member's
+  ORDERED band of seeded `system`/`user`/`assistant` turns on create/patch, validated by
+  `normalizeAgentPrefixes`/`requirePrefixTurns` (keys must be FINAL members; ≤64 turns per band
+  (`MAX_PREFIX_TURNS`); ≤32000 characters per turn (`MAX_PREFIX_TURN_CHARS`); content is VERBATIM —
+  never trimmed, an empty string is legal; a turn's fields outside `role` + `content` are DROPPED,
+  not refused) and the same REPLACE semantics (`{}` clears every band, a member's `[]` is a valid
+  band that seeds no history). Like the text maps it is EXECUTABLE state — `update()` rebuilds the
+  factory, `presetToRecord`/`readDescriptor` persist both halves, and the factory hands the map to
+  `agent({ prefix })` so the NEXT session's member seeds it between its instruction block and its
+  first real turn. Unlike them, a band is read ONLY on the identified definition read (a card never
+  carries it), because an array of turns per member does not scale the way one string per member
+  does; a session restates its own band on the binding route (`prefix`, where `null` RESTORES the
+  frozen definition's band rather than deleting the key — that key is the seed a restored session
+  rebuilds from), and `GET /sessions/:id/agents/:agentId/prefix` reads the LIVE band off the brain
+  via `agentPrefixOf` (`src/engine/core/agent.ts`), so a read can never disagree with the write;
+  F1 (2026-11-24) adds the missing half: `GET /sessions/:id/definition` states the FROZEN copy on
+  `SessionDefinitionResource.agent_prefixes` (`src/server/api-reads.ts sessionDefinitionOf` reads
+  `record.definition.agentPrefixes`, the copy `describeHarness` wrote at creation and no session
+  write touches), under the NON-empty rule — so a keyed `[]` survives while a session frozen on a
+  definition that seeds nothing keeps its pre-U6 row. That is the deliberate opposite of the
+  identified harness read's always-stated `{}`: a session client negotiates the feature from the
+  per-agent route above (a build without it answers 404), so the property advertises nothing here
+  and adding it would move the wire shape of every saved session recorded before prefixes existed;
 - unknown names are 404; duplicate names are 409; everything else is 400. No
   registry failure is a 403.
 

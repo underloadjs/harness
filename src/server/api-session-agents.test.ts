@@ -45,6 +45,9 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { AGENT_RANKS, agent, harness } from '../engine/harness';
+// U6: the closed prefix turn, so the banded fixture below states its bands in the SAME type the
+// registry stores and the runtime seeds (no structural cast).
+import type { HarnessPrefixTurn } from '../engine/harness';
 import { agentInstruction } from '../engine/agents';
 import { effectiveAgentProfile } from './harnesses/agent-state';
 import { createHarnessRegistry } from './harnesses';
@@ -1253,5 +1256,602 @@ describe('session agent bindings', () => {
         expect(
             (await call(api, 'DELETE', `${MOUNT}/sessions/${sessionId}/agents/${CUSTOM}`)).status
         ).toBe(200);
+    });
+});
+
+// U6 — PRESET HISTORY (the seeded prefix band) over HTTP.
+//
+// What this block pins, in the order a band editor actually hits it:
+//   1. a definition that seeds a band shows it on the identified read (`agent_prefixes`), and the
+//      SAME bytes reach the session's live transcript on the first read of
+//      `GET …/agents/{id}/prefix` with `source: "harness"`;
+//   2. `PATCH …/agents/{id} {prefix}` replaces ONLY the band — accumulated history is kept — and
+//      the read follows the live brain, with `source: "session"`;
+//   3. the three states of the field are three different durable outcomes: an ARRAY records the
+//      session's own band, `[]` records the explicit choice "no preset history", and `null` removes
+//      the session key so the frozen definition's band comes back;
+//   4. turn validation runs at the EDGE, before the store's gates, and refuses a malformed band, a
+//      tool role, or a band for a member the definition never selected — with the registry's own
+//      wording on both surfaces;
+//   5. DURABILITY: a second process opened from `<root>/harness/` still seeds the band the session
+//      wrote, which is only true because `agentPrefixes` is part of the preset RECORD the factory is
+//      rebuilt from (./persistence.ts `readPresetRecord`, ./harnesses/registry.ts `presetFromRecord`).
+//
+// U9 (2026-11-24) adds the two cross-component pins an independent review found missing:
+//   - F2 — `GET /harnesses/{name}` states `agent_prefixes` on EVERY answer, `{}` when nothing is
+//     seeded, because that presence is the CAPABILITY a client negotiates the preset editor from
+//     (the PATCH field is a whole-map REPLACE whose `{}` clears every band, so a client may only
+//     send a map it READ; a pre-U6 backend omits the property and its PATCH refuses the field).
+//     Pinned for the cleared definition and the seeded card, together with the cards staying clean;
+//   - F1 — `GET /sessions/{id}/definition` carries the FROZEN map (a keyed `[]` included, and
+//     omitted when the captured copy states nothing, which is what keeps an old session's row
+//     byte-identical), and F3 — a prefix write is refused 409 with the store's own idle/queued-work
+//     gate, exactly like an instruction write, on both the array and the `null` undo.
+//
+// Cross-references:
+//   - ../engine/harness.ts            — setAgentPrefix and the three lives it moves
+//   - ./sessions.ts                   — setSessionAgentPrefix / addSessionAgent / applyBindingMaps
+//   - ./api.ts                        — the allowlists, the edge validator call, and the prefix route
+//   - ./api-reads.ts                  — `harnessDefinitionOf` (`agent_prefixes`)
+//   - ./harnesses/registry.ts         — requirePrefixTurns / normalizeAgentPrefixes / presetFromRecord
+describe('session agent preset history (U6)', () => {
+    type Turn = { role: 'system' | 'user' | 'assistant'; content: string };
+
+    // The band the fixture DEFINITION seeds, asserted byte for byte everywhere it surfaces
+    // (definition read, live transcript, prefix read, durable document, rebuilt session).
+    const DEFINITION_BAND: Turn[] = [
+        { role: 'system', content: 'Cite every figure.' },
+        { role: 'user', content: 'Draft the summary.' },
+        { role: 'assistant', content: 'Summary drafted.' }
+    ];
+
+    // A one-member live preset whose factory seeds the band — the fixture mirror of what
+    // `createProfiledHarness` does for a shipped card through `agentsFromProfiles` →
+    // `agentConfigurationFromProfile(…, prefix)` → `agent({ prefix })` (./harnesses/toolbox.ts).
+    // `agentPrefixes` is the EXECUTABLE map: the same object the registry copies, the record
+    // stores, and this factory closes over.
+    const bandedPreset = (agentPrefixes?: Record<string, Turn[]>): HarnessPreset => ({
+        name: 'instruct',
+        title: 'Instruct',
+        description: 'Single-role fixture for the preset-history contract.',
+        requiresEndpoint: false,
+        template: 'live',
+        entry: 'instruct',
+        ranks: { instruct: 'A' },
+        agents: ['instruct'],
+        tools: [],
+        builtin: false,
+        editable: true,
+        ...(agentPrefixes === undefined ? {} : { agentPrefixes }),
+        create: (settings, progress) =>
+            harness({
+                agents: {
+                    instruct: agent({
+                        model: settings.model,
+                        instruction: 'Fixture agent.',
+                        ...(agentPrefixes?.instruct === undefined
+                            ? {}
+                            : { prefix: agentPrefixes.instruct as HarnessPrefixTurn[] }),
+                        stream: async function* () {
+                            yield { type: 'text', delta: 'ok' };
+                            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                        }
+                    })
+                },
+                entry: 'instruct',
+                presets: false,
+                report: { progress }
+            })
+    });
+
+    const openBanded = (agentPrefixes?: Record<string, Turn[]>) => {
+        const registry = createHarnessRegistry([bandedPreset(agentPrefixes)]);
+        const store = new SessionStore(SETTINGS, registry);
+        const api = createHarnessApi({ store, defaults: API_DEFAULTS, registry });
+
+        return { api, store, registry };
+    };
+
+    // A file-backed pair on the SAME banded fixture (the in-memory `openOnDisk` above is welded to
+    // `narrowPreset`, which seeds no history at all).
+    const openBandedOnDisk = (root: string, agentPrefixes?: Record<string, Turn[]>) => {
+        const persistence = new HarnessPersistence(root);
+        const database = persistence.load();
+        const registry = createHarnessRegistry([bandedPreset(agentPrefixes)]);
+        const store = new SessionStore(SETTINGS, registry, undefined, { persistence, database: database ?? undefined });
+        const api = createHarnessApi({ store, defaults: API_DEFAULTS, registry });
+
+        return { api, store, registry, persistence };
+    };
+
+    const prefixOf = async (api: ReturnType<typeof createHarnessApi>, sessionId: string, agentId = 'instruct') =>
+        jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents/${agentId}/prefix`));
+
+    // The live brain's transcript as `{ role, content }` pairs — the seed the provider reads, with
+    // the minted ids left out because those are derived from the whole transcript.
+    const bandOf = (store: SessionStore, sessionId: string, agentId = 'instruct') => {
+        const record = store.liveSession(sessionId);
+        const brain = record?.harness.agents[agentId];
+
+        return (brain?.messages ?? []).map((entry: { role: string; content: unknown }) => ({
+            role: entry.role,
+            content: entry.content
+        }));
+    };
+
+    it('seeds the definition band and names the definition as its source', async () => {
+        const { api, store } = openBanded({ instruct: DEFINITION_BAND });
+        const sessionId = await createSession(api);
+
+        const read = await prefixOf(api, sessionId);
+
+        expect(read.status).toBe(200);
+        // THE WHOLE DOCUMENT, four keys and no more (the spec says `additionalProperties: false`).
+        expect(read.body).toEqual({
+            session_id: sessionId,
+            agent_id: 'instruct',
+            prefix: [
+                { role: 'system', content: 'Cite every figure.' },
+                { role: 'user', content: 'Draft the summary.' },
+                { role: 'assistant', content: 'Summary drafted.' }
+            ],
+            source: 'harness'
+        });
+
+        // The same bytes are the live transcript below the instruction block — the read is not a
+        // re-projection of the stored map.
+        expect(bandOf(store, sessionId)).toEqual([
+            { role: 'system', content: 'Fixture agent.' },
+            { role: 'system', content: 'Cite every figure.' },
+            { role: 'user', content: 'Draft the summary.' },
+            { role: 'assistant', content: 'Summary drafted.' }
+        ]);
+
+        // And the band stays OUT of the roster row: a band is a list of prompt-length strings, so it
+        // is addressed per agent rather than carried on every list frame.
+        const roster = jsonOf(await call(api, 'GET', `${MOUNT}/sessions/${sessionId}/agents`));
+
+        expect(roster.status).toBe(200);
+        expect(Object.keys(roster.body.agents[0])).not.toContain('prefix');
+    });
+
+    it('replaces the band and reports the session as its source', async () => {
+        const { api, store } = openBanded({ instruct: DEFINITION_BAND });
+        const sessionId = await createSession(api);
+
+        const patched = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, {
+                prefix: [{ role: 'user', content: 'Answer in one sentence.' }]
+            })
+        );
+
+        expect(patched.status).toBe(200);
+        expect(patched.body.agent.agent_id).toBe('instruct');
+
+        const read = await prefixOf(api, sessionId);
+
+        expect(read.body).toEqual({
+            session_id: sessionId,
+            agent_id: 'instruct',
+            prefix: [{ role: 'user', content: 'Answer in one sentence.' }],
+            // The band differs from what the definition seeds, which is exactly what `session` means.
+            source: 'session'
+        });
+
+        // THE WHOLE TRANSCRIPT: three seeded turns in, one turn out, and the instruction block above
+        // the band untouched. That "only the band moved" claim is what the write is for, and the
+        // guarantee that an ALREADY-accumulated conversation survives it byte-for-byte (and by object
+        // identity) is pinned at the engine level, ./../engine/harness.prefix.test.ts.
+        expect(bandOf(store, sessionId)).toEqual([
+            { role: 'system', content: 'Fixture agent.' },
+            { role: 'user', content: 'Answer in one sentence.' }
+        ]);
+
+        // DURABLE STATE, exactly: the session's own preset copy carries the band it wrote.
+        expect(store.liveSession(sessionId)!.preset.agentPrefixes).toEqual({
+            instruct: [{ role: 'user', content: 'Answer in one sentence.' }]
+        });
+    });
+
+    it('keeps an explicit empty band as the session choice it is', async () => {
+        const { api, store } = openBanded({ instruct: DEFINITION_BAND });
+        const sessionId = await createSession(api);
+
+        const patched = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, { prefix: [] })
+        );
+
+        expect(patched.status).toBe(200);
+
+        const read = await prefixOf(api, sessionId);
+
+        expect(read.body).toEqual({ session_id: sessionId, agent_id: 'instruct', prefix: [], source: 'session' });
+
+        // `[]` is a value: the preset keeps the KEY, so the suppression survives a restart instead of
+        // reverting to the definition's history.
+        expect(store.liveSession(sessionId)!.preset.agentPrefixes).toEqual({ instruct: [] });
+    });
+
+    it('restores the frozen definition band on null, in the transcript and in the record', async () => {
+        const { api, store } = openBanded({ instruct: DEFINITION_BAND });
+        const sessionId = await createSession(api);
+
+        await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, {
+            prefix: [{ role: 'user', content: 'Temporary history.' }]
+        });
+
+        const restored = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, { prefix: null })
+        );
+
+        expect(restored.status).toBe(200);
+
+        const read = await prefixOf(api, sessionId);
+
+        expect(read.body).toEqual({
+            session_id: sessionId,
+            agent_id: 'instruct',
+            prefix: DEFINITION_BAND,
+            source: 'harness'
+        });
+
+        // THE POINT OF THE `null`: the session's own override is gone, and what stands in its place is
+        // the definition's band — recorded in the preset because the preset is what a RESTART seeds
+        // the member from. Leaving the map empty would rebuild this member with no history at all.
+        expect(store.liveSession(sessionId)!.preset.agentPrefixes).toEqual({ instruct: DEFINITION_BAND });
+        // And the frozen definition copy was never rewritten by any session write.
+        expect(store.liveSession(sessionId)!.definition.agentPrefixes).toEqual({ instruct: DEFINITION_BAND });
+    });
+
+    it('reads a restated definition band as harness, and a definition with no history as none', async () => {
+        const identical = openBanded({ instruct: DEFINITION_BAND });
+        const identicalSession = await createSession(identical.api);
+
+        await call(identical.api, 'PATCH', `${MOUNT}/sessions/${identicalSession}/agents/instruct`, {
+            prefix: DEFINITION_BAND
+        });
+
+        const identicalRead = await prefixOf(identical.api, identicalSession);
+
+        expect(identicalRead.body.source).toBe('harness');
+        // The session DID record it (the write is real), yet the read refuses to claim a divergence
+        // the model cannot observe.
+        expect(identical.store.liveSession(identicalSession)!.preset.agentPrefixes).toEqual({
+            instruct: DEFINITION_BAND
+        });
+
+        // A definition that seeds nothing at all: no key on the descriptor, and the read answers
+        // `none` rather than inventing a layer.
+        const bare = openBanded();
+        const bareSession = await createSession(bare.api);
+        const bareRead = await prefixOf(bare.api, bareSession);
+
+        expect(bareRead.status).toBe(200);
+        expect(bareRead.body).toEqual({ session_id: bareSession, agent_id: 'instruct', prefix: [], source: 'none' });
+        expect(bare.store.liveSession(bareSession)!.definition.agentPrefixes).toBeUndefined();
+    });
+
+    it('binds a new member with its own history, and inherits the definition band when none is stated', async () => {
+        const { api } = openBanded({ instruct: DEFINITION_BAND });
+        const sessionId = await createSession(api);
+
+        const bound = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, {
+                name: BINDING,
+                profile: BINDING,
+                prefix: [{ role: 'assistant', content: 'Earlier exchange.' }]
+            })
+        );
+
+        expect(bound.status).toBe(201);
+
+        const read = await prefixOf(api, sessionId, BINDING);
+
+        expect(read.body).toEqual({
+            session_id: sessionId,
+            agent_id: BINDING,
+            prefix: [{ role: 'assistant', content: 'Earlier exchange.' }],
+            // The definition has no band for this member, so the bind's own array is the whole story.
+            source: 'session'
+        });
+
+        // A second bind that states nothing asks for nothing of its own — and the definition seeds no
+        // band for `summarizer` either, so `none` is the honest answer.
+        const plain = jsonOf(
+            await call(api, 'POST', `${MOUNT}/sessions/${sessionId}/agents`, { name: 'reviewer', profile: 'reviewer' })
+        );
+
+        expect(plain.status).toBe(201);
+
+        const plainRead = await prefixOf(api, sessionId, 'reviewer');
+
+        expect(plainRead.body).toEqual({ session_id: sessionId, agent_id: 'reviewer', prefix: [], source: 'none' });
+    });
+
+    it('refuses a malformed band at the edge, in the registry wording, with nothing written', async () => {
+        const { api, store } = openBanded({ instruct: DEFINITION_BAND });
+        const sessionId = await createSession(api);
+
+        const notAnArray = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, { prefix: 'nope' })
+        );
+
+        expect(notAnArray.status).toBe(400);
+        expect(notAnArray.body.error.message).toBe(
+            '`prefix.instruct` must be an ARRAY of preset-history turns ({ role, content }).'
+        );
+
+        const toolTurn = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, {
+                prefix: [{ role: 'tool', content: 'Orphan.' }]
+            })
+        );
+
+        expect(toolTurn.status).toBe(400);
+        expect(toolTurn.body.error.message).toBe(
+            '`prefix.instruct`[0] has role "tool". A preset history turn is "system", "user", or "assistant" — a tool turn belongs to a conversation, not to a preset.'
+        );
+
+        // Both refusals left the band, the preset, and the live transcript exactly as they were: the
+        // session's preset copy still carries the band its definition seeded, which is what a fresh
+        // session of the same card starts with.
+        const read = await prefixOf(api, sessionId);
+
+        expect(read.body.source).toBe('harness');
+        expect(store.liveSession(sessionId)!.preset.agentPrefixes).toEqual({ instruct: DEFINITION_BAND });
+        expect(bandOf(store, sessionId)).toEqual([
+            { role: 'system', content: 'Fixture agent.' },
+            ...DEFINITION_BAND
+        ]);
+    });
+
+    it('carries agent_prefixes on the harness definition read and both harness write bodies', async () => {
+        const { api } = openBanded({ instruct: DEFINITION_BAND });
+
+        const created = jsonOf(
+            await call(api, 'POST', `${MOUNT}/harnesses`, {
+                name: 'banded-card',
+                agents: ['instruct'],
+                entry: 'instruct',
+                agent_prefixes: { instruct: DEFINITION_BAND }
+            })
+        );
+
+        expect(created.status).toBe(201);
+        // The map the client sent, echoed exactly — including the ORDER inside each band, which is
+        // the whole content of the field.
+        expect(created.body.harness.agent_prefixes).toEqual({ instruct: DEFINITION_BAND });
+
+        // A PATCH REPLACES the map, and an explicit `[]` on a member is a band, not a clear.
+        const emptied = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/harnesses/banded-card`, { agent_prefixes: { instruct: [] } })
+        );
+
+        expect(emptied.status).toBe(200);
+        expect(emptied.body.harness.agent_prefixes).toEqual({ instruct: [] });
+
+        // `{}` clears every band, and F2 changes only what the READ looks like afterwards: the map
+        // comes back EMPTY rather than leaving the row, because on this contract the identified read
+        // states `agent_prefixes` on every answer. Presence is the capability a client negotiates the
+        // preset editor from (the PATCH field is a whole-map REPLACE, so only a client that READ the
+        // map may send `{}` back), and a server that omitted an empty map would look exactly like a
+        // pre-U6 backend that has no editor at all.
+        const cleared = jsonOf(await call(api, 'PATCH', `${MOUNT}/harnesses/banded-card`, { agent_prefixes: {} }));
+
+        expect(cleared.status).toBe(200);
+        expect(cleared.body.harness.agent_prefixes).toEqual({});
+
+        // THE CAPABILITY ADVERTISEMENT: the identified read states `agent_prefixes` on EVERY
+        // answer — the `{}` above for the definition whose bands were just cleared, and the seeded
+        // map for the fixture card that always had one — while the CARD LIST omits the field
+        // entirely, so a band stays definition detail and the identified read stays its only
+        // publisher. That is what keeps "absent" meaningful for a client: a pre-U6 backend omits
+        // the property on this route, and that is the signal to hide the editor rather than to send
+        // a destructive `{}`.
+        const clearedDefinition = jsonOf(await call(api, 'GET', `${MOUNT}/harnesses/banded-card`));
+
+        expect(clearedDefinition.status).toBe(200);
+        expect(clearedDefinition.body.harness.agent_prefixes).toEqual({});
+
+        const seededRead = jsonOf(await call(api, 'GET', `${MOUNT}/harnesses/instruct`));
+
+        expect(seededRead.status).toBe(200);
+        expect(seededRead.body.harness.agent_prefixes).toEqual({ instruct: DEFINITION_BAND });
+
+        const cards = jsonOf(await call(api, 'GET', `${MOUNT}/harnesses`));
+
+        expect(cards.status).toBe(200);
+        expect(cards.body.items.every((card: Record<string, unknown>) => !('agent_prefixes' in card))).toBe(true);
+    });
+
+    // F1 — the frozen-definition read carries the band map this conversation was built with.
+    //
+    // WHY IT NEEDS ITS OWN CASE: `SessionDefinitionResource` inherits `HarnessDefinition`, so the
+    // type has named `agent_prefixes` since U6, and `main.ts` uses exactly this read as the
+    // fallback for a saved conversation whose per-member band read has not answered (or failed).
+    // With the projection missing the field, the UI painted an empty editor over a template that
+    // seeds three turns, and the durable record DID hold them the whole time (./persistence.ts
+    // `readDescriptor` / `readPresetRecord` both restore the map, pinned at
+    // ./persistence.test.ts:3029-3068). Asserted against the REAL read, on both halves:
+    //   - a non-empty frozen map, copied byte for byte in the contract's turn shape;
+    //   - a map whose only key holds `[]`, which is NON-empty and must stay keyed (an explicit
+    //     "no preset history" the definition stated, not an absence);
+    //   - a definition that states nothing at all, which keeps the pre-U6 row exactly (the omission
+    //     rule here is deliberate — see `api-reads.ts sessionDefinitionOf`; a session negotiates the
+    //     feature from `GET …/agents/{id}/prefix`, and old saved sessions stay additive-compatible).
+    it('carries the frozen prefix bands on the session definition read', async () => {
+        const seeded = openBanded({ instruct: DEFINITION_BAND });
+        const sessionId = await createSession(seeded.api);
+
+        const frozen = jsonOf(await call(seeded.api, 'GET', `${MOUNT}/sessions/${sessionId}/definition`));
+
+        expect(frozen.status).toBe(200);
+        // Byte for byte the band the definition seeds — and the live brain seeds the same turns,
+        // which is the claim that makes this read safe to paint from.
+        expect(frozen.body.definition.agent_prefixes).toEqual({ instruct: DEFINITION_BAND });
+        expect(bandOf(seeded.store, sessionId)).toEqual([
+            { role: 'system', content: 'Fixture agent.' },
+            ...DEFINITION_BAND
+        ]);
+
+        // The copy is detached: a caller rewriting the response cannot rewrite the frozen record
+        // (the same discipline `harnessDefinitionOf` and ./harnesses/descriptor.ts follow).
+        frozen.body.definition.agent_prefixes.instruct[0].content = 'Rewritten by a caller.';
+        expect(seeded.store.liveSession(sessionId)!.definition.agentPrefixes).toEqual({
+            instruct: DEFINITION_BAND
+        });
+
+        // A keyed `[]` is a NON-empty map, so an explicit "this member seeds no history" survives
+        // the projection instead of collapsing into the absent form.
+        const explicit = openBanded({ instruct: [] });
+        const explicitSession = await createSession(explicit.api);
+        const explicitFrozen = jsonOf(
+            await call(explicit.api, 'GET', `${MOUNT}/sessions/${explicitSession}/definition`)
+        );
+
+        expect(explicitFrozen.body.definition.agent_prefixes).toEqual({ instruct: [] });
+
+        // And the pre-U6 shape: a definition that never names the map leaves the property OFF the
+        // session read, so a session stored before prefixes existed answers exactly as it did.
+        const bare = openBanded();
+        const bareSession = await createSession(bare.api);
+        const bareFrozen = jsonOf(await call(bare.api, 'GET', `${MOUNT}/sessions/${bareSession}/definition`));
+
+        expect(bareFrozen.status).toBe(200);
+        expect('agent_prefixes' in bareFrozen.body.definition).toBe(false);
+    });
+
+    // F3(a) — the prefix write obeys the SAME idle discipline as an instruction write. The store
+    // gate (`./sessions.ts assertBindingIdle`, the one every binding route calls) refuses while a
+    // turn is running or queued, and the runtime repeats it (`../engine/harness.ts
+    // assertRosterIdle`), because `setAgentPrefix` splices the transcript a live turn is reading.
+    // Pinned with the store's own `busy` flag — the same field a streaming run sets — so this is
+    // the real predicate, and pinned on BOTH shapes of the request (an array and the `null` undo).
+    it('refuses a prefix write while the session has live or queued work', async () => {
+        const { api, store } = openBanded({ instruct: DEFINITION_BAND });
+        const sessionId = await createSession(api);
+        const record = store.liveSession(sessionId);
+
+        record.busy = true;
+
+        const written = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, {
+                prefix: [{ role: 'user', content: 'While a turn runs.' }]
+            })
+        );
+
+        expect(written.status).toBe(409);
+        expect(written.body.error.message).toContain('queued work');
+
+        const undone = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, { prefix: null })
+        );
+
+        expect(undone.status).toBe(409);
+        expect(undone.body.error.message).toContain('queued work');
+
+        // The refused requests changed NOTHING: the live band is still the one the definition
+        // seeded, and the session's preset copy never recorded the attempted band.
+        expect(store.liveSession(sessionId)!.preset.agentPrefixes).toEqual({ instruct: DEFINITION_BAND });
+        expect(bandOf(store, sessionId)).toEqual([
+            { role: 'system', content: 'Fixture agent.' },
+            ...DEFINITION_BAND
+        ]);
+
+        // The gate is the run, not the field: once the session is idle the same request lands.
+        record.busy = false;
+
+        const accepted = jsonOf(
+            await call(api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, {
+                prefix: [{ role: 'user', content: 'Once idle.' }]
+            })
+        );
+
+        expect(accepted.status).toBe(200);
+        expect(store.liveSession(sessionId)!.preset.agentPrefixes).toEqual({
+            instruct: [{ role: 'user', content: 'Once idle.' }]
+        });
+    });
+
+    it('refuses a band for a member the definition never selected, and a malformed turn', async () => {
+        const { api } = openBanded();
+
+        const unknownMember = jsonOf(
+            await call(api, 'POST', `${MOUNT}/harnesses`, {
+                name: 'wrong-band',
+                agents: ['instruct'],
+                agent_prefixes: { ghost: [{ role: 'user', content: 'Unseedable.' }] }
+            })
+        );
+
+        expect(unknownMember.status).toBe(400);
+        expect(unknownMember.body.error.message).toBe(
+            '`agentPrefixes` names "ghost", which is not a member of this harness. Members: instruct.'
+        );
+
+        const badTurn = jsonOf(
+            await call(api, 'POST', `${MOUNT}/harnesses`, {
+                name: 'bad-band',
+                agents: ['instruct'],
+                agent_prefixes: { instruct: [{ role: 'user', content: 7 }] }
+            })
+        );
+
+        expect(badTurn.status).toBe(400);
+        expect(badTurn.body.error.message).toBe(
+            '`agentPrefixes.instruct`[0] needs a string "content". Received 7.'
+        );
+
+        // Neither refusal created an entry: the registry still lists exactly the seeded fixture.
+        const cards = jsonOf(await call(api, 'GET', `${MOUNT}/harnesses`));
+
+        expect(cards.body.items.map((card: Record<string, unknown>) => card.name)).toEqual(['instruct']);
+    });
+
+    it('re-seeds the session band and the definition band in a second process', async () => {
+        const root = tempRoot('prefix-durable');
+        const first = openBandedOnDisk(root, { instruct: DEFINITION_BAND });
+        const sessionId = await createSession(first.api);
+
+        // A session-scoped band, written by the first process and durable in its own preset copy.
+        const patched = jsonOf(
+            await call(first.api, 'PATCH', `${MOUNT}/sessions/${sessionId}/agents/instruct`, {
+                prefix: [{ role: 'user', content: 'History that must survive.' }]
+            })
+        );
+
+        expect(patched.status).toBe(200);
+
+        const document = readDocument(root);
+
+        expect(document.sessions[0].preset.agentPrefixes).toEqual({
+            instruct: [{ role: 'user', content: 'History that must survive.' }]
+        });
+
+        // A REAL restart: `load()` runs the validators (`readPresetRecord` / `readDescriptor`), and
+        // the rebuilt harness seeds the band the record names — not the one the shipped template
+        // seeds, and not nothing.
+        const second = openBandedOnDisk(root, { instruct: DEFINITION_BAND });
+        const reloaded = await call(second.api, 'GET', `${MOUNT}/sessions/${sessionId}`);
+        const reloadedJson = reloaded.kind === 'json' ? (reloaded.body as Record<string, any>) : {};
+
+        expect(reloaded.status).toBe(200);
+        expect(reloadedJson.session?.id).toBe(sessionId);
+
+        const read = await prefixOf(second.api, sessionId);
+
+        expect(read.status).toBe(200);
+        expect(read.body).toEqual({
+            session_id: sessionId,
+            agent_id: 'instruct',
+            prefix: [{ role: 'user', content: 'History that must survive.' }],
+            source: 'session'
+        });
+
+        // The frozen definition copy survived too, so the `null` undo still means the same thing
+        // after a restart.
+        expect(second.store.liveSession(sessionId)!.definition.agentPrefixes).toEqual({
+            instruct: DEFINITION_BAND
+        });
     });
 });

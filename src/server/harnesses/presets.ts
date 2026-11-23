@@ -464,7 +464,7 @@ const chat: HarnessPreset = {
     // deployment-wide creation default applied and `chat` regained the shared toolbox on any
     // executable edit — the exact widening this card exists to prevent.
     creation: { factory: 'profiled', toolbox: { sharedToolbox: false, websearch: false, webfetch: false } },
-    create: createProfiledHarness('general', ['general'], { general: ENTRY_RANK }, {}, {}, {}, {}, {
+    create: createProfiledHarness('general', ['general'], { general: ENTRY_RANK }, {}, {}, {}, {}, {}, {
         sharedToolbox: false
     })
 };

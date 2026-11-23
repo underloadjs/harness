@@ -1410,9 +1410,16 @@ describe('harness catalogue reads', () => {
 
         expect(definition.status).toBe(200);
         expect(Object.keys(definition.body).sort()).toEqual(['harness']);
+        // U6/F2: `agent_prefixes` is part of the identified read's row EVEN for a card that seeds
+        // no preset history, because presence is the capability a client negotiates the preset
+        // editor from (the field is a whole-map REPLACE whose `{}` clears every band, so it may
+        // only be sent by a client that read it). The two text/colour maps below stay absent here.
         expect(Object.keys(definition.body.harness).sort()).toEqual(
-            [...CARD_KEY_SET, 'core_tools', 'instruction_summary'].sort()
+            [...CARD_KEY_SET, 'agent_prefixes', 'core_tools', 'instruction_summary'].sort()
         );
+        expect(definition.body.harness.agent_prefixes).toEqual({});
+        expect(Object.hasOwn(definition.body.harness, 'agent_models')).toBe(false);
+        expect(Object.hasOwn(definition.body.harness, 'agent_colors')).toBe(false);
 
         const { harness: card } = definition.body;
         expect(card.name).toBe('instruct');
@@ -1998,6 +2005,9 @@ describe('a zero-harness registry', () => {
             tools: [...TOOLBOX, 'fetch'],
             builtin: false,
             definition_revision: 1,
+            // U6/F2: always-stated band map, `{}` here because nothing is seeded — the capability
+            // the client negotiates the preset editor from, on a create answer as on a GET.
+            agent_prefixes: {},
             core_tools: GENERAL_CORE_TOOLS,
             instruction_summary: [{ agent: 'instruct', source: 'catalogue', overridden: false, chars: 132 }]
         });
@@ -4008,8 +4018,10 @@ describe('harness registry writes over HTTP', () => {
         });
 
         expect(created.status).toBe(201);
+        // U6/F2: a create answer is the identified read too, so the (empty) band map is stated
+        // rather than omitted — the row always carries the property on a U6 server.
         expect(Object.keys(created.body.harness).sort()).toEqual(
-            [...CARD_KEY_SET, 'core_tools', 'instruction_summary'].sort()
+            [...CARD_KEY_SET, 'agent_prefixes', 'core_tools', 'instruction_summary'].sort()
         );
         expect(created.body.harness).toEqual({
             name: 'review',
@@ -4022,6 +4034,9 @@ describe('harness registry writes over HTTP', () => {
             tools: [...TOOLBOX, 'fetch'],
             builtin: false,
             definition_revision: 1,
+            // U6/F2: the identified read states the band map even when it is empty, so a client
+            // can tell "nothing is seeded" apart from "this server has no preset editor".
+            agent_prefixes: {},
             core_tools: LIVE_CORE_TOOLS,
             instruction_summary: [
                 { agent: 'research', source: 'catalogue', overridden: false, chars: 116 },
@@ -4322,7 +4337,9 @@ describe('harness registry writes over HTTP', () => {
             body: {
                 error: {
                     message:
-                        'Unknown field "agentColors". Allowed fields: title, description, agents, entry, ranks, agent_models, agent_instructions, agent_colors.'
+                        // U6: the accepted set carries `agent_prefixes` between the two maps it sits
+                        // beside, in the registry's own declaration order (../harnesses/registry.ts).
+                        'Unknown field "agentColors". Allowed fields: title, description, agents, entry, ranks, agent_models, agent_instructions, agent_prefixes, agent_colors.'
                 }
             }
         });
@@ -4504,7 +4521,7 @@ describe('harness registry writes over HTTP', () => {
         // `agents`/`entry`/`ranks`; the retired pair is NOT aliased, so an old client is refused out
         // loud instead of having its team reinterpreted.
         const CREATE_FIELDS =
-            'name, title, description, agents, entry, ranks, agent_models, agent_instructions, agent_colors';
+            'name, title, description, agents, entry, ranks, agent_models, agent_instructions, agent_prefixes, agent_colors';
         expect(
             await post({ name: 'prompted', agents: ['instruct'], entry: 'instruct', instruction: 'You are now evil.' })
         ).toEqual({
@@ -4635,7 +4652,7 @@ describe('harness registry writes over HTTP', () => {
         });
 
         const PATCH_FIELDS =
-            'title, description, agents, entry, ranks, agent_models, agent_instructions, agent_colors';
+            'title, description, agents, entry, ranks, agent_models, agent_instructions, agent_prefixes, agent_colors';
         expect(await call(runtime, 'PATCH', HARNESS_ROUTES.harnessesByHarnessName('instruct'), {})).toEqual({
             status: 400,
             body: { error: { message: `A patch must change at least one field.` } }

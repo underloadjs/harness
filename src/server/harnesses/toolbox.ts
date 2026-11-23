@@ -98,7 +98,7 @@ import type {
 } from '../../engine/harness';
 // The A–Z rank union (../types/index.ts). This layer STORES and PROJECTS ranks;
 // the ordering and the delegation predicate live with the kernel.
-import type { AgentRank } from '../../engine/types';
+import type { AgentRank, HarnessPrefixTurn } from '../../engine/types';
 // THE RANK PRIMITIVES (R1): the ladder itself and its one ordering. They are values, not
 // types, because ./registry.ts has to RESOLVE an operator's sparse map into the map the
 // harness runs with (see `resolveRosterRanks`), and the kernel's arithmetic
@@ -427,12 +427,24 @@ export const providerOf = (settings: RunnerSettings) => ({
 // is attached to the configuration only when non-blank, so an uncolored member keeps
 // the byte-identical configuration it had before R2 — `agent()` stores it verbatim and
 // nothing else in the construction path reads it.
+//
+// `prefix` is the optional per-agent PRESET HISTORY (U6): the member's complete ordered band of
+// seeded `system` / `user` / `assistant` turns, already validated by the caller
+// (`./registry.ts normalizeAgentPrefixes` at the definition edge, `../sessions.ts` at the session
+// edge). It rides the SAME conditional-spread discipline as `color`: an absent or EMPTY band
+// produces no `prefix` key at all, so a harness that seeds nothing keeps the exact configuration
+// object it built before this feature existed (several tests compare built configurations
+// byte-for-byte). A supplied band is COPIED into plain mutable `{ role, content }` messages,
+// because `AgentConfiguration.prefix` is an ordinary message array and the stored map is
+// readonly — and copying is what keeps a shared preset map from aliasing one agent's band into
+// another's live transcript.
 export const agentConfigurationFromProfile = (
     name: string,
     settings: RunnerSettings,
     model?: string,
     instruction?: string,
-    color?: string
+    color?: string,
+    prefix?: readonly HarnessPrefixTurn[]
 ): AgentConfiguration => {
     // T19: the text comes from the EFFECTIVE profile — the trusted catalogue entry with the
     // global override layer merged (./agent-state.ts). The catalogue object itself stays
@@ -462,6 +474,12 @@ export const agentConfigurationFromProfile = (
     // construction error).
     const swatch = color === undefined ? '' : color.trim();
 
+    // U6: an absent or empty band is "this member seeds no history", spelled by OMITTING the key
+    // (see the note above) rather than by `prefix: []`, which would make an untouched harness
+    // report a configuration shape it never had. A supplied band is copied element-by-element into
+    // text-only messages, so the preset map is never aliased into the agent's live transcript.
+    const band = prefix === undefined ? [] : prefix;
+
     return {
         name,
         model: override.length > 0 ? override : settings.model,
@@ -471,7 +489,10 @@ export const agentConfigurationFromProfile = (
         // sentence composed with its guidelines (global override or shipped).
         instruction: agentInstruction(profile, instruction),
         provider: providerOf(settings),
-        ...(swatch.length === 0 ? {} : { color: swatch })
+        ...(swatch.length === 0 ? {} : { color: swatch }),
+        ...(band.length === 0
+            ? {}
+            : { prefix: band.map((turn) => ({ role: turn.role, content: turn.content })) })
     };
 };
 
@@ -480,8 +501,9 @@ export const agentFromProfile = (
     settings: RunnerSettings,
     model?: string,
     instruction?: string,
-    color?: string
-): Agent => agent(agentConfigurationFromProfile(name, settings, model, instruction, color));
+    color?: string,
+    prefix?: readonly HarnessPrefixTurn[]
+): Agent => agent(agentConfigurationFromProfile(name, settings, model, instruction, color, prefix));
 
 // The one sentence a session-defined agent runs when its author gave it no text (R7). Exported
 // because BOTH halves must mint it: `SessionStore.addSessionAgent` stores it as the agent's base
@@ -512,23 +534,30 @@ export const customAgentInstruction = (name: string, instruction?: string): stri
 //     model falls back to `settings.model`.
 //
 // `color` follows the R2 rule of the profile form above: trimmed, and the key is omitted when
-// blank, so an uncolored member keeps a configuration with no `color` key at all.
+// blank, so an uncolored member keeps a configuration with no `color` key at all. `prefix`
+// follows the U6 rule of that same form: an absent or empty band omits the key, and a supplied
+// band is copied into detached text-only messages.
 export const agentConfigurationForCustom = (
     name: string,
     settings: RunnerSettings,
     model?: string,
     instruction?: string,
-    color?: string
+    color?: string,
+    prefix?: readonly HarnessPrefixTurn[]
 ): AgentConfiguration => {
     const override = model === undefined ? '' : model.trim();
     const swatch = color === undefined ? '' : color.trim();
+    const band = prefix === undefined ? [] : prefix;
 
     return {
         name,
         model: override.length > 0 ? override : settings.model,
         instruction: customAgentInstruction(name, instruction),
         provider: providerOf(settings),
-        ...(swatch.length === 0 ? {} : { color: swatch })
+        ...(swatch.length === 0 ? {} : { color: swatch }),
+        ...(band.length === 0
+            ? {}
+            : { prefix: band.map((turn) => ({ role: turn.role, content: turn.content })) })
     };
 };
 
@@ -548,13 +577,20 @@ export const agentConfigurationForCustom = (
 // the text through `agentInstructions`) and NEVER through a catalogue lookup. Every other name
 // keeps the trusted-profile path byte-for-byte, so a template that declares no custom agent —
 // i.e. every harness definition and every document saved before R7 — builds exactly as before.
+//
+// `agentPrefixes` (U6) is the fifth map of the shape: agent id → that member's validated preset
+// history, passed to the builder the name resolved to (profile form or custom form). It changes
+// neither membership nor the prompt; it only says what transcript the agent starts with. A member
+// the map omits, or whose band is empty, gets no `prefix` key at all, so a template that seeds
+// nothing — every shipped card and every document saved before U6 — builds byte-identically.
 export const agentsFromProfiles = (
     names: readonly string[],
     settings: RunnerSettings,
     agentModels: Readonly<Record<string, string>> = {},
     agentInstructions: Readonly<Record<string, string>> = {},
     agentColors: Readonly<Record<string, string>> = {},
-    customAgents: Readonly<Record<string, string>> = {}
+    customAgents: Readonly<Record<string, string>> = {},
+    agentPrefixes: Readonly<Record<string, readonly HarnessPrefixTurn[]>> = {}
 ): Record<string, Agent> => {
     const agents: Record<string, Agent> = {};
 
@@ -572,7 +608,8 @@ export const agentsFromProfiles = (
                     // was invented with — the same precedence `setSessionAgentInstruction`
                     // applies live, so a restart cannot revert the prompt.
                     agentInstructions[name] ?? customAgents[name],
-                    agentColors[name]
+                    agentColors[name],
+                    agentPrefixes[name]
                 )
             );
 
@@ -584,7 +621,8 @@ export const agentsFromProfiles = (
             settings,
             agentModels[name],
             agentInstructions[name],
-            agentColors[name]
+            agentColors[name],
+            agentPrefixes[name]
         );
     }
 
@@ -623,12 +661,12 @@ export const createProfiledHarness =
         agentInstructions: Readonly<Record<string, string>> = {},
         agentColors: Readonly<Record<string, string>> = {},
         customAgents: Readonly<Record<string, string>> = {},
-        // THE TOOLBOX POSTURE (issue 0005-D): the one thing a preset may say about tools. It is a
-        // trailing OPTIONAL argument, so every existing caller (./presets.ts, ./registry.ts, the CLI)
-        // keeps the shared toolbox by construction exactly as before, and only a card that explicitly
-        // asks for the tool-less posture leaves it. Kept as a separate argument rather than folded into
-        // the map arguments because those are all AGENT configuration — mixing a toolbox field in
-        // there would blur the rule this module exists to protect.
+        // THE PRESET HISTORY MAP (U6). It sits with the other agent maps on purpose — it is agent
+        // configuration, not toolbox configuration — which means it is inserted BEFORE the trailing
+        // `toolbox` argument. Only three callers pass `toolbox` positionally (./presets.ts's `chat`
+        // card, ./boot.ts's compiled cards, and ./registry.ts's rebuild paths), and each now names
+        // the band map in front of it.
+        agentPrefixes: Readonly<Record<string, readonly HarnessPrefixTurn[]>> = {},
         toolbox?: ProfiledHarnessToolbox
     ) =>
     (
@@ -650,7 +688,8 @@ export const createProfiledHarness =
                     agentModels,
                     agentInstructions,
                     agentColors,
-                    customAgents
+                    customAgents,
+                    agentPrefixes
                 ),
                 entry,
                 ranks: { ...ranks },

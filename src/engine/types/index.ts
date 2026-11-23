@@ -698,6 +698,37 @@ export type HarnessProviderConfiguration = {
 // Agent (the brain)
 // ---------------------------------------------------------------------------
 
+// ONE PRESET PREFIX TURN (U6) — the CLOSED, text-only spelling of a turn of preset agentic
+// history, i.e. of a `AgentConfiguration.prefix` entry and of `Harness.setAgentPrefix`'s input.
+//
+// WHY A SEPARATE TYPE WHEN `prefix` ALREADY HAS ONE. `prefix` is the wider engine field: a seed
+// entry may carry attachments (a user turn with an image) because the seed loop validates and
+// copies them (./core/agent.ts). The SURFACE that edits a prefix — the harness wire contract
+// (`HarnessPrefixTurn` in src/engine/shared/harness-api.ts, the `agent_prefixes` map of a harness
+// definition, and a session's prefix override) — is deliberately text-only: a dialog edits role +
+// content, never an attachment or a tool call. Spelling that as its own type is what lets the wire
+// refuse a `tool` role or a `toolCall` key INSTEAD of silently dropping it.
+//
+// ONE VOCABULARY, NOT TWO: the generated contract re-exports THIS type (see the `ALIASES` map in
+// scripts/generate-harness-contract.ts), so the wire name and the engine name are one definition
+// and a rename on either side fails the assignability probe in
+// src/engine/shared/harness-api.test.ts rather than drifting quietly.
+//
+// IT IS A DISCRIMINATED UNION (one member per role), and that shape is load-bearing twice over:
+//   - it is assignable BOTH ways to `Extract<HarnessMessage, { role: 'system' | 'user' |
+//     'assistant' }>` — the member for a role carries no key that variant lacks, and the variant
+//     carries no REQUIRED key this member lacks — which is what lets a `HarnessPrefixTurn[]` go
+//     straight into `AgentConfiguration.prefix` with no cast or conversion pass; a single object
+//     with `role: 'system' | 'user' | 'assistant'` would NOT be, because a union-valued tag does
+//     not select a member of a discriminated union;
+//   - a `tool` turn is unrepresentable by construction, exactly as on `prefix`: a tool message is
+//     the answer to an assistant `tool_calls` block a prefix never carries, so an unpaired result
+//     would reach a provider as an orphan.
+export type HarnessPrefixTurn =
+    | { role: 'system'; content: string }
+    | { role: 'user'; content: string }
+    | { role: 'assistant'; content: string };
+
 // Everything needed to construct a brain. `name` is optional: inside a harness
 // the registry key names the agent (see harness.ts), so `writer: agent({...})`
 // is enough. Standalone agents keep the default label.
@@ -708,7 +739,38 @@ export type AgentConfiguration = {
     // System instruction(s). A string or a list; each entry becomes its own
     // system message, in order, so persona + rules + format can compose.
     instruction?: string | string[];
-    // Seed history. Instructions are prepended ahead of these.
+    // Preset agentic HISTORY — prior memory and scripted turns a spawn must start
+    // with (a previous session's dialogue, a few worked examples, a recalled scene).
+    // `instruction` can only say "you are X"; this says "this has already happened".
+    //
+    // ORDER, exactly, on every fresh seed and on every `reset()` (core/agent.ts
+    // `seed`): every `instruction` system message, then `prefix`, then `messages`,
+    // then whatever the conversation adds. `prefix` is the older memory, so it
+    // always comes first when both are set, and legacy `messages` keeps the exact
+    // position existing callers already get — nothing is deprecated and using both
+    // is not an error.
+    //
+    // ROLES: `system | user | assistant` only. A `tool` turn is an answer to an
+    // assistant `tool_calls` block this field never carries, so an unpaired result
+    // would reach a provider as an orphan; the type refuses it instead of adding a
+    // runtime validation rule.
+    //
+    // HYGIENE: identical to `messages`, because both feed one seed loop — the
+    // `included` normalization, the detached copy, seeded-attachment validation and
+    // runtime `messageId` minting. A caller-supplied id is dropped and re-minted, and
+    // live history never aliases the caller's array or objects.
+    //
+    // LIFECYCLE: a new host THREAD reseeds it (same brain, new conversation), while a
+    // FORK does not inject it again — a branch starts from its source's materialized
+    // transcript, which already contains these turns.
+    //
+    // EDITABLE (U6): `Harness.setAgentPrefix(name, turns)` replaces this band of an ALREADY
+    // RUNNING agent — the transcript entries seeded from it, its reset baseline, and what a
+    // future host thread of that agent seeds — while the harness is idle. The turns that route
+    // accepts are the narrower `HarnessPrefixTurn` (role + content only), so the wire surface
+    // cannot express an attachment or a tool call even though this field can.
+    prefix?: Extract<HarnessMessage, { role: 'system' | 'user' | 'assistant' }>[];
+    // Seed history. Instructions and `prefix` are prepended ahead of these.
     messages?: HarnessMessage[];
     // Endpoint config for the built-in transport.
     provider?: HarnessProviderConfiguration;
@@ -5703,6 +5765,42 @@ export type Harness = {
     //     seeded context, turns, tool results — is untouched, and no transcript is ever
     //     rebuilt. Throws for an unknown agent or blank/non-string text.
     setAgentInstruction: (name: string, instruction: string) => void;
+    //   - `setAgentPrefix(name, prefix)` — replace the SEEDED PREFIX BAND of one registered
+    //     member IN PLACE: the run of transcript entries that `agent()` seeded from
+    //     `AgentConfiguration.prefix` (immediately after the instruction block, before any legacy
+    //     seed history and before every accumulated turn), plus the baseline that band is reseeded
+    //     from. `prefix` is an ARRAY of closed role/content turns (`HarnessPrefixTurn`) — no
+    //     `null`, because "inherit" is a SERVER-layer question (`GET …/agents/{id}/prefix` reports
+    //     the source, and a session write resolves inheritance before calling this) and the runtime
+    //     has nothing to inherit FROM. `[]` is the explicit removal: the band is deleted and the
+    //     member reseeds without preset history.
+    //
+    //     WHAT IS PRESERVED: every accumulated conversation turn (the whole transcript after the
+    //     band), the legacy `AgentConfiguration.messages` seed entries, the instruction block, the
+    //     brain's model/transport, and every OTHER member. Nothing is rebuilt, so a prefix edit
+    //     costs a conversation nothing — the same property `setAgentInstruction` has.
+    //
+    //     WHAT MOVES: the construction/reset baseline, so `reset()` returns to the new band, and
+    //     the thread factory, so a NEW host thread of this agent seeds the new band. Existing
+    //     separate host threads are NOT rewritten — each is its own transcript, and the same
+    //     limitation is documented for `setAgentInstruction` ("one override moves only this
+    //     member's leading block"); and a FORK gets no band of its own, because a branch starts
+    //     from its source's materialized transcript, which already carries these turns.
+    //
+    //     REFUSALS, all `HarnessError` with nothing changed: an unknown agent; a run in flight
+    //     (the same roster-idle gate as the other three writes); a turn that is not a
+    //     role/content text turn (`system | user | assistant`, string `content`, no tool role, no
+    //     tool call, no unknown key); and a transcript whose band is no longer where the seed put
+    //     it — a compactor or a host edit removed or moved one of those entries, so the band is
+    //     noncontiguous or overwritten and splicing here would rewrite unrelated history. The
+    //     guard is the same shape as the instruction write's "no longer starts with its seeded
+    //     instruction block" check.
+    //
+    //     HYGIENE, identical to the seed loop: the caller's array and objects are never adopted —
+    //     each turn is copied, a caller-supplied `messageId` is dropped, and the new entries are
+    //     minted transcript-scoped ids the same way `agent()` mints them, so a prefix edit cannot
+    //     collide with an id an accumulated turn already owns.
+    setAgentPrefix: (name: string, prefix: readonly HarnessPrefixTurn[]) => void;
     // Reset to "start over": EVERY agent's conversation goes back to its seeded
     // instructions (R12 — a subagent kept its old transcript before this), tool
     // discovery is forgotten, and the session todo list and record stores are

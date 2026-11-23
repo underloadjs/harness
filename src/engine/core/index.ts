@@ -63,6 +63,11 @@
 // compare tags. They are exported for tests and for tooling that inspects a
 // schema, and are not re-exported from the package root.
 export { agent } from './agent';
+// U6 — the seeded-prefix-band seam `Harness.setAgentPrefix` and the server's prefix read call.
+// `writeAgentPrefix` replaces one brain's band + reset baseline + thread seed; `agentPrefixOf`
+// reports the band's current text turns. Both are WeakMap-backed, so the public `Agent` type
+// stays free of mutable configuration (see ./agent.ts, "The prefix-band seam").
+export { agentPrefixOf, writeAgentPrefix } from './agent';
 // (issue 0001 B) The structured-output codes travel with the factory that raises them:
 // a host (or the server's error mapper) classifies a rejection by `error.code` instead
 // of parsing prose, and both names are part of `agent()`'s contract.

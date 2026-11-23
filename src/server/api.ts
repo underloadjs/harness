@@ -151,6 +151,9 @@ import type {
     HarnessDefinitionResponse,
     HarnessInstructionIndexResponse,
     HarnessInstructionTextResponse,
+    // U6: one preset-history turn (the closed role/content pair the wire and the engine share) and
+    // the document `GET …/agents/{id}/prefix` answers with.
+    HarnessPrefixTurn,
     ModelDiscoveryRequest,
     ModelIndex,
     PendingActionListResponse,
@@ -169,6 +172,7 @@ import type {
     SessionAgentResponse,
     SessionDefinitionResponse,
     SessionInstructionTextResponse,
+    SessionPrefixTurnsResponse,
     SessionResponse,
     SessionSummaryPage,
     SessionToolPage,
@@ -226,7 +230,11 @@ import {
     SettingsError
 } from './config';
 import type { ProviderCredential, ProviderTimeoutConfiguration, ServerRuntimeConfiguration } from './config';
-import { HarnessRegistryError } from './harnesses/registry';
+import { HarnessRegistryError, requirePrefixTurns } from './harnesses/registry';
+// U6: the ONE preset-history band validator (./harnesses/registry.ts). The edge calls it only to
+// keep BODY validation ahead of the store's durability and idle gates — a malformed band is a 400
+// on ANY session, never a 409 about a scripted template — and the store calls the same function, so
+// the wording cannot drift between the two surfaces.
 // T19: the global agent overlay's error type (status-carrying, like the registry's) and the
 // durable overlay file. The dispatcher never builds the layer itself: the registry owns it,
 // and this file only commits what the registry changed.
@@ -244,7 +252,11 @@ import type { ContextBlock, TurnSection } from '../engine/shared/turn-display';
 // it lands in the entry agent's DEFAULT conversation, whose id prefix is `THREAD_AGENT_PREFIX`
 // (src/core/thread.ts). `src/server/sessions.ts:216` imports this same pair, so the API layer and
 // the store cannot drift onto two different transcript validators or two spellings of that id.
-import { readHarnessMessages, THREAD_AGENT_PREFIX } from '../engine/core';
+// U6: `agentPrefixOf` is the engine's own read of one brain's seeded PRESET-HISTORY band. The
+// prefix subresource reports the LIVE band (what the next turn sends), so the dispatcher reads it
+// through the same seam the server's write goes through — never by re-deriving it from the stored
+// maps, which would let the read and the write disagree after a runtime refusal.
+import { agentPrefixOf, readHarnessMessages, THREAD_AGENT_PREFIX } from '../engine/core';
 // The rank vocabulary is the one authority scale: the PATCH edge names the same letters the
 // store validator accepts, so a client never has to hold two spellings.
 import { AGENT_RANKS } from '../engine/types';
@@ -2348,6 +2360,7 @@ export const createHarnessApi = ({
             'ranks',
             'agent_models',
             'agent_instructions',
+            'agent_prefixes',
             'agent_colors'
         ]);
 
@@ -2380,6 +2393,12 @@ export const createHarnessApi = ({
                 // snake_case at the edge, camelCase in the domain (see NAMING above).
                 ...(body.agent_models === undefined ? {} : { agentModels: body.agent_models }),
                 ...(body.agent_instructions === undefined ? {} : { agentInstructions: body.agent_instructions }),
+                // U6: the per-agent PRESET-HISTORY map rides the same edge, unvalidated here on
+                // purpose — membership, band shape, roles, and the turn/character bounds are the
+                // registry's decision (`normalizeAgentPrefixes`/`requirePrefixTurns`), which is
+                // where a 400 naming the agent and the turn index comes from. This handler only
+                // moves bytes, exactly like the three maps above.
+                ...(body.agent_prefixes === undefined ? {} : { agentPrefixes: body.agent_prefixes }),
                 // R2: display colors ride the same edge. Membership and the hex shape are the
                 // registry's decision (`normalizeAgentColors`), which is where a 400 naming the
                 // agent comes from; this handler only moves bytes.
@@ -2413,6 +2432,7 @@ export const createHarnessApi = ({
             'ranks',
             'agent_models',
             'agent_instructions',
+            'agent_prefixes',
             'agent_colors'
         ]);
 
@@ -2424,6 +2444,9 @@ export const createHarnessApi = ({
             body.ranks === undefined &&
             body.agent_models === undefined &&
             body.agent_instructions === undefined &&
+            // U6: an explicit `{}` or `{"member": []}` is a real change, so the field counts on
+            // presence alone — the same rule the other three maps use.
+            body.agent_prefixes === undefined &&
             body.agent_colors === undefined
         ) {
             throw new HttpError(400, 'A patch must change at least one field.');
@@ -2452,6 +2475,12 @@ export const createHarnessApi = ({
                 // Present = REPLACE the map; `{}` is the explicit clear.
                 ...(body.agent_models === undefined ? {} : { agentModels: body.agent_models }),
                 ...(body.agent_instructions === undefined ? {} : { agentInstructions: body.agent_instructions }),
+                // U6: `agent_prefixes` REPLACES the map exactly like the three above — `{}` clears
+                // every band, every key must name a member of the resulting roster, and an override
+                // for a member this patch removed is dropped rather than rejected. One difference
+                // the registry owns and the contract states: an empty ARRAY is a meaningful band
+                // ("no preset history"), so `{ "editor": [] }` is a write, not a clear.
+                ...(body.agent_prefixes === undefined ? {} : { agentPrefixes: body.agent_prefixes }),
                 // R2: same replace semantics for the color map.
                 ...(body.agent_colors === undefined ? {} : { agentColors: body.agent_colors })
             })
@@ -3985,11 +4014,11 @@ export const createHarnessApi = ({
         const agentId = ctx.params.agent_id;
         const body = requireObjectBody<UpdateSessionAgentRequest>(await ctx.body());
 
-        requireKnownFields(body, ['model', 'instruction', 'rank']);
+        requireKnownFields(body, ['model', 'instruction', 'rank', 'prefix']);
 
         if (findAgentBinding(record, agentId) === undefined) throw missing('agent', agentId, record.id);
 
-        if (body.model === undefined && body.instruction === undefined && body.rank === undefined) {
+        if (body.model === undefined && body.instruction === undefined && body.rank === undefined && body.prefix === undefined) {
             throw new HttpError(400, 'A patch must change at least one field.');
         }
 
@@ -4003,6 +4032,26 @@ export const createHarnessApi = ({
                 400,
                 `An agent rank must be one letter of the authority scale, ${AGENT_RANKS.join(', ')}.`
             );
+        }
+
+        // U6: the PRESET-HISTORY band is validated HERE, by the ONE validator the registry and the
+        // store also call (./harnesses/registry.ts `requirePrefixTurns`), so a malformed band — a
+        // non-array, a `tool` turn, a content block instead of text, a turn over the bound — answers
+        // 400 naming the turn index BEFORE the rank or instruction half of this same patch has
+        // moved anything. `null` names no band, so it is not validated: the store resolves it to the
+        // frozen definition's own history.
+        let prefixBand: HarnessPrefixTurn[] | undefined;
+
+        if (body.prefix !== undefined && body.prefix !== null) {
+            try {
+                prefixBand = requirePrefixTurns(body.prefix, 'prefix', agentId);
+            } catch (error) {
+                if (error instanceof HarnessRegistryError) {
+                    throw new HttpError(error.status, error.message);
+                }
+
+                throw error;
+            }
         }
 
         // T27: a session-level INSTRUCTION override is now backed by the runtime
@@ -4047,6 +4096,19 @@ export const createHarnessApi = ({
             );
 
             fields.push('instruction');
+        }
+
+        // U6: the PRESET-HISTORY write, sequenced with the instruction write rather than folded
+        // into it, because the two seeds are different state (a prompt block vs a run of transcript
+        // turns) and the receipt lists both. Like an instruction override, this retunes a SEED
+        // inside the roster the record already carries — it never changes the team a restart
+        // resolves — so it takes no `assertDurableRoster` gate and stays writable on every template.
+        // An ARRAY (empty included) is this session's own band; `null` hands the store the
+        // "restore what my definition seeds" undo.
+        if (body.prefix !== undefined) {
+            await store.setSessionAgentPrefix(record.id, agentId, prefixBand ?? null);
+
+            fields.push('prefix');
         }
 
         if (body.model === undefined) {
@@ -4100,7 +4162,7 @@ export const createHarnessApi = ({
         // `validateBindingRank`, whose message names the accepted letters and never guesses a
         // default). Calling it HERE, before the durability and idle gates, keeps the established
         // precedence: an invalid body answers 400 on ANY session, not 409 about a busy one.
-        requireKnownFields(body, ['name', 'profile', 'model', 'instruction', 'rank']);
+        requireKnownFields(body, ['name', 'profile', 'model', 'instruction', 'rank', 'prefix']);
 
         for (const field of ['name', 'profile', 'model', 'instruction'] as const) {
             const value = body[field];
@@ -4142,6 +4204,25 @@ export const createHarnessApi = ({
             );
         }
 
+        // U6: the member's PRESET HISTORY, validated at the edge by the ONE band validator so a
+        // malformed array is a 400 on ANY session rather than a 409 about a scripted template
+        // (the same precedence this handler already keeps for `rank` and a blank name). The store
+        // calls the identical function; this mirror exists only for ordering, and an OMITTED field
+        // stays absent — which means "seed what the frozen definition seeds", not "no history".
+        let bindingPrefix: HarnessPrefixTurn[] | undefined;
+
+        if (body.prefix !== undefined && body.prefix !== null) {
+            try {
+                bindingPrefix = requirePrefixTurns(body.prefix, 'prefix');
+            } catch (error) {
+                if (error instanceof HarnessRegistryError) {
+                    throw new HttpError(error.status, error.message);
+                }
+
+                throw error;
+            }
+        }
+
         // T28: durability first, before the roster moves (see `assertDurableRoster`). A 409 here
         // is the honest version of a 201 that a restart takes back.
         assertDurableRoster(record, 'bind an agent');
@@ -4162,7 +4243,11 @@ export const createHarnessApi = ({
             profile: body.profile,
             model: body.model,
             instruction: body.instruction,
-            rank: bindingRank
+            rank: bindingRank,
+            // U6: the band this binding states, or nothing at all — an absent field is resolved by
+            // the store against the frozen definition, which is what keeps a bind from quietly
+            // dropping the history that definition seeds.
+            ...(bindingPrefix === undefined ? {} : { prefix: bindingPrefix })
         });
 
         const name = typeof body.name === 'string' ? body.name.trim() : '';
@@ -4327,6 +4412,77 @@ export const createHarnessApi = ({
             instruction,
             guidelines: [...(profile?.guidelines ?? [])],
             chars: instruction.length
+        };
+
+        return json(200, response);
+    };
+
+    // U6: one member's PRESET HISTORY — the band it actually seeds, plus which layer wrote it.
+    // READ-ONLY by contract: the write is the session-agent PATCH (`prefix` is one field of that
+    // body, and the same store operation backs it), so a client editing a band and a client
+    // reading one never disagree about which call owns the change. This document exists because a
+    // band is a LIST OF PROMPT-LENGTH STRINGS: it stays out of the roster row (R1/R3 payload rule,
+    // the same reasoning that keeps instruction text out of it) and is addressed per agent.
+    const getSessionAgentPrefix: Handler = (ctx) => {
+        const record = requireSession(ctx.params.session_id);
+        const agentId = ctx.params.agent_id;
+
+        // Same membership rule as the instruction subresource: a name the session's roster does not
+        // carry is a 404, never an empty band pretending to be a member.
+        if (!record.definition.agents.includes(agentId)) {
+            throw new HttpError(404, `Agent "${agentId}" is not a member of session "${record.id}".`);
+        }
+
+        // The LIVE band is the answer, not the stored map: `agentPrefixOf` (../../engine/core) reads
+        // the transcript run the brain seeds — the same three lives `setAgentPrefix` updates — so
+        // what a client sees is byte-for-byte what the next turn sends. A brain the engine never
+        // handed a band reports `[]`, which is also the honest value for `source: none`.
+        const brain = record.harness.agents[agentId];
+        const prefix = brain === undefined ? [] : agentPrefixOf(brain);
+
+        // PROVENANCE. Three layers can state a band and the contract admits exactly three answers:
+        //   - `session`  — this conversation wrote a band that DIFFERS from what its definition
+        //     seeds. A stored key whose content is byte-identical to the definition's is not
+        //     reported as a session choice, because the read would then claim a divergence the
+        //     model cannot observe; and an empty band with `source: session` is precisely the
+        //     documented "this conversation chose no preset history over the band its definition
+        //     would have seeded";
+        //   - `harness`  — the band is the frozen definition's own, untouched by this session;
+        //   - `none`     — no layer seeds anything, which is what an empty band with nothing stored
+        //     and nothing to restore states.
+        // The comparison is against the FROZEN definition copy (`record.definition.agentPrefixes`),
+        // i.e. the state a `null` patch restores to, never against another harness's map.
+        const stored = record.preset.agentPrefixes?.[agentId];
+        const seeded = record.definition.agentPrefixes?.[agentId] ?? [];
+
+        const sameTurns = (left: readonly HarnessPrefixTurn[], right: readonly HarnessPrefixTurn[]) =>
+            left.length === right.length &&
+            left.every((turn, index) => turn.role === right[index]!.role && turn.content === right[index]!.content);
+
+        let source: SessionPrefixTurnsResponse['source'];
+
+        if (sameTurns(prefix, seeded) && (stored === undefined || sameTurns(stored, seeded))) {
+            // The band IS the frozen definition's own — whether or not a session write happens to
+            // have restated the same bytes, which the model cannot observe. `none` when that
+            // definition seeds nothing at all.
+            source = seeded.length === 0 ? 'none' : 'harness';
+        } else if (stored !== undefined) {
+            // The session holds a stored band and the definition's copy is not it: this
+            // conversation owns the history the member seeds. The empty case lives here too, and it
+            // is the documented "this session chose no preset history" rather than `none`.
+            source = 'session';
+        } else {
+            // Nothing stored, and the live band is not the definition's either — a band written
+            // straight into the brain by a session-scoped bind, which is still a session statement.
+            // With no band at all on either side, `none` is the only honest answer.
+            source = prefix.length === 0 && seeded.length === 0 ? 'none' : 'session';
+        }
+
+        const response: SessionPrefixTurnsResponse = {
+            session_id: record.id,
+            agent_id: agentId,
+            prefix,
+            source
         };
 
         return json(200, response);
@@ -5988,6 +6144,10 @@ export const createHarnessApi = ({
         // accepts `instruction`; this is the same store operation reached from the document a
         // client is looking at, and it returns that same document after the write.
         sessionsBySessionIdAgentsByAgentIdInstruction: { GET: getSessionAgentInstruction, PATCH: patchSessionAgentInstruction },
+        // U6: the PRESET-HISTORY subresource. READ-ONLY: the write is the binding PATCH above
+        // (`prefix` is one field of that body), and this document is the lazy read a band editor
+        // polls — the live band in order, plus the layer that wrote it.
+        sessionsBySessionIdAgentsByAgentIdPrefix: { GET: getSessionAgentPrefix },
         sessionsBySessionIdTools: { GET: getSessionTools, POST: postSessionTool },
         sessionsBySessionIdToolsByToolId: { GET: getSessionTool, PATCH: patchSessionTool, DELETE: deleteSessionTool },
         sessionsBySessionIdToolsByToolIdSource: { GET: getSessionToolSource },

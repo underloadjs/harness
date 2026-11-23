@@ -75,6 +75,11 @@ import { SHARED_TOOL_NAMES } from './toolbox';
 // equal exactly what the trusted catalogue composes, and duplicating the prose (or the
 // join rule) in this file is how a pin silently drifts from the shipped prompt.
 import { AGENT_PROFILES, agentInstruction } from '../../engine/agents';
+// U6: the engine's read of one brain's SEEDED PREFIX BAND. The assertions below check what a
+// harness actually seeds through this seam — the same read the server's
+// `GET …/agents/{id}/prefix` answers with (../api.ts `getSessionAgentPrefix`) — rather than
+// re-deriving the band from the preset map the registry hands back.
+import { agentPrefixOf } from '../../engine/core';
 
 // The exact tool-order assertions below assume a KEYLESS host: search is
 // registered only when EXA_API_KEY/TAVILY_API_KEY resolves (harness.ts:728-738),
@@ -2423,5 +2428,286 @@ describe('session-defined agents in the durable preset record (R7)', () => {
         expect(() =>
             presetFromRecord({ ...record, customAgents: { [CUSTOM]: CUSTOM_BASE } }, injected)
         ).toThrow('changed incompatibly');
+    });
+});
+
+// U6 — PER-AGENT PRESET HISTORY (`agentPrefixes` in the domain model, `agent_prefixes` on the wire).
+//
+// The fourth map of the same shape, with one asymmetry that changes what "empty" means: a band is an
+// ARRAY, so an entry keyed with `[]` is a NON-empty map ("this member seeds no history") while `{}`
+// is the whole clear. The assertions below follow that rule through every layer this file owns —
+// create, PATCH, the factory closure the card carries, the durable record, and the rebuild — because
+// a band that does not survive the record is a definition that lies about the transcript the model
+// reads on turn one.
+describe('per-agent preset history (U6)', () => {
+    const BAND = [
+        { role: 'system' as const, content: 'Cite every figure.' },
+        { role: 'user' as const, content: 'Draft the summary.' },
+        { role: 'assistant' as const, content: 'Summary drafted.' }
+    ];
+
+    it('seeds one member, leaves the rest with no band, and touches no other seed', () => {
+        const registry = createHarnessRegistry();
+        const preset = registry.create({
+            name: 'banded',
+            agents: ['research', 'summarizer'],
+            agentPrefixes: { research: BAND }
+        });
+
+        expect(preset.agentPrefixes).toEqual({ research: BAND });
+
+        const built = preset.create(SETTINGS, progress);
+
+        // THE SEED, read through the engine's own seam (the same read the server's prefix route
+        // answers with): the member the map names holds the band in order; the member it omits holds
+        // none, and an absent band is `[]`, never `undefined`.
+        expect(agentPrefixOf(built.agents.research!)).toEqual(BAND);
+        expect(agentPrefixOf(built.agents.summarizer!)).toEqual([]);
+
+        // And the band is additive: the trusted instruction block above it and the model beside it
+        // are exactly what the same team without any band produces.
+        const bare = registry.create({ name: 'plain-team', agents: ['research', 'summarizer'] }).create(SETTINGS, progress);
+
+        expect(built.agents.research!.instructions).toEqual(bare.agents.research!.instructions);
+        expect(built.agents.research!.model()).toBe(bare.agents.research!.model());
+    });
+
+    it('validates the map shape, its keys, each band, and each turn', () => {
+        const registry = createHarnessRegistry();
+        const refusal = (agentPrefixes: unknown): { status: number; message: string } =>
+            registryError(() => registry.create({ name: 'x', agents: ['instruct'], agentPrefixes: agentPrefixes as never }));
+
+        // Not a plain object.
+        expect(refusal([])).toEqual({
+            status: 400,
+            message: '`agentPrefixes` must be an object mapping agent ids to arrays of preset-history turns.'
+        });
+
+        // A key that is not a final member: a band for an agent this harness never selects could
+        // never be seeded, so it is a visible 400 rather than a stored no-op.
+        expect(refusal({ ghost: [] })).toEqual({
+            status: 400,
+            message: '`agentPrefixes` names "ghost", which is not a member of this harness. Members: instruct.'
+        });
+
+        // A band that is not an array (`null` and a string are the two shapes a client actually sends).
+        expect(refusal({ instruct: null })).toEqual({
+            status: 400,
+            message: '`agentPrefixes.instruct` must be an ARRAY of preset-history turns ({ role, content }).'
+        });
+        expect(refusal({ instruct: 'once upon a time' })).toEqual({
+            status: 400,
+            message: '`agentPrefixes.instruct` must be an ARRAY of preset-history turns ({ role, content }).'
+        });
+
+        // A turn that is not an object, a fourth role, and a non-string content each name the
+        // position, because the client has to be able to point at the row it got wrong.
+        expect(refusal({ instruct: ['nope'] })).toEqual({
+            status: 400,
+            message: '`agentPrefixes.instruct`[0] must be an object with a "role" and a "content" string.'
+        });
+        expect(refusal({ instruct: [{ role: 'user', content: 'ok' }, { role: 'tool', content: 'orphan' }] })).toEqual({
+            status: 400,
+            message:
+                '`agentPrefixes.instruct`[1] has role "tool". A preset history turn is "system", "user", or "assistant" — a tool turn belongs to a conversation, not to a preset.'
+        });
+        expect(refusal({ instruct: [{ role: 'user', content: 7 }] })).toEqual({
+            status: 400,
+            message: '`agentPrefixes.instruct`[0] needs a string "content". Received 7.'
+        });
+
+        // THE BOUNDS, stated once in this file and read by every layer (registry.ts
+        // `MAX_PREFIX_TURNS` / `MAX_PREFIX_TURN_CHARS`, and the contract's `maxItems` / `maxLength`).
+        expect(
+            refusal({ instruct: Array.from({ length: 65 }, () => ({ role: 'user', content: 'x' })) })
+        ).toEqual({
+            status: 400,
+            message: '`agentPrefixes.instruct` cannot hold more than 64 turns. Received 65.'
+        });
+        expect(refusal({ instruct: [{ role: 'user', content: 'a'.repeat(32_001) }] })).toEqual({
+            status: 400,
+            message: '`agentPrefixes.instruct`[0] content cannot exceed 32000 characters.'
+        });
+
+        // The bound itself is inclusive on both axes.
+        const atTheBound = registry.create({
+            name: 'at-bound',
+            agents: ['instruct'],
+            agentPrefixes: {
+                instruct: [
+                    ...Array.from({ length: 63 }, (_entry, index) => ({
+                        role: 'user' as const,
+                        content: `turn ${String(index)}`
+                    })),
+                    { role: 'assistant', content: 'a'.repeat(32_000) }
+                ]
+            }
+        });
+
+        expect(atTheBound.agentPrefixes!.instruct).toHaveLength(64);
+        expect(atTheBound.agentPrefixes!.instruct[63]!.content).toHaveLength(32_000);
+    });
+
+    it('keeps an empty band as the value it is, and treats only an empty map as the clear', () => {
+        const registry = createHarnessRegistry();
+        const cleared = registry.create({ name: 'no-history', agents: ['instruct'], agentPrefixes: { instruct: [] } });
+
+        // The KEY survives, and so does the read that echoes it: this is the contract's "this member
+        // starts with no preset history", not an omitted field.
+        expect(cleared.agentPrefixes).toEqual({ instruct: [] });
+        expect(describeHarness(cleared).agentPrefixes).toEqual({ instruct: [] });
+        expect(agentPrefixOf(cleared.create(SETTINGS, progress).agents.instruct!)).toEqual([]);
+
+        // `{}` clears every band, and an empty MAP is the one state equivalent to absence — the card
+        // carries no `agentPrefixes` field at all.
+        const empty = registry.create({ name: 'untouched', agents: ['instruct'], agentPrefixes: {} });
+
+        expect(empty.agentPrefixes).toEqual({});
+        expect(describeHarness(empty).agentPrefixes).toBeUndefined();
+
+        const omitted = registry.create({ name: 'no-field', agents: ['instruct'] });
+
+        expect(omitted.agentPrefixes).toEqual({});
+        expect(describeHarness(omitted).agentPrefixes).toBeUndefined();
+    });
+
+    it('drops every extra turn field and detaches each band from the caller objects', () => {
+        const registry = createHarnessRegistry();
+        // A caller reusing a transcript row (an id, a `toolCalls` block, an attachments array): the
+        // extras are DROPPED, never refused, and never stored — the durable value is `{ role, content }`.
+        const caller = [{ role: 'user', content: '  verbatim  ', id: 9, toolCalls: [], included: false }];
+        const preset = registry.create({ name: 'detached', agents: ['instruct'], agentPrefixes: { instruct: caller as never } });
+
+        expect(preset.agentPrefixes).toEqual({ instruct: [{ role: 'user', content: '  verbatim  ' }] });
+
+        // A band is an array of OBJECTS, so a one-level copy would still share every turn with the
+        // request body (or a shipped template constant). Mutating the caller's object must not move
+        // what this card seeds.
+        (caller[0] as { content: string }).content = 'rewritten after the fact';
+        caller.push({ role: 'assistant', content: 'appended' } as never);
+
+        expect(preset.agentPrefixes).toEqual({ instruct: [{ role: 'user', content: '  verbatim  ' }] });
+
+        // The factory closed over the DETACHED copy too, so the card seeds what the request said —
+        // not whatever the caller's object became afterwards.
+        expect(agentPrefixOf(preset.create(SETTINGS, progress).agents.instruct!)).toEqual([
+            { role: 'user', content: '  verbatim  ' }
+        ]);
+    });
+
+    it('replaces the map on PATCH, keeps it when the field is omitted, and drops a band for a member the roster dropped', () => {
+        const registry = createHarnessRegistry();
+        const created = registry.create({
+            name: 'patched',
+            agents: ['research', 'summarizer'],
+            agentPrefixes: { research: BAND, summarizer: [{ role: 'user', content: 'Earlier exchange.' }] }
+        });
+
+        // An omitted field keeps the map exactly — a title patch is not a history patch.
+        const titled = registry.update('patched', { title: 'Renamed' });
+
+        expect(titled.agentPrefixes).toEqual({
+            research: BAND,
+            summarizer: [{ role: 'user', content: 'Earlier exchange.' }]
+        });
+
+        // A stated map REPLACES the whole map (not per key): the member this patch stops naming has
+        // no band any more.
+        const replaced = registry.update('patched', { agentPrefixes: { summarizer: [] } });
+
+        expect(replaced.agentPrefixes).toEqual({ summarizer: [] });
+
+        // A band for a member the NEW roster dropped is dropped rather than rejected, so an operator
+        // can shrink a team and fix its history in one call.
+        const shrunk = registry.update('patched', { agents: ['summarizer'] });
+
+        expect(shrunk.agents).toEqual(['summarizer']);
+        expect(shrunk.agentPrefixes).toEqual({ summarizer: [] });
+
+        // `{}` clears every band.
+        expect(registry.update('patched', { agentPrefixes: {} }).agentPrefixes).toEqual({});
+
+        // And a PATCH that names a member the resulting roster does not contain is the 400.
+        expect(
+            registryError(() => registry.update('patched', { agentPrefixes: { ghost: [] } }))
+        ).toEqual({
+            status: 400,
+            message: '`agentPrefixes` names "ghost", which is not a member of this harness. Members: summarizer.'
+        });
+    });
+
+    it('is EXECUTABLE state: a prefix patch rebuilds the factory so the next harness seeds the new band', () => {
+        const registry = createHarnessRegistry();
+        const before = registry.create({ name: 'executable', agents: ['instruct'], agentPrefixes: { instruct: BAND } });
+
+        expect(agentPrefixOf(before.create(SETTINGS, progress).agents.instruct!)).toEqual(BAND);
+
+        const after = registry.update('executable', { agentPrefixes: { instruct: [{ role: 'user', content: 'Replaced.' }] } });
+
+        // The captured factory is a NEW closure: the old card's factory still seeds the old band, and
+        // the entry the registry now holds seeds the new one — which is what lets a live session keep
+        // the history it was built with while the next session gets the edit.
+        expect(agentPrefixOf(before.create(SETTINGS, progress).agents.instruct!)).toEqual(BAND);
+        expect(agentPrefixOf(after.create(SETTINGS, progress).agents.instruct!)).toEqual([
+            { role: 'user', content: 'Replaced.' }
+        ]);
+    });
+
+    it('round-trips the durable record and re-seeds the same band', () => {
+        const registry = createHarnessRegistry();
+        const created = registry.create({
+            name: 'durable',
+            agents: ['research', 'summarizer'],
+            agentPrefixes: { research: BAND, summarizer: [] }
+        });
+
+        const record = presetToRecord(created);
+
+        expect(record.agentPrefixes).toEqual({ research: BAND, summarizer: [] });
+
+        const rebuilt = presetFromRecord(record);
+
+        expect(rebuilt.agentPrefixes).toEqual({ research: BAND, summarizer: [] });
+        expect(rebuilt.agents).toEqual(['research', 'summarizer']);
+        expect(rebuilt.entry).toBe('research');
+
+        const built = rebuilt.create(SETTINGS, progress);
+
+        expect(Object.keys(built.agents).sort()).toEqual(['research', 'summarizer']);
+        expect(agentPrefixOf(built.agents.research!)).toEqual(BAND);
+        expect(agentPrefixOf(built.agents.summarizer!)).toEqual([]);
+
+        // The record of the rebuilt entry compares equal, so a restore takes the UNCHANGED registry
+        // entry rather than rebuilding this row for nothing.
+        expect(presetRecordEquals(presetToRecord(rebuilt), record)).toBe(true);
+
+        // A band is EXECUTABLE: a record that states one differs from the same row without it, which
+        // is the comparison `./sessions.ts` uses to decide whether the frozen record or the live
+        // registry entry builds a restored session's harness.
+        expect(
+            presetRecordEquals(record, { ...record, agentPrefixes: { research: [{ role: 'user', content: 'One turn.' }] } })
+        ).toBe(false);
+    });
+
+    it('writes no field without bands, so a pre-U6 record restores byte-identically', () => {
+        const registry = createHarnessRegistry();
+        const bare = presetToRecord(registry.create({ name: 'plain', agents: ['research'] }));
+
+        // Absent, not `{}`: a document saved before U6 keeps its exact old byte shape.
+        expect(Object.hasOwn(bare, 'agentPrefixes')).toBe(false);
+
+        // Absent and empty are the same statement, so they compare equal... and a rebuild of a
+        // pre-U6 row keeps the field ABSENT, so an old document's preset comes back with the exact
+        // key set it was written with.
+        expect(presetRecordEquals(bare, { ...bare, agentPrefixes: {} })).toBe(true);
+        expect(Object.hasOwn(presetFromRecord(bare), 'agentPrefixes')).toBe(false);
+        expect(Object.hasOwn(presetFromRecord({ ...bare, agentPrefixes: undefined }), 'agentPrefixes')).toBe(false);
+        expect(Object.keys(presetFromRecord({ ...bare, agentPrefixes: undefined }).create(SETTINGS, progress).agents)).toEqual(['research']);
+
+        // ...while a record naming a band is a different definition, and the rebuild seeds it.
+        const banded = { ...bare, agentPrefixes: { research: BAND } };
+
+        expect(presetRecordEquals(bare, banded)).toBe(false);
+        expect(agentPrefixOf(presetFromRecord(banded).create(SETTINGS, progress).agents.research!)).toEqual(BAND);
     });
 });

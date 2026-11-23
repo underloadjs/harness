@@ -457,7 +457,7 @@ import { MODEL_TOKEN_BYTES, MODEL_TOOL_RESULT_BUDGET_TOKENS } from './core/resul
 // The single context-inclusion normalizer (core/agent.ts). Direct module import,
 // the same convention as `./core/context-estimate` above: the projection needs it
 // and must not pay for the whole core barrel to get one helper.
-import { withoutWithheldReasoning, withIncluded } from './core/agent';
+import { withoutWithheldReasoning, withIncluded, writeAgentPrefix } from './core/agent';
 // Stable transcript addresses (context T1.2): the minting rule for the one canonical
 // creation point that lives HERE — a committed tool result. `setIncluded`'s new
 // `messageId` target reads the ids this mints (see `indexOfMessageId` in `emitTurnBefore`);
@@ -554,6 +554,10 @@ import type {
     HarnessContextEditPatch,
     HarnessMessage,
     HarnessPendingTool,
+    // U6: the closed role/content turn of an agent's SEEDED PREFIX BAND, the input of
+    // `setAgentPrefix` below and of the server's prefix routes. Declared in ./types so the
+    // generated contract can alias it (scripts/generate-harness-contract.ts `ALIASES`).
+    HarnessPrefixTurn,
     HarnessProgress,
     HarnessRunIdentity,
     HarnessRunOptions,
@@ -17077,11 +17081,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // reference — a holder of `agent.instructions` must see the new baseline.
         const baseline = brain.instructions as string[];
 
-        // `agent()` seeds the transcript as [every instruction, ...configuration.messages]
-        // (see core/agent.ts `seed`), so the CURRENT instruction list is exactly how many
-        // leading system messages belong to the prompt. Using that count — instead of
-        // "every leading system message" — is what makes this safe for an agent seeded
-        // with its own system context messages: those are history, and they stay.
+        // `agent()` seeds the transcript as [every instruction, ...prefix,
+        // ...configuration.messages] (see core/agent.ts `seed`), so the CURRENT
+        // instruction list is exactly how many leading system messages belong to the
+        // prompt. Using that count — instead of "every leading system message" — is
+        // what makes this safe for an agent seeded with its own system context
+        // messages (`prefix` included): those are history, and they stay.
         const replace = baseline.length;
 
         for (let index = 0; index < replace; index += 1) {
@@ -17103,6 +17108,61 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         if (replace === 0) history.unshift({ role: 'system', content: text });
         else history.splice(0, replace, { role: 'system', content: text });
+    };
+
+    // Replace one registered member's SEEDED PREFIX BAND in place (U6) — the run of transcript
+    // entries `agent()` seeded from `AgentConfiguration.prefix`, i.e. the preset history that
+    // sits immediately AFTER the instruction block and BEFORE the legacy seed messages and every
+    // accumulated turn.
+    //
+    // WHY THIS IS NOT "rewrite the transcript". A prefix is a SEED, and a seed has three lives:
+    // the current transcript band, the `reset()` baseline, and the configuration a NEW host thread
+    // is built from. All three are closure state inside the brain, so this route hands the turn
+    // list to the brain's own writer (./core/agent.ts `writeAgentPrefix`, registered on every
+    // `agent()` through a WeakMap so the public `Agent` keeps no mutable configuration field) and
+    // all three move together. Rebuilding the agent — the other way to change a seed — would drop
+    // the conversation, which is exactly what a caller editing a preset prompt is trying to keep.
+    //
+    // WHAT IS PRESERVED, byte for byte and by reference where the array allows it: the instruction
+    // block above the band, every legacy `configuration.messages` entry, and every committed turn
+    // after the band. `[]` removes the band entirely, which is the caller's "this member has no
+    // preset history" and a legal write.
+    //
+    // WHAT DOES NOT MOVE: an already-created host thread. Each is its own transcript seeded when
+    // it was created, and `setAgentInstruction` states the same limitation for the same reason —
+    // rewriting a live conversation's prompt behind a running conversation is a different, bigger
+    // operation than re-seeding the next one. A FORK never gets a band of either kind: a branch
+    // starts from its source's materialized transcript, which already carries these turns, and the
+    // writer refuses a branch object outright rather than injecting the band a second time.
+    //
+    // REFUSALS, each with the roster untouched: the roster-idle gate every other roster write uses
+    // (a run in flight reads the transcript this call splices); an unknown name; a non-array
+    // `prefix` (there is no `null` here — "inherit" is a SERVER-layer question that
+    // src/server/sessions.ts resolves before calling this, and the runtime has nothing to inherit
+    // from); a turn that is not a role/content text turn; and a band the transcript no longer
+    // holds where the seed put it, which is the prefix analogue of the contiguity check above.
+    const setAgentPrefix = (name: string, prefix: readonly HarnessPrefixTurn[]): void => {
+        assertRosterIdle('change an agent prefix');
+
+        const key = typeof name === 'string' ? name.trim() : '';
+
+        if (!Object.prototype.hasOwnProperty.call(agents, key)) {
+            throw new HarnessError(
+                `Agent "${key}" is not registered. Configured agents: ${Object.keys(agents).join(', ')}.`
+            );
+        }
+
+        if (!Array.isArray(prefix)) {
+            throw new HarnessError(
+                `Agent "${key}" needs an ARRAY of prefix turns. Send [] to remove the seeded band; the runtime has no layer to inherit from.`
+            );
+        }
+
+        // The brain answers every remaining question — the band's live position (which follows the
+        // instruction block, whose length `setAgentInstruction` may have changed), the per-turn
+        // validation, the copy-and-mint hygiene, and the baseline/thread rewrite. Its refusals name
+        // this registry key, because registration assigns `brain.name = key`.
+        writeAgentPrefix(agents[key], prefix);
     };
 
     // The brain a root call runs on. Resolved at CALL time rather than captured at
@@ -17394,6 +17454,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         removeAgent,
         setAgentRank,
         setAgentInstruction,
+        // U6: the prefix-band write, beside the instruction write it mirrors (see
+        // `setAgentPrefix` above for the full contract and ./types `Harness.setAgentPrefix`).
+        setAgentPrefix,
         // R3a persistence. `snapshot` never mutates; `restore` validates fully
         // and recompiles created-tool sources without executing them.
         snapshot,

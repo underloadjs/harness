@@ -574,6 +574,14 @@ const compilePreset = (
                   base.agentInstructions ?? {},
                   base.agentColors ?? {},
                   {},
+                  // U6: the band map sits BEFORE `toolbox` because `createProfiledHarness` groups it
+                  // with the other agent maps, so this call site has to name it. It reads the map back
+                  // off the validated base rather than passing a literal, which keeps the arity honest
+                  // and carries whatever the scratch registry's `create()` settled on (today always
+                  // `{}`: `HarnessBootPresetConfiguration` declares `agentModels`/`agentInstructions`/
+                  // `agentColors` only, so a boot card states prose, and a band enters a template
+                  // through a registry write or a restored row — see ./harnesses/registry.ts).
+                  base.agentPrefixes ?? {},
                   declaration.toolbox
               )
             : (source.create as HarnessPreset['create']);

@@ -440,8 +440,9 @@ paths:
       summary: Create a harness definition
       description: >-
         Selection-only body: a client picks trusted agent names and may record per-agent model ids,
-        instruction overrides, and display colors. It cannot supply a provider, a credential, a transport, or a
-        tool list - those are deployment-owned. The registry validates the name and every member before
+        instruction overrides, preset-history bands, and display colors. It cannot supply a provider, a
+        credential, a transport, or a tool list - those are deployment-owned. The registry validates the name
+        and every member before
         anything is written, and each refusal is the one the server actually answers: a `name` that is not a
         letter followed by letters, digits, `_` or `-` within 64 characters is 400, a `name` that is one of
         the built-in ALIASES (`writer`, `assistant`, `researcher`) is 400 because an alias is a redirect, not
@@ -478,6 +479,12 @@ paths:
                     researcher: merge/ds4-flash
                   agent_instructions:
                     editor: Tighten prose. Never restructure headings.
+                  agent_prefixes:
+                    editor:
+                      - role: user
+                        content: Rewrite the launch post so it opens on the customer, not the feature list.
+                      - role: assistant
+                        content: Shorter, customer-first, no heading changes.
                   agent_colors:
                     editor: '#f97316'
       responses:
@@ -499,12 +506,18 @@ paths:
       operationId: getHarness
       summary: Read one harness definition
       description: >-
-        The identified read: the card plus `agent_models`, the per-agent `agent_colors` display map, and the
+        The identified read: the card plus `agent_models`, the per-agent `agent_colors` display map, the
+        per-agent `agent_prefixes` preset-history bands, and the
         resolved `core_tools` the definition's runs will actually declare (runtime visibility, including
         `search` only when a provider key exists), plus `instruction_summary` - one entry per member stating whether an override
         exists and how long it is, WITHOUT the text. Instruction text is a separate, explicitly named
         subresource, because a definition that embeds every member's system prompt is the single largest
-        payload class this API removes.
+        payload class this API removes. A prefix band is NOT split off the same way: it is an array of bounded
+        turns per member over a roster this API already bounds, so the identified read carries it and a client
+        that shows preset history needs one request, not one per member. That read states `agent_prefixes` on
+        EVERY answer, `{}` when the definition seeds nothing, so a client negotiates the preset-history editor
+        from the property itself instead of from the route answering - a backend from before the feature omits
+        it, and its PATCH would refuse the field.
       responses:
         '200':
           description: Harness definition.
@@ -520,9 +533,12 @@ paths:
       summary: Change a harness definition
       description: >-
         `harness_name` is immutable; an omitted field keeps its current value. `agent_models`,
-        `agent_instructions` and `agent_colors` REPLACE the map they name: `{}` clears it, every key must name a
-        member of the resulting definition (400 otherwise), and an override for a member the same patch removes is
-        dropped rather than rejected. THE ROSTER FIELDS FOLLOW THE RANK RULES: `agents` REPLACES the roster;
+        `agent_instructions`, `agent_prefixes` and `agent_colors` REPLACE the map they name: `{}` clears it, every
+        key must name a member of the resulting definition (400 otherwise), and an override for a member the same
+        patch removes is dropped rather than rejected. A prefix band REPLACES that member's whole seeded history -
+        it never appends to one - and an explicit `[]` is a valid band meaning "no preset history", so clearing one
+        member keeps its key. Like an instruction override, a prefix write changes the factory the NEXT session is
+        built from and never rewrites a transcript an existing session already accumulated. THE ROSTER FIELDS FOLLOW THE RANK RULES: `agents` REPLACES the roster;
         an omitted `entry` keeps the current entry agent when the new roster still contains it and otherwise
         falls back to the new roster's first agent, while a `entry` that is passed explicitly replaces the
         recorded agent as-is; `ranks` REPLACES the authority map, and a key naming an agent outside the
@@ -1694,7 +1710,9 @@ paths:
         stating its role, where it came from (`definition` or `session`), the model it runs NOW, the
         model it would run if its session override were cleared, and the provenance of its current
         instruction text. Rows omit the instruction and guideline TEXT - one row per member stays
-        constant-size however long the prompts are - and the roster itself is contract-bounded to 64
+        constant-size however long the prompts are - and they omit a member's preset-history TURNS for the
+        same reason: a band is an array of turns, so it lives on `GET …/agents/{id}/prefix` instead of
+        enlarging every row. The roster itself is contract-bounded to 64
         entries, so this response has no page cursor by design. Membership is the frozen definition: a
         later global agent edit cannot add or remove a member here.
       responses:
@@ -1737,7 +1755,10 @@ paths:
         structural role is gone with the role axis. An omitted or null value asks for NO authority and gives the
         binding the LOWEST letter of the scale, never a guess and never "inherit". What stays structural is the
         ENTRY agent, and it is protected by MEMBERSHIP, not by rank: `DELETE .../agents/:name` refuses the entry
-        agent at any rank. The session must be
+        agent at any rank. `prefix` seeds this member's complete preset history - the ordered `system` / `user` /
+        `assistant` turns after its instruction block - stored verbatim and durable with the binding, and an
+        explicit `[]` is a valid choice meaning "no preset history"; a malformed band is 400 and is detected
+        BEFORE anything is bound, so a refused body adds no member. The session must be
         IDLE: any live run or queued work answers 409, because a turn is accepted against the roster it can
         already see. The harness template also decides: a session built from a SCRIPTED definition or from a
         preset injected in memory answers 409 here, because that factory replays the shipped team (or cannot
@@ -1806,23 +1827,27 @@ paths:
     patch:
       tags: [Session Agents]
       operationId: updateSessionAgent
-      summary: Override one session agent's model or instruction, or change its rank before the first thread
+      summary: Override one session agent's model, instruction, or preset history, or change its rank before the first thread
       description: >-
         Stated per field: an omitted property is no change, a string REPLACES that field, and an explicit
         `null` clears the session override and RESTORES the inherited binding - for `model` the model this
-        session's settings carry, for `instruction` the harness, global, or catalogue text. That is what makes
+        session's settings carry, for `instruction` the harness, global, or catalogue text, and for `prefix`
+        the preset-history band the frozen harness definition seeds. That is what makes
         an override reversible without rebuilding the session, and the response states the resulting
         provenance. `{}` is a 400 - the route refuses a success that changed nothing - while an all-`null`
         body is valid and clears every override it names.
-        The two fields have different concurrency rules, because they are different operations: a MODEL change
+        These fields have different concurrency rules, because they are different operations: a MODEL change
         runs through the live brains and is accepted while the session is running (an in-flight request keeps
-        the model it started with and only later requests observe it), while an INSTRUCTION change rewrites a
-        prompt a turn has already been accepted against, so it requires an idle session and answers 409 while
+        the model it started with and only later requests observe it), while an INSTRUCTION change and a
+        PRESET-HISTORY change each rewrite a seed a turn has already been accepted against, so they require an
+        idle session and answer 409 while
         any live run OR queued work exists. A retired profile member's instruction is 409 as well - the
         deployment text it would restore no longer exists - and so is the runtime's own refusal to re-seed the
         member. Blank or non-string instruction text is 400 (send `null` to restore instead), as is more than
         8000 characters; a model id is trimmed and must be non-empty and at most 200 characters with no
-        control characters. Neither field is gated by the roster-durability rule that answers 409 on
+        control characters; a `prefix` must be an array of well-formed turns - a tool role, a non-string
+        `content`, or a malformed array is 400 (a field outside `role`/`content` is ignored, never stored) - and an explicit `[]` is a valid band
+        meaning "this member starts with no preset history", which is NOT the same request as `null`. Neither field is gated by the roster-durability rule that answers 409 on
         `POST …/agents` and `DELETE …/agents/{id}` for a scripted or in-memory-injected harness template: an
         override retunes a seed inside the team the record already carries, so the write is accepted on every
         template - though the template still decides what a restart keeps, and only the instruction route states
@@ -1987,6 +2012,38 @@ paths:
           $ref: '#/components/responses/Conflict'
         '413':
           $ref: '#/components/responses/PayloadTooLarge'
+  /v1/harness/sessions/{session_id}/agents/{agent_id}/prefix:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+      - $ref: '#/components/parameters/AgentId'
+    get:
+      tags: [Session Agents]
+      operationId: getSessionAgentPrefix
+      summary: Read one session agent's preset history
+      description: >-
+        The complete ordered band of seeded `system` / `user` / `assistant` turns this member actually starts a
+        conversation with, plus the `source` that supplied it. It is read from the LIVE brain - the messages
+        between this member's instruction block and its first real turn - rather than from the stored override
+        alone, so the answer is what the next turn sends and not what some layer once proposed, and the turns
+        come back verbatim, with no trim. `source` follows where the band came from: `session` when THIS
+        conversation carries its own band for the member (an override written here - including one that states
+        no turns at all, which is a band this conversation chose), `harness` when the band is the one this
+        session's FROZEN harness definition seeds, and `none` when nothing seeds history for this member, in
+        which case `prefix` is empty. A band is a SEED, not a transcript: this route reports no committed turns,
+        because the conversation a member really accumulated is served by the turn-block routes. Writes go
+        through the binding `PATCH` and its `prefix` field - the band belongs to the same idle-gated document a
+        client edits an instruction on - so this route is the lazy read behind a "show preset history"
+        affordance, and neither the roster nor a session read carries the turns. An unknown session or agent is
+        404, resolved before anything else.
+      responses:
+        '200':
+          description: Effective preset history and its provenance.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPrefixTurnsResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
   /v1/harness/sessions/{session_id}/tools:
     parameters:
       - $ref: '#/components/parameters/SessionId'
@@ -3935,7 +3992,7 @@ components:
             unknown-field:
               value:
                 error:
-                  message: 'Unknown field "instructions". Allowed fields: name, title, description, agents, entry, ranks, agent_models, agent_instructions, agent_colors.'
+                  message: 'Unknown field "instructions". Allowed fields: name, title, description, agents, entry, ranks, agent_models, agent_instructions, agent_prefixes, agent_colors.'
             stale-cursor:
               value:
                 error:
@@ -4720,11 +4777,49 @@ components:
           type: integer
           minimum: 0
           description: EXACT character count of the effective text, so a client can size a preview honestly.
+    # A preset-history turn: the narrowest slice of a transcript a preset is allowed to own. It is deliberately
+    # NOT `HarnessMessage` - the engine's own `HarnessPrefixTurn` (src/engine/types/index.ts) is the same closed
+    # three-role shape, aliased in the generated contract (scripts/generate-harness-contract.ts `ALIASES`) and
+    # guarded by the assignability probe in src/engine/shared/harness-api.test.ts, so a tool turn can never enter
+    # a preset through either end of the wire.
+    HarnessPrefixTurn:
+      type: object
+      description: >-
+        One seeded history turn - a message the definition places in a member's transcript BEFORE its first real
+        turn, which the model then reads as conversation rather than as instructions. Only the three text roles
+        exist here: `tool` and `toolResult` are refused, because a tool turn belongs to a conversation that
+        produced it and a preset cannot fake a tool execution whose call never ran, and `toolCalls` / `toolCallId`
+        / `usage` / attachments belong to the transcript record, not to the request - a prefix is the one
+        cross-layer write whose value must mean exactly the same bytes in a template, a session override, and an
+        engine band. A field outside this pair is IGNORED and never stored - what reaches a transcript is
+        `role` plus `content`, with an id this server mints - while a missing role, a fourth role, or a
+        non-string `content` is a 400 naming the turn's position. Dropping rather than refusing the extras is
+        deliberate: a client that echoes a transcript row back has already paid for those fields elsewhere, and
+        a preset write must not fail because it sent the richer shape.
+      required: [role, content]
+      additionalProperties: false
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant]
+          description: >-
+            The role the seeded turn carries into the transcript. Any of the three is legal, including `system`:
+            a preset band is a SEED, not a conversation, so a system turn here does not compete with the member's
+            instruction - the band sits below it. A tool role is 400, and so is any other value.
+        content:
+          type: string
+          maxLength: 32000
+          description: >-
+            The turn's text, VERBATIM: unlike an instruction this route never trims, re-wraps, or normalises,
+            because the bytes a client saved are the bytes the model reads. An empty string is legal and stays
+            empty (a blank turn is a real transcript entry); more than 32000 characters is 400. A non-string
+            value - a number, an array of content blocks, null - is 400 too, because narrowing content to text is
+            exactly what keeps this shape portable across every layer that stores it.
     HarnessDefinition:
       type: object
       description: >-
         The identified read of one definition: a card plus the per-agent model overrides, the per-agent
-        display colors, the resolved core-tool set, and the instruction summary.
+        display colors, the per-agent preset-history bands, the resolved core-tool set, and the instruction summary.
       allOf:
         - $ref: '#/components/schemas/HarnessCard'
         - type: object
@@ -4758,6 +4853,30 @@ components:
               additionalProperties:
                 type: string
                 pattern: '^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$'
+            agent_prefixes:
+              type: object
+              description: >-
+                Per-agent PRESET-HISTORY bands (agent name to that member's complete ordered turns). The
+                identified read ALWAYS states this map, `{}` when the definition seeds nothing - unlike
+                `agent_models` and `agent_colors` above, which keep the non-empty omission rule. The
+                difference is capability, not data: a harness PATCH REPLACES `agent_prefixes` and a present
+                `{}` is the explicit clear of every stored band, so a client may only send the map it has
+                READ, and a backend from before this feature answers the route with no such property. Absent
+                therefore means "this server has no preset-history editor", and `{}` means "the editor
+                exists and nothing is seeded" - a negotiation that only holds while an empty map is emitted.
+                This is the one place a client READS the band text: unlike an instruction, whose text is a
+                named subresource because one string per member still scales with the prompt, a band is an
+                array of turns per member and the roster is bounded, so the identified read inlines it and
+                no definition subresource exists for prefixes. A member absent from the map has no band, and
+                a member keyed `[]` is echoed back, because an explicit "no preset history" is a stated
+                choice. A card in a LIST row never carries the field, and neither does a SAVED SESSION's
+                copy of this resource (`SessionDefinitionResource`, which keeps the non-empty rule because a
+                session client negotiates the feature from the per-agent prefix route instead).
+              additionalProperties:
+                type: array
+                maxItems: 64
+                items:
+                  $ref: '#/components/schemas/HarnessPrefixTurn'
             instruction_summary:
               type: array
               description: One row per member, in the roster's DECLARATION ORDER. No text.
@@ -4828,6 +4947,28 @@ components:
           additionalProperties:
             type: string
             maxLength: 8000
+        agent_prefixes:
+          type: object
+          description: >-
+            Agent name to that member's PRESET HISTORY: the ordered `system` / `user` / `assistant` turns
+            the agent is SEEDED with, immediately after its instruction block and before any conversation.
+            An instruction says "you are X"; this says "this has already happened". Each supplied value is
+            the member's COMPLETE ordered list - a key REPLACES that member's whole band, it never appends
+            to one - and an explicit `[]` is a valid value meaning "this member starts with no preset
+            history". Keys follow the same membership rule as the map above: every key names a member of
+            the resulting definition, and `{}` clears every prefix. Like `agent_instructions`, the map is
+            captured by the definition's factory, so a PATCH rebuilds the factory for FUTURE sessions and
+            never rewrites a transcript an existing session already accumulated. Text is stored verbatim:
+            no trim, no case change, and a turn carries only a role and its text (a tool role, a tool
+            call, and an attachment are not part of this contract).
+          additionalProperties:
+            type: array
+            maxItems: 64
+            description: >-
+              The member's complete ordered band. Empty means "no preset history", which is a stated
+              choice and not the same thing as omitting the member's key entirely.
+            items:
+              $ref: '#/components/schemas/HarnessPrefixTurn'
         agent_colors:
           type: object
           description: >-
@@ -4841,9 +4982,10 @@ components:
     UpdateHarnessRequest:
       type: object
       description: >-
-        An omitted field keeps its current value; the name is immutable. `agent_models`, `agent_instructions`
-        and `agent_colors` REPLACE the map they name (`{}` clears it), and an override for a member this
-        patch removes is dropped rather than rejected. `agents` REPLACES the roster; an omitted `entry` keeps
+        An omitted field keeps its current value; the name is immutable. `agent_models`, `agent_instructions`,
+        `agent_prefixes` and `agent_colors` REPLACE the map they name (`{}` clears it), and an override for a
+        member this patch removes is dropped rather than rejected. `agents` REPLACES the roster; an omitted
+        `entry` keeps
         the current entry agent when the new roster still contains it and otherwise falls back to the new
         roster's FIRST agent (a harness whose entry agent left has to route to someone); `ranks` REPLACES the
         authority map, and a key naming an agent outside the resulting roster is 400 rather than a silent
@@ -4886,6 +5028,23 @@ components:
           additionalProperties:
             type: string
             maxLength: 8000
+        agent_prefixes:
+          type: object
+          description: >-
+            Replaces each member's complete preset-history band, with the same map semantics as the two
+            maps above: `{}` clears every prefix, every key names a member of the resulting roster, and a
+            band for a member this patch removes is dropped rather than rejected. An explicit `[]` states
+            "this member starts with no preset history" and is a valid band, so clearing one member's
+            history is `{ "agent_prefixes": { "editor": [] } }` - the member keeps its key and gets no
+            turns. Accepted on every harness template: like an instruction override, a band retunes a seed
+            inside the team the record already carries, so it does not take the durability gate a roster
+            change takes. What it changes is the factory the NEXT session is built from; a session already
+            running keeps the transcript it seeded.
+          additionalProperties:
+            type: array
+            maxItems: 64
+            items:
+              $ref: '#/components/schemas/HarnessPrefixTurn'
         agent_colors:
           type: object
           description: >-
@@ -5945,8 +6104,15 @@ components:
         The harness definition this session captured at creation, which is the authority for its member set,
         delegation allowlist, declared and core tools, and per-agent overrides - including the per-agent
         `agent_colors` display map it inherits from `HarnessDefinition`, present only when the captured copy
-        configured at least one color. A saved session restores from this record, so a later global edit
-        cannot move it, and the swatches a client paints for this conversation come from here.
+        configured at least one color. `agent_prefixes` follows that SAME non-empty rule here, which is the
+        one place this resource answers differently from the `HarnessDefinition` it extends: the identified
+        harness read always states the map (`{}` included) to advertise the template capability, while this
+        read omits it while the captured copy seeds nothing - a session client negotiates preset history from
+        the per-agent route (`GET /sessions/{id}/agents/{agent_id}/prefix`, 404 on a build that never
+        mounted it), and a session frozen before the feature keeps its exact previous row. A member keyed `[]`
+        makes the map non-empty and is echoed. A saved session restores from this record, so a later global
+        edit cannot move it, and the swatches a client paints for this conversation come from here - as do
+        the seeded bands, which live beside the session's own override in `preset.agentPrefixes`.
       allOf:
         - $ref: '#/components/schemas/HarnessDefinition'
         - type: object
@@ -6296,6 +6462,22 @@ components:
             this conversation builds for the name. A blank value is therefore "none", not an error, on this
             route - the PATCH is stricter and refuses blank instead of clearing. More than 8000 characters is
             400. Never mutates the profile it overrides.
+        prefix:
+          type: array
+          maxItems: 64
+          description: >-
+            Optional PRESET HISTORY for this member: the ordered `system` / `user` / `assistant` turns it is
+            seeded with after its instruction block. A supplied array is the member's complete band, stored
+            verbatim and durable in this session's record, so the same history is re-seeded when the session is
+            restored - `[]` is a valid value meaning "this member starts with no preset history", which for an
+            agent bound from a profile member OVERRIDES the seeded band down to nothing, and for a
+            session-defined agent means the same as omitting it. Omitted or null asks for nothing of its own: a
+            profile member keeps the band its harness definition seeds, and an invented agent starts with no
+            history. Turn validation is the shared one - a tool role, a non-string `content`, or a malformed
+            array is 400, while a field outside `role`/`content` is ignored and never stored - and it runs BEFORE
+            anything is bound, so a refused body adds no member. Text is never trimmed.
+          items:
+            $ref: '#/components/schemas/HarnessPrefixTurn'
         rank:
           $ref: '#/components/schemas/AgentRank'
           description: >-
@@ -6344,6 +6526,24 @@ components:
             re-seeds a profile member from the deployment's CURRENT effective profile text and restores an agent
             this conversation invented to the base it was created with. Changing it at all requires an idle
             session, because a queued turn has already been accepted against the prompt it will run.
+        prefix:
+          type: array
+          nullable: true
+          maxItems: 64
+          description: >-
+            The member's COMPLETE preset-history band, written with the same three-way rule as `instruction`: an
+            omitted key is no change, an array REPLACES the whole band (`[]` is a complete band of no turns,
+            which seeds this member with no preset history), and `null` removes the session's override so the
+            member is re-seeded from the band its FROZEN harness definition carries - or from no history at all,
+            when that definition seeds none. Like an instruction write it needs an idle session and answers 409
+            while a live run or queued work exists, and it rewrites only this member's seeded band: the turns it
+            has already accumulated, every other member's transcript, the harness definition, and the global
+            catalogue are untouched. Text is stored verbatim - no trim - and the turn rules are the shared ones,
+            so a tool role, a non-string `content`, or a malformed array is 400, while a field outside
+            `role`/`content` is ignored and never stored. The band
+            is durable in this session's record, so a restart re-seeds the same history.
+          items:
+            $ref: '#/components/schemas/HarnessPrefixTurn'
     # The write verb of the session agent instruction subresource: the same store operation this binding
     # PATCH performs when it names `instruction`, reached from the document instead of the roster row, and
     # answered with that document. `instruction` is required here (absent is a 400, not a no-op), the store
@@ -6438,6 +6638,40 @@ components:
           type: integer
           minimum: 0
           description: EXACT character count of `instruction`.
+    SessionPrefixTurnsResponse:
+      type: object
+      description: >-
+        The preset history one session agent actually seeds, plus its provenance. The turns are the LIVE band,
+        in order, verbatim - which is what makes this read worth addressing per agent: a band is an array rather
+        than one string, so it stays in this named document and out of the roster row.
+      required: [session_id, agent_id, prefix, source]
+      additionalProperties: false
+      properties:
+        session_id:
+          type: string
+        agent_id:
+          type: string
+        prefix:
+          type: array
+          maxItems: 64
+          description: >-
+            The member's complete ordered band, exactly as the next turn will read it. EMPTY when nothing seeds
+            this member, which is also what `source: none` states; an empty band whose source is `session` means
+            this conversation chose "no preset history" over the band its definition would have seeded.
+          items:
+            $ref: '#/components/schemas/HarnessPrefixTurn'
+        source:
+          type: string
+          enum: [harness, session, none]
+          description: >-
+            Which layer wrote the band the member runs, in these three cases only: `session` for a band this
+            conversation stored that DIFFERS from what its definition seeds, `harness` for the band the frozen
+            harness definition seeds, and `none` when no layer seeds one. A session write that restates the
+            definition's own bytes answers `harness`, because no reader - not the model, not a restart - can
+            observe a difference that is not there. Unlike the instruction ladder there is no `catalogue` or
+            `global` value, because a preset history has no catalogue layer - the shipped profiles seed no
+            history, and the global profile layer stores text, not turns - and no band is ever inherited from
+            a profile.
     # ---------------------------------------------------------------------
     # Session tools
     # ---------------------------------------------------------------------

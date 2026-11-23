@@ -167,6 +167,7 @@ import type {
     HarnessAssistantMessage,
     HarnessAttachment,
     HarnessMessage,
+    HarnessPrefixTurn,
     HarnessRetryConfiguration,
     HarnessStopReason,
     HarnessStream,
@@ -184,6 +185,71 @@ const normalizeInstructions = (instruction: string | string[] | undefined): stri
     if (typeof instruction === 'string') return [instruction];
     return [...instruction];
 };
+
+// ONE SEEDED PREFIX ENTRY (U6). The exact element type of `AgentConfiguration.prefix`
+// (`system | user | assistant`, the roles a preset history may hold), named once so the seed
+// bookkeeping, the writer, and the read accessor below all speak the same type instead of
+// re-spelling the `Extract` twice more.
+type PrefixSeedMessage = Extract<HarnessMessage, { role: 'system' | 'user' | 'assistant' }>;
+
+// The roles a prefix turn may hold — the SAME set the `HarnessPrefixTurn` type and
+// `AgentConfiguration.prefix` admit, stated as a value so a runtime caller (a host, a test, a
+// deserialized document) that slipped past the type gets a refusal rather than an orphaned turn
+// reaching a provider. A `tool` turn is deliberately absent: it answers an assistant
+// `tool_calls` block a prefix never carries.
+const PREFIX_TURN_ROLES: readonly PrefixSeedMessage['role'][] = ['system', 'user', 'assistant'];
+
+// One DETACHED, TEXT-ONLY copy of a submitted prefix turn (U6 writer input).
+//
+// Refuse, don't coerce, and mirror the seed loop's hygiene exactly:
+//   - the role must be one of the three preset-history roles (a `tool` turn, a missing role, or
+//     a number is a refusal naming the position — silent coercion would put an unpaired tool
+//     result in front of a model);
+//   - `content` must be a string, and it is copied VERBATIM (no trim): a preset history line is
+//     the author's text, and the server's contract keeps content byte-for-byte too, so trimming
+//     here would make a write and a re-read disagree;
+//   - every OTHER key is dropped rather than carried — an id, an `included` flag, an
+//     `attachments` array or a `toolCalls` block is not part of the closed turn, and the entry
+//     the transcript ends up with is `{ role, content }` plus a minted id. This is the same
+//     "a caller's object is never adopted" rule `withIncluded` applies to a seed entry, and it
+//     is what makes a caller reusing one object across two agents harmless.
+const copyPrefixTurn = (turn: unknown, owner: string, index: number): PrefixSeedMessage => {
+    if (typeof turn !== 'object' || turn === null || Array.isArray(turn)) {
+        throw new HarnessError(
+            `Agent "${owner}" prefix turn ${String(index)} must be an object with a "role" and "content" string.`
+        );
+    }
+
+    const candidate = turn as { role?: unknown; content?: unknown };
+
+    if (typeof candidate.role !== 'string' || !PREFIX_TURN_ROLES.includes(candidate.role as PrefixSeedMessage['role'])) {
+        throw new HarnessError(
+            `Agent "${owner}" prefix turn ${String(index)} must have role "system", "user", or "assistant"; a tool turn belongs to a conversation, not to a preset history.`
+        );
+    }
+
+    if (typeof candidate.content !== 'string') {
+        throw new HarnessError(
+            `Agent "${owner}" prefix turn ${String(index)} needs a string "content".`
+        );
+    }
+
+    return { role: candidate.role, content: candidate.content } as PrefixSeedMessage;
+};
+
+// Whether a transcript entry is STILL the seeded prefix entry the band record names (U6 guard).
+//
+// Role + content, not object identity, and that choice is deliberate: a snapshot round-trip
+// (`harness.restore`) replaces every transcript entry with a copy that carries the same bytes,
+// so an identity-only check would refuse a perfectly good prefix write after any restore. A
+// band that was COMPACTED, truncated, or overwritten in place still fails, because the entry at
+// that position then says something else (or nothing) — which is the case the guard exists for:
+// splicing there would rewrite accumulated conversation history the caller never named. This is
+// the prefix counterpart of `setAgentInstruction`'s "no longer starts with its seeded
+// instruction block" check (../harness.ts), made content-based because a prefix band, unlike an
+// instruction block, is not identifiable by role alone.
+const samePrefixTurn = (entry: HarnessMessage | undefined, seeded: PrefixSeedMessage): boolean =>
+    entry !== undefined && entry.role === seeded.role && entry.content === seeded.content;
 
 // Accepted identity-color spelling (R2): a CSS hex color, 3/4/6/8 digits, either
 // case. Nothing else: a named color (`red`), an `rgb()`/`hsl()` function, or an
@@ -843,21 +909,50 @@ const createAgent = (
     // the assistant message it commits names that model (requestModel below).
     let model = configuration.model;
 
-    // History starts as instructions + seed messages. Every mutation below goes
-    // through this one array, so plugins and callers observe a single source of
-    // truth.
+    // History starts as instructions + seed history (`prefix`, then `messages`).
+    // Every mutation below goes through this one array, so plugins and callers
+    // observe a single source of truth.
     const messages: HarnessMessage[] = [];
+
+    // THE LIVE PREFIX SEED (U6 — `Harness.setAgentPrefix`).
+    //
+    // `prefixOverride` replaces the seed source for the WHOLE life of this brain: `seed()` reads
+    // through it, so a prefix write moves the CURRENT transcript band, the `reset()` baseline, and
+    // the configuration a NEW host thread is built from (see `registerAgentThreader` below) in one
+    // place, and does it without giving the public `Agent`/`AgentConfiguration` shape a mutable
+    // field the host could scribble on.
+    //
+    // `undefined` means "no write happened", which keeps the historical behaviour byte-for-byte:
+    // `seed()` re-reads `configuration.prefix` on every call, so a caller that mutates its own
+    // configuration array between turns still gets the new seed (a documented property of `reset()`
+    // — see the note in `seed`). An EXPLICIT `[]` is different and meaningful: it is the
+    // removal (`setAgentPrefix(name, [])`), and it must beat a non-empty `configuration.prefix`,
+    // which is why the sentinel is `undefined` and not an empty array.
+    let prefixOverride: readonly PrefixSeedMessage[] | undefined;
+
+    // The transcript entries the LAST seed pushed from the prefix source, IN ORDER, kept by
+    // reference. This is what makes the band addressable: `writeAgentPrefix` replaces exactly
+    // these entries and refuses (rather than splicing unrelated history) when the transcript no
+    // longer holds them where the seed put them. Empty for a fork, whose transcript IS its own
+    // baseline and therefore has no mutable seed band (see the fork branch of `seed`).
+    let seededPrefix: PrefixSeedMessage[] = [];
+
+    // The seed source, resolved on EVERY call so an un-written agent keeps reading the caller's
+    // live configuration object.
+    const prefixSourceOf = (): readonly PrefixSeedMessage[] =>
+        prefixOverride === undefined ? (configuration.prefix ?? []) : prefixOverride;
 
     const seed = (): void => {
         // Build the fully validated next transcript FIRST and replace the live
         // array only once every seed message passed. reset() calls this on an
         // already-committed conversation, so a bad seeded attachment (the caller
-        // may have mutated `configuration.messages` after construction) must
-        // throw WITHOUT erasing the transcript the session is using.
+        // may have mutated `configuration.prefix` or `configuration.messages`
+        // after construction) must throw WITHOUT erasing the transcript the
+        // session is using.
         const next: HarnessMessage[] = [];
 
         // FORK BASELINE: a branch starts from its cloned source transcript, not
-        // from instructions + configuration.messages (the source's history
+        // from instructions + prefix + configuration.messages (the source's history
         // already contains those). Reset re-clones it, so a branch never shares
         // mutable state with its source or with a previous reset.
         if (baseline !== undefined) {
@@ -871,6 +966,13 @@ const createAgent = (
 
             messages.length = 0;
             for (const message of next) messages.push(message);
+
+            // A branch has NO mutable prefix band: its transcript is its own baseline and already
+            // contains the source's preset turns (`forkFrom` deliberately does not forward
+            // `prefix`, and `writeAgentPrefix` refuses a branch for exactly this reason). Clearing
+            // the record here also makes a later `reset()` of a fork re-derive the empty band.
+            seededPrefix = [];
+
             return;
         }
 
@@ -881,7 +983,27 @@ const createAgent = (
             next.push(assignMessageId({ role: 'system', content: instruction }, next));
         }
 
-        for (const message of configuration.messages ?? []) {
+        // ONE loop for BOTH seed-history fields, so `prefix` (preset agentic history)
+        // and legacy `messages` get byte-identical hygiene below: the `included`
+        // normalization, the detached copy, seeded-attachment validation and id
+        // minting. Two copies of this body is how one field would silently drift from
+        // the other.
+        //
+        // ORDER is the published contract: instructions, then `prefix`, then
+        // `messages`. The spread copies the caller's ARRAY only (its entries are still
+        // the caller's objects); each entry is detached again by `withIncluded`, so
+        // live history never aliases a caller object, while a reset still re-reads
+        // whatever the caller has since written into either array.
+        //
+        // U6: the prefix source is resolved ONCE, into `prefixTurns`, and its length is kept.
+        // That count is the ONLY way the band record below can tell a seeded prefix entry from a
+        // legacy `messages` entry: both run through the same loop, and after the commit the two
+        // kinds are indistinguishable by shape (a prefix turn and a seed-history turn are the same
+        // role/content message).
+        const prefixTurns = prefixSourceOf();
+        const prefixCount = prefixTurns.length;
+
+        for (const message of [...prefixTurns, ...(configuration.messages ?? [])]) {
             // Every seed entry passes through `withIncluded`, which is where a
             // host-supplied `included: true` (or `included: undefined`) stops being
             // a canonical key: absent is the only spelling of "included", so no
@@ -934,9 +1056,125 @@ const createAgent = (
         // Commit point: everything above succeeded.
         messages.length = 0;
         for (const message of next) messages.push(message);
+
+        // THE MUTABLE PREFIX BAND (U6). Record which entries THIS seed pushed from the prefix
+        // source, so `writeAgentPrefix` can replace exactly them: the instructions occupy
+        // `[0, instructions.length)` and the prefix follows immediately, so the band is
+        // `[instructions.length, instructions.length + prefixCount)`. These are the live objects
+        // the transcript now holds (the same references `agent.messages` exposes), which is what
+        // lets the guard below distinguish "this entry is still the seeded one" from "a compactor
+        // replaced it". The slice can only hold prefix-source entries — a legacy
+        // `configuration.messages` entry, which may carry a `tool` role, starts at
+        // `instructions.length + prefixCount` — so narrowing it to `PrefixSeedMessage[]` is the
+        // order the seed itself established, not an assumption.
+        seededPrefix = next.slice(instructions.length, instructions.length + prefixCount) as PrefixSeedMessage[];
     };
 
     seed();
+
+    // -----------------------------------------------------------------------
+    // THE PREFIX BAND SEAM (U6) — `Harness.setAgentPrefix` / the server's prefix read
+    // -----------------------------------------------------------------------
+    //
+    // WHAT THIS IS. The one place that can move a brain's SEEDED PREFIX BAND: the run of
+    // transcript entries `seed()` pushed from the prefix source, sitting between the instruction
+    // block and the legacy `configuration.messages` seed (and therefore before every turn the
+    // conversation has accumulated). A host that edits preset history wants three things at once
+    // and none of them is reachable through the public `Agent` surface:
+    //   1. the CURRENT transcript's band replaced, in place, with every accumulated turn kept by
+    //      reference (no rebuild, so no lost conversation);
+    //   2. the RESET baseline replaced, so `reset()` returns to the new band;
+    //   3. the THREAD factory replaced, so the next host thread of this agent seeds the new band.
+    // All three fall out of writing `prefixOverride` once, because `seed()` and the thread factory
+    // both read the source through `prefixSourceOf`.
+    //
+    // WHY A WEAKMAP AND NOT A FIELD. The registered pair below is reached from the exported
+    // `writeAgentPrefix`/`agentPrefixOf` helpers by object identity, so the PUBLIC `Agent` type
+    // gains no mutable configuration field a host could scribble on outside the guards here (the
+    // same seam style as `registerAgentForker`/`registerAgentThreader`, and the reason
+    // `setAgentInstruction` had to reach into `agent.instructions` as a widened local).
+    const writePrefix = (turns: readonly HarnessPrefixTurn[]): void => {
+        // The runtime check behind the declared `readonly HarnessPrefixTurn[]`: `setAgentPrefix`
+        // has no `null` spelling (the SERVER resolves inheritance before calling it, and the
+        // runtime has nothing to inherit from), so anything that is not an array is a caller
+        // mistake and `[]` is the one that means "remove the band".
+        if (!Array.isArray(turns)) {
+            throw new HarnessError(
+                `Agent "${self.name}" needs an ARRAY of prefix turns. Send [] to remove the seeded band.`
+            );
+        }
+
+        // A FORK HAS NO BAND TO REWRITE (see the fork branch of `seed`, and `forkFrom`, which
+        // deliberately does not forward `prefix`). Its transcript IS the baseline — the source's
+        // preset turns are already in it — so giving a branch a second mutable seed band would
+        // put those turns in front of the branch twice. Roster writes address the registered
+        // brain, never a branch object, so this refusal is the backstop rather than the ordinary
+        // path; it exists so a caller that grabs a branch handle gets a sentence instead of a
+        // double injection.
+        if (baseline !== undefined) {
+            throw new HarnessError(
+                `Agent "${self.name}" is a forked conversation: its transcript is its own baseline, so it has no seeded prefix band to rewrite.`
+            );
+        }
+
+        // STEP 1 — validate and detach the submitted turns BEFORE anything moves. A bad role, a
+        // non-string content, or a non-object answers with the position that is wrong and leaves
+        // the transcript exactly as it was (the same "build the next value first, commit last"
+        // discipline `seed()` applies to a bad seeded attachment).
+        const band: PrefixSeedMessage[] = [];
+
+        for (const [index, turn] of turns.entries()) band.push(copyPrefixTurn(turn, self.name, index));
+
+        // STEP 2 — prove the band the last seed created is still the band the transcript holds.
+        // `instructions.length` is the live band start, so this stays correct after
+        // `setAgentInstruction` changed the instruction block above it. A missing, moved, or
+        // rewritten entry is a refusal: splicing at a shifted position would rewrite an
+        // accumulated turn the caller never named.
+        const start = instructions.length;
+
+        for (let index = 0; index < seededPrefix.length; index += 1) {
+            if (!samePrefixTurn(messages[start + index], seededPrefix[index] as PrefixSeedMessage)) {
+                throw new HarnessError(
+                    `Agent "${self.name}" no longer carries its seeded prefix band at position ${String(index)}; refusing to splice unrelated history.`
+                );
+            }
+        }
+
+        // STEP 3 — replace exactly the band, in place. `messages` is the live array the handle
+        // hands out, so a server holding `agent.messages` sees the new state immediately, and
+        // every entry from `start + seededPrefix.length` onward — the legacy seed history and
+        // every committed turn — keeps its object identity untouched.
+        messages.splice(start, seededPrefix.length, ...band);
+
+        // Mint one id per new entry, against the LIVE transcript and in order: each scan sees the
+        // id the previous iteration wrote, so the band takes the ids above everything the
+        // conversation already owns. This is the same reserve-from-max rule every canonical
+        // creation point uses (core/message-id.ts) and the reason a caller-supplied id, dropped
+        // by `copyPrefixTurn`, can never collide with a committed turn.
+        for (let offset = 0; offset < band.length; offset += 1) {
+            messages[start + offset] = assignMessageId(
+                messages[start + offset] as HarnessMessage,
+                messages
+            );
+        }
+
+        // STEP 4 — the new BASELINE. `prefixOverride` is what `seed()` (a `reset()`) and
+        // `registerAgentThreader` (a NEW host thread) read from now on, so the write survives
+        // both. It holds the id-free copies, and that is deliberate: a later seed mints its own
+        // ids for the band exactly like the construction seed did, and the reset transcript
+        // numbers can never be stale copies of the ones the replaced band had.
+        prefixOverride = band;
+        seededPrefix = messages.slice(start, start + band.length) as PrefixSeedMessage[];
+    };
+
+    // The CURRENT band, in the closed wire shape. Role + content only: a seeded entry that
+    // carries an attachment (the wider `AgentConfiguration.prefix` allows one) is reported as its
+    // text, because the surface this read serves — a prefix editor — edits text and would
+    // otherwise round-trip a field it cannot write. An empty array is the honest answer for a
+    // member with no prefix and for a fork, whose turns are conversation history rather than a
+    // seed band.
+    const readPrefix = (): HarnessPrefixTurn[] =>
+        seededPrefix.map((entry) => ({ role: entry.role, content: entry.content }));
 
     // The retry policy for this agent, resolved once (see resolveRetryPolicy).
     const retryPolicy = resolveRetryPolicy(configuration.retry);
@@ -1626,6 +1864,9 @@ const createAgent = (
         // The child shares the resolved transport (so provider credentials and
         // external side effects are shared, not sandboxed). Its instructions are
         // the source's snapshot, while its seed/baseline is the cloned transcript.
+        // `prefix` is deliberately NOT forwarded beside those instructions: the
+        // baseline already contains the source's preset history, so re-seeding it
+        // would put those turns in front of the branch twice.
         // The retry policy is inherited too: a branch makes the same kind of model
         // calls, so it must not silently fall back to a different retry budget.
         const child = createAgent(
@@ -1727,6 +1968,12 @@ const createAgent = (
     // The registry is a WeakMap, so this adds no field to the public Agent shape.
     registerAgentForker(self, (options) => forkFrom(options));
 
+    // The prefix-band seam (U6). Same WeakMap discipline as the forker above: `writeAgentPrefix`
+    // and `agentPrefixOf` (bottom of this module) reach these two closures by object identity, so
+    // `Harness.setAgentPrefix` can rewrite the transcript band, the reset baseline, and the thread
+    // seed from one guarded place without the public `Agent` type carrying mutable configuration.
+    registerAgentPrefix(self, { write: writePrefix, read: readPrefix });
+
     // Persistent-thread factory (R2). A thread is an INDEPENDENT conversation of
     // the same brain: same instructions, seed messages, and resolved transport.
     // The model here is only the STARTING value: the runtime re-reads the OWNING
@@ -1736,12 +1983,21 @@ const createAgent = (
     // run. A request already in flight keeps the model it started with, because
     // that run captured `requestModel` above.
     //
-    // The transcript is seeded from instructions + `configuration.messages` (the
-    // pre-call seed history), NOT from the live source history: a new thread is a
-    // new conversation, while the source's own conversation stays the default
-    // thread (`agent:<name>`, see core/thread.ts).
-    registerAgentThreader(self, () =>
-        createAgent({
+    // The transcript is seeded from instructions + `configuration.prefix` +
+    // `configuration.messages` (the pre-call seed history), NOT from the live source
+    // history: a new thread is a new conversation, while the source's own conversation
+    // stays the default thread (`agent:<name>`, see core/thread.ts).
+    registerAgentThreader(self, () => {
+        // U6 — THE PREFIX A NEW THREAD SEEDS. `prefixOverride` (what the last
+        // `setAgentPrefix` wrote) wins over `configuration.prefix`; falling back to the
+        // configuration is what keeps an agent nobody ever edited seeding exactly what it
+        // seeded before this seam existed, and the empty/absent test preserves the historical
+        // "omit the key" spelling (`prefixSourceOf` would answer `[]` where the configuration
+        // held no key at all, and `[]` and absent are the same seed but not the same object).
+        // The array is copied so the thread's agent never shares the source brain's seed array.
+        const threadPrefix = prefixOverride ?? configuration.prefix;
+
+        return createAgent({
             // The harness rewrites `name` to the registry key after construction,
             // so the LIVE name (not the original configuration value, which may be
             // undefined) is what keeps events, invocation records, and the
@@ -1749,6 +2005,14 @@ const createAgent = (
             name: self.name,
             model,
             instruction: [...instructions],
+            // Preset agentic history is forwarded beside `messages`, with the same
+            // omit-the-key-when-unset discipline: a thread is a NEW conversation of
+            // this brain, so it reseeds the memory the source was spawned with. A fork
+            // needs no such forwarding — it starts from the materialized transcript,
+            // which already carries these turns (see `forkFrom`).
+            ...(threadPrefix === undefined || threadPrefix.length === 0
+                ? {}
+                : { prefix: [...threadPrefix] }),
             ...(configuration.messages === undefined ? {} : { messages: configuration.messages }),
             stream: transport,
             // A thread is another conversation of the SAME brain, so it inherits the
@@ -1765,10 +2029,65 @@ const createAgent = (
             // R2: and the same identity color, for the same reason — the UI paints one
             // swatch per agent, and a thread is that agent's conversation, not a new agent.
             ...(self.color === undefined ? {} : { color: self.color })
-        })
-    );
+        });
+    });
 
     return self;
+};
+
+// ---------------------------------------------------------------------------
+// The prefix-band seam (U6)
+// ---------------------------------------------------------------------------
+//
+// One WeakMap from a public `Agent` to the two closures that can read and rewrite its SEEDED
+// PREFIX BAND, plus the two internal helpers the runtime calls. This is the same seam style as
+// `registerAgentForker` (./branch.ts) and `registerAgentThreader` (./thread.ts): the capability
+// lives with the brain that owns the transcript, and the public `Agent` type stays a read/append
+// surface with no mutable configuration field.
+//
+// WHY THE READ IS HERE TOO. `Harness.setAgentPrefix` is a write, but the server's
+// `GET …/agents/{agent_id}/prefix` needs the value the member ACTUALLY runs, and after a live
+// prefix write the stored maps (harness definition, session override) and the transcript agree
+// only if the read comes from the brain. Returning it from the same bookkeeping the writer uses
+// is what makes a write and a read of the same band impossible to disagree with.
+type AgentPrefixAccess = {
+    // Replace the band (see `writePrefix` inside `createAgent` for the full contract).
+    write: (turns: readonly HarnessPrefixTurn[]) => void;
+    // The band's current text turns, in order, in the closed `HarnessPrefixTurn` shape.
+    read: () => HarnessPrefixTurn[];
+};
+
+const agentPrefixAccesses = new WeakMap<Agent, AgentPrefixAccess>();
+
+// Registers one brain's seam. Internal to this module: `createAgent` is the only caller, and a
+// brain it did not build simply has no entry (both helpers below answer that honestly).
+const registerAgentPrefix = (brain: Agent, access: AgentPrefixAccess): void => {
+    agentPrefixAccesses.set(brain, access);
+};
+
+// THE WRITE BEHIND `Harness.setAgentPrefix` (../harness.ts). Throws when the brain was not built
+// by `agent()` (a host-supplied stub carries no seed bookkeeping to rewrite) rather than
+// half-applying the change.
+export const writeAgentPrefix = (brain: Agent, turns: readonly HarnessPrefixTurn[]): void => {
+    const access = agentPrefixAccesses.get(brain);
+
+    if (access === undefined) {
+        throw new HarnessError(
+            `Agent "${brain.name}" was not built by \`agent()\`, so it has no seeded prefix band to rewrite.`
+        );
+    }
+
+    access.write(turns);
+};
+
+// THE READ BEHIND THE SERVER'S PREFIX ROUTE (src/server/api.ts `getSessionAgentPrefix`).
+// An agent with no seam entry and a fork both answer `[]`, which is the truth for both: neither
+// carries a seeded prefix band. Never throws, so a read surface can call it for every roster
+// member without probing which kind of brain it got.
+export const agentPrefixOf = (brain: Agent): HarnessPrefixTurn[] => {
+    const access = agentPrefixAccesses.get(brain);
+
+    return access === undefined ? [] : access.read();
 };
 
 // Public factory. The optional baseline stays internal (see createAgent above),

@@ -3,6 +3,8 @@
 // These tests pin the history contract, because that is the part the harness and
 // every plugin depend on:
 //   - instructions are seeded as system messages, in order;
+//   - `prefix` (preset agentic history) is seeded AFTER the instructions and BEFORE
+//     legacy `messages`, and reseeds on `reset()`;
 //   - turn() runs one request against the current history and commits only the
 //     assistant message (no user append, no rollback);
 //   - stream() commits a turn atomically (user + assistant) and rolls back on
@@ -20,6 +22,7 @@ import {
 } from '../index';
 import type {
     AgentStreamEvent,
+    HarnessMessage,
     HarnessStream,
     HarnessStreamEvent,
     HarnessStreamRequest
@@ -110,6 +113,135 @@ describe('agent', () => {
             { role: 'system', content: 'You are a writer.' },
             { role: 'user', content: 'Earlier question' }
         ]);
+    });
+
+    // -----------------------------------------------------------------------
+    // `prefix` — preset agentic HISTORY (prior memory, scripted turns). Where
+    // `instruction` can only say "you are X", `prefix` says "this already
+    // happened", and it is the mechanism `distribution/story-generator`-style
+    // hosts need: a fresh spawn that starts mid-conversation.
+    //
+    // Published order, on EVERY seed and EVERY reset(): every `instruction`
+    // system message, then `prefix`, then legacy `messages`, then the live
+    // conversation. The expected transcripts below are spelled out in full and
+    // in order because the ORDER is the contract — and the ids are exact too:
+    // a fresh transcript always mints `msg-1…msg-n` (core/message-id.ts), so
+    // there is nothing to approximate.
+    // -----------------------------------------------------------------------
+
+    it('seeds prefix turns after the instructions and before legacy messages', () => {
+        const brain = agent({
+            model: 'merge/ds4-flash',
+            instruction: ['You are a writer.', 'Answer in prose.'],
+            prefix: [
+                { role: 'system', content: 'Recalled scene: the lighthouse.' },
+                { role: 'user', content: 'What came before?' },
+                { role: 'assistant', content: 'The keeper left.' }
+            ],
+            messages: [{ role: 'user', content: 'The latest seeded turn.' }],
+            stream: transport
+        });
+
+        expect(withoutIds(brain.messages)).toEqual([
+            { role: 'system', content: 'You are a writer.' },
+            { role: 'system', content: 'Answer in prose.' },
+            { role: 'system', content: 'Recalled scene: the lighthouse.' },
+            { role: 'user', content: 'What came before?' },
+            { role: 'assistant', content: 'The keeper left.' },
+            { role: 'user', content: 'The latest seeded turn.' }
+        ]);
+        // Ids follow the seeded order, so an address names the turn the host means.
+        expect(brain.messages.map((message) => message.messageId)).toEqual([
+            'msg-1',
+            'msg-2',
+            'msg-3',
+            'msg-4',
+            'msg-5',
+            'msg-6'
+        ]);
+        // `instructions` stays the instruction block ALONE: `setAgentInstruction`
+        // replaces exactly this many leading system messages, so a `system` prefix
+        // turn is history and survives a prompt rewrite (src/harness.ts).
+        expect(brain.instructions).toEqual(['You are a writer.', 'Answer in prose.']);
+    });
+
+    it('seeds prefix as the whole transcript when no instruction is configured', () => {
+        const brain = agent({
+            model: 'merge/ds4-flash',
+            prefix: [
+                { role: 'user', content: 'Earlier question' },
+                { role: 'assistant', content: 'Earlier answer' }
+            ],
+            stream: transport
+        });
+
+        expect(withoutIds(brain.messages)).toEqual([
+            { role: 'user', content: 'Earlier question' },
+            { role: 'assistant', content: 'Earlier answer' }
+        ]);
+        expect(brain.instructions).toEqual([]);
+    });
+
+    // The point of prefix is that the MODEL sees it, so this pins the projected
+    // request rather than only the live array, and pins what the first prompt is
+    // appended AFTER.
+    it('sends prefix turns to the transport ahead of the first prompt', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        // `fakeStream`'s `onRequest` hook is how this file records a wire payload.
+        const stream = fakeStream([{ type: 'text', delta: 'ok' }, done()], (request) => {
+            seen.push(request);
+        });
+        const brain = agent({
+            model: 'model-a',
+            instruction: 'You are a writer.',
+            prefix: [
+                { role: 'user', content: 'What came before?' },
+                { role: 'assistant', content: 'The keeper left.' }
+            ],
+            messages: [{ role: 'user', content: 'seed' }],
+            stream
+        });
+
+        await collect(brain.stream('Say hello'));
+
+        expect(seen).toHaveLength(1);
+        expect(seen[0].model).toBe('model-a');
+        // The projection is the seeded transcript plus the prompt at the END.
+        expect(withoutIds(seen[0].messages)).toEqual([
+            { role: 'system', content: 'You are a writer.' },
+            { role: 'user', content: 'What came before?' },
+            { role: 'assistant', content: 'The keeper left.' },
+            { role: 'user', content: 'seed' },
+            { role: 'user', content: 'Say hello' }
+        ]);
+    });
+
+    it('normalizes, copies and mints ids on prefix entries exactly as on messages', () => {
+        // The hygiene contract: a prefix entry is treated EXACTLY like a seeded
+        // `messages` entry, because both feed one loop in core/agent.ts `seed()` —
+        // `included` normalized to the `false`-only spelling, a caller id dropped
+        // and re-minted, and no live entry aliasing a caller object.
+        const prefix: Extract<HarnessMessage, { role: 'system' | 'user' | 'assistant' }>[] = [
+            { role: 'system', content: 'Recalled scene', messageId: 'caller-owned' },
+            { role: 'user', content: 'included turn', included: true },
+            { role: 'assistant', content: 'withheld turn', included: false }
+        ];
+        const before = JSON.parse(JSON.stringify(prefix)) as HarnessMessage[];
+
+        const brain = agent({ model: 'model-a', prefix, stream: transport });
+
+        expect(withoutIds(brain.messages)).toStrictEqual([
+            { role: 'system', content: 'Recalled scene' },
+            { role: 'user', content: 'included turn' },
+            { role: 'assistant', content: 'withheld turn', included: false }
+        ]);
+        expect(JSON.stringify(brain.messages)).not.toContain('"included":true');
+        expect(JSON.stringify(brain.messages)).not.toContain('caller-owned');
+        expect(brain.messages.map((message) => message.messageId)).toEqual(['msg-1', 'msg-2', 'msg-3']);
+
+        // The caller keeps its own untouched array.
+        expect(prefix).toEqual(before);
+        expect(brain.messages[0]).not.toBe(prefix[0]);
     });
 
     it('defaults the name when none is given', () => {
@@ -376,6 +508,47 @@ describe('agent', () => {
         expect(withoutIds(brain.messages)).toEqual([
             { role: 'system', content: 'You are a writer.' },
             { role: 'user', content: 'seed' }
+        ]);
+    });
+
+    it('reset() reseeds the prefix turns', () => {
+        // `reset()` re-runs `seed()`, and `seed()` builds instructions + prefix +
+        // messages from the configuration every time — so prior memory comes back
+        // after a reset instead of only the instructions.
+        const brain = agent({
+            model: 'model-a',
+            instruction: 'You are a writer.',
+            prefix: [
+                { role: 'system', content: 'Recalled scene: the lighthouse.' },
+                { role: 'user', content: 'What came before?' },
+                { role: 'assistant', content: 'The keeper left.' }
+            ],
+            messages: [{ role: 'user', content: 'seed' }],
+            stream: transport
+        });
+
+        brain.user('Say hello');
+        brain.assistant('A long answer that must not survive a reset.');
+        // instruction + 3 prefix turns + seed user + the two turns above.
+        expect(brain.messages).toHaveLength(7);
+
+        brain.reset();
+
+        expect(withoutIds(brain.messages)).toEqual([
+            { role: 'system', content: 'You are a writer.' },
+            { role: 'system', content: 'Recalled scene: the lighthouse.' },
+            { role: 'user', content: 'What came before?' },
+            { role: 'assistant', content: 'The keeper left.' },
+            { role: 'user', content: 'seed' }
+        ]);
+        // The transcript is rebuilt from scratch, so the seed's ids are minted again
+        // from the top of the sequence (core/message-id.ts).
+        expect(brain.messages.map((message) => message.messageId)).toEqual([
+            'msg-1',
+            'msg-2',
+            'msg-3',
+            'msg-4',
+            'msg-5'
         ]);
     });
 

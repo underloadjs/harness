@@ -587,4 +587,60 @@ describe('Agent.fork', () => {
         expect(Object.hasOwn(source.fork(), 'color')).toBe(false);
         expect(Object.hasOwn(createThreadAgent(source), 'color')).toBe(false);
     });
+
+    // `prefix` (preset agentic history) on the two clone paths — the sibling contract
+    // of the identity tests above, and the reason both live in this file:
+    //   - a THREAD is a NEW conversation of the same brain, so the threader forwards
+    //     `prefix` and the thread seeds it, exactly as the source did on spawn;
+    //   - a FORK starts from the source's MATERIALIZED transcript, which already
+    //     carries those turns, so the fork factory does not forward `prefix` and a
+    //     branch never injects the memory twice.
+    it('reseeds prefix on a new thread and injects it once across a fork', () => {
+        const source = agent({
+            model: 'model-a',
+            instruction: 'You are a writer.',
+            prefix: [
+                { role: 'system', content: 'Recalled scene: the lighthouse.' },
+                { role: 'user', content: 'What came before?' },
+                { role: 'assistant', content: 'The keeper left.' }
+            ],
+            messages: [{ role: 'user', content: 'seed' }],
+            stream: fakeStream()
+        });
+
+        const seeded = [
+            { role: 'system', content: 'You are a writer.' },
+            { role: 'system', content: 'Recalled scene: the lighthouse.' },
+            { role: 'user', content: 'What came before?' },
+            { role: 'assistant', content: 'The keeper left.' },
+            { role: 'user', content: 'seed' }
+        ];
+        expect(withoutIds(source.messages)).toEqual(seeded);
+
+        // A thread seeded AFTER the source has talked still starts from the configured
+        // seed history — never from the source's live conversation.
+        source.user('only in the source conversation');
+
+        const thread = createThreadAgent(source);
+
+        expect(withoutIds(thread.messages)).toEqual(seeded);
+        expect(thread.messages).not.toBe(source.messages);
+
+        // A fork clones the live transcript: the prefix turns are the entries already
+        // in it, so the branch has the SAME five turns and no re-injected block. A
+        // duplicate seed would show up here as 8 entries.
+        const branch = thread.fork();
+
+        expect(withoutIds(branch.messages)).toEqual(seeded);
+        expect(branch.messages).toHaveLength(5);
+        // A fork COPIES ids (context T1.4), which is the other half of "it did not
+        // re-seed": the branch's entries carry the thread's addresses verbatim.
+        expect(branch.messages.map((message) => message.messageId)).toEqual(
+            thread.messages.map((message) => message.messageId)
+        );
+        // And a branch reset re-clones that baseline, still without a second injection.
+        branch.user('only on the branch');
+        branch.reset();
+        expect(withoutIds(branch.messages)).toEqual(seeded);
+    });
 });

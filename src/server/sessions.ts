@@ -180,7 +180,7 @@ import type {
 // store gives a binding that names none — derived, never hard-coded, so a vocabulary change here
 // cannot drift from the runtime's own rank rules (`rankIndexOf`/`isLowerRank` live there).
 import { AGENT_RANKS, isAgentRank } from '../engine/types';
-import type { AgentRank } from '../engine/types';
+import type { AgentRank, HarnessPrefixTurn } from '../engine/types';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { validateAttachments } from '../engine/shared/attachments';
 import {
@@ -252,6 +252,11 @@ import {
     createHarnessRegistry,
     HarnessRegistryError,
     normalizeAgentModels,
+    // U6: the ONE preset-history validator (./harnesses/registry.ts). The store re-wraps its
+    // HarnessRegistryError into a SessionError the way `setAgentModels` already re-wraps the model
+    // map's, so a bad band answers the same 400 wording from a harness PATCH, a session binding,
+    // and a binding PATCH.
+    requirePrefixTurns,
     presetFromRecord,
     presetRecordEquals,
     presetToRecord
@@ -1630,13 +1635,19 @@ const copyDescriptor = (descriptor: HarnessDescriptor): HarnessDescriptor =>
 // frame would put the whole system prompt of every member on the default wire — the
 // exact payload class R1/R3 removes, and the reason a `/views` client reads instruction
 // content from ONE lazy block instead (`TurnBlockDetail.entries` of a `system`
-// segment). Members, promotion order, models and the rest are untouched, so every
-// existing read of this field keeps working. The RAW surface (`SessionSnapshot`) still
-// reports the descriptor VERBATIM — only the display surface trims it.
+// segment). U6 adds the SAME reasoning for `agentPrefixes`: a preset-history band is a
+// LIST OF PROMPT-LENGTH STRINGS, so a definition that seeds three turns per member would
+// multiply the payload the rule exists to avoid. Members, promotion order, models and the
+// rest are untouched, so every existing read of this field keeps working. The RAW surface
+// (`SessionSnapshot`) still reports the descriptor VERBATIM — only the display surface
+// trims it.
 const viewDescriptorOf = (descriptor: HarnessDescriptor): HarnessDescriptor => {
     const copy = copyDescriptor(descriptor);
 
     delete copy.agentInstructions;
+    // U6: same trim, same reason, and the dedicated read (`GET …/agents/{id}/prefix`) is the
+    // lazy surface a client uses instead.
+    delete copy.agentPrefixes;
 
     return copy;
 };
@@ -7391,6 +7402,17 @@ export class SessionStore {
             model?: string | null;
             instruction?: string | null;
             customInstruction?: string;
+            // U6: the member's EFFECTIVE preset-history band. This map is the seed source a
+            // RESTART rebuilds from (`presetFromRecord` feeds it back to `agent({ prefix })`), so
+            // it must always say what the live brain holds. HOW A RESTORE ARRIVES IS THE POINT:
+            // the runtime has no inherit layer, so the CALLER resolves one before calling here —
+            // `setSessionAgentPrefix` reads the frozen definition's own band (the
+            // `HarnessDescriptor` copy, which no session write touches), detaches it turn by turn,
+            // and hands THAT ARRAY to this field. A `null` therefore never carries a restore today;
+            // it is only the detach half (`removed`) and the belt for a future caller that wants to
+            // drop the key without naming a band, and dropping the key is the same statement as
+            // "no band at all".
+            prefix?: HarnessPrefixTurn[] | null;
         }
     ): void {
         const keep = (list: readonly string[]): string[] =>
@@ -7433,6 +7455,37 @@ export class SessionStore {
             customs[agent] = change.customInstruction;
         }
 
+        // U6: the preset-history map, rebuilt from the previous copy so one member's band write
+        // never drops another member's. Two writers reach this field, and neither of them asks the
+        // map to "inherit" anything:
+        //   - an ARRAY, empty or not, WRITES the key — a band the session owns, and `[]` is the
+        //     stated choice "this member seeds no history" (the contract's explicit clear), so it
+        //     survives a restart instead of reverting to what the template seeds. This is also how
+        //     a `null` request lands: `setSessionAgentPrefix` resolves that request into the
+        //     frozen definition's OWN band and writes the resolved array, which is what keeps the
+        //     durable preset and the live transcript seeding the same turns after the undo;
+        //   - `removed` (a detach) DELETEs the key, so a member this conversation detached leaves
+        //     nothing for `presetFromRecord` to rebuild. `null` deletes it too, and no caller
+        //     passes one today — it is the same statement as "no band at all", kept as the honest
+        //     shape for a caller that wants to drop the key without naming a band.
+        // Each surviving band is copied turn-by-turn: the caller's array (a parsed request body)
+        // must not stay aliased inside the durable preset.
+        const bands: Record<string, HarnessPrefixTurn[]> = Object.fromEntries(
+            Object.entries(previous.agentPrefixes ?? {}).map(([member, turns]) => [
+                member,
+                turns.map((turn) => ({ role: turn.role, content: turn.content }))
+            ])
+        );
+
+        if (change.removed === true || change.prefix === null) delete bands[agent];
+
+        if (change.removed !== true && Array.isArray(change.prefix)) {
+            bands[agent] = change.prefix.map((turn) => ({
+                role: turn.role,
+                content: turn.content
+            }));
+        }
+
         // RANK map, rebuilt from the previous copy so one binding never drops another member's
         // authority. `removed` deletes the key (what makes a detach final) and `rank` is the only
         // writer of a new one — this helper never invents a rank for a member it was not given.
@@ -7459,6 +7512,11 @@ export class SessionStore {
             agentModels: _previousModels,
             agentInstructions: _previousInstructions,
             customAgents: _previousCustoms,
+            // U6: carried out of the spread for the same reason as the three above — a cleared
+            // override map has to actually leave the preset, or a `null` prefix patch would come
+            // back on the next restart and suppress the definition band the live brain no longer
+            // carries.
+            agentPrefixes: _previousPrefixes,
             ranks: _previousRanks,
             ...carried
         } = previous;
@@ -7474,7 +7532,11 @@ export class SessionStore {
             // Absent vs `{}` are the same statement ("this session defines no extra agent"), and
             // the absent form is what keeps a pre-R7 document's preset byte-identical through a
             // round trip (`presetToRecord` writes no field for an empty map).
-            ...(Object.keys(customs).length === 0 ? {} : { customAgents: customs })
+            ...(Object.keys(customs).length === 0 ? {} : { customAgents: customs }),
+            // U6: the same absent-vs-empty rule on the OUTER map, and the same one exception the
+            // registry applies: a member keyed with `[]` is a NON-empty map, so an explicit
+            // "no preset history" survives while a wholly untouched map does not.
+            ...(Object.keys(bands).length === 0 ? {} : { agentPrefixes: bands })
         };
 
         const definition = session.definition;
@@ -7523,7 +7585,14 @@ export class SessionStore {
      */
     async addSessionAgent(
         id: string,
-        input: { name?: unknown; profile?: unknown; model?: unknown; instruction?: unknown; rank?: unknown }
+        input: {
+            name?: unknown;
+            profile?: unknown;
+            model?: unknown;
+            instruction?: unknown;
+            rank?: unknown;
+            prefix?: unknown;
+        }
     ): Promise<SessionSnapshot> {
         const session = this.require(id);
 
@@ -7629,6 +7698,32 @@ export class SessionStore {
             );
         }
 
+        // U6: the member's PRESET HISTORY. Validated by the ONE band validator
+        // (./harnesses/registry.ts `requirePrefixTurns`), re-wrapped into this store's error type
+        // exactly like the model map above, so the wire wording cannot drift between surfaces —
+        // and validated HERE, before the runtime call, so a malformed band never leaves a half-
+        // bound member behind.
+        //
+        // `undefined` and `null` both mean "this binding states no band of its own", which is not
+        // the same as the member having none: the configuration built below then inherits the band
+        // the FROZEN definition carries (`preset.agentPrefixes`), so binding a profile member into
+        // a session cannot quietly strip the history that definition seeds. An ARRAY — including
+        // `[]` — is this session's own statement, and it is written to the preset key so a restart
+        // re-seeds exactly that.
+        let bindingPrefix: HarnessPrefixTurn[] | undefined;
+
+        if (input.prefix !== undefined && input.prefix !== null) {
+            try {
+                bindingPrefix = requirePrefixTurns(input.prefix, 'prefix');
+            } catch (error) {
+                if (error instanceof HarnessRegistryError) {
+                    throw new SessionError(error.status, error.message);
+                }
+
+                throw error;
+            }
+        }
+
         // B3 R15 — the requested authority, validated against the A-Z scale by the ONE validator
         // (./`validateBindingRank`; an absent value stays absent here and is resolved below). ANY rank
         // is bindable, including a top one and including several members at the same level: the
@@ -7660,20 +7755,32 @@ export class SessionStore {
         // profile lookup, no guidelines, and the instruction is the base text verbatim. Both
         // builders receive the SAME swatch lookup, so a custom member is painted by the definition
         // exactly like a profile one.
+        //
+        // U6: the 6th argument is the member's preset history, resolved in the same precedence the
+        // swatch above uses — what this binding states wins, otherwise what the FROZEN definition
+        // carries (`session.preset.agentPrefixes`, the copy the factory seeds from). Passing the
+        // definition's band when the caller named none is what keeps `POST …/agents` from silently
+        // binding a member WITHOUT the history the same harness gives its own roster, and an
+        // explicit `[]` is the caller's own band, so it wins over the definition and writes the
+        // preset key below.
+        const bindingBand = bindingPrefix ?? session.preset.agentPrefixes?.[name] ?? [];
+
         const configuration = isProfile
             ? agentConfigurationFromProfile(
                   profile,
                   session.settings,
                   model,
                   instruction,
-                  session.preset.agentColors?.[name]
+                  session.preset.agentColors?.[name],
+                  bindingBand
               )
             : agentConfigurationForCustom(
                   name,
                   session.settings,
                   model,
                   baseInstruction,
-                  session.preset.agentColors?.[name]
+                  session.preset.agentColors?.[name],
+                  bindingBand
               );
 
         const previous = this.captureBindingState(session);
@@ -7714,7 +7821,11 @@ export class SessionStore {
             model,
             instruction: isProfile ? (instruction ?? null) : null,
             rank: bindingRank,
-            customInstruction: baseInstruction
+            customInstruction: baseInstruction,
+            // U6: written ONLY when the caller stated a band. An unstated binding inherits the
+            // frozen definition's band WITHOUT claiming a session override, which is what keeps
+            // `GET …/prefix` able to report `source: harness` for a member that was merely bound.
+            ...(bindingPrefix === undefined ? {} : { prefix: bindingPrefix })
         });
         session.sessionAgents = [...previous.sessionAgents, name];
         session.updatedAt = Date.now();
@@ -7966,6 +8077,117 @@ export class SessionStore {
         // override recorded here is exactly what the rebuilt brain is seeded with, and clearing it
         // (`null`) returns the rebuild to the stored base.
         this.applyBindingMaps(session, agent, { instruction: override });
+
+        session.updatedAt = Date.now();
+
+        try {
+            session.core = session.harness.snapshot();
+            await this.persistOrThrow();
+        } catch (error) {
+            this.rollbackBindingState(session, previous);
+
+            throw error;
+        }
+
+        return this.snapshot(session);
+    }
+
+    /**
+     * Replace or CLEAR one member's PRESET-HISTORY band (U6 — the session-scoped `prefix` write
+     * on `PATCH /sessions/{id}/agents/{agent_id}`, and the same write the dedicated prefix
+     * subresource reads back).
+     *
+     * WHAT A BAND IS: the run of transcript turns `agent()` seeded from `AgentConfiguration.prefix`
+     * — the preset history immediately AFTER the instruction block and BEFORE the legacy seed
+     * messages and every accumulated turn. Like an instruction, it is a SEED with three lives (the
+     * live band, the `reset()` baseline, and what a NEW host thread starts from), so the write goes
+     * through `harness.setAgentPrefix` and all three move together. Committed turns, the instruction
+     * block, and every other member are untouched, and an already-created host thread keeps its own
+     * seeded transcript (the same limitation `setSessionAgentInstruction` states).
+     *
+     * THE REQUEST STATES, exactly as the contract words them:
+     *   - an ARRAY (empty or not) is THIS SESSION's band: validated by the ONE band validator
+     *     (./harnesses/registry.ts `requirePrefixTurns`), written to the live brain, and recorded in
+     *     `preset.agentPrefixes`, which is what a restart re-seeds. `[]` is a real value — "no
+     *     preset history" — so it writes the key with an empty array rather than deleting it;
+     *   - `null` RESTORES the band the FROZEN harness definition carries, i.e. the copy on
+     *     `session.definition.agentPrefixes`, which no session write ever touches. That restored band
+     *     is then recorded in the session's own map as well, because `preset.agentPrefixes` is the
+     *     seed source `presetFromRecord` rebuilds from — a map that went empty here would rebuild the
+     *     member WITHOUT the history the live brain was just given, and a stored `[]` would keep
+     *     suppressing it after a restart while the transcript no longer held it. A definition that
+     *     seeds nothing therefore lands on an empty band, which is the honest undo;
+     *   - `undefined` never reaches this method — the HTTP edge refuses a patch that names no field
+     *     with its own 400, like the instruction subresource.
+     *
+     * WHY THE IDLE GATE: `setAgentPrefix` splices the transcript every running turn reads, and the
+     * runtime refuses it (`assertRosterIdle`). The store states the rule up front so a busy session
+     * refuses the whole PATCH before any other field of the same request moves.
+     */
+    async setSessionAgentPrefix(
+        id: string,
+        agentId: string,
+        prefix: HarnessPrefixTurn[] | null
+    ): Promise<SessionSnapshot> {
+        const session = this.require(id);
+
+        this.assertBindingIdle(session, 'change an agent prefix in a session');
+
+        const agent = typeof agentId === 'string' ? agentId.trim() : '';
+
+        if (!session.definition.agents.includes(agent)) {
+            throw new SessionError(404, `Agent "${agent}" is not a member of session "${id}".`);
+        }
+
+        // THE BAND THIS WRITE SEEDS, resolved BEFORE anything moves.
+        //
+        // `null` reads the definition's own copy and detaches it turn-by-turn: the live brain must
+        // not end up aliasing the frozen descriptor's array, or a later write to one rewrites the
+        // other and the restore stops being idempotent. An array goes through the shared validator,
+        // which also returns detached turns, so a parsed request body never stays inside the
+        // durable preset.
+        let band: HarnessPrefixTurn[];
+
+        if (prefix === null) {
+            band = (session.definition.agentPrefixes?.[agent] ?? []).map((turn) => ({
+                role: turn.role,
+                content: turn.content
+            }));
+        } else {
+            try {
+                band = requirePrefixTurns(prefix, 'prefix', agent);
+            } catch (error) {
+                // The registry validator's wording IS the wire wording for a malformed band (the
+                // same re-wrap `addSessionAgent` uses), so a client that PATCHes the same body into
+                // a definition and into a session sees one shape of 400.
+                if (error instanceof HarnessRegistryError) {
+                    throw new SessionError(error.status, error.message);
+                }
+
+                throw error;
+            }
+        }
+
+        const previous = this.captureBindingState(session);
+
+        try {
+            session.harness.setAgentPrefix(agent, band);
+        } catch (error) {
+            // A runtime refusal (a brain with no seeded band, a band the transcript no longer holds
+            // where the seed put it, a roster that moved after the gate) is a conflict about LIVE
+            // state, so it keeps the runtime's own reason at 409 — and memory is still untouched,
+            // because the durable half has not run yet.
+            throw new SessionError(409, messageOf(error));
+        }
+
+        // THE DURABLE HALF. For `null` that is the DEFINITION band this call just seeded, restated in
+        // the session's own map rather than an emptying of it: `preset.agentPrefixes` is the seed
+        // source `presetFromRecord` rebuilds the harness from on the next start, so recording nothing
+        // would rebuild the member WITHOUT the history the live brain now holds, and the frozen
+        // definition's copy (which no session write touches) would survive as display metadata only.
+        // The map therefore always says what the live brain seeds — which is also what makes the
+        // prefix read's `source` ladder decidable from the record alone.
+        this.applyBindingMaps(session, agent, { prefix: band });
 
         session.updatedAt = Date.now();
 

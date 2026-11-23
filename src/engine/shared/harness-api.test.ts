@@ -31,8 +31,12 @@ import {
 } from './harness-stream';
 import type {
     AnswerActionResult,
+    CreateHarnessRequest,
+    CreateSessionAgentRequest,
     CreateSessionRequest,
     DisplayState,
+    HarnessDefinition,
+    HarnessPrefixTurn,
     HarnessUsage,
     PageMeta,
     PatchTurnBlockRequest,
@@ -41,6 +45,7 @@ import type {
     PluginSummary,
     PluginSummaryPage,
     SessionDefinitionResource,
+    SessionPrefixTurnsResponse,
     SessionResponse,
     SessionSummaryPage,
     TaskReceipt,
@@ -48,6 +53,8 @@ import type {
     TurnBlockWriteReceipt,
     TurnDisplay,
     TurnSummaryPage,
+    UpdateHarnessRequest,
+    UpdateSessionAgentRequest,
     UpdateThreadTranscriptRequest,
 } from './harness-api';
 import type * as Projector from './turn-display';
@@ -110,9 +117,9 @@ describe('harness contract root and headers', () => {
 });
 
 describe('harness contract route tables', () => {
-    it('covers all 51 spec paths', () => {
-        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(51);
-        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(51);
+    it('covers all 52 spec paths', () => {
+        expect(Object.keys(HARNESS_PATH_TEMPLATES)).toHaveLength(52);
+        expect(Object.keys(HARNESS_ROUTES)).toHaveLength(52);
         // R1: the stop's counterpart is addressable with the same two ids, in the same
         // order, so a client builds it exactly the way it builds `cancel`.
         expect(HARNESS_ROUTES.sessionsBySessionIdThreadsByThreadIdResume('ses_1', 'thr_3')).toBe(
@@ -122,6 +129,14 @@ describe('harness contract route tables', () => {
         // the `?since=` query, never a path segment, so the builder takes ONE value.
         expect(HARNESS_ROUTES.sessionsBySessionIdRecords('ses_1')).toBe(
             '/v1/harness/sessions/ses_1/records',
+        );
+        // U6: the preset-history subresource is addressed with the SAME two ids as the instruction
+        // document, in the same order, so a band editor builds it the way it builds the prompt read.
+        expect(HARNESS_PATH_TEMPLATES.sessionsBySessionIdAgentsByAgentIdPrefix).toBe(
+            '/v1/harness/sessions/{session_id}/agents/{agent_id}/prefix',
+        );
+        expect(HARNESS_ROUTES.sessionsBySessionIdAgentsByAgentIdPrefix('ses_1', 'research')).toBe(
+            '/v1/harness/sessions/ses_1/agents/research/prefix',
         );
     });
 
@@ -680,6 +695,12 @@ describe('harness contract type wiring (compile time)', () => {
             // contract.ts ALIASES) instead of re-spelling 26 literals. A letter added or dropped on
             // either side — or a contract that reverts to a prose role — fails to compile here.
             Expect<Equal<Domain.AgentRank, import('./harness-api').AgentRank>>,
+            // U6: THE PREFIX TURN (preset history). The spec declares the closed role/content shape
+            // once and the generator ALIASES the kernel's own `HarnessPrefixTurn` rather than
+            // re-spelling three string unions, so a band travels between the wire, the server, and
+            // `AgentConfiguration.prefix` with no cast and no drift: a role added on either side —
+            // or a contract that widens `content` past text — fails to compile here.
+            Expect<Equal<Domain.HarnessPrefixTurn, import('./harness-api').HarnessPrefixTurn>>,
             Expect<
                 Equal<
                     import('./agent-results').AgentResultReference,
@@ -687,7 +708,7 @@ describe('harness contract type wiring (compile time)', () => {
                 >
             >,
         ];
-        const guards: AliasGuards = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
+        const guards: AliasGuards = [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true];
         expect(guards.every((guard) => guard)).toBe(true);
     });
 
@@ -844,5 +865,127 @@ describe('harness contract type wiring (compile time)', () => {
 
         const response: SessionResponse = { session: { id: 'ses_1', revision: 1 } as never };
         expect(response.session.id).toBe('ses_1');
+    });
+});
+
+// U6 — THE PRESET-HISTORY WIRE SHAPES (src/harness-server.swagger.yaml: `HarnessPrefixTurn`,
+// `agent_prefixes`, the session `prefix` fields, and `SessionPrefixTurnsResponse`). Each guard below
+// is a COMPILE-time probe of the exact shape the spec states, paired with a RUNTIME assertion of the
+// same bytes, so a regeneration that renames a key, widens a role, or drops the `null` on one of the
+// two session bodies fails loudly in both runners.
+describe('harness contract preset history (U6)', () => {
+    it('keeps one closed prefix turn for every layer that stores a band', () => {
+        // A turn is CLOSED to a role and its text — no tool role, no `toolCalls`, no unknown key — and
+        // the three roles are spelled as a union, because the band that reaches
+        // `AgentConfiguration.prefix` is the SAME object the wire carries (see the alias guard above).
+        type TurnKeySet = Equal<keyof HarnessPrefixTurn, 'role' | 'content'>;
+        type TurnRoles = Equal<HarnessPrefixTurn['role'], 'system' | 'user' | 'assistant'>;
+        const guards: [Expect<TurnKeySet>, Expect<TurnRoles>] = [true, true];
+
+        expect(guards).toEqual([true, true]);
+
+        // Content is VERBATIM and in order, and an empty string stays a real transcript entry.
+        const band: HarnessPrefixTurn[] = [
+            { role: 'system', content: 'Draft in complete sentences.' },
+            { role: 'user', content: '' },
+            { role: 'assistant', content: 'Understood.' },
+        ];
+
+        expect(band).toEqual([
+            { role: 'system', content: 'Draft in complete sentences.' },
+            { role: 'user', content: '' },
+            { role: 'assistant', content: 'Understood.' },
+        ]);
+    });
+
+    it('keys the band per agent on the definition read and on both harness write bodies', () => {
+        // THE SAME MAP SHAPE on all three (agent id → an ORDERED array), and all three OPTIONAL: the
+        // absent form is what keeps every pre-U6 card and request byte-identical, while `{}` is the
+        // explicit clear the contract states.
+        type DefinitionBands = Equal<
+            HarnessDefinition['agent_prefixes'],
+            Record<string, HarnessPrefixTurn[]> | undefined
+        >;
+        type CreateBands = Equal<
+            CreateHarnessRequest['agent_prefixes'],
+            Record<string, HarnessPrefixTurn[]> | undefined
+        >;
+        type PatchBands = Equal<
+            UpdateHarnessRequest['agent_prefixes'],
+            Record<string, HarnessPrefixTurn[]> | undefined
+        >;
+        const guards: [Expect<DefinitionBands>, Expect<CreateBands>, Expect<PatchBands>] = [
+            true,
+            true,
+            true,
+        ];
+
+        expect(guards).toEqual([true, true, true]);
+
+        // `{ editor: [] }` is a WRITE, not an omission — the one shape that separates this map from
+        // the three text maps beside it, so it is pinned here as well as in the server tests.
+        const clear: UpdateHarnessRequest = { agent_prefixes: { editor: [] } };
+
+        expect(clear).toEqual({ agent_prefixes: { editor: [] } });
+    });
+
+    it('states the session band as a value on create and a nullable value on patch', () => {
+        // THE ONE DIFFERENCE between the two session bodies, and the reason a patch needs the read:
+        // a bind can only STATE a band or name none, while a patch can also REMOVE this session's own
+        // band so the frozen definition's history comes back. An omitted field means "ask for nothing"
+        // on create and "no change" on patch, which is why both types include `undefined`.
+        type BindBand = Equal<CreateSessionAgentRequest['prefix'], HarnessPrefixTurn[] | undefined>;
+        type PatchBand = Equal<UpdateSessionAgentRequest['prefix'], HarnessPrefixTurn[] | null | undefined>;
+        const guards: [Expect<BindBand>, Expect<PatchBand>] = [true, true];
+
+        expect(guards).toEqual([true, true]);
+
+        const bind: CreateSessionAgentRequest = {
+            name: 'research',
+            prefix: [{ role: 'user', content: 'Start from the brief.' }],
+        };
+
+        expect(bind).toEqual({ name: 'research', prefix: [{ role: 'user', content: 'Start from the brief.' }] });
+
+        const restore: UpdateSessionAgentRequest = { prefix: null };
+
+        expect(restore).toEqual({ prefix: null });
+    });
+
+    it('answers the prefix read with the band and its provenance, and nothing else', () => {
+        // CLOSED object (`additionalProperties: false`), four keys, and the three-case ladder with NO
+        // `catalogue`/`global` value: a preset history has no catalogue layer to inherit from.
+        type ResponseKeySet = Equal<
+            keyof SessionPrefixTurnsResponse,
+            'session_id' | 'agent_id' | 'prefix' | 'source'
+        >;
+        type SourceCases = Equal<SessionPrefixTurnsResponse['source'], 'harness' | 'session' | 'none'>;
+        const guards: [Expect<ResponseKeySet>, Expect<SourceCases>] = [true, true];
+
+        expect(guards).toEqual([true, true]);
+
+        const response: SessionPrefixTurnsResponse = {
+            session_id: 'ses_1',
+            agent_id: 'research',
+            prefix: [{ role: 'system', content: 'Cite every figure.' }],
+            source: 'harness',
+        };
+
+        expect(response).toEqual({
+            session_id: 'ses_1',
+            agent_id: 'research',
+            prefix: [{ role: 'system', content: 'Cite every figure.' }],
+            source: 'harness',
+        });
+
+        // An EMPTY band is a legal document, and `none` is the answer that names it.
+        const empty: SessionPrefixTurnsResponse = {
+            session_id: 'ses_1',
+            agent_id: 'research',
+            prefix: [],
+            source: 'none',
+        };
+
+        expect(empty).toEqual({ session_id: 'ses_1', agent_id: 'research', prefix: [], source: 'none' });
     });
 });

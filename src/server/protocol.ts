@@ -24,7 +24,7 @@ import type { AgentResultReference } from '../engine/shared/agent-results';
 // (./types/index.ts), reused here verbatim rather than re-declared, so the wire can
 // never drift from what the kernel accepts. `import type` only: the emitted file has
 // no runtime dependency, which this module must keep (a browser imports it).
-import type { AgentRank } from '../engine/types';
+import type { AgentRank, HarnessPrefixTurn } from '../engine/types';
 // The display contract is imported (not just re-exported) because the view
 // envelopes below embed its shapes. `import type` only: this file stays free of any
 // runtime dependency, and `../shared/turn-display.ts` never imports this file back,
@@ -427,7 +427,16 @@ export type HarnessDescriptor = {
     // `Agent.color` for that member, so the swatch a card paints and the swatch a
     // session's agents carry are the same bytes.
     agentColors?: Record<string, string>;
-    // Shipped with the application vs created through POST /harnesses. Informational
+    // PER-AGENT PRESET HISTORY (U6): agent id → that member's complete ordered band of seeded
+    // `system` / `user` / `assistant` turns. PRESENT ONLY WHEN the definition seeds at least one
+    // band, so every existing card keeps its exact shape — and unlike the three text maps above,
+    // a band is an ARRAY, which is why an entry keyed with `[]` still counts as "configured":
+    // "this member seeds no history" is a decision the definition owns and the read must echo.
+    //
+    // It is the UNTOUCHED definition statement, not the session's current band: a session's own
+    // override lives in its preset copy, and this copy is what a `null` prefix patch restores from
+    // (./sessions.ts `setSessionAgentPrefix`), so no session write ever rewrites it.
+    agentPrefixes?: Record<string, HarnessPrefixTurn[]>;
     // only: every harness in the in-memory registry is an editable application copy
     // of a template or a client-created harness.
     builtin: boolean;

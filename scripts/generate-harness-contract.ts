@@ -68,6 +68,21 @@ const ALIASES = {
     // added or removed on either side fails the assignability probe in
     // src/engine/shared/harness-api.test.ts instead of drifting quietly.
     AgentRank: { from: '../types', as: 'AgentRank' },
+    // THE PRESET-HISTORY TURN (U6, 2026-11-23). `HarnessPrefixTurn` is the engine's closed
+    // discriminated union of the three text roles (src/engine/types/index.ts), and the spec
+    // declares the same closed shape - required `role` (enum system|user|assistant) and a verbatim
+    // string `content`, `additionalProperties: false` - so aliasing rather than generating a second
+    // record keeps ONE vocabulary across the definition map, the session override, the durable
+    // preset, and the engine's seeded band. That identity is load-bearing, not cosmetic: the server
+    // hands a wire value straight to `Harness.setAgentPrefix`, and an engine-side
+    // `AgentConfiguration.prefix` is the same type, so `AgentPrefixBindingModel.prefix` flows into
+    // the runtime with no cast and no structural conversion. Aliasing is also the only spelling that
+    // keeps `AgentPrefixBindingModel` mutually assignable with `AgentBindingPatch`: the spec's
+    // `{ role: enum; content: string }` record would otherwise sit beside a union in one field type,
+    // and each direction of that assignment fails. A role, field, or nullability edit on either
+    // side fails the assignability probe in src/engine/shared/harness-api.test.ts instead of
+    // drifting quietly.
+    HarnessPrefixTurn: { from: '../types', as: 'HarnessPrefixTurn' },
     // Subagent result reference (src/engine/shared/agent-results.ts).
     AgentResultReference: { from: './agent-results', as: 'AgentResultReference' },
 };

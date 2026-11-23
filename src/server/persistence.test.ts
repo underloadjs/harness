@@ -3008,3 +3008,142 @@ describe('compaction pass persistence (T3 pruning, T4.4 coalescing)', () => {
         expect(flaggedOf(durableTranscript(rootWithout))).toEqual([]);
     });
 });
+
+    // ---------------------------------------------------------------------------
+    // U6: the PRESET-HISTORY band. The writer is the registry / session preset (`presetToRecord`),
+    // and what this layer owns is the READER: a band is the transcript a member seeds on turn one,
+    // so a stored value the loader cannot trust is a LOAD failure, never a silent repair — while a
+    // document that predates the field must restore with the exact key set it was written with, and
+    // an EMPTY band (`{ member: [] }`) must keep its key, because that is a stated choice
+    // ("this member seeds no history") rather than an omission.
+    // ---------------------------------------------------------------------------
+    describe('the preset-history band (U6)', () => {
+        const BAND = [
+            { role: 'system', content: 'Cite every figure.' },
+            { role: 'assistant', content: 'Summary drafted.' }
+        ];
+
+        // A stored band on all three halves a foreign writer may stamp: the registry row, a frozen
+        // session's preset copy, and that session's frozen DEFINITION copy (which is what a `null`
+        // prefix patch restores from, ./sessions.ts `setSessionAgentPrefix`).
+        const stamp = (document: Record<string, any>, sessionId: string, presetBand: unknown, definitionBand: unknown): void => {
+            const stored = document.sessions.find((entry: Record<string, any>) => entry.id === sessionId);
+
+            stored.preset.agentPrefixes = presetBand;
+            stored.definition.agentPrefixes = definitionBand;
+            document.registry[0].agentPrefixes = presetBand;
+        };
+
+        it('restores a stored band on every half, keeps an empty band keyed, and invents nothing for an old document', async () => {
+            const root = tempRoot('prefix-map');
+            const first = runtimeOf(root, [liveScriptedPreset('one')]);
+            const sessionId = (await first.store.create('one')).id;
+
+            first.store.dispose();
+
+            const document = readDocument(root) as Record<string, any>;
+            const stored = document.sessions.find((entry: Record<string, any>) => entry.id === sessionId);
+
+            // Absent, not `{}`: a session and a card that seed no history write no key anywhere, so
+            // the file is byte-identical to what an older build saved.
+            expect(Object.hasOwn(stored.preset, 'agentPrefixes')).toBe(false);
+            expect(Object.hasOwn(stored.definition, 'agentPrefixes')).toBe(false);
+            expect(Object.hasOwn(document.registry[0], 'agentPrefixes')).toBe(false);
+
+            stamp(document, sessionId, { research: BAND, summarizer: [] }, { research: BAND });
+            writeDocument(root, document);
+
+            const loaded = readHarnessDatabase(readDocument(root));
+            const session = loaded.sessions.find((entry) => entry.id === sessionId)!;
+
+            expect(session.preset.agentPrefixes).toEqual({ research: BAND, summarizer: [] });
+            expect(session.definition.agentPrefixes).toEqual({ research: BAND });
+            // The registry row was stamped with the SAME band as the preset, so it comes back the
+            // same way — including the empty `summarizer` key, which is a stated choice on a card.
+            expect(loaded.registry.find((entry) => entry.name === 'one')!.agentPrefixes).toEqual({ research: BAND, summarizer: [] });
+
+            // THE EMPTY BAND SURVIVES AS A KEY. Dropping it would turn an explicit "no history"
+            // back into an omission, and the rebuilt harness would seed whatever the template says.
+            expect(Object.hasOwn(session.preset.agentPrefixes!, 'summarizer')).toBe(true);
+            expect(session.preset.agentPrefixes!.summarizer).toEqual([]);
+        });
+
+        it('drops a stored turn field the closed contract does not carry', async () => {
+            const root = tempRoot('prefix-extra');
+            const first = runtimeOf(root, [liveScriptedPreset('one')]);
+            const sessionId = (await first.store.create('one')).id;
+
+            first.store.dispose();
+
+            const document = readDocument(root) as Record<string, any>;
+
+            // An enriched row (an id, a `toolCalls` block, an attachment list) — from a human edit or
+            // an older writer. The extras are never carried forward: the restored value is the text
+            // pair the engine seeds.
+            stamp(
+                document,
+                sessionId,
+                { research: [{ role: 'user', content: 'Earlier exchange.', id: 9, toolCalls: [], attachments: [] }] },
+                { research: [{ role: 'user', content: 'Earlier exchange.', toolCallId: 'call_1' }] }
+            );
+            writeDocument(root, document);
+
+            const loaded = readHarnessDatabase(readDocument(root));
+            const session = loaded.sessions.find((entry) => entry.id === sessionId)!;
+
+            expect(session.preset.agentPrefixes).toEqual({ research: [{ role: 'user', content: 'Earlier exchange.' }] });
+            expect(session.definition.agentPrefixes).toEqual({ research: [{ role: 'user', content: 'Earlier exchange.' }] });
+        });
+
+        // The three halves a foreign writer may stamp, and the EXACT address each is read under:
+        // registry rows are named by ROW INDEX (`registry[0]`), a frozen session names its own two
+        // copies (`sessions[0].preset`, `sessions[0].definition`). Only ONE half is malformed per
+        // call, so an assertion can never be satisfied by a different half's error.
+        type Half = 'registry' | 'preset' | 'definition';
+
+        it('refuses a malformed stored band, naming the exact path, on either half', async () => {
+            const root = tempRoot('prefix-broken');
+            const first = runtimeOf(root, [liveScriptedPreset('one')]);
+            const sessionId = (await first.store.create('one')).id;
+
+            first.store.dispose();
+
+            const refusal = (band: unknown, half: Half): string | void => {
+                const document = readDocument(root) as Record<string, any>;
+                const stored = document.sessions.find((entry: Record<string, any>) => entry.id === sessionId);
+
+                document.registry[0].agentPrefixes = half === 'registry' ? band : { research: BAND };
+                stored.preset.agentPrefixes = half === 'preset' ? band : { research: BAND };
+                stored.definition.agentPrefixes = half === 'definition' ? band : { research: BAND };
+
+                try {
+                    readHarnessDatabase(document);
+                } catch (error) {
+                    return (error as Error).message;
+                }
+
+                throw new Error(`Expected a load failure for ${half} = ${JSON.stringify(band)}.`);
+            };
+
+            // A band that is not an array — on the session half, then the registry half, then the
+            // frozen definition half. Same rule, three addresses.
+            expect(refusal({ research: 'nope' }, 'preset')).toBe('sessions[0].preset.agentPrefixes.research must be an ARRAY of preset-history turns.');
+            expect(refusal({ research: 'nope' }, 'registry')).toBe('registry[0].agentPrefixes.research must be an ARRAY of preset-history turns.');
+            expect(refusal({ research: 'nope' }, 'definition')).toBe('sessions[0].definition.agentPrefixes.research must be an ARRAY of preset-history turns.');
+            // A turn that is not an object.
+            expect(refusal({ research: ['nope'] }, 'preset')).toBe('sessions[0].preset.agentPrefixes.research[0] must be an object.');
+            // A role outside the three text roles, including the tool role a preset can never mean.
+            expect(refusal({ research: [{ role: 'tool', content: 'x' }] }, 'preset')).toBe(
+                'sessions[0].preset.agentPrefixes.research[0].role must be "system", "user", or "assistant". Received "tool".'
+            );
+            expect(refusal({ research: [{ content: 'x' }] }, 'definition')).toBe(
+                'sessions[0].definition.agentPrefixes.research[0].role must be "system", "user", or "assistant". Received undefined.'
+            );
+            // A `content` that is not a string (a content-block array is the real-world case).
+            expect(refusal({ research: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }] }, 'registry')).toBe(
+                'registry[0].agentPrefixes.research[0].content must be a string.'
+            );
+            // A band map that is not an object at all.
+            expect(refusal([], 'preset')).toBe('sessions[0].preset.agentPrefixes must be an object.');
+        });
+    });

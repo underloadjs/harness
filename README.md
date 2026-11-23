@@ -507,7 +507,7 @@ That loop is exactly what `harness()` automates.
 | `fork({ label? })` | Create a detached private branch of this agent's entire committed history, model, and instruction snapshot. `label` is display metadata only (≤120 characters). |
 | `system` / `user` / `assistant` | Append a message, return the agent for chaining. |
 | `model()` / `model('x')` | Read / write the model. |
-| `reset()` | Restore the seeded instructions and clear the conversation. For a fork it restores the branch's own fork-time baseline, never the live source history. |
+| `reset()` | Restore the seeded instructions, `prefix`, and seed messages, and clear the conversation. For a fork it restores the branch's own fork-time baseline, never the live source history. |
 
 `agent.fork()` is the standalone primitive. A fork owns a materialized copy of the
 transcript with provider-safe tool-call ids and explicit non-success placeholders
@@ -515,6 +515,43 @@ for calls that were still pending; it shares the transport (and therefore creden
 and external tool side effects), so it is a conversation copy, **not a sandbox**.
 `agent.messages` on the source is never touched. In a harness, the same primitive
 backs the `threadFork` tool.
+
+#### Seed history: `instruction`, `prefix`, `messages`
+
+Three fields decide what a fresh agent's transcript holds before its first prompt, and
+the order is the contract: **every `instruction` system message, then `prefix`, then
+`messages`, then the conversation**.
+
+```ts
+const brain = agent({
+    model: 'merge/ds4-flash',
+    provider: { baseURL },
+    instruction: 'You are a writer.',   // → one system message per entry
+    prefix: [                           // preset agentic history
+        { role: 'system', content: 'Recalled scene: the lighthouse.' },
+        { role: 'user', content: 'What came before?' },
+        { role: 'assistant', content: 'The keeper left.' }
+    ],
+    messages: [{ role: 'user', content: 'Latest seed turn.' }] // legacy seed history
+});
+```
+
+`instruction` says who the agent **is**; `prefix` says what **already happened** — the
+prior session a host is resuming, the worked examples a spawn should start with. That is
+what `distribution/story-generator`-style hosts need and what no instruction string can
+express. Roles are `system | user | assistant` **only**: a `tool` turn answers an
+assistant `tool_calls` block this field never carries, so an orphan result would reach a
+provider as an invalid request, and the type refuses it rather than adding a runtime rule.
+
+A `prefix` entry is treated exactly like a seeded `messages` entry — the `included`
+normalization (only `false` is ever stored), a detached copy, seeded-attachment
+validation, and a runtime-minted `messageId` (a caller-supplied id is dropped, because
+seeded history enters as a NEW conversation). `prefix` and `messages` compose instead of
+compete: `prefix` comes first, nothing is deprecated, and using both is not an error.
+
+Lifecycle: `reset()` reseeds `prefix`, and a new harness **thread** reseeds it too (same
+brain, new conversation). A **fork** does not — it starts from its source's materialized
+transcript, which already contains these turns, so a branch never injects them twice.
 
 #### Retries
 
@@ -3453,10 +3490,10 @@ were deleted rather than kept behind a flag. See
 | `GET /v1/harness/config` | Global provider defaults and the deployment runtime facts (never per-session) |
 | `PATCH /v1/harness/config` | Change the global provider defaults — `{ settings: { base_url?, model?, api_key? } }`; an explicit `null` puts the shipped default back |
 | `GET /v1/harness/harnesses` | Harness definitions, paged (`q` matches name/title/description). Every entry is an editable application copy |
-| `POST /v1/harness/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, agents, entry?, ranks?, agent_models?, agent_instructions?, agent_colors? }` → `201 { harness }`. `agents` is the ONLY roster field and is REQUIRED beside `name`; it keeps DECLARATION order (the display/cycle order), which is presentation only. `entry` is optional, must be a member, defaults to the first name, and grants no authority. `ranks` may cover fewer members than the roster and is RESOLVED into the map the harness runs with (an omitted map = entry `'A'`, every other member `'B'`; a stated map is filled one rank below the lowest letter it names). A duplicate name, a roster over 16 members, an `entry` outside the roster, a `ranks` key outside the roster, and a bad rank letter are each a `400` naming the members. `primary`/`subagents` are not accepted at all |
-| `PATCH /v1/harness/harnesses/:name` | Change a harness definition. The EXECUTABLE fields are `agents`/`entry`/`ranks`/`agent_models`/`agent_instructions`/`agent_colors` — stating any of them rebuilds the harness's factory, so the change reaches the NEXT session, never a running one; an omitted `entry` survives whenever the patch left it a member, and an omitted `ranks` keeps the current ranks restricted to the surviving members (a member the patch added takes the filled value, so a newcomer never lands at `'A'` by accident) |
+| `POST /v1/harness/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, agents, entry?, ranks?, agent_models?, agent_instructions?, agent_prefixes?, agent_colors? }` → `201 { harness }`. `agents` is the ONLY roster field and is REQUIRED beside `name`; it keeps DECLARATION order (the display/cycle order), which is presentation only. `entry` is optional, must be a member, defaults to the first name, and grants no authority. `ranks` may cover fewer members than the roster and is RESOLVED into the map the harness runs with (an omitted map = entry `'A'`, every other member `'B'`; a stated map is filled one rank below the lowest letter it names). A duplicate name, a roster over 16 members, an `entry` outside the roster, a `ranks` key outside the roster, and a bad rank letter are each a `400` naming the members. `primary`/`subagents` are not accepted at all |
+| `PATCH /v1/harness/harnesses/:name` | Change a harness definition. The EXECUTABLE fields are `agents`/`entry`/`ranks`/`agent_models`/`agent_instructions`/`agent_prefixes`/`agent_colors` — stating any of them rebuilds the harness's factory, so the change reaches the NEXT session, never a running one; `agent_prefixes` REPLACES the whole preset-history map exactly like `agent_instructions` (`{}` clears every band, a member's `[]` is a valid band that seeds no history, and an omitted map leaves every band as it was); an omitted `entry` survives whenever the patch left it a member, and an omitted `ranks` keeps the current ranks restricted to the surviving members (a member the patch added takes the filled value, so a newcomer never lands at `'A'` by accident) |
 | `DELETE /v1/harness/harnesses/:name` | Remove one — `{ deleted: true, harness_name, tombstoned, restored_by_restart: false }`; a deleted built-in stays deleted across a restart. `404` unknown/repeat/alias-only delete. `409` while ANY live or restored session belongs to this canonical harness, or while one of its session removals is still in flight: nothing is removed, no session is cascaded, and each owned session must be deleted individually (there is deliberately no bulk delete). After the registry write succeeds the route removes the knowledge articles attributed to this harness and flushes before the `200`; other harnesses', unowned/legacy and Storyline articles survive. A cleanup/flush failure after that commit is a `500` naming the partial outcome (the harness is already gone; a repeat DELETE is `404` and does not retry cleanup) |
-| `GET /v1/harness/harnesses/:name` | Read ONE definition — the identified read carries what a card omits (the per-agent model map, instruction text, resolved core-tool set); `404` for an unknown name |
+| `GET /v1/harness/harnesses/:name` | Read ONE definition — the identified read carries what a card omits (`core_tools`, the per-agent `agent_models` / `agent_colors` / `agent_prefixes` maps — the two text/colour maps only when non-empty, while `agent_prefixes` is stated on EVERY answer, `{}` when nothing is seeded — plus `instruction_summary`: one row per member with provenance and length, never the text). The always-stated `agent_prefixes` is the CAPABILITY flag: a harness PATCH REPLACES that map and a present `{}` clears every band, so a client may only send what it has read, and a backend from before the feature omits the property (its PATCH would refuse the field) — absent means "no preset-history editor", `{}` means "the editor exists and nothing is seeded". A member absent from `agent_prefixes` seeds no history; a member keyed with `[]` is echoed back, because an explicit "no preset history" is a stated choice, not an omission. `404` for an unknown name |
 | `GET /v1/harness/harnesses/:name/instructions` | Which members carry an instruction override (not paged: membership is bounded by the definition) |
 | `GET /v1/harness/harnesses/:name/instructions/:agentId` | One member's effective instruction text |
 | `GET /v1/harness/agents` | The trusted agent profiles, paged |
@@ -3475,7 +3512,7 @@ were deleted rather than kept behind a flag. See
 | `GET /v1/harness/sessions/:id` | One session's metadata plus its live model map and counters — still no turns, threads, transcripts or display trees. It DOES carry `inactive_thread_ids` (additive, absent when the session never deleted one): the ids of the conversations this route's roster HIDES because a `DELETE …/threads/:threadId` retired them. The roster omission is the listing rule, not evidence — after a reload a client cannot tell "deleted" from "never existed" — so the deletion fact travels as its own field, and the roster keeps meaning "the conversations this session can still run" |
 | `PATCH /v1/harness/sessions/:id` | Retarget models in a live session: body `{ agent_models: { agent: model } }` (and/or `title`, where `null` clears it) → `{ session }`. Merges into the live map, validates every key/value, applies all-or-nothing, and is allowed while the session is running (the next request uses the new model; the current one keeps its own). See [Server and UI](#server-and-ui) |
 | `DELETE /v1/harness/sessions/:id` | Dispose a session — `{ deleted: true, session_id, aborted_turns, dropped_queued_tasks }` |
-| `GET /v1/harness/sessions/:id/definition` | The harness definition this session froze, plus `frozen_at`, `source_revision` / `current_revision` / `current`, and `discovered_tools` — the enabled set, omitted while it is empty and therefore already populated on a session the server created (`enableAllTools`) |
+| `GET /v1/harness/sessions/:id/definition` | The harness definition this session froze, plus `frozen_at`, `source_revision` / `current_revision` / `current`, and `discovered_tools` — the enabled set, omitted while it is empty and therefore already populated on a session the server created (`enableAllTools`). The frozen copy's per-agent `agent_colors` (R2) and `agent_prefixes` (U6) maps ride it too, each read off `record.definition` and each OMITTED while the captured copy configures nothing — so a session frozen before either feature keeps its exact previous row. That is deliberately the opposite of the identified harness read's always-stated `agent_prefixes`: a session client negotiates preset history from `GET /v1/harness/sessions/:id/agents/:agentId/prefix` (a build without it answers `404`), so the property buys nothing here, while a member keyed `[]` makes the map non-empty and is echoed back |
 | `GET /v1/harness/sessions/:id/usage` | The session's token accounting (server-summed from the recorded `usage` events) |
 | `GET /v1/harness/sessions/:id/commands` | The slash commands this session can run (discovery only — execution is a task submit) |
 | `GET /v1/harness/sessions/:id/records` | The session record store, whole or as a `?since=` delta; read-only, so polling it moves no revision. A delta is a CLOSED object — `{ session_id, revision, store_rev, collections_rev, changes, reset }` — and `reset: true` says your `since` is no longer answerable: the store rewound under that watermark (a session `reset()` takes `store_rev` to 0), or the retained window trimmed past it, or a restore/restart cleared the feed. It is a `200`, not an error, and `changes` still carries what IS retained; the recovery is the snapshot read of this same path, and only that. The per-collection window keys (`oldestAvailableRev` / `droppedEvents`) are not published on either form of this route |
@@ -3486,12 +3523,13 @@ were deleted rather than kept behind a flag. See
 | `GET /v1/harness/sessions/:id/actions` | The owner questions still waiting for an answer |
 | `POST /v1/harness/sessions/:id/actions/:requestId/answer` | `{ choice: { kind: 'option', option_id } \| { kind: 'custom', text } }` → `{ ok: true, request_id, resolved_at }`. Settles one pending `actionRequest`; allowed while the session is busy. `400` invalid/unknown option, `404` unknown session/request, `409` answered or expired |
 | `GET /v1/harness/sessions/:id/agents` | This session's agent roster (bindings joined with what the session actually runs). Each row states the member's `rank`: the definition's `ranks` map is the ONLY authority — the read never derives a letter from the name, the roster order, or "is this the entry agent" — and a member the map does not name reports the LOWEST rank, because authority exists only where the definition grants it (`rankOfMember`, `src/server/api-reads.ts:1477-1488`). Any number of members may share a rank, `'A'` included. The row also carries `deletable`, the same predicate the `DELETE` behind it refuses on |
-| `POST /v1/harness/sessions/:id/agents` | Bind a trusted profile, or define a session-owned agent, into this session only. The answer is ONE `SessionAgentBinding`, and it names the member's `rank` — a letter the caller may state, and one the runtime fills when it does not: an omitted rank takes ONE RANK BELOW the lowest rank configured anywhere (the store's own fallback for a handle that reports no `ranks` at all is `'Z'`, the bottom of the scale — never an inherited middle rank), so a bound newcomer cannot land above the harness's delegator by accident |
+| `POST /v1/harness/sessions/:id/agents` | Bind a trusted profile, or define a session-owned agent, into this session only. The answer is ONE `SessionAgentBinding`, and it names the member's `rank` — a letter the caller may state, and one the runtime fills when it does not: an omitted rank takes ONE RANK BELOW the lowest rank configured anywhere (the store's own fallback for a handle that reports no `ranks` at all is `'Z'`, the bottom of the scale — never an inherited middle rank), so a bound newcomer cannot land above the harness's delegator by accident. A bind may also state its own preset history: `prefix` absent or `null` seeds whatever this session's frozen definition states, and an ARRAY — `[]` included, which means "this member seeds no history" — is this conversation's own band, validated by the same edge validator a definition write uses (≤64 turns, ≤32000 characters each, `system`/`user`/`assistant` only, content verbatim) |
 | `GET /v1/harness/sessions/:id/agents/:agentId` | One binding |
-| `PATCH /v1/harness/sessions/:id/agents/:agentId` | Override one session agent's model or instruction, or change its rank while the session has not started a thread (a started conversation keeps the ranks its template defines and answers `409`) |
+| `PATCH /v1/harness/sessions/:id/agents/:agentId` | Override one session agent's model or instruction, change its rank, or restate its preset history (`prefix`) while the session allows the write (a started conversation keeps the ranks its template defines and answers `409`; a prefix write is idle-gated the same way, so live or queued work answers `409`). `prefix` follows the three-state rule the same field does on `POST`: omitted = leave every band alone, an ARRAY = replace THIS conversation's band for this member (a malformed band is a `400` naming the turn index before the rank or instruction half of the same patch has moved anything), and `null` = restore the band this session's frozen harness definition seeds — which is a written band, not a deletion, so the member keeps seeding history after a restart |
 | `DELETE /v1/harness/sessions/:id/agents/:agentId` | Remove one binding. The ENTRY agent is the one member that is never detachable (`harness.name` and `handle.agent` point at it), and a binding can never REPLACE `definition.entry` — promoting a member is a harness-definition edit, not a session-scoped binding. That entry guard is the SERVER's, and the library handle is looser on purpose: `harness.removeAgent(entry)` is legal (`src/harness.ts:16687-16691`) and `harness.name`/`handle.agent` then resolve to the first still-registered agent, because this route — not the library — is the one that guards a durable roster. An agent that still owns a conversation is refused with a `409` naming those thread ids (delete the threads first), and live or queued work is a `409` |
 | `GET /v1/harness/sessions/:id/agents/:agentId/instruction` | One session agent's effective instruction, naming the layer it came from |
 | `PATCH /v1/harness/sessions/:id/agents/:agentId/instruction` | Replace or clear it (`{ instruction: "…" \| null }`) and return that same document |
+| `GET /v1/harness/sessions/:id/agents/:agentId/prefix` | One member's effective PRESET HISTORY — the closed `{ session_id, agent_id, prefix, source }` document. The band is read from the LIVE brain (the seeded turns between the instruction block and the member's first real turn), so the answer is what the next request sends rather than what some layer once proposed, and the turns are verbatim (no trim). `source` says where it came from: `session` when this conversation carries a band that DIFFERS from its definition's — including an empty band it chose over a non-empty one, which is `session` with `prefix: []`, not `none`; `harness` when the band is the frozen definition's own (a session write that restated the same bytes is not a divergence the model can observe); `none` when nothing seeds history. A band is a SEED, never a transcript: committed turns stay on the turn-block routes, and writes go through the binding `PATCH`, so this is the read behind a "show preset history" affordance. Unknown session or agent is `404` |
 | `GET /v1/harness/sessions/:id/tools` | This session's toolbox: one row per live registry name, with `declared` (in the frozen definition's **`coreTools`**, not the preset's tool list), `enabled` — the CALL axis, `!withheld && (holds a cap slot ? in the capped set : true)` (`src/server/api-reads.ts` `sessionToolRowsOf`). So `false` means EITHER "this conversation switched it off" OR "the cap has no free slot for it", and only the first appears in `harness.withheldTools`; a slotless row (a core declaration, the pending-only `toolCancel`) can only be `false` because it is switched off. The row carries no separate withheld flag, so for a searchable name those two `false`s read identically here. A session the server CREATED starts with every cap-eligible name there, `enableAllTools`, and so does one it RESETS; a name the deployment denies is the one name the seed leaves off, and the denial outranks this figure — `GET /v1/harness/tools` is the row that states it), `origin` (`created` / `discovered` / `catalogue`) and `protected` — the UNREGISTER axis: `visibility === 'core'` on the live registry map, exactly the `DELETE` `403` and nothing else. It is never consulted by an enable/disable PATCH, and `toolCancel` is `protected: false` because the kernel's `remove` accepts it |
 | `POST /v1/harness/sessions/:id/tools` | Register a session-local tool |
 | `GET /v1/harness/sessions/:id/tools/:toolId` | One session tool with its argument schema |
@@ -3604,7 +3642,7 @@ including the shipped templates (`general`, `instruct`, `research`, `workspace`,
 metadata-only `PATCH` (`title`/`description`) preserves the template's captured
 factory, so a harness that does not use the live profiled factory keeps whatever it
 was built with. An executable `PATCH`
-(`agents`/`entry`/`ranks`/`agent_models`/`agent_instructions`/`agent_colors`) rebuilds the
+(`agents`/`entry`/`ranks`/`agent_models`/`agent_instructions`/`agent_prefixes`/`agent_colors`) rebuilds the
 harness as a live profiled harness from the shared toolbox. `agent_colors` is display-only
 yet still counts as executable: the map is captured by the factory closure and reaches every
 `Agent` built from it, so a stated color must rebuild the factory rather than be stored as a
@@ -3632,7 +3670,7 @@ are members and whose values are single rank letters, reserved aliases
 title/description — and reject unknown fields, so a client cannot supply a bare
 `instruction`, a provider, or a tool list. THE OLD VOCABULARY IS NOT TRANSLATED: because the
 field set is closed (`name`/`title`/`description`/`agents`/`entry`/`ranks`/`agent_models`/
-`agent_instructions`/`agent_colors`), a body still sending `primary` or `subagents` is a `400`
+`agent_instructions`/`agent_prefixes`/`agent_colors`), a body still sending `primary` or `subagents` is a `400`
 naming the ACCEPTED set — that is the intended migration signal, because accepting the old pair
 would invent authority for a roster the client never ranked. A lowercase letter is refused the
 same way, with the exact shape spelled out:
@@ -3685,6 +3723,34 @@ were built with (its system messages are already in the transcript), which is wh
 `PATCH /v1/harness/sessions/:id` still accepts `agent_models` only. The browser's agent dialog
 edits all of this as a local draft: nothing is written until its bottom-right action,
 and dismissing the dialog sends nothing at all.
+
+`agent_prefixes` is the configuration map whose value is not a string: a map of **selected
+agent id → that member's preset history**, an ordered band of `system` / `user` / `assistant`
+turns seeded in front of the member's first real turn, e.g.
+`{ "summarizer": [{ "role": "user", "content": "Earlier exchange." }] }`. A band is a SEED,
+not a transcript: the model reads it as conversation — that is what a resumed prior session or
+a worked example is — and it sits BELOW the instruction, so a `system` turn here does not
+compete with the member's prompt. Those three roles are the whole vocabulary: a `tool` turn
+answers a `tool_calls` block a preset never carries, so an orphan result would reach a provider
+as an invalid request. `content` is VERBATIM — never trimmed, and an empty string is a real
+entry — with at most 64 turns per band and 32000 characters per turn, and a field outside
+`role` + `content` is IGNORED rather than refused, so echoing a transcript row back is legal.
+Like `agent_instructions` this is EXECUTABLE (it rebuilds the factory, so the NEXT session
+seeds the new band) and REPLACED wholesale on `PATCH`, with one shape difference the client has
+to honour: an empty band is a VALUE, so `{ "editor": [] }` states "this member seeds no
+history" and is echoed back by the identified read instead of collapsing into "unconfigured".
+Presence is the second half of that shape rule: the identified `GET /v1/harness/harnesses/:name`
+answers with `agent_prefixes` ALWAYS — `{}` when the definition seeds nothing — while a backend
+from before the feature has no such property at all, and because the PATCH field is a whole-map
+REPLACE, a client is only allowed to send the map it has actually read. Absent therefore means
+"this server has no preset editor", `{}` means "the editor exists and nothing is seeded".
+Session-scoped, a band is overridden on the binding routes above, and `null` there is a
+RESTORE rather than a deletion — the frozen definition's own band is written back, because that
+value is the seed a restored session rebuilds from. The turns a conversation ACTUALLY seeds never
+ride in a roster row or a session read — the frozen definition read above carries the template's own
+copy, which no session write touches, while this conversation's override lives in its preset record —
+so `GET /v1/harness/sessions/:id/agents/:agentId/prefix` is the one route that
+states them, with the `source` layer they came from.
 
 `POST /v1/harness/models` takes `{ settings?: { base_url?, api_key?, model? } }` — every
 field optional, an unknown field a `400`, and the key is never echoed back. It exists
