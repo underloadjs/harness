@@ -1029,9 +1029,12 @@ describe('retired build layer', () => {
         expect(PERMITTED_BUILD_ARTIFACT).toBe('src/server/workers/worker-boot.mjs');
         expect(packed).toContain(PERMITTED_BUILD_ARTIFACT);
 
-        // Exact non-`.ts` inventory: the worker bootstrap plus the OpenAPI
-        // document. The UI assets moved to `@loadscript/harness`.
+        // Exact non-`.ts` inventory: the worker bootstrap, the server's OpenAPI
+        // document, and the engine's programmatic contract as markdown (the engine is
+        // a callable TypeScript object, so it has no OpenAPI document of its own). The
+        // UI assets moved to `@loadscript/harness`.
         expect(packed.filter((file: string) => !file.endsWith('.ts'))).toEqual([
+            'src/harness-engine.md',
             'src/harness-server.swagger.yaml',
             'src/server/workers/worker-boot.mjs'
         ]);

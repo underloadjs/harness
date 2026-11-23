@@ -49,8 +49,8 @@ export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.
 // `dist/` directory this constant used to name does not exist and must not come back.
 export const EDITABLE_SOURCE_ROOT = 'src';
 
-// The ONE non-TypeScript file the published tree is allowed to carry, and the only
-// exception to `BUILD_ARTIFACT`: the plain-JS worker-thread bootstrap. `node:
+// The ONE non-TypeScript RUNTIME file the published tree is allowed to carry, and
+// the only exception to `BUILD_ARTIFACT`: the plain-JS worker-thread bootstrap. `node:
 // worker_threads` loads its entry with raw Node, which cannot parse this repo's
 // TypeScript, so the spawn entry has to be JS — everything it runs is `.ts`, fetched
 // through Vite's ModuleRunner (see that file's header for the full reasoning).
