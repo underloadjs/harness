@@ -46,7 +46,10 @@
 //   - ../webfetch/request — the fetch tool's own (100 KiB) page budget
 //   - ../../util   — HarnessError (the message the model ends up reading)
 
-import { HarnessError } from '../../util';
+// `clipPrefix` is the pair-safe bound every text field here passes through (T3, the
+// lone-surrogate defect): the caps below are code-unit counts, so a plain `slice` could
+// end a title or snippet on half of an emoji.
+import { clipPrefix, HarnessError } from '../../util';
 import type { WebSearchMatch } from '../../types';
 
 // Default result count when the model (or a direct caller) does not ask.
@@ -154,10 +157,14 @@ export const createRedactor = (secrets: readonly string[]) => {
 
 // Collapse whitespace, trim, and bound one text field. Titles and snippets often
 // arrive with newlines and runs of spaces; one line is what a tool result wants.
+//
+// The bound is a CODE-UNIT count, so a plain `slice` could end a title or snippet on
+// half of an emoji (T3, the lone-surrogate defect); `clipPrefix` backs that cut off one
+// unit, and a `Number.POSITIVE_INFINITY` bound still means "no bound".
 export const text = (value: unknown, max: number): string => {
     if (typeof value !== 'string') return '';
 
-    return value.replace(/\s+/g, ' ').trim().slice(0, max);
+    return clipPrefix(value.replace(/\s+/g, ' ').trim(), max);
 };
 
 // Redact the RAW provider string, then collapse and bound it.
@@ -185,7 +192,10 @@ export const boundedFlagged = (
     if (typeof value !== 'string') return { value: '', truncated: false };
 
     const collapsed = text(redact(value), Number.POSITIVE_INFINITY);
-    return { value: collapsed.slice(0, max), truncated: collapsed.length > max };
+
+    // The same pair-safe bound as `text`; `truncated` stays a statement about the SOURCE
+    // being longer than `max`, so backing the cut off one unit cannot flip the flag.
+    return { value: clipPrefix(collapsed, max), truncated: collapsed.length > max };
 };
 
 // A snippet source may be a string (Tavily content) or a list of strings (Exa

@@ -391,6 +391,11 @@ import { planContextPruning } from '../core/context-pruning';
 // only the shrink plan asks for the conservative, attachment-aware figure (see
 // `planCompactionRequest`).
 import { estimateContextTokens } from '../core/context-estimate';
+// (T3, the lone-surrogate defect) The pair-safe clip. `../util` is a LEAF below core
+// (`util/index.ts` imports nothing), so this adds no dependency above "core + types" and
+// no cycle: the same helper the transport's send path and every other clip site use, so
+// one pairing rule governs every cut in the package.
+import { clipPrefix } from '../util';
 import type {
     Agent,
     HarnessLifecycleHandler,
@@ -1421,7 +1426,14 @@ const clipShrinkText = (value: unknown, budget: number): unknown => {
     // The marker is part of the budget arithmetic ONLY in the sense that it rides along: the
     // estimate of a clipped entry is the estimate of the clipped text, so the ladder's next
     // measurement already includes it.
-    return `${value.slice(0, budget)}\u2026 [truncated by compaction]`;
+    //
+    // PAIR-SAFE (T3, the lone-surrogate defect): a code-unit cut may land between a high
+    // half and its low half, and the clipped text would END on half of an emoji. That half
+    // is legal here — the transcript holds it, `JSON.stringify` escapes it as `\ud83d` — and
+    // fatal on the wire: the provider's strict UTF-8 encoder refuses the whole request.
+    // `clipPrefix` backs the cut off one unit instead, so the marker now rides on a boundary
+    // that never splits a pair.
+    return `${clipPrefix(value, budget)}\u2026 [truncated by compaction]`;
 };
 
 // The exclusive end of the PAIRABLE block starting at `index`: an assistant turn that asked for
@@ -1762,7 +1774,11 @@ export const planCompactionRequest = (
         for (const entry of unit) {
             const text = typeof entry.content === 'string' ? entry.content.trim() : '';
             if (text.length === 0) continue;
-            excerpts.push(text.slice(0, SHRINK_CLIP_CHARS));
+            // PAIR-SAFE (T3), and more important here than at the clip above: the digest is
+            // a synthetic entry the harness WRITES, so it rides every later request. An
+            // orphan half in it would poison the thread permanently, and the model cannot
+            // edit its way out of a message the harness authored.
+            excerpts.push(clipPrefix(text, SHRINK_CLIP_CHARS));
         }
 
         dropped += 1;

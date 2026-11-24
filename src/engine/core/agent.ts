@@ -746,6 +746,67 @@ const isContextOverflowFailure = (error: unknown): boolean => {
 };
 
 // ---------------------------------------------------------------------------
+// The operator's retry line (2026-11-24, the per-attempt provider trace)
+// ---------------------------------------------------------------------------
+
+// ONE LINE PER RETRIED ATTEMPT, from the only layer that knows the LADDER. The transport
+// prints the wire-fact pair around every request (`provider attempt:` before the dial,
+// `provider attempt failed:` on the way out — ../transport/openai.ts, "Operator log"), and
+// those are the ONLY lines for a failure this file never re-sends: a terminal class, a
+// one-attempt run, `retry: false`. What only the retry owner has is the count and the wait,
+// and without them an operator watching `attempt 1..11 of 11 failed` cannot tell a provider
+// that died eleven times from a request that was refused eleven times.
+//
+// COMPLEMENTARY, NOT DOUBLED. The transport line for this same attempt already named the
+// model, the redacted dial target and the class one line earlier in the same stream, so this
+// line contributes the attempt number, the class total and the delay. It REPEATS the model on
+// purpose — that is the fact the reported incident was missing, the published `retry` event
+// has no model field (../types/index.ts `HarnessProviderAttemptDiagnostics`, frozen: a new
+// field cascades into a forked type copy and a Rust port), and a UI tile renders THIS line's
+// vocabulary, so the model has to be greppable on it. It does NOT repeat the URL: that is the
+// transport line's job, and copying it here would be the same sentence twice.
+//
+// `console.error`, `[harness]`-prefixed, ungated: this package has no debug sink to route an
+// operator line to, and nothing resembling a verbosity level to gate behind (its `HARNESS_*`
+// variables are provider timeouts, worker limits and filesystem paths —
+// ../transport/provider-timeouts.ts and ../../../server/config.ts — not log tiers), so the
+// alternative would be inventing a deployment contract for one line per retried attempt. The
+// precedent — including the stated rationale ("this package has no debug sink to route one
+// to") — is the store's stderr note at ../../../server/workers/lane-host.ts:1104-1131.
+
+// The model id for the log line, printed WITHOUT ever throwing. `model` is an
+// `AgentModelAccessor`, and the reported incident was a request the provider answered
+// `Model 'undefined' not found`, so a non-string model must still NAME itself on the line
+// rather than take the retry loop down: a bare interpolation THROWS on a Symbol, and `String`
+// itself refuses an object with no usable `toString` (a null-prototype object).
+const logModelFieldOf = (model: unknown): string => {
+    try {
+        return typeof model === 'string' ? model : String(model);
+    } catch {
+        return '<unprintable>';
+    }
+};
+
+// The line itself, never fatal: a host that replaced `console`, or a lane worker whose stdio
+// closed mid-ladder, must not turn a retry into a failure because a log line threw.
+const providerRetryLog = (input: {
+    attempt: number;
+    maxAttempts: number;
+    delayMs: number;
+    model: unknown;
+    failureClass: string | undefined;
+}): void => {
+    try {
+        console.error(
+            `[harness] provider attempt ${input.attempt} of ${input.maxAttempts} failed, retrying in ${input.delayMs}ms: ` +
+                `model=${logModelFieldOf(input.model)} · class=${logModelFieldOf(input.failureClass ?? 'unclassified')}`
+        );
+    } catch {
+        // Logging never changes control flow.
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Pre-request context floor (issue 0004)
 // ---------------------------------------------------------------------------
 
@@ -1672,6 +1733,25 @@ const createAgent = (
                     // consumer sees the event shape it always saw. `maxAttempts` is the
                     // CLASS's total, so a connection retry honestly reports "1 of 3".
                     const provider = providerDiagnosticsOf(error);
+
+                    // THE OPERATOR'S LINE FOR THIS ATTEMPT — the attempt number, the class
+                    // total and the delay, which nothing else prints, plus the model id the
+                    // event below cannot carry (see the "operator's retry line" section above
+                    // for why this complements the transport's `provider attempt failed:` line
+                    // instead of repeating it). The class is read from the SAME two sources the
+                    // ladder above acted on — the frame's machine `code`, else the diagnostics'
+                    // `errorClass` — so the line names exactly what the retry decision was made
+                    // from, and prints `unclassified` honestly for a frame that named nothing.
+                    providerRetryLog({
+                        attempt,
+                        maxAttempts: attemptsForClass,
+                        delayMs,
+                        // The request's own snapshot, the same value handed to the transport on
+                        // every attempt: a mid-run `agent.model` change must not relabel the
+                        // attempt that already failed.
+                        model: requestModel,
+                        failureClass: code ?? provider?.errorClass
+                    });
 
                     yield {
                         type: 'retry',

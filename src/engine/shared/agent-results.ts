@@ -42,6 +42,11 @@
 //   - ../frontend/ui/turns.ts      — the block projection this mirrors
 
 import type { HarnessEvent } from '../harness';
+// (T3, the lone-surrogate defect) The pair-safe clip, from the leaf both the tools and
+// the transport use, so one pairing rule governs every cut in the package. This module
+// is isomorphic (server, UI, and a worker can all load it), and `../util` is the leaf
+// that survives all three.
+import { clipPrefix } from '../util';
 // The invocation-RUN key (W19, 2026-11-17). A block is ONE invocation RUN: the id the runtime stamps on
 // `thread.id` is a per-process counter, so two runs in one recorded turn can legitimately share it, and a
 // block keyed by the bare id merges them and labels the pair with one conversation's name. The key rule is
@@ -919,7 +924,16 @@ export const boundAgentResultContent = (
     const marker = truncationMarker(content.length - keep);
     if (marker.length > limit) return '';
 
-    return `${content.slice(0, keep)}${marker}`;
+    // PAIR-SAFE (T3, the lone-surrogate defect): `keep` is a code-unit figure, so the cut
+    // may land inside a surrogate pair and leave the block ending on half of an emoji —
+    // which then reaches the provider inside the delegated prompt. Backing off one unit
+    // keeps the bound honest (the result is at most one character UNDER `limit`, never over
+    // it) and never emits an orphan half. The one cosmetic cost, stated because the marker
+    // is a character count a reader may diff against the source: `removed` is still computed
+    // from `keep`, so a backed-off block reports one character fewer removed than it
+    // actually dropped — an under-report of exactly the unit the pair cost, never an
+    // over-report, and never a silent loss.
+    return `${clipPrefix(content, keep)}${marker}`;
 };
 
 // The locator line above one block's content. Extracted from the composer loop so a

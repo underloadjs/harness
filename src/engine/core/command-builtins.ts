@@ -66,7 +66,10 @@
 // `toErrorInfo` is the harness's total thrown-value formatter (a compiled or
 // host-supplied tool may throw a primitive); reusing it keeps a command's error
 // text identical to what the model path would have shown.
-import { toErrorInfo } from '../util';
+// `clipPrefix` is the pair-safe clip (T3, the lone-surrogate defect): a cap that cuts at a
+// code-unit boundary must not leave half of an emoji behind, and `../util` is the leaf
+// every other cut in this package takes its rule from (see ./unicode.ts).
+import { clipPrefix, toErrorInfo } from '../util';
 import { MODEL_TOOL_RESULT_BUDGET_BYTES, utf8ByteLength } from './result-budget';
 import { formatCommandHelp, normalizeCommandName } from './command';
 import type {
@@ -122,14 +125,17 @@ const capText = (content: string): string => {
     if (originalBytes <= MODEL_TOOL_RESULT_BUDGET_BYTES) return content;
 
     const marker = `\n… truncated: ${content.length} characters, ${originalBytes} bytes (64 KiB command cap).`;
+    // `keep` is a BYTE budget standing in for a code-unit count (one code unit is never
+    // fewer than one byte, so the first cut is an upper bound). `clipPrefix` keeps that
+    // bound and backs the cut off one unit when it would split a surrogate pair.
     let keep = Math.min(content.length, MODEL_TOOL_RESULT_BUDGET_BYTES);
-    let text = content.slice(0, keep) + marker;
+    let text = clipPrefix(content, keep) + marker;
 
     // Geometric shrink, so the marker itself can never overflow the cap. Each
     // step strictly reduces `keep`, so this terminates at 0.
     while (keep > 0 && utf8ByteLength(text) > MODEL_TOOL_RESULT_BUDGET_BYTES) {
         keep = Math.floor(keep * 0.9);
-        text = content.slice(0, keep) + marker;
+        text = clipPrefix(content, keep) + marker;
     }
 
     return text;
@@ -592,8 +598,12 @@ const toolsCommand: HarnessCommand = {
                 SPACE_STRING
             );
 
+            // The preview is a code-unit cut on text this package did not write (a tool
+            // author's own description, emoji included), so it gets the same pair-safe bound
+            // as every other clip here (T3) — the `/tools` listing is a command result, and a
+            // command result goes to a host that may put it in front of a model.
             return description.length > TOOL_DESCRIPTION_PREVIEW_CHARS
-                ? `${name} — ${description.slice(0, TOOL_DESCRIPTION_PREVIEW_CHARS)}…`
+                ? `${name} — ${clipPrefix(description, TOOL_DESCRIPTION_PREVIEW_CHARS)}…`
                 : `${name} — ${description}`;
         });
 

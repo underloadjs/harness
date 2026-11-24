@@ -260,7 +260,10 @@
 // role folder with its own barrel, and the public surface is re-exported at the
 // bottom of this file.
 
-import { HarnessError, isInstanceOf, toErrorInfo } from './util';
+// `clipPrefix` is the pair-safe clip every preview/cut in this file takes (T3, the
+// lone-surrogate defect): a code-unit cut that lands inside a surrogate pair would put
+// half an emoji into a model-facing preview, and the provider's UTF-8 encoder refuses it.
+import { clipPrefix, HarnessError, isInstanceOf, toErrorInfo } from './util';
 // (2026-11-17, the unrecoverable-timeout report) The provider failure vocabulary, read
 // directly rather than through the re-export at the bottom of this file: `classifyRunStopReason`
 // switches on the two network CLASSES to answer `provider-network` for the session layer,
@@ -1111,7 +1114,10 @@ const assertToolArgumentsAreAnObject = (call: HarnessToolCall): void => {
     const parsed: unknown = JSON.parse(call.arguments);
 
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        const shown = call.arguments.slice(0, 120);
+        // Pair-safe (T3): this error text is quoted back to the MODEL inside a tool result
+        // that rides every later request, so a cut through an emoji here would put a lone
+        // surrogate on the wire just as surely as a clip in compaction does.
+        const shown = clipPrefix(call.arguments, 120);
         throw new SyntaxError(
             `arguments must be a JSON object; the model sent \`${shown}${
                 call.arguments.length > 120 ? '…' : ''
@@ -4887,7 +4893,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             kind: record.kind,
             status: record.status,
             contentLength: record.content.length,
-            preview: truncated ? `${trimmed.slice(0, AGENT_MANAGE_PREVIEW_CHARS)}…` : trimmed,
+            // Pair-safe (T3): a glance preview that ends on half of an emoji would reach the
+            // model as a lone surrogate inside a tool result.
+            preview: truncated
+                ? `${clipPrefix(trimmed, AGENT_MANAGE_PREVIEW_CHARS)}…`
+                : trimmed,
             truncated
         };
     };
@@ -10381,7 +10391,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 failedPartial === undefined || failedPartial.trim().length === 0
                     ? undefined
                     : failedPartial.length > FORK_PARTIAL_PREVIEW_CHARS
-                      ? `${failedPartial.slice(0, FORK_PARTIAL_PREVIEW_CHARS)}…`
+                      // Pair-safe (T3): a preview cut through an emoji would put a lone
+                      // surrogate in the failure sentence the model reads every later turn.
+                      ? `${clipPrefix(failedPartial, FORK_PARTIAL_PREVIEW_CHARS)}…`
                       : failedPartial;
 
             content = boundDelivery(

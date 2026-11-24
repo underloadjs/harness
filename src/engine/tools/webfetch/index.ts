@@ -69,7 +69,10 @@
 //   - ../../types      — WebFetchConfiguration / WebFetchResult
 
 import { tool } from '../../core';
-import { HarnessError } from '../../util';
+// `clipPrefix` and `trimBrokenLeadSurrogate` are the pair-safe helpers the whole package
+// takes its pairing rule from (../../util/unicode.ts). The lead trim is the half the
+// local trailing trim below could never see: a window that STARTS mid-pair.
+import { clipPrefix, HarnessError, trimBrokenLeadSurrogate } from '../../util';
 import type {
     Tool,
     WebFetchConfiguration,
@@ -302,6 +305,13 @@ const fitResult = (content: string): string => {
     // Code-unit slice as an upper bound (one code unit is never fewer than one
     // UTF-8 byte), then step back until the encoded form fits. Bounded by the
     // budget itself, so this terminates.
+    //
+    // The trailing trim inside the loop is what keeps a cut that splits a surrogate pair
+    // from shipping an orphan high half (T3 asked whether the FIRST candidate could skip
+    // that repair, and it cannot, by arithmetic: a candidate of `keep` units ending on a
+    // lone high half encodes to at least (keep - 1) + 3 bytes, and `keep` is already
+    // capped at the byte budget, so `utf8ByteLength(candidate) > budget` and the loop —
+    // which does trim — always runs in exactly that case).
     let keep = Math.min(content.length, budget);
     let candidate = content.slice(0, keep);
 
@@ -678,7 +688,26 @@ export const createWebFetchTool = (
             // "you already have the end" an answer rather than a dead end.
             const startOffset = Math.min(invocation.offset, safeContent.length);
             const offsetClamped = startOffset !== invocation.offset;
-            const window = safeContent.slice(startOffset);
+
+            // The window, repaired at BOTH of its ends (T3, the lone-surrogate defect):
+            //   - LEAD: `offset` is a code-unit figure a model computes from a byte count
+            //     or a `nextOffset` it was handed, so it can land on the LOW half of a
+            //     surrogate pair, and the page would then START with a lone surrogate. The
+            //     trailing trim in `fitResult` below could never see that half, because it
+            //     only looks at the last unit. `trimBrokenLeadSurrogate` drops the orphan.
+            //   - TAIL: the character bound is a code-unit cut too, so `clipPrefix` backs
+            //     off one unit rather than ending the page on a high half. (A byte-budget
+            //     cut still repairs its own tail inside `fitResult`.)
+            //
+            // OFFSETS DO NOT MOVE. `offset` echoes the window the caller ASKED for and
+            // `nextOffset` stays `startOffset + content.length`, so paging keeps its exact
+            // contract. What the trim drops is an orphan that is not a character of the
+            // document at all — half of one — and a caller that paged from a reported
+            // `nextOffset` never hits this branch, because the tail fix above makes a page
+            // end on a pair boundary. It fires for an offset the caller computed itself (a
+            // byte count, its own arithmetic), which the parameter description already
+            // warns is not interchangeable with a character offset.
+            const window = trimBrokenLeadSurrogate(safeContent.slice(startOffset));
 
             // Optional section selection (fetch + grep). A matching `query` is
             // answered with the sections that contain it, so one call over a long
@@ -804,7 +833,13 @@ export const createWebFetchTool = (
             // and leave the model unable to resume). `truncated` is computed from
             // the SOURCE length, not the slice length, which is what fixes the
             // off-by-one where a page cut exactly at the budget claimed to be whole.
-            const output = fitResult(window.slice(0, MAX_CONTENT_CHARS));
+            //
+            // `clipPrefix` (T3, the lone-surrogate defect): this bound counts code units, so a
+            // plain slice could end the window on a high half. It is belt-and-braces — the
+            // BYTE bound inside `fitResult` binds long before 240,000 characters can — but the
+            // two bounds are independent constants, and the one that ships text must not depend
+            // on the other. `fitResult`'s own cut is repaired in `fitResult` (see its note).
+            const output = fitResult(clipPrefix(window, MAX_CONTENT_CHARS));
             // True only when bytes exist BEYOND what is returned here: the end of
             // the last window is not truncation.
             const truncated = startOffset + output.length < safeContent.length;

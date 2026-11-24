@@ -57,7 +57,9 @@
 //   - ../core/tool-media    — the tool media this module expands into user parts
 //   - ./index.ts      — the transport barrel
 
-import { HarnessError, toErrorInfo } from '../util';
+// `sanitizeWireBody` is the wire guarantee against an unpaired surrogate (see the send
+// path below, and ../util/unicode.ts for why the requirement lives here).
+import { HarnessError, sanitizeWireBody, toErrorInfo } from '../util';
 // (T6) The three provider time bounds, the two new failure classes, and the
 // connection classifier. A leaf module, so this adds no cycle; the same facts are
 // read by ../server/config.ts for startup validation.
@@ -1429,6 +1431,165 @@ const overflowDetailOf = (detail: string): string => {
 };
 
 // ---------------------------------------------------------------------------
+// Operator log: the per-attempt provider trace (2026-11-24)
+// ---------------------------------------------------------------------------
+
+// WHY THESE LINES EXIST. A live session reported, on ONE provider URL, an
+// `provider-transit: attempt 1..11 of 11 failed · retrying in Xs · Upstream stream
+// terminated · <url>` ladder and then a `provider-rejected: … HTTP 404 … The provider said:
+// {"error":"Model 'undefined' not found"}` — and NOTHING in this package, log or journal,
+// carried the model id that went out on the wire. Both halves of the answer already exist
+// in the code: the retry vocabulary in ../core/agent.ts and the redacted dial target here
+// (`dial`, from `providerURLOf` below) — but neither was ever PRINTED with the model, and
+// the published `retry` event has no model field (../types/index.ts
+// `HarnessProviderAttemptDiagnostics`, and adding one is a contract change with a forked
+// copy and a Rust port, so it is out of reach here). An operator therefore could not
+// attribute a failing attempt to a session, a model id, or a relay. Two lines close that
+// gap, and they are the only durable record a bare transport run has:
+//
+//   [harness] provider attempt: model=<id> · dial=<redacted url> · stream=yes · messages=N · body=N bytes
+//   [harness] provider attempt failed: model=<id> · dial=<redacted url> · class=<code|errorClass|unclassified>
+//
+// THE HYGIENE RULE, absolute for both lines and for any field added to them later: the
+// model id, the `providerURLOf`-redacted dial target, the streaming flag, the message
+// COUNT and the serialized body's BYTE COUNT. Nothing else reaches a line — never a message
+// body, a system prompt, a tool payload, a response body, and never `Authorization`
+// material. The URL comes from `providerURLOf` (origin + path, no userinfo/query/fragment),
+// and `redactProviderKey` still runs over the COMPOSED line as a belt: the one case
+// `providerURLOf` has to quote as written is a malformed/relative base URL, which is exactly
+// where an embedded credential can hide, and a model id that happens to BE the key must not
+// echo it either.
+//
+// WHY `console.error`, AND WHY NO GATE: this package has no debug sink to route an operator
+// line to, and nothing resembling a verbosity level to gate behind — its `HARNESS_*` variables
+// are provider timeouts (./provider-timeouts.ts:156-158), worker limits and filesystem paths
+// (../../../server/config.ts), not log tiers, so inventing one would be a new deployment
+// contract for a two-line trace. The precedent is the store's `[harness]` stderr note
+// (../../../server/workers/lane-host.ts:1104-1131), whose comment states this same rationale
+// ("this package has no debug sink to route one to"). Both lines go to STDERR so a host that
+// pipes JSON on stdout stays clean, and so the two halves of one failed attempt stay adjacent,
+// in order, in ONE stream. The cost is one line per provider request plus one per failed
+// request: the same order as the request count.
+//
+// LOGGING NEVER CHANGES CONTROL FLOW: nothing below can throw (`providerLog`, `logText` and
+// `logBytesOf` all swallow), and every call site is a plain statement beside the code it
+// describes — no reordering, no extra awaits, no new frames.
+
+// The ONE sink both lines go through, `[harness]`-prefixed like every other line this
+// package writes to a terminal.
+const providerLog = (line: string): void => {
+    try {
+        console.error(`[harness] ${line}`);
+    } catch {
+        // A host that replaced `console`, or a lane worker whose stdio closed mid-run, must
+        // not lose its provider request over a log line.
+    }
+};
+
+// Any field rendered WITHOUT ever throwing. `request.model` is typed `string`, and the
+// incident above was a request whose model reached the wire as the WORD `undefined` — so the
+// field must print something an operator can read instead of taking the send path down. A bare
+// template interpolation THROWS on a Symbol; `String` itself refuses an object with no usable
+// `toString`, e.g. a null-prototype object. Both land in the `catch` or print a name.
+const logText = (value: unknown): string => {
+    try {
+        return typeof value === 'string' ? value : String(value);
+    } catch {
+        // The no-`toString` case: `String` refuses it, and an interpolation would have thrown.
+        return '<unprintable>';
+    }
+};
+
+// The serialized body's size IN BYTES, which is the number the provider counts.
+// `TextEncoder` is a global from Node 18 and in every browser build of this package; a host
+// that stripped the global gets the UTF-16 length instead, which is an estimate — never a
+// throw on the send path.
+const logBytesOf = (text: string): number => {
+    try {
+        return new TextEncoder().encode(text).length;
+    } catch {
+        return text.length;
+    }
+};
+
+// WHAT THE WRAPPER NEEDS TO KNOW ABOUT THE ATTEMPT ITS INNER GENERATOR IS RUNNING.
+// Per-attempt state, deliberately NOT a configuration-closure variable: one
+// `openAICompatible` transport may be iterated by two concurrent requests, and a shared
+// flag would let one attempt answer for the other's dial.
+type ProviderAttemptRecord = {
+    // Flips the instant `fetch` is called. It is the line between a refusal produced BEFORE
+    // the dial (an unmappable attachment, a rejected `extraBody`, an unserializable body — a
+    // request-building mistake with no request to attribute, so no line) and a WIRE failure
+    // (a line, naming the model and the endpoint).
+    dialled: boolean;
+    // The key THAT attempt sent. `resolveKey()` may rotate credentials between turns, so
+    // re-resolving it at log time would scrub a key the request never carried and leave the
+    // one it did — this is the credential that was actually on the wire.
+    key?: string;
+};
+
+// The class of a failed attempt, read from EITHER channel a failure leaves on: a terminal
+// error FRAME (`code`, then the structured `details.errorClass`) or a THROW (a coded
+// `HarnessError`'s `code`, then its `details`). `details.errorClass` is what keeps a CODELESS
+// `provider-transit` failure attributable; `undefined` means the transport named nothing, and
+// the line prints `unclassified`. Duck-typed on purpose: the reader's rethrow and a host
+// wrapper are both allowed to throw anything, so this must not depend on `instanceof`.
+const providerFailureClassOf = (source: unknown): string | undefined => {
+    if (typeof source !== 'object' || source === null) return undefined;
+
+    const record = source as { code?: unknown; details?: unknown };
+
+    if (typeof record.code === 'string' && record.code.length > 0) return record.code;
+
+    const details = record.details;
+
+    if (typeof details === 'object' && details !== null) {
+        const errorClass = (details as { errorClass?: unknown }).errorClass;
+
+        if (typeof errorClass === 'string' && errorClass.length > 0) return errorClass;
+    }
+
+    return undefined;
+};
+
+// THE ATTEMPT LINE: one per outbound request, immediately before `fetch`. The fields are the
+// four the operator cannot recover from anywhere else, in the order they get asked about —
+// "which model?" then "which endpoint?" then "how big was it?".
+const logProviderAttempt = (input: {
+    model: unknown;
+    url: string;
+    key?: string;
+    streaming: boolean;
+    messages: number;
+    bytes: number;
+}): void => {
+    providerLog(
+        redactProviderKey(
+            `provider attempt: model=${logText(input.model)} · dial=${input.url} · ` +
+                `stream=${input.streaming ? 'yes' : 'no'} · messages=${input.messages} · body=${input.bytes} bytes`,
+            input.key
+        )
+    );
+};
+
+// THE FAILURE LINE: one per failed attempt, the WIRE FACTS the transport knows. Its
+// complement is the retry owner's line (`provider attempt N of M failed, retrying in Xms`,
+// ../core/agent.ts), which adds the ladder and the delay — the two facts ONLY the retry loop
+// has. That pair is deliberate and is not a duplicate: this one says what was dialled and how
+// it was classified, the other says which attempt it was and what happens next. A terminal
+// failure (a refused request, `retry: false`) gets this line and no retry line, which is why
+// the line lives here rather than beside the retry event.
+const logProviderAttemptFailure = (input: { model: unknown; url: string; key?: string; source: unknown }): void => {
+    providerLog(
+        redactProviderKey(
+            `provider attempt failed: model=${logText(input.model)} · dial=${input.url} · ` +
+                `class=${logText(providerFailureClassOf(input.source) ?? 'unclassified')}`,
+            input.key
+        )
+    );
+};
+
+// ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
 
@@ -1526,7 +1687,59 @@ export const openAICompatible = (
         });
     }
 
-    return async function* stream(request): AsyncGenerator<HarnessStreamEvent> {
+    // THE OPERATOR WRAPPER — see the "Operator log" section above for why the lines exist.
+    // This is the ONE place that sees every terminal outcome of one attempt in one shape: a
+    // terminal `error` FRAME (the classification the transport made) or a THROW (the SSE
+    // reader's rethrow, a provider wrapper's cleanup). Each dialled attempt therefore gets
+    // exactly one failure line, and a NEW terminal frame cannot forget to print one — which is
+    // why this is a wrapper rather than an inline call at each of this file's thirteen
+    // post-fetch terminal-frame sites (nine `yield`s plus the two `timeoutFrame`/
+    // `connectionFrame` helpers at their two call sites each): a trace that depends on every one
+    // of them remembering to print goes stale quietly.
+    //
+    // BEHAVIOUR IS UNCHANGED, in four parts: every event is `yield`ed through in order; a
+    // throw is re-thrown UNCHANGED (../core/agent.ts switches on its `code`, so wrapping or
+    // swallowing it here would be a behaviour change, not a log line); `return()` and `throw()`
+    // still delegate through the `for await`, which is what runs the inner
+    // `finally { release() }` on every exit path, including a consumer that stops reading
+    // early; and nothing is logged for an attempt that never reached `fetch`.
+    return async function* loggedAttempt(request: HarnessStreamRequest): AsyncGenerator<HarnessStreamEvent> {
+        // ONE record per INVOCATION, deliberately not a configuration-closure variable: a host
+        // may iterate one transport concurrently (two agents, or a fan-out), and a flag shared
+        // across invocations would let one attempt answer for another's dial. The inner
+        // generator writes it the moment it dials; this loop reads it on the way out.
+        const attempt: ProviderAttemptRecord = { dialled: false };
+
+        try {
+            // `wireAttempt` is declared below — a function declaration, so hoisting is what
+            // lets the reader see the trace before the ~600 lines of wire.
+            for await (const event of wireAttempt(request, attempt)) {
+                if (attempt.dialled && event.type === 'error') {
+                    logProviderAttemptFailure({ model: request.model, url: dial.url, key: attempt.key, source: event });
+                }
+
+                yield event;
+            }
+        } catch (error) {
+            // A throw is a failed attempt that had no frame to carry it — the two live cases
+            // are `streamState.stallError` re-thrown by the reader below and a provider
+            // wrapper's own cleanup. Logged with whatever class it names (`unclassified` when
+            // it names none), then re-thrown as-is.
+            if (attempt.dialled) {
+                logProviderAttemptFailure({ model: request.model, url: dial.url, key: attempt.key, source: error });
+            }
+
+            throw error;
+        }
+    };
+
+    // One attempt against the wire: the request body, the three time bounds, the SSE reader,
+    // and every terminal frame. `attempt` is the record above, and the ONLY thing it is used
+    // for here is to say, on the line that calls `fetch`, that a request is now in flight.
+    async function* wireAttempt(
+        request: HarnessStreamRequest,
+        attempt: ProviderAttemptRecord
+    ): AsyncGenerator<HarnessStreamEvent> {
         const key = resolveKey();
         const toolList = (request.tools ?? []).map(wireTool);
         const allowVideo = allowsVideoFor(url);
@@ -1594,7 +1807,40 @@ export const openAICompatible = (
         let serialized: string;
 
         try {
-            serialized = JSON.stringify(body);
+            // (T3, 2026-11-24 — the lone-surrogate defect) THE WIRE GUARANTEE, one line
+            // above the serializer and below `buildBody`, so it covers a body this package
+            // built AND a body a host rewrote. A JavaScript string may hold an UNPAIRED
+            // surrogate, and `JSON.stringify` writes it as a `\udXXX` escape: valid JSON, so
+            // the provider accepts the body, and then its strict UTF-8 encoder refuses to
+            // encode it. Measured live: `HTTP 500 … 'utf-8' codec can't encode character
+            // '\ud83d' in position 643: surrogates not allowed`, and because the transcript
+            // is replayed verbatim, all eleven retries re-sent the same poisoned bytes.
+            //
+            // WHY HERE RATHER THAN AT THE PRODUCERS: models emit lone surrogates on their
+            // own (the `write` tool's `lossy` flag documents it) and the transcript keeps
+            // them as "a replayable fact", so no producer fix can ever be complete. This is
+            // the same call `wireArguments` makes three hundred lines up — repair at the
+            // wire boundary, where the provider's requirement lives, not in the history.
+            //
+            // A CLEAN BODY IS UNTOUCHED: the walk mutates in place and writes only the
+            // strings that actually carried an orphan half, so `serialized` for every
+            // request that was already wire-safe is byte-for-byte what it was.
+            const sanitized = sanitizeWireBody(body);
+
+            if (sanitized.replaced > 0) {
+                // One line, and ONLY on the repaired path, so the per-attempt trace keeps
+                // its exact existing shape for every clean request. Count only — the
+                // hygiene rule of this section forbids putting message text on a log line.
+                providerLog(
+                    redactProviderKey(
+                        `provider body sanitized: model=${logText(request.model)} · ` +
+                            `dial=${dial.url} · surrogates=${sanitized.replaced}`,
+                        key
+                    )
+                );
+            }
+
+            serialized = JSON.stringify(sanitized.value);
         } catch (error) {
             yield {
                 type: 'error',
@@ -1700,6 +1946,39 @@ export const openAICompatible = (
 
         try {
             let response: Response;
+
+            // --- THE OPERATOR'S TRACE FOR THIS ATTEMPT, immediately before `fetch` --------
+            // Emitted BEFORE the request leaves rather than after the head arrives, because the
+            // case it exists for is an attempt that produced no answer at all: a wedged gateway
+            // that hits a time bound, a refused socket, a process that dies mid-dial. Having the
+            // line means "we dialled THIS model at THIS endpoint, streaming, N messages, N bytes"
+            // is on the record even when nothing came back. `attempt.dialled` flips on the same
+            // statement so the wrapper can tell a wire failure from a pre-flight refusal, and
+            // `attempt.key` captures the credential this attempt actually sent, because
+            // `resolveKey()` may rotate between attempts and re-reading it at log time would
+            // scrub a key the request never carried.
+            attempt.dialled = true;
+            attempt.key = key;
+
+            logProviderAttempt({
+                model: request.model,
+                // `dial` (built once above from `providerURLOf`): origin + path, no
+                // userinfo/query/fragment. The helper still runs `redactProviderKey` over the
+                // composed line for the fallback arm where a malformed base URL is quoted as
+                // written — the one place an embedded key can survive.
+                url: dial.url,
+                key,
+                // The flag comes from the FINAL BODY, not from the constant the default body
+                // writes: `options.buildBody` may drop `stream`, and the operator is asking what
+                // went out, not what was intended.
+                streaming: body.stream === true,
+                // WIRE messages, i.e. the count the provider sees after mapping — not the harness
+                // transcript, which maps one-to-many for attachments.
+                messages: messages.length,
+                // The exact string handed to `fetch`, counted in bytes.
+                bytes: logBytesOf(serialized)
+            });
+
             // The response-head bound: it covers ONLY the wait for response headers, so
             // it is over the moment the head arrives and can never cut off a stream that
             // is delivering — the first-token and inter-chunk bounds own the body from
