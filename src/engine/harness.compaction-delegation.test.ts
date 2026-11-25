@@ -146,25 +146,33 @@ const SEED = 'x'.repeat(2100);
 // serializes each declared tool and 12512-12533 hands those bytes to the estimator;
 // core/payload-bytes.ts prices them and core/context-estimate.ts:392-418 adds them to the payload
 // before the /4), so a limit can
-// no longer sit below a thread's catalogue floor. With `presets: false` the floors are exactly
-// divisible by 4, and `turn.before` carries `toolSchemaBytes` (the parent's own catalogue) while the
-// delegated child prices ITS OWN catalogue, so the two floors differ:
-//   parent catalogue = 39,785 serialized bytes / 4 = 9,947 tokens
-//   child  catalogue = 32,379 serialized bytes / 4 = 8,095 tokens
-// probe: Temp/coding-w2/probe-delegation-floor.ts
+// no longer sit below a thread's catalogue floor. With `presets: false` the two floors differ,
+// because `turn.before` carries the thread's OWN declared tools and the delegated child prices
+// ITS OWN catalogue (no `delegate` row):
+//   parent catalogue = 43,827 serialized bytes / 4 = 10,956.75 -> 10,957 tokens
+//   child  catalogue = 36,115 serialized bytes / 4 =  9,028.75 ->  9,029 tokens
+// probe: Temp/fix-f5/probe-floors.ts (shape C), re-measured 2026-11-25 for the +1,976 B that
+// F1's threadList (+1,038) and threadSend (+938) disclosure added to every declared catalogue.
+// The figures this block used to carry (39,785 / 9,947 and 32,379 / 8,095) were already stale at
+// pristine HEAD, where the SAME probe measured 41,851 and 34,139 bytes; the case still passed
+// because it only needs the inequalities below, but a constant that claims to be the floor has to
+// BE the floor, so both are restated from the measurement and the margins fall out as designed.
 // The fixture is therefore sized off the CHILD's floor: the child must stay under the limit while
-// its round-1 estimate (floor + 7 = 8,102) and cross it when the seed tool result lands (round 2 =
-// floor + 534 = 8,629), and the parent still crosses the same limit from its own floor (9,947 + 115
-// = 10,062 on its first request).
+// its round-1 estimate (floor + 7 = 9,036) and cross it when the seed tool result lands (round 2 =
+// floor + 534 = 9,563), and the parent still crosses the same limit from its own floor (10,957 + 1
+// = 10,958 on its first request). Both transcript terms are MEASURED, not hand-counted: probe
+// Temp/fix-f5/probe-transcript.ts arms the shipped plugin at an unreachable limit and reads every
+// `turn.before` estimate off the fixture itself (9,036 / 9,563 for the child, 10,958 / 11,032 for
+// the parent, i.e. floor + 7 / floor + 534 and floor + 1 / floor + 75).
 // THE DEAD-RUN GUARD (./plugins/context-compaction.plugin.ts `turnBefore`) is what keeps this case
-// to ONE pass: the PARENT's summarize pass is refused outright — its 9,946-token floor is above the
-// 8,625 ceiling, so no ladder rung could build a request the provider would take — and reported once
-// as `stage: 'unreachable-target'`, while the CHILD's floor (8,095) sits under the ceiling, so its
+// to ONE pass: the PARENT's summarize pass is refused outright — its 10,957-token floor is above the
+// 9,559 ceiling, so no ladder rung could build a request the provider would take — and reported once
+// as `stage: 'unreachable-target'`, while the CHILD's floor (9,029) sits under the ceiling, so its
 // clipped compaction request fits and its pass runs. The two boundaries the case walks, sampled from
 // the guard:
-//   writer     9 947 = floor 9 946 + transcript 1    → refused (floor >= ceiling)
-//   researcher 8 629 = floor 8 095 + transcript 534  → the pass, the only one in the case
-const CHILD_CATALOGUE = 8_095;
+//   writer    10 958 = floor 10 957 + transcript 1     → refused (floor >= ceiling)
+//   researcher 9 563 = floor  9 029 + transcript 534   → the pass, the only one in the case
+const CHILD_CATALOGUE = 9_029;
 const LIMIT = CHILD_CATALOGUE + 530;
 const MODEL = 'merge/ds4-flash';
 
@@ -210,7 +218,7 @@ const callTool = (id: string, name: string, args: string): HarnessStreamEvent[] 
 // `headroomRatio: 0` is the documented opt-out (X2, F3 took the headroom buffer off the "declared
 // window only" gate, so it now comes off EVERY binding ceiling), and this file needs it: the whole
 // sizing block above derives `LIMIT` against the plain number the operator typed — the child's
-// seeded round (8,629) crosses it and its opening round (8,102) does not, which is what makes the
+// seeded round (9,563) crosses it and its opening round (9,036) does not, which is what makes the
 // overflow THIS case is about a TOOL RESULT rather than the delegation input. Left on the declared
 // 0.15 the child would compact on its opening turn instead, and the scenario would stop being the
 // one this file describes (the request-count-keyed transport, the AC7 inclusion table, and the

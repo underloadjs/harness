@@ -193,8 +193,19 @@ export const metadata = {
                     tools: {
                         type: 'array',
                         items: { type: 'string' },
+                        // F9 (2026-11-25) — one added clause advertising F8's diagnostic. F8 made
+                        // an unresolvable name VISIBLE (`HarnessDelegationResult.notes`,
+                        // ../../types/index.ts; the exact sentences are pinned in
+                        // ../../harness.delegate-diagnostics.test.ts:166-168) without changing the
+                        // grant, so until now a misspelling was a silent narrowing the caller could
+                        // only read as a missing capability. Wording only, and it belongs HERE (the
+                        // `scope.tools` property) rather than in the tool description: a property
+                        // description never reaches the discovery scorer, which charges NAME and
+                        // DESCRIPTION substrings (../../core/discovery.ts:128-141) — the trap that
+                        // cost F2 time when the bare word `delegate` went into `agentResult`'s
+                        // description and moved its capability-tag answers.
                         description:
-                            'Wire names the child may use (e.g. ["read", "glob", "grep"] for a read-only review). An empty array declares no tools at all; toolRequest is still available to it as the discovery door, unless the user of this conversation has switched toolRequest off.'
+                            'Wire names the child may use (e.g. ["read", "glob", "grep"] for a read-only review). An empty array declares no tools at all; toolRequest is still available to it as the discovery door, unless the user of this conversation has switched toolRequest off. A name this harness has no tool for grants nothing and is not an error - the envelope then carries a `notes` entry naming it, so a misspelling reaches you instead of only narrowing the child\'s toolbox.'
                     }
                 },
                 additionalProperties: false

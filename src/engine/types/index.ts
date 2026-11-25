@@ -1751,6 +1751,25 @@ export type HarnessDelegationResult = {
     // answered a moment after the release reports `status: 'completed'` next to this marker.
     // Every other door omits it, so its absence never means "not cancelled".
     callCancelled?: boolean;
+    // F8 (2026-11-25, delegate-diagnostics) — DISPATCH NOTES: how this delegation was SET UP,
+    // never what the child did.
+    //
+    // WHY IT EXISTS. A `scope.tools` entry that no tool in this harness answers to has always
+    // granted nothing, and that is correct: `isToolInScope` (../harness.ts) is name-equality
+    // against the registered definitions, so a misspelled name matches no definition, the
+    // declaration filter simply never shows it, and the child gets the documented `forbidden`
+    // answer when it asks for it. What was missing is the CALLER'S half of the same fact — the
+    // typo vanished silently, so "the child could not use `red`" read like a capability the
+    // child lacked rather than a name the caller mistyped. This field is the honest, additive
+    // channel for that: the grant semantics and the child's disclosure are untouched, and an
+    // unrecognised name is still just not granted.
+    //
+    // ABSENT means "nothing to add", never "checked and clean". Only the doors that dispatch
+    // the child raise it (the live `delegate` result, and the `toolCancel` delivery of that
+    // same call through its trace); the reprint doors rebuild the envelope from the child's
+    // ledger record, which holds no scope, so they omit the key exactly as they omit `error`
+    // for a completed child.
+    notes?: string[];
 };
 
 // Terminal (or in-flight) state of one agent invocation. The same vocabulary
@@ -2320,6 +2339,14 @@ export type RecordsPageInfo = {
     // before `limit` did. Without it a budget-cut page and a limit-cut page are
     // indistinguishable, and the two call for different fixes.
     budgetTruncated?: boolean;
+    // F7-4 — the DELIVERY-CAP marker, additive and present only on a page the harness cap
+    // trimmed. `budgetTruncated` says a byte bound cut this page; this says WHICH one:
+    // 32,768 payload bytes (`MODEL_TOOL_RESULT_BUDGET_BYTES`, core/result-budget.ts:231),
+    // the most one tool result can be delivered at, rather than the collection's own
+    // `responseBudgetBytes`. It is the fact a caller acts on: a page carrying it will not
+    // get bigger by raising the collection's budget — only by asking for fewer rows
+    // (`limit`), a narrower read, or a smaller record.
+    deliveryBudgetBytes?: number;
 };
 
 // Counts are always derived from the whole collection, never from the page: a
@@ -2381,6 +2408,21 @@ export type RecordsResult = {
     // the change feed is NOT covered by it: a feed cut says so with `changesHasMore` and
     // `droppedEvents`, and it carries no record body to lose.
     budgetTruncated?: boolean;
+    // F7-4 — the DELIVERY-CAP sibling of the flag above, present only on an answer the
+    // harness cap trimmed (see `RecordsPageInfo.deliveryBudgetBytes`). The two carry the
+    // same number for the same reason: an action-wrapper mutation has no `page` beside it,
+    // and a caller that cannot see WHICH bound fired cannot tell "raise my collection's
+    // `responseBudgetBytes`" (works for a budget cut, useless for a cap cut) from "ask for
+    // less per call" (the only fix for a cap cut).
+    deliveryBudgetBytes?: number;
+    // F7-4 — the last-resort degradation, keyed by record id: the FIELD KEYS this response
+    // withheld from that record so the answer would fit the delivery cap at all. One record
+    // can be bigger than 32,768 bytes by construction (`RECORD_MAX_FIELDS` 16 x
+    // `RECORD_MAX_TEXT` 4,000 chars), and a record delivered with its leading fields beats
+    // a record discarded. The keys are absent from the delivered entry, never emptied — the
+    // `copyEntry` rule for anything the engine does not show — and this ledger is what stops
+    // an absent field reading as a cleared one.
+    fieldsWithheld?: Record<string, string[]>;
     // R-0013 — what the caller SENT and the record did not keep, per field: field key →
     // number of `strings` ENTRIES dropped by normalization (duplicates, and entries that
     // trim onto an earlier one). The engine used to answer an accepted write with the

@@ -261,6 +261,10 @@ describe('agentManage', () => {
             ],
             totalResults: 2,
             activeResults: 0,
+            // F1-1 (2026-11-25): `hiddenResults` is the GLOBAL count of retained rows no
+            // per-agent list shows; both rows here are listed, and neither agent overflowed the
+            // 5-row cap, so both flags are 0/false.
+            hiddenResults: 0,
             truncated: false
         });
 
@@ -302,6 +306,7 @@ describe('agentManage', () => {
             ],
             totalResults: 1,
             activeResults: 0,
+            hiddenResults: 0,
             truncated: false
         });
 
@@ -318,6 +323,203 @@ describe('agentManage', () => {
             offset: 0,
             limit: 4000,
             hasMore: false
+        });
+    });
+
+    // F1-1 (2026-11-25) — the two listing counters are SEPARATE facts, and this is the pair of
+    // cases that keeps them apart. `truncated` is per-agent (some agent has more retained rows
+    // than the 5 its own entry lists, `AGENT_MANAGE_LIST_PER_AGENT`); `hiddenResults` is the
+    // global count of retained rows that appear in no per-agent list, from either cause (cap
+    // overflow, or rows retired with a released conversation). The old implementation computed
+    // the first from the second (`records.length > listed`, src/engine/harness.ts), so the
+    // release case below used to answer `truncated: true` beside `invocationCount: 2` — a flag
+    // naming an overflow that had not happened, with no cursor to act on it.
+    it('flags per-agent overflow as `truncated`, and the rows past the cap as `hiddenResults`', async () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('sixth')])) },
+            presets: false
+        });
+
+        for (let index = 0; index < 6; index += 1) {
+            await writer('go');
+        }
+
+        expect(await writer.executeTool('agentManage', {})).toEqual({
+            agents: [
+                {
+                    name: 'writer',
+                    rank: 'A',
+                    model: 'merge/ds4-flash',
+                    // `invocationCount` is the RETAINED count; `results` is capped at 5.
+                    invocationCount: 6,
+                    results: [
+                        {
+                            invocationId: '6',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 5,
+                            preview: 'sixth',
+                            truncated: false
+                        },
+                        {
+                            invocationId: '5',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 5,
+                            preview: 'sixth',
+                            truncated: false
+                        },
+                        {
+                            invocationId: '4',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 5,
+                            preview: 'sixth',
+                            truncated: false
+                        },
+                        {
+                            invocationId: '3',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 5,
+                            preview: 'sixth',
+                            truncated: false
+                        },
+                        {
+                            invocationId: '2',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 5,
+                            preview: 'sixth',
+                            truncated: false
+                        }
+                    ]
+                }
+            ],
+            totalResults: 6,
+            activeResults: 0,
+            // The one row the cap hid is the whole of `hiddenResults` here, and `truncated` is
+            // true because THAT agent overflowed its own list.
+            hiddenResults: 1,
+            truncated: true
+        });
+
+        // The oldest row is still readable by id — a flag is not a deletion.
+        await expect(writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })).resolves.toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'sixth',
+            contentLength: 5,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+    });
+
+    it('answers `truncated: false` with `hiddenResults` above 0 when every agent is inside its cap', async () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('listed')])) },
+            presets: false
+        });
+
+        await writer('go');
+        await writer('go');
+
+        // A host thread's run is a row of the SAME agent, owned by that conversation.
+        const thread = writer.createThread('writer');
+        await writer.sendThreadInput(thread.id, 'doomed');
+
+        // Before the release every retained row is listed: `hiddenResults` is 0, and `truncated`
+        // is false because 3 is inside the 5-row cap.
+        expect(await writer.executeTool('agentManage', {})).toEqual({
+            agents: [
+                {
+                    name: 'writer',
+                    rank: 'A',
+                    model: 'merge/ds4-flash',
+                    invocationCount: 3,
+                    results: [
+                        {
+                            invocationId: '3',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 6,
+                            preview: 'listed',
+                            truncated: false
+                        },
+                        {
+                            invocationId: '2',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 6,
+                            preview: 'listed',
+                            truncated: false
+                        },
+                        {
+                            invocationId: '1',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 6,
+                            preview: 'listed',
+                            truncated: false
+                        }
+                    ]
+                }
+            ],
+            totalResults: 3,
+            activeResults: 0,
+            hiddenResults: 0,
+            truncated: false
+        });
+
+        writer.deleteThread(thread.id);
+
+        // THE DISCRIMINATING CASE. The released conversation's row leaves the per-agent list
+        // (`recordsForAgent` retires a row whose conversation is marked inactive) but stays in the
+        // retention ring, so the global row count and the listed count now differ — the exact
+        // condition the old `records.length > listed` reported as `truncated: true`. Nothing
+        // overflowed: the agent has 2 retained rows and shows both.
+        expect(await writer.executeTool('agentManage', {})).toEqual({
+            agents: [
+                {
+                    name: 'writer',
+                    rank: 'A',
+                    model: 'merge/ds4-flash',
+                    invocationCount: 2,
+                    results: [
+                        {
+                            invocationId: '2',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 6,
+                            preview: 'listed',
+                            truncated: false
+                        },
+                        {
+                            invocationId: '1',
+                            kind: 'root',
+                            status: 'completed',
+                            contentLength: 6,
+                            preview: 'listed',
+                            truncated: false
+                        }
+                    ]
+                }
+            ],
+            totalResults: 3,
+            activeResults: 0,
+            hiddenResults: 1,
+            truncated: false
+        });
+
+        // And the hidden row is still answerable by id, which is what makes `hiddenResults` a
+        // count of reachable rows rather than a loss.
+        await expect(writer.executeTool('agentResult', { agent: 'writer', invocationId: '3' })).resolves.toMatchObject({
+            invocationId: '3',
+            status: 'completed',
+            content: 'listed'
         });
     });
 
@@ -598,6 +800,7 @@ describe('agentResult', () => {
             ],
             totalResults: 0,
             activeResults: 0,
+            hiddenResults: 0,
             truncated: false
         });
         expect(await writer.executeTool('agentResult', { agent: 'writer' })).toEqual({

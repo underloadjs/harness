@@ -234,23 +234,28 @@ const summarizeSettings = (limit: number): HarnessPluginSettingsProvider => {
 // same seed the single-thread summarize fixture uses. The seed rides in the CHILD's transcript as a
 // tool result, which is what carries the CHILD's estimate past the limit on its second round.
 const SEED = 'x'.repeat(2100);
-// THE SAME SIZING as ./harness.compaction-delegation.test.ts:165-180, re-derived here (the tool
+// THE SAME SIZING as ./harness.compaction-delegation.test.ts:143-176, re-derived here (the tool
 // catalogue is inside every unanchored `turn.before` estimate — harness.ts serializes the declared
 // tools and core/context-estimate.ts adds those bytes before the /4), so a limit can no longer sit
 // below a thread's catalogue floor:
-//   parent (writer) catalogue floor = 9,946 tokens
-//   child  (researcher) catalogue floor = 8,095 tokens
+//   parent (writer)    catalogue = 43,827 serialized bytes / 4 -> 10,957 tokens
+//   child  (researcher) catalogue = 36,115 serialized bytes / 4 ->  9,029 tokens
+// floors: probe Temp/fix-f5/probe-floors.ts (shape C — the same `presets: false` writer/researcher
+// roster with ranks A/B and the one `seed` tool this file builds), re-measured 2026-11-25 for the
+// +1,976 B F1's threadList/threadSend disclosure added to every declared catalogue. The floors this
+// block used to quote (9,946 / 8,095) were already stale at pristine HEAD, where that probe
+// measured 41,851 and 34,139 bytes.
 // probe: src/plugins/context-compaction.plugin.ts `turnBefore`, sampled per boundary
-//   writer     9 947 = floor 9 946 + transcript 1      (parent, round 1)
-//   researcher 8 102 = floor 8 095 + transcript 7      (child, round 1)
-//   researcher 8 636 = floor 8 095 + transcript 541    (child, round 2 — the seed tool result)
-//   writer    10 020 = floor 9 946 + transcript 74     (parent, round 2)
+//   writer    10 958 = floor 10 957 + transcript 1      (parent, round 1)
+//   researcher  9 036 = floor  9 029 + transcript 7      (child, round 1)
+//   researcher  9 570 = floor  9 029 + transcript 541    (child, round 2 — the seed tool result)
+//   writer    11 031 = floor 10 957 + transcript 74      (parent, round 2)
 // `LIMIT` therefore sits ABOVE the child's floor (so its clipped compaction request can fit, and
 // the dead-run guard in ./plugins/context-compaction.plugin.ts lets the pass run) and BELOW its
-// seeded round (8 636), so exactly ONE summarize pass runs — on the subthread. The parent crosses
-// the same limit from its own 9 946 floor and its pass is REFUSED by that guard, which is what keeps
+// seeded round (9 570), so exactly ONE summarize pass runs — on the subthread. The parent crosses
+// the same limit from its own 10 957 floor and its pass is REFUSED by that guard, which is what keeps
 // the case at one pass and three child requests; the parent's estimate is not what stops it.
-const CHILD_CATALOGUE = 8_095;
+const CHILD_CATALOGUE = 9_029;
 const LIMIT = CHILD_CATALOGUE + 530;
 
 const BRIEF_TASK = 'dig into the seeded report';

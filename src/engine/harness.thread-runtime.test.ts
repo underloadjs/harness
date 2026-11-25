@@ -2097,21 +2097,29 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         // caller caused and can report. `totalResults` still counts both rows, which is the
         // retention half of the same page.
         //
-        // A wart this page now exposes, pinned by the values rather than disputed in code: with
-        // every row hidden, `agentManage` answers `invocationCount: 0` and an empty `results`
-        // beside `truncated: true`, and the tool's own description defines that flag as "some
-        // agent has more retained invocations than the 5 shown here". The sentence is now true for
-        // a reason it does not describe (retention, not the 5-row cap), and there is no cursor to
-        // act on it — the ids are still reachable, only by id. REPORTED, not asserted: a fix here
-        // is a production change, and production is frozen for this pass.
+        // F1-1 (2026-11-25) FIXED THIS, and the assertion replaced the report. The page used to
+        // answer `invocationCount: 0` / `results: []` beside `truncated: true`, because the flag
+        // was computed from a GLOBAL comparison (`records.length > listed`) while the description
+        // defined it as a per-agent overflow; with every row retired there was no overflow to
+        // act on and no cursor to page with. The two facts now have their own fields, so both
+        // are asserted rather than reported: `truncated: false` (no agent listed fewer rows than
+        // it retains — each lists 0 of 0) and `hiddenResults: 2` (both retained rows sit in no
+        // per-agent list). `totalResults` is unchanged: the retention ring still holds them, and
+        // the two `agentResult` lookups below are what that claim is worth.
         const listing = (await writer.executeTool('agentManage', {})) as {
             agents: { invocationCount: number; name: string; results: unknown[] }[];
             totalResults: number;
+            activeResults: number;
+            hiddenResults: number;
+            truncated: boolean;
         };
         expect(listing.agents.map((entry) => [entry.name, entry.invocationCount, entry.results])).toEqual([
             ['writer', 0, []]
         ]);
         expect(listing.totalResults).toBe(2);
+        expect(listing.activeResults).toBe(0);
+        expect(listing.hiddenResults).toBe(2);
+        expect(listing.truncated).toBe(false);
 
         // Both lookups still ANSWER by id. IT19 R2 destroys nothing on a thread delete, so the
         // rows the receipt names are retired from the listing, not deleted: only a session
@@ -2141,6 +2149,66 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
             offset: 0,
             limit: 4000,
             hasMore: false
+        });
+    });
+
+    // F1-2 (2026-11-25) — the MODEL page is a PROJECTION, and this pins both halves of that
+    // word. `modelThreadRosterOf` (src/engine/harness.ts) strips `ownerThreadId` from an
+    // `origin: 'agent'` row, because the adoption link a default carries is lineage bookkeeping
+    // the model has no door for (`threadDelete` refuses every `agent:` default outright, and no
+    // tool takes an owner id) — while the RECORD keeps the link, and `threadFamilyOf` step 4 reads
+    // it from the record, so the strip cannot move one id in or out of `actOn`. A host row keeps
+    // its owner link on the same page, because there the id IS an address; that half is pinned by
+    // the lineage case at the `a scoped roster is session-wide` test below, whose `child` and
+    // `borrowed` rows still carry `ownerThreadId` (unchanged, byte for byte).
+    it('keeps an adopted default out of the model page\'s owner links while its family still reaches it', async () => {
+        const helper = brain(scripted([answer('facts')]));
+        const lead = brain(
+            scripted([
+                callTool('d1', 'delegate', JSON.stringify({ agent: 'helper', input: 'find' })),
+                answer('lead done')
+            ])
+        );
+        const writer = harness({
+            agents: { lead, helper },
+            entry: 'lead',
+            ranks: { lead: 'A', helper: 'B' },
+            presets: false
+        });
+
+        await writer('go');
+
+        // The WRITE is untouched: the first-wins link lands on the record (src/engine/harness.ts,
+        // beside the `epoch` stamp) and the host seam still publishes it.
+        expect(writer.thread('agent:helper')?.ownerThreadId).toBe('agent:lead');
+        expect(writer.threads().find((record) => record.id === 'agent:helper')?.ownerThreadId).toBe('agent:lead');
+
+        const roster = writer.runtime.threadList('agent:lead');
+
+        // The model row EXACTLY. `toEqual` is the assertion that proves ABSENCE: a key present
+        // with an `undefined` value fails it, so this pins the strip rather than a blanked value
+        // — and it pins the `epoch` strip in the same breath.
+        expect(roster.threads.find((record) => record.id === 'agent:helper')).toEqual({
+            id: 'agent:helper',
+            agent: 'helper',
+            origin: 'agent',
+            status: 'idle',
+            sequence: 2,
+            invocationId: '2'
+        });
+
+        // THE LINEAGE WALK STILL REACHES IT. `actOn` is the family set, and this default is a
+        // member of it ONLY because its record's `ownerThreadId` is `agent:lead` — the page
+        // hiding that field changes nothing about the walk.
+        expect(roster.currentThreadId).toBe('agent:lead');
+        expect(roster.actOn).toEqual(['agent:helper', 'agent:lead']);
+
+        // And the door that reads the link still admits the address the page advertises: a
+        // lineage-gated send from this family to that default is accepted (`runtime.threadSend`
+        // is the caller-scoped door: agent name, caller thread, parameters).
+        expect(writer.runtime.threadSend('lead', 'agent:lead', { thread: 'agent:helper', message: 'still reachable' })).toMatchObject({
+            threadId: 'agent:helper',
+            delivered: 'started'
         });
     });
 

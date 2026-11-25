@@ -37,6 +37,10 @@ export const PROFILE_MAX_TRAIT = 200;
 export const PROFILES_COLLECTION: RecordCollectionDefinition = {
     name: 'profiles',
     maxRecords: PROFILE_MAX_RECORDS,
+    // THE CONFIGURED PAGE BUDGET — 64 KiB. Producer-side, not a delivery promise: the
+    // 32,768-byte harness cap is enforced serve-time by `clampToDeliveryCap`
+    // (./records.ts:739), which trims whole trailing rows and re-derives the cursor.
+    // See ./task.ts:45-60 for the full reasoning (F7-4, 2026-11-25).
     responseBudgetBytes: 64 * 1024,
     wrapper: { tool: 'profiles', plural: 'profiles', singular: 'profile', style: 'action' },
     fields: [

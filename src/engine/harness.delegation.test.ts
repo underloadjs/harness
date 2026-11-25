@@ -1889,6 +1889,14 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
             ],
             totalResults: 2,
             activeResults: 0,
+            // `hiddenResults` is the GLOBAL count of retained rows that appear in NO agent's list
+            // — the overflow past the 5-row cap, plus the rows retired when the conversation that
+            // ran them was released (./shared/agent-results.ts; the same split the `agentManage`
+            // description publishes, where the per-agent `truncated` flag is the LOCAL half).
+            // Nothing overflowed here, so the key is still emitted, as 0. It rides beside
+            // `totalResults`, which counts the whole retained ring and is therefore NOT the sum of
+            // the per-agent `invocationCount`s above.
+            hiddenResults: 0,
             truncated: false
         });
 
@@ -3326,8 +3334,13 @@ describe('per-delegation turn cap (I5)', () => {
             invocationId: '2',
             threadId: 'agent:researcher',
             status: 'failed',
+            // The caller-set branch of `turnCapErrorOf` (./harness.ts:775-797) spells the bound
+            // AND the consequence: `maxTurns` caps model REQUESTS, so N turns leave N-1 tool
+            // rounds and the answer has to be one of them. Pinned whole, because "the cap fired"
+            // is only actionable to a model once it is told why its next call needs an answer
+            // rather than another tool.
             error:
-                'Agent "researcher" requested tools on all 2 model turns without answering, the maxTurns this run was given.',
+                'Agent "researcher" requested tools on all 2 model turns without answering, the maxTurns this run was given (2). maxTurns caps model REQUESTS, not tool rounds, and the child\'s answer has to be one of them, so N turns allow at most N-1 tool rounds: 2 turns = 1 tool round, and its answer had to land on turn 2.',
             partialContent: 'pass 2',
             cancelledAtMessage: 5
         });
@@ -3432,8 +3445,10 @@ describe('per-delegation turn cap (I5)', () => {
             invocationId: '2',
             threadId: 'agent:researcher',
             status: 'failed',
+            // `maxTurns: 1` is the degenerate cap: the first tool call a child makes IS the turn
+            // the cap fires on, so the refusal names zero tool rounds (./harness.ts:793-795).
             error:
-                'Agent "researcher" requested tools on its single model turn without answering, the maxTurns this run was given.',
+                'Agent "researcher" requested tools on its single model turn without answering, the maxTurns this run was given (1). maxTurns caps model REQUESTS, not tool rounds, and the child\'s answer has to be one of them, so N turns allow at most N-1 tool rounds: 1 turn = 0 tool rounds — at maxTurns: 1 a child gets no tool round at all, and must answer without calling one.',
             partialContent: 'pass 1',
             cancelledAtMessage: 3
         });

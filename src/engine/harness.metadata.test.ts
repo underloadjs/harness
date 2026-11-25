@@ -30,34 +30,35 @@ describe('core tool metadata', () => {
         const writer = solo();
 
         expect(writer.tools.toolRequest.parameters).toEqual({
-            type: 'object',
-            properties: {
-                names: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    description:
-                        'Exact wire names to enable, case-sensitive (e.g. ["files"]).'
+        "type": "object",
+        "properties": {
+            "names": {
+                "type": "array",
+                "items": {
+                    "type": "string"
                 },
-                regex: {
-                    type: 'string',
-                    description:
-                        'JavaScript regex tested against tool names; bare source or /source/flags.'
-                },
-                tags: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    description: 'Capability tags to look for, e.g. ["files", "read", "shell"].'
-                },
-                limit: {
-                    type: 'integer',
-                    minimum: 1,
-                    description:
-                        "Optional per-query narrowing: return at most this many of THIS query's matches. It is not a global request cap."
-                }
+                "description": "Exact wire names to enable, case-sensitive (e.g. [\"files\"])."
             },
-            required: [],
-            additionalProperties: false
-        });
+            "regex": {
+                "type": "string",
+                "description": "JavaScript regex tested against tool names; bare source or /source/flags."
+            },
+            "tags": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "Capability tags to look for, e.g. [\"files\", \"read\", \"shell\"]."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Optional per-query narrowing: return at most this many of THIS query's matches. It is not a global request cap."
+            }
+        },
+        "required": [],
+        "additionalProperties": false
+    });
 
         // The model reads the description, not this file: uncapped selection, the
         // host-configured enabled bound, and newest-request precedence have to be
@@ -68,12 +69,44 @@ describe('core tool metadata', () => {
         expect(writer.tools.toolRequest.tags).toEqual(['discovery', 'tools', 'catalogue']);
         expect(writer.tools.toolRequest.visibility).toBe('core');
 
+        // F2: the inventory is a PAGED surface, so its schema is the model's only
+        // notice that a page is not the whole registry. `additionalProperties: false`
+        // stays, which is what makes `limit`/`offset`/`fields` a real contract instead
+        // of a suggestion — before this, the same names were a schema error.
         expect(writer.tools.toolList.parameters).toEqual({
-            type: 'object',
-            properties: {},
-            required: [],
-            additionalProperties: false
-        });
+        "type": "object",
+        "properties": {
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Zero-based row to start from, in registration order. Defaults to 0. Pass `page.nextOffset` back to get the next page; an offset past the end answers with no rows and `hasMore: false`."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Rows per page, 1-100 (default 10). A page is also byte-budgeted, so it can carry fewer rows than this - `page.budgetTruncated` says when it did."
+            },
+            "fields": {
+                "type": "string",
+                "enum": [
+                    "name",
+                    "name+description"
+                ],
+                "default": "name+description",
+                "description": "What each row carries. \"name+description\" (default) is the usage contract and costs the most bytes; \"name\" is the whole roster at a fraction of the size."
+            }
+        },
+        "required": [],
+        "additionalProperties": false
+    });
+
+        // The text the model reads, pinned because it is the only place the default
+        // page size, the cursor semantics, and `fields` are stated for a model
+        // (./harness.tool-list.test.ts measures that the described behaviour is real).
+        expect(writer.tools.toolList.description).toBe(
+            "List every registered tool by name and description, whether or not toolRequest has enabled it — this is the inventory, and listing never means a tool is callable. One call never covers the whole inventory: `tools` carries at most `limit` rows (default 10, 1-100) starting at `offset` (default 0) in registration order, and each page is also byte-budgeted, so it can be shorter than `limit` - `page.hasMore` and `page.nextOffset` say exactly where to continue, and `page.budgetTruncated: true` says the byte cap rather than `limit` ended it. `fields: \"name\"` drops the descriptions, so a page is hundreds of bytes rather than tens of kilobytes - request it with a large `limit` to see every name in one page. Use toolRequest to make searchable tools callable, and toolManage for tags, schema, source, or editing.",
+        );
         expect(writer.tools.toolList.tags).toEqual([
             'tools',
             'list',
@@ -85,6 +118,27 @@ describe('core tool metadata', () => {
             enum: ['list', 'details', 'source', 'path', 'create', 'update', 'reload'],
             description: 'What to do.'
         });
+        // F2: `operation: "list"` carries the same honest page envelope as toolList,
+        // because its rows carry each tool's full `parameters` schema (5,074 bytes per
+        // row on this registry) and the un-paged answer was 134,192 bytes — over the
+        // 32,768-byte cap, and therefore discarded rather than truncated. The bounds
+        // are declared for the same reason toolList declares them: with
+        // `additionalProperties: false`, an undeclared `limit` is a refusal.
+        expect((writer.tools.toolManage.parameters as any).properties.offset).toEqual({
+            type: 'integer',
+            minimum: 0,
+            description:
+                'Zero-based row of the `list` page to start from (default 0). Pass `page.nextOffset` back for the next page; ignored by every other operation.'
+        });
+        expect((writer.tools.toolManage.parameters as any).properties.limit).toEqual({
+            type: 'integer',
+            minimum: 1,
+            maximum: 100,
+            description:
+                "Rows in the `list` page, 1-100 (default 5). Each details row carries the tool's full schema, so a page is also byte-budgeted and can carry fewer rows: `page.budgetTruncated` says when it did. Ignored by every other operation."
+        });
+        // Paging is a `list` addition: the operation enum and the required set are the
+        // contract every other toolManage consumer already relies on.
         expect((writer.tools.toolManage.parameters as any).required).toEqual(['operation']);
     });
 
@@ -153,40 +207,40 @@ describe('core tool metadata', () => {
         );
         expect(writer.tools.toolCreate.parameters).toEqual(
             {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Wire name: a letter first, then letters, digits, \"_\" or \"-\", at most 64 characters."
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "What the tool does, shown to toolRequest and the model."
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {
-                            "type": "string"
-                        },
-                        "description": "Capability tags, e.g. [\"text\", \"upper\"]. Required so toolRequest can find it."
-                    },
-                    "parameters": {
-                        "type": "object",
-                        "description": "Optional JSON Schema for the new tool's arguments."
-                    },
-                    "source": {
-                        "type": "string",
-                        "description": "Async function body, e.g. \"return args.trim().toUpperCase();\"."
-                    }
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Wire name: a letter first, then letters, digits, \"_\" or \"-\", at most 64 characters."
+            },
+            "description": {
+                "type": "string",
+                "description": "What the tool does, shown to toolRequest and the model."
+            },
+            "tags": {
+                "type": "array",
+                "items": {
+                    "type": "string"
                 },
-                "required": [
-                    "name",
-                    "description",
-                    "tags",
-                    "source"
-                ],
-                "additionalProperties": false
+                "description": "Capability tags, e.g. [\"text\", \"upper\"]. Required so toolRequest can find it."
+            },
+            "parameters": {
+                "type": "object",
+                "description": "Optional JSON Schema for the new tool's arguments."
+            },
+            "source": {
+                "type": "string",
+                "description": "Async function body, e.g. \"return args.trim().toUpperCase();\"."
             }
+        },
+        "required": [
+            "name",
+            "description",
+            "tags",
+            "source"
+        ],
+        "additionalProperties": false
+    }
         );
         expect(writer.tools.toolCreate.tags).toEqual(
             [
@@ -212,110 +266,106 @@ describe('core tool metadata', () => {
         // so every one of those keys must be in this schema.
         expect(writer.tools.tasks.parameters).toEqual(
             {
-                "type": "object",
-                "properties": {
-                    "tasks": {
-                        "type": "array",
-                        "description": "Changes to apply, in order. Omit \"id\" to add a task (its \"text\" is required); give a known \"id\" to patch that task, leaving omitted fields unchanged. An empty list is a read. A patch of an existing id needs its \"expects\" token.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Existing task id to patch. Omit it to add a new task. Unknown ids are rejected."
-                                },
-                                "text": {
-                                    "type": "string",
-                                    "description": "Task text: required to add, and an optional rename when patching an \"id\". Trimmed, maximum 4000 characters, never blank."
-                                },
-                                "completed": {
-                                    "type": "boolean",
-                                    "description": "true marks the task done, false reopens it. Omitted leaves the stored flag unchanged."
-                                }
-                            },
-                            "additionalProperties": false
-                        }
-                    },
-                    "remove": {
-                        "type": "array",
-                        "items": {
-                            "type": "string"
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "description": "Changes to apply, in order. Omit \"id\" to add a task (its \"text\" is required); give a known \"id\" to patch that task, leaving omitted fields unchanged. An empty list is a read. A patch of an existing id needs its \"expects\" token.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Existing task id to patch. Omit it to add a new task. Unknown ids are rejected."
                         },
-                        "description": "Exact task ids to delete. Every id must exist; an id may not also appear in \"tasks\". A deletion needs its \"expects\" token."
-                    },
-                    "ids": {
-                        "type": "array",
-                        "items": {
-                            "type": "string"
+                        "text": {
+                            "type": "string",
+                            "description": "Task text: required to add, and an optional rename when patching an \"id\". Trimmed, maximum 4000 characters, never blank."
                         },
-                        "description": "Task ids to read, for when you want one record rather than a page. One id answers with \"entry\", several with \"entries\". A repeated id is read once, and the bodies are charged to the same response budget as a page: a read the budget cannot pay for in full answers with the records that fit, `page.hasMore: true` and `page.nextOffset`, and you continue with the same call at that `offset`. A single id is never cut - `get` always keeps its body."
-                    },
-                    "expects": {
-                        "type": "array",
-                        "description": "The revisions you READ, one { id, rev } per id this call patches or removes (required for those writes). A rev that no longer matches rejects the whole call AND returns the current task, so you re-read in the same step rather than overwriting their work; or pass `mergeDisjoint: true` when the concurrent change touched only fields your patch leaves out. A rev HIGHER than the task has ever reached is not somebody else editing under you: the refusal says the task is at revision N and nothing has changed since you read it, and names the rev to send. An id may carry at most one token.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Task id you read."
-                                },
-                                "rev": {
-                                    "type": "integer",
-                                    "minimum": 1,
-                                    "description": "The \"rev\" that record had when you read it, copied from an earlier result."
-                                }
-                            },
-                            "required": [
-                                "id",
-                                "rev"
-                            ],
-                            "additionalProperties": false
+                        "completed": {
+                            "type": "boolean",
+                            "description": "true marks the task done, false reopens it. Omitted leaves the stored flag unchanged."
                         }
                     },
-                    "since": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Asks for the task change log after this revision: the result also carries \"changes\" (at most 50 entries, oldest first) with \"changesHasMore\", \"changesTruncated\", \"oldestAvailableRev\" and \"droppedEvents\" - the oldest revision the retained 200-event window still holds, and exactly how many events between your revision and that floor were trimmed away for good. Each entry is an EVENT ENVELOPE, not a diff: an `update` names WHICH fields moved in `fields` and never their VALUES, and an `add`/`remove` names nothing beyond the id, so the feed tells you what to re-read and the read supplies the values. There is no separate gap field, by design: `droppedEvents` (what you lost) beside `oldestAvailableRev` (where you resume) IS the disclosure, and a `since` the window still covers reports `droppedEvents: 0` with `changesTruncated: false`. Through this `tasks` wrapper both keys ride ONLY beside `changes` - a plain read has no feed and carries neither, while the un-wrapped `records` surface reports a collection's floor on a plain read too. `changesHasMore` is a DIFFERENT flag: the feed was cut at 50 entries or by the page budget, which withholds later events but loses nothing you were owed. Pass the \"storeRev\" of your last read. Must not be ahead of the store. `storeRev` is PER COLLECTION - the token you poll with must come from a `tasks` read, never from another collection's. `since` always returns a page beside the feed, so poll cheaply with `{ since, limit: 1 }`; the feed itself is unfiltered and can be combined with `ids` but not with `where`."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "0-based index of the first returned task. Defaults to 0; use page.nextOffset from the previous page. Cannot be combined with \"afterId\"."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "Page size, 1-100. Defaults to 20. This caps the page EVERY successful call echoes - a mutation included, not just a read - so pass `limit: 1` on any add, patch or remove whose list you do not need: when the call changed exactly ONE record it also arrives in `entry` (a deletion in `removed`) whatever `limit` you sent. A batch that changed SEVERAL records answers with the page instead of `entry`, and it names what it wrote with id lists that ignore `limit` entirely: `addedIds` for every id it minted, `changedIds` for every id it really patched, and `noopIds` for every id whose patch wrote nothing - each of those three appears whenever the call did that kind of write, AT ANY COUNT and independently of the others, so a batch of one add plus one patch names BOTH ids (`entry` is only the one-record convenience and never suppresses a list). `removedIds` keeps its own rule: two or more deletions, where the singular `removed` could not name them all. So `limit: 1` stays the cheap call even for a batch - the ids of your own write arrive whatever the page says, and you never re-read the list to confirm the write landed."
-                    },
-                    "afterId": {
-                        "type": "string",
-                        "pattern": "^[0-9]+$",
-                        // R2/T2.2 reworded this sentence (src/tools/runtime/tasks.tool.ts):
-                        // it now names the order the cursor walks and forbids mixing
-                        // offset and keyset inside one walk. Pinned verbatim, like every
-                        // other schema text in this file.
-                        "description": "Keyset cursor: an id, and the walk it drives runs in ID ORDER - not the page order, which on a collection with a sortable field is a different order. Returns the tasks with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike \"offset\". Never mix the two modes inside one walk: switching from \"offset\" to \"afterId\" part-way (or back) can skip or repeat records, so follow one cursor throughout; if you do switch, the only safe cursor is the page.nextAfterId an offset page of a sortable collection sets to the LARGEST id it returned. Walking \"afterId\" from below the smallest id is the complete walk - ids start at 1, so `afterId: \"0\"` is that sentinel and walks every task. Sets page.nextAfterId while page.hasMore. The `page.offset` a keyset page echoes is the EFFECTIVE index, informational only: it is not a cursor you can send back beside \"afterId\"."
-                    },
-                    "where": {
-                        "type": "object",
-                        "description": "Equality filter for a list read: { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered read still counts the whole collection. Values are text, integer or boolean; a strings field cannot be filtered. Cannot be combined with \"since\", because the change feed is the unfiltered log, nor with \"ids\", which answers with the records it names rather than a filtered page.",
-                        "additionalProperties": {
-                            "type": [
-                                "string",
-                                "integer",
-                                "boolean"
-                            ]
-                        }
-                    },
-                    "mergeDisjoint": {
-                        "type": "boolean",
-                        "description": "true applies a stale content patch anyway when every concurrent change since your read touched only fields your patch does not set; an overlapping field still rejects. Never merges a removal, and it belongs to a PATCH: a call that sends no patch - a read, a removal, an addition - is refused rather than accepting the flag and doing nothing with it."
-                    }
+                    "additionalProperties": false
+                }
+            },
+            "remove": {
+                "type": "array",
+                "items": {
+                    "type": "string"
                 },
-                "additionalProperties": false
+                "description": "Exact task ids to delete. Every id must exist; an id may not also appear in \"tasks\". A deletion needs its \"expects\" token."
+            },
+            "ids": {
+                "type": "array",
+                "items": {
+                    "type": "string"
+                },
+                "description": "Task ids to read, for when you want one record rather than a page. One id answers with \"entry\", several with \"entries\". A repeated id is read once, and the bodies are charged to the same response budget as a page: a read the budget cannot pay for in full answers with the records that fit, `page.hasMore: true` and `page.nextOffset`, and you continue with the same call at that `offset`. A single id is never cut: the first record always fits the budget, and a task is under 13,000 bytes even with both fields filled, so a 32,768-byte ceiling the harness applies has nothing to trim."
+            },
+            "expects": {
+                "type": "array",
+                "description": "The revisions you READ, one { id, rev } per id this call patches or removes (required for those writes). A rev that no longer matches rejects the whole call AND returns the current task, so you re-read in the same step rather than overwriting their work; or pass `mergeDisjoint: true` when the concurrent change touched only fields your patch leaves out. A rev HIGHER than the task has ever reached is not somebody else editing under you: the refusal says the task is at revision N and nothing has changed since you read it, and names the rev to send. An id may carry at most one token.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Task id you read."
+                        },
+                        "rev": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "The \"rev\" that record had when you read it, copied from an earlier result."
+                        }
+                    },
+                    "required": [
+                        "id",
+                        "rev"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "since": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Asks for the task change log after this revision: the result also carries \"changes\" (at most 50 entries, oldest first) with \"changesHasMore\", \"changesTruncated\", \"oldestAvailableRev\" and \"droppedEvents\" - the oldest revision the retained 200-event window still holds, and exactly how many events between your revision and that floor were trimmed away for good. Each entry is an EVENT ENVELOPE, not a diff: an `update` names WHICH fields moved in `fields` and never their VALUES, and an `add`/`remove` names nothing beyond the id, so the feed tells you what to re-read and the read supplies the values. There is no separate gap field, by design: `droppedEvents` (what you lost) beside `oldestAvailableRev` (where you resume) IS the disclosure, and a `since` the window still covers reports `droppedEvents: 0` with `changesTruncated: false`. Through this `tasks` wrapper both keys ride ONLY beside `changes` - a plain read has no feed and carries neither, while the un-wrapped `records` surface reports a collection's floor on a plain read too. `changesHasMore` is a DIFFERENT flag: the feed was cut at 50 entries or by the page budget, which withholds later events but loses nothing you were owed. Pass the \"storeRev\" of your last read. Must not be ahead of the store. `storeRev` is PER COLLECTION - the token you poll with must come from a `tasks` read, never from another collection's. `since` always returns a page beside the feed, so poll cheaply with `{ since, limit: 1 }`; the feed itself is unfiltered and can be combined with `ids` but not with `where`."
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "0-based index of the first returned task. Defaults to 0; use page.nextOffset from the previous page. Cannot be combined with \"afterId\"."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Page size, 1-100. Defaults to 20. This caps the page EVERY successful call echoes - a mutation included, not just a read - so pass `limit: 1` on any add, patch or remove whose list you do not need: when the call changed exactly ONE record it also arrives in `entry` (a deletion in `removed`) whatever `limit` you sent. A batch that changed SEVERAL records answers with the page instead of `entry`, and it names what it wrote with id lists that ignore `limit` entirely: `addedIds` for every id it minted, `changedIds` for every id it really patched, and `noopIds` for every id whose patch wrote nothing - each of those three appears whenever the call did that kind of write, AT ANY COUNT and independently of the others, so a batch of one add plus one patch names BOTH ids (`entry` is only the one-record convenience and never suppresses a list). `removedIds` keeps its own rule: two or more deletions, where the singular `removed` could not name them all. So `limit: 1` stays the cheap call even for a batch - the ids of your own write arrive whatever the page says, and you never re-read the list to confirm the write landed."
+            },
+            "afterId": {
+                "type": "string",
+                "pattern": "^[0-9]+$",
+                "description": "Keyset cursor: an id, and the walk it drives runs in ID ORDER - not the page order, which on a collection with a sortable field is a different order. Returns the tasks with a higher id, which cannot skip or repeat one when another agent deletes a record mid-walk, unlike \"offset\". Never mix the two modes inside one walk: switching from \"offset\" to \"afterId\" part-way (or back) can skip or repeat records, so follow one cursor throughout; if you do switch, the only safe cursor is the page.nextAfterId an offset page of a sortable collection sets to the LARGEST id it returned. Walking \"afterId\" from below the smallest id is the complete walk - ids start at 1, so `afterId: \"0\"` is that sentinel and walks every task. Sets page.nextAfterId while page.hasMore. The `page.offset` a keyset page echoes is the EFFECTIVE index, informational only: it is not a cursor you can send back beside \"afterId\"."
+            },
+            "where": {
+                "type": "object",
+                "description": "Equality filter for a list read: { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered read still counts the whole collection. Values are text, integer or boolean; a strings field cannot be filtered. Cannot be combined with \"since\", because the change feed is the unfiltered log, nor with \"ids\", which answers with the records it names rather than a filtered page.",
+                "additionalProperties": {
+                    "type": [
+                        "string",
+                        "integer",
+                        "boolean"
+                    ]
+                }
+            },
+            "mergeDisjoint": {
+                "type": "boolean",
+                "description": "true applies a stale content patch anyway when every concurrent change since your read touched only fields your patch does not set; an overlapping field still rejects. Never merges a removal, and it belongs to a PATCH: a call that sends no patch - a read, a removal, an addition - is refused rather than accepting the flag and doing nothing with it."
             }
+        },
+        "additionalProperties": false
+    }
         );
         expect(writer.tools.tasks.tags).toEqual(
             [
@@ -333,7 +383,7 @@ describe('core tool metadata', () => {
         // and the `storeRev`/`afterId`/`since` result contract all have to be
         // stated here as well as in the schema above.
         expect(writer.tools.tasks.description).toEqual(
-            "Maintain the task list for this harness session (the `tasks` collection of the session store). Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no \"id\" ADDS a task and must carry \"text\"; an entry with a known \"id\" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete; `ids` reads specific tasks. Unknown ids are invalid, one id may appear in only ONE of `tasks`/`remove`/`ids` per call, and the whole call is validated before anything changes - a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls, and unique across every collection in the session. THE LIST IS SHARED: every agent and thread in this harness writes the same records, and another agent may change one while you work. There are no locks and no claims: any thread may write any task at any time. Each record carries `rev`, its content revision (starts at 1; only a real text/completed change bumps it), plus who last edited it and when. Send `expects: [{ id, rev }]` with the rev you READ for every id you patch or remove - a call from an agent must send it, or the write is refused as a guarded write. It guards a WRITE, so a token for a task this call neither patches nor removes is refused, never ignored, and a read takes none. If the rev moved, the WHOLE call is rejected AND the refusal returns the CURRENT TASK (its fields and values), so you can retry in one step instead of re-reading; when the concurrent change touched only fields your patch leaves out, pass `mergeDisjoint: true` and your patch applies anyway. EVERY successful call returns the SAME bounded page: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId?, budgetTruncated? only when the byte budget cut the page short of \"limit\" }, storeRev, budgetTruncated? beside the envelope whenever the byte budget withheld anything else from this answer - a write echo collapsed to `{ id, rev }`, or the bodies of an `ids` read cut short and continued at `page.nextOffset` - because a page flag alone cannot tell a caller that its own write came back without its body, entry? when one record answers, removed? when exactly one record was deleted, removedIds? when two or more were deleted, addedIds? naming every id the call minted, changedIds? naming every id it really patched and noopIds? naming every patch that wrote nothing - those three id lists appear whenever the call did that kind of write, AT ANY COUNT and independently of each other, so a batch of one add plus one patch names BOTH ids; an id listed only in `noopIds` wrote nothing and bumped no rev; and a `tasks: []` beside `entry` is deliberate, because the plural key is always present while the record itself rides in the singular one } - 20 items by default, at most 100, charged against the collection's own response budget in one pass over the whole answer (the page first, then the bodies your write echoes back, so one record body is never paid for twice), and still capped by the harness's 32,768-byte limit when a tool result is delivered. Page by `offset`/`limit`, or by `afterId` (an id cursor - the walk runs in ID order, which on a sortable collection is NOT the page order) when tasks may be removed mid-walk, and never mix the two modes inside one walk. Pass `since: storeRev` to also get `changes` with `changesHasMore`/`changesTruncated`/`oldestAvailableRev`/`droppedEvents`: the task events since that revision (add/update/remove) - an EVENT envelope of ids, field NAMES, revisions and who/when, with no field VALUES, so it replaces the poll for what changed but never the read of what they now say; the values still come from `tasks`/`ids`. It also reports the oldest revision the retained window still holds, and exactly how many events before it are gone for good - so a truncated feed says where you can resume AND how much you lost. Through this wrapper `oldestAvailableRev` and `droppedEvents` ride ONLY beside `changes`: a plain `tasks` read has no feed, so it carries neither. Caps: 200 tasks, 4000 characters of text (counted as UTF-16 code units, so one astral emoji is 2 of them). If this tool is what stops you - a field you cannot name, a cap you need to escape - the same records are open through the `records` store tool (tags: records, store, collection) with no field-level restriction at all."
+            "Maintain the task list for this harness session (the `tasks` collection of the session store). Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no \"id\" ADDS a task and must carry \"text\"; an entry with a known \"id\" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete; `ids` reads specific tasks. Unknown ids are invalid, one id may appear in only ONE of `tasks`/`remove`/`ids` per call, and the whole call is validated before anything changes - a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls, and unique across every collection in the session. THE LIST IS SHARED: every agent and thread in this harness writes the same records, and another agent may change one while you work. There are no locks and no claims: any thread may write any task at any time. Each record carries `rev`, its content revision (starts at 1; only a real text/completed change bumps it), plus who last edited it and when. Send `expects: [{ id, rev }]` with the rev you READ for every id you patch or remove - a call from an agent must send it, or the write is refused as a guarded write. It guards a WRITE, so a token for a task this call neither patches nor removes is refused, never ignored, and a read takes none. If the rev moved, the WHOLE call is rejected AND the refusal returns the CURRENT TASK (its fields and values), so you can retry in one step instead of re-reading; when the concurrent change touched only fields your patch leaves out, pass `mergeDisjoint: true` and your patch applies anyway. EVERY successful call returns the SAME bounded page: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? or afterId?/nextAfterId?, budgetTruncated? only when the byte budget cut the page short of \"limit\" }, storeRev, budgetTruncated? beside the envelope whenever the byte budget withheld anything else from this answer - a write echo collapsed to `{ id, rev }`, or the bodies of an `ids` read cut short and continued at `page.nextOffset` - because a page flag alone cannot tell a caller that its own write came back without its body, entry? when one record answers, removed? when exactly one record was deleted, removedIds? when two or more were deleted, addedIds? naming every id the call minted, changedIds? naming every id it really patched and noopIds? naming every patch that wrote nothing - those three id lists appear whenever the call did that kind of write, AT ANY COUNT and independently of each other, so a batch of one add plus one patch names BOTH ids; an id listed only in `noopIds` wrote nothing and bumped no rev; and a `tasks: []` beside `entry` is deliberate, because the plural key is always present while the record itself rides in the singular one } - 20 items by default, at most 100, charged against the collection's own response budget in one pass over the whole answer (the page first, then the bodies your write echoes back, so one record body is never paid for twice), and a SEPARATE bound caps what the harness can deliver: one tool result is held to 32,768 payload bytes whatever the budget says, so an over-cap answer is trimmed at the delivery seam at a whole-record boundary rather than DISCARDED as a document - it still arrives with `page.hasMore` and `page.nextOffset` pointing at its first withheld row, `page.budgetTruncated`, and `deliveryBudgetBytes: 32768` naming the cap that fired. Raising the response budget cannot lift that cap - only a smaller `limit` can. Page by `offset`/`limit`, or by `afterId` (an id cursor - the walk runs in ID order, which on a sortable collection is NOT the page order) when tasks may be removed mid-walk, and never mix the two modes inside one walk. Pass `since: storeRev` to also get `changes` with `changesHasMore`/`changesTruncated`/`oldestAvailableRev`/`droppedEvents`: the task events since that revision (add/update/remove) - an EVENT envelope of ids, field NAMES, revisions and who/when, with no field VALUES, so it replaces the poll for what changed but never the read of what they now say; the values still come from `tasks`/`ids`. It also reports the oldest revision the retained window still holds, and exactly how many events before it are gone for good - so a truncated feed says where you can resume AND how much you lost. Through this wrapper `oldestAvailableRev` and `droppedEvents` ride ONLY beside `changes`: a plain `tasks` read has no feed, so it carries neither. Caps: 200 tasks, 4000 characters of text (counted as UTF-16 code units, so one astral emoji is 2 of them). If this tool is what stops you - a field you cannot name, a cap you need to escape - the same records are open through the `records` store tool (tags: records, store, collection) with no field-level restriction at all."
         );
     });
 
@@ -343,102 +393,102 @@ describe('core tool metadata', () => {
         // profiles: same action set for every record wrapper.
         expect(writer.tools.profiles.parameters).toEqual(
             {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "add",
-                            "list",
-                            "get",
-                            "update",
-                            "remove"
-                        ],
-                        "description": "One of: add, list, get, update, remove."
-                    },
-                    "id": {
-                        "type": "string",
-                        "description": "Profile id returned by \"add\". Required for get/update/remove."
-                    },
-                    "name": {
-                        "type": "string",
-                        "maxLength": 200,
-                        "description": "Profile name for \"add\", or a replacement name for \"update\". Required for \"add\"; trimmed. Maximum 200 characters."
-                    },
-                    "description": {
-                        "type": "string",
-                        "maxLength": 4000,
-                        "description": "Profile description for \"add\", or a replacement for \"update\". Required for \"add\"; trimmed. Maximum 4000 characters."
-                    },
-                    "traits": {
-                        "type": "array",
-                        "items": {
-                            "type": "string",
-                            "maxLength": 200
-                        },
-                        "maxItems": 32,
-                        "description": "Optional traits for \"add\" or \"update\", e.g. [\"brave\", \"loyal\"]. Entries are trimmed and deduplicated; omitting the field leaves traits unchanged on update. At most 32 traits of 200 characters each."
-                    },
-                    "notes": {
-                        "type": "string",
-                        "maxLength": 4000,
-                        "description": "Optional free-form notes for \"add\" or \"update\". Omitting the field leaves notes unchanged on update; an empty string clears them. Maximum 4000 characters."
-                    },
-                    "expects": {
-                        "type": "array",
-                        "description": "The revisions you READ, one { id, rev } per id this call updates or removes (required for those writes). A rev that no longer matches rejects the call and returns the current profile.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Profile id you read."
-                                },
-                                "rev": {
-                                    "type": "integer",
-                                    "minimum": 1,
-                                    "description": "The \"rev\" that record had when you read it, copied from an earlier result."
-                                }
-                            },
-                            "required": [
-                                "id",
-                                "rev"
-                            ],
-                            "additionalProperties": false
-                        }
-                    },
-                    "mergeDisjoint": {
-                        "type": "boolean",
-                        "description": "true applies a stale update anyway when every concurrent change since your read touched only fields your update does not set. It belongs to a PATCH: beside an action that sends none - \"list\", \"get\", \"remove\", or an \"add\" - the call is refused rather than accepting the flag and doing nothing with it."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "For \"list\" only: 0-based index of the first profile. Defaults to 0; use page.nextOffset from the previous page."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "For \"list\" only: page size, 1-100. Defaults to 20."
-                    },
-                    "where": {
-                        "type": "object",
-                        "description": "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered. Values are text, integer or boolean and must match the field type; a strings field cannot be filtered.",
-                        "additionalProperties": {
-                            "type": [
-                                "string",
-                                "integer",
-                                "boolean"
-                            ]
-                        }
-                    }
-                },
-                "required": [
-                    "action"
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "add",
+                    "list",
+                    "get",
+                    "update",
+                    "remove"
                 ],
-                "additionalProperties": false
+                "description": "One of: add, list, get, update, remove."
+            },
+            "id": {
+                "type": "string",
+                "description": "Profile id returned by \"add\". Required for get/update/remove."
+            },
+            "name": {
+                "type": "string",
+                "maxLength": 200,
+                "description": "Profile name for \"add\", or a replacement name for \"update\". Required for \"add\"; trimmed. Maximum 200 characters."
+            },
+            "description": {
+                "type": "string",
+                "maxLength": 4000,
+                "description": "Profile description for \"add\", or a replacement for \"update\". Required for \"add\"; trimmed. Maximum 4000 characters."
+            },
+            "traits": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "maxLength": 200
+                },
+                "maxItems": 32,
+                "description": "Optional traits for \"add\" or \"update\", e.g. [\"brave\", \"loyal\"]. Entries are trimmed and deduplicated; omitting the field leaves traits unchanged on update. At most 32 traits of 200 characters each."
+            },
+            "notes": {
+                "type": "string",
+                "maxLength": 4000,
+                "description": "Optional free-form notes for \"add\" or \"update\". Omitting the field leaves notes unchanged on update; an empty string clears them. Maximum 4000 characters."
+            },
+            "expects": {
+                "type": "array",
+                "description": "The revisions you READ, one { id, rev } per id this call updates or removes (required for those writes). A rev that no longer matches rejects the call and returns the current profile.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Profile id you read."
+                        },
+                        "rev": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "The \"rev\" that record had when you read it, copied from an earlier result."
+                        }
+                    },
+                    "required": [
+                        "id",
+                        "rev"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "mergeDisjoint": {
+                "type": "boolean",
+                "description": "true applies a stale update anyway when every concurrent change since your read touched only fields your update does not set. It belongs to a PATCH: beside an action that sends none - \"list\", \"get\", \"remove\", or an \"add\" - the call is refused rather than accepting the flag and doing nothing with it."
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "For \"list\" only: 0-based index of the first profile. Defaults to 0; use page.nextOffset from the previous page."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "For \"list\" only: page size, 1-100. Defaults to 20."
+            },
+            "where": {
+                "type": "object",
+                "description": "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered. Values are text, integer or boolean and must match the field type; a strings field cannot be filtered.",
+                "additionalProperties": {
+                    "type": [
+                        "string",
+                        "integer",
+                        "boolean"
+                    ]
+                }
             }
+        },
+        "required": [
+            "action"
+        ],
+        "additionalProperties": false
+    }
         );
         expect(writer.tools.profiles.tags).toEqual(
             [
@@ -451,115 +501,115 @@ describe('core tool metadata', () => {
             ]
         );
         expect(writer.tools.profiles.description).toEqual(
-            "Manage character and people profiles for this harness session (the `profiles` collection of the session store). Actions: \"add\" (requires name and description; optional traits and notes), \"list\", \"get\" (requires id), \"update\" (requires id and at least one of name, description, traits, notes; fields you omit are unchanged), and \"remove\" (requires id). Traits are trimmed and deduplicated, and an empty string clears notes. Ids are stable strings returned by \"add\", unique across every collection in the session. Profiles are shared by every agent in this harness, kept across turns, and cleared by reset. \"list\" returns ONE PAGE: { profiles, counts { total }, page { offset, limit, hasMore, nextOffset?, budgetTruncated? only when the byte budget cut the page short of \"limit\" } } - 20 by default, at most 100, charged against the collection's own response budget in one pass over the whole answer, and still capped by the harness's 32,768-byte limit when a tool result is delivered. \"get\" and \"add\"/\"update\" return { profile, counts } and \"remove\" returns { removed, counts }, with NO list. Any of those answers can also carry `budgetTruncated: true`: the byte budget withholds a BODY rather than truncating one, so a written profile that came back as `{ id, rev }` is a profile this answer had no budget left to echo - not a profile whose fields were cleared - while `get`, the one read that pays for the body, is never cut. `traits` is the strings field here: entries that trim onto an earlier entry store once, and an accepted write that dropped entries says how many as `droppedEntries: { traits: N }`. Every record carries `rev`, its content revision (starts at 1, bumps only when a field actually changes), plus who last edited it and when. There are no locks and no claims - any agent on any thread may write any profile - so an update or a removal from an agent MUST send `expects: [{ id, rev }]` with the rev you read; a stale rev rejects the whole call AND returns the current profile, and \"mergeDisjoint\": true applies your update anyway when the concurrent change touched only fields you left out. Caps: 200 profiles, 200-character names, 4000-character descriptions and notes, up to 32 traits of 200 characters each (lengths counted as UTF-16 code units, so one astral emoji is 2 of them). If this tool is what stops you, the same records are open through the `records` store tool (tags: records, store, collection)."
+            "Manage character and people profiles for this harness session (the `profiles` collection of the session store). Actions: \"add\" (requires name and description; optional traits and notes), \"list\", \"get\" (requires id), \"update\" (requires id and at least one of name, description, traits, notes; fields you omit are unchanged), and \"remove\" (requires id). Traits are trimmed and deduplicated, and an empty string clears notes. Ids are stable strings returned by \"add\", unique across every collection in the session. Profiles are shared by every agent in this harness, kept across turns, and cleared by reset. \"list\" returns ONE PAGE: { profiles, counts { total }, page { offset, limit, hasMore, nextOffset?, budgetTruncated? only when the byte budget cut the page short of \"limit\" } } - 20 by default, at most 100, charged against the collection's own response budget in one pass over the whole answer, and a SEPARATE bound caps what the harness can deliver: one tool result is held to 32,768 bytes of payload whatever the budget says, so an over-cap answer is trimmed at the delivery seam at a whole-record boundary rather than DISCARDED as a document - it still arrives with `page.hasMore` and `page.nextOffset` pointing at its first withheld row, `page.budgetTruncated`, and `deliveryBudgetBytes: 32768` naming the cap that fired. Raising the response budget cannot lift that cap - only a smaller `limit` can. \"get\" and \"add\"/\"update\" return { profile, counts } and \"remove\" returns { removed, counts }, with NO list. Any of those answers can also carry `budgetTruncated: true`: the byte budget withholds a BODY rather than truncating one, so a written profile that came back as `{ id, rev }` is a profile this answer had no budget left to echo - not a profile whose fields were cleared - while `get`, the one read that pays for the body, keeps whatever fits the 32,768-byte ceiling the harness applies to one answer: a profile with 32 traits of 200 characters plus two full 4,000-character texts passes that, and then its trailing fields are withheld and named in `fieldsWithheld` - never an empty entry. `traits` is the strings field here: entries that trim onto an earlier entry store once, and an accepted write that dropped entries says how many as `droppedEntries: { traits: N }`. Every record carries `rev`, its content revision (starts at 1, bumps only when a field actually changes), plus who last edited it and when. There are no locks and no claims - any agent on any thread may write any profile - so an update or a removal from an agent MUST send `expects: [{ id, rev }]` with the rev you read; a stale rev rejects the whole call AND returns the current profile, and \"mergeDisjoint\": true applies your update anyway when the concurrent change touched only fields you left out. Caps: 200 profiles, 200-character names, 4000-character descriptions and notes, up to 32 traits of 200 characters each (lengths counted as UTF-16 code units, so one astral emoji is 2 of them). If this tool is what stops you, the same records are open through the `records` store tool (tags: records, store, collection)."
         );
 
         // chapterManage: the schema states the summary/body split and the order
         // sort, which is what the model relies on instead of reading the source.
         expect(writer.tools.chapters.parameters).toEqual(
             {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "add",
-                            "list",
-                            "get",
-                            "update",
-                            "remove"
-                        ],
-                        "description": "One of: add, list, get, update, remove."
-                    },
-                    "id": {
-                        "type": "string",
-                        "description": "Chapter id returned by \"add\". Required for get/update/remove."
-                    },
-                    "title": {
-                        "type": "string",
-                        "maxLength": 200,
-                        "description": "Chapter title for \"add\", or a replacement for \"update\". Required for \"add\"; trimmed. Maximum 200 characters."
-                    },
-                    "summary": {
-                        "type": "string",
-                        "maxLength": 4000,
-                        "description": "Chapter summary for \"add\", or a replacement for \"update\". Required for \"add\"; trimmed. Maximum 4000 characters. Lists show this, never the body."
-                    },
-                    "content": {
-                        "type": "string",
-                        "maxLength": 4000,
-                        "description": "Optional chapter body for \"add\" or \"update\". Omitting it leaves the stored body unchanged; an empty string clears it. Returned only by \"get\". Maximum 4000 characters."
-                    },
-                    "status": {
-                        "type": "string",
-                        "enum": [
-                            "planned",
-                            "draft",
-                            "complete"
-                        ],
-                        "description": "Lifecycle state. \"add\" defaults to planned; omitting it on \"update\" leaves the state unchanged."
-                    },
-                    "order": {
-                        "type": "integer",
-                        "minimum": -1000000,
-                        "maximum": 1000000,
-                        "description": "Optional sort position for \"add\" or \"update\"; a list sorts ordered chapters ascending, then unordered ones by insertion. There is no move action and no way to clear it - set a new value."
-                    },
-                    "expects": {
-                        "type": "array",
-                        "description": "The revisions you READ, one { id, rev } per id this call updates or removes (required for those writes). A rev that no longer matches rejects the call and returns the current chapter.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Chapter id you read."
-                                },
-                                "rev": {
-                                    "type": "integer",
-                                    "minimum": 1,
-                                    "description": "The \"rev\" that record had when you read it, copied from an earlier result."
-                                }
-                            },
-                            "required": [
-                                "id",
-                                "rev"
-                            ],
-                            "additionalProperties": false
-                        }
-                    },
-                    "mergeDisjoint": {
-                        "type": "boolean",
-                        "description": "true applies a stale update anyway when every concurrent change since your read touched only fields your update does not set. It belongs to a PATCH: beside an action that sends none - \"list\", \"get\", \"remove\", or an \"add\" - the call is refused rather than accepting the flag and doing nothing with it."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "For \"list\" only: 0-based index of the first chapter. Defaults to 0; use page.nextOffset from the previous page."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "For \"list\" only: page size, 1-100. Defaults to 20."
-                    },
-                    "where": {
-                        "type": "object",
-                        "description": "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered, including one a list withholds (a chapter body). Values are text, integer or boolean and must match the field type; a strings field cannot be filtered.",
-                        "additionalProperties": {
-                            "type": [
-                                "string",
-                                "integer",
-                                "boolean"
-                            ]
-                        }
-                    }
-                },
-                "required": [
-                    "action"
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "add",
+                    "list",
+                    "get",
+                    "update",
+                    "remove"
                 ],
-                "additionalProperties": false
+                "description": "One of: add, list, get, update, remove."
+            },
+            "id": {
+                "type": "string",
+                "description": "Chapter id returned by \"add\". Required for get/update/remove."
+            },
+            "title": {
+                "type": "string",
+                "maxLength": 200,
+                "description": "Chapter title for \"add\", or a replacement for \"update\". Required for \"add\"; trimmed. Maximum 200 characters."
+            },
+            "summary": {
+                "type": "string",
+                "maxLength": 4000,
+                "description": "Chapter summary for \"add\", or a replacement for \"update\". Required for \"add\"; trimmed. Maximum 4000 characters. Lists show this, never the body."
+            },
+            "content": {
+                "type": "string",
+                "maxLength": 4000,
+                "description": "Optional chapter body for \"add\" or \"update\". Omitting it leaves the stored body unchanged; an empty string clears it. Returned only by \"get\". Maximum 4000 characters."
+            },
+            "status": {
+                "type": "string",
+                "enum": [
+                    "planned",
+                    "draft",
+                    "complete"
+                ],
+                "description": "Lifecycle state. \"add\" defaults to planned; omitting it on \"update\" leaves the state unchanged."
+            },
+            "order": {
+                "type": "integer",
+                "minimum": -1000000,
+                "maximum": 1000000,
+                "description": "Optional sort position for \"add\" or \"update\"; a list sorts ordered chapters ascending, then unordered ones by insertion. There is no move action and no way to clear it - set a new value."
+            },
+            "expects": {
+                "type": "array",
+                "description": "The revisions you READ, one { id, rev } per id this call updates or removes (required for those writes). A rev that no longer matches rejects the call and returns the current chapter.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Chapter id you read."
+                        },
+                        "rev": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "The \"rev\" that record had when you read it, copied from an earlier result."
+                        }
+                    },
+                    "required": [
+                        "id",
+                        "rev"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "mergeDisjoint": {
+                "type": "boolean",
+                "description": "true applies a stale update anyway when every concurrent change since your read touched only fields your update does not set. It belongs to a PATCH: beside an action that sends none - \"list\", \"get\", \"remove\", or an \"add\" - the call is refused rather than accepting the flag and doing nothing with it."
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "For \"list\" only: 0-based index of the first chapter. Defaults to 0; use page.nextOffset from the previous page."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "For \"list\" only: page size, 1-100. Defaults to 20."
+            },
+            "where": {
+                "type": "object",
+                "description": "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered, including one a list withholds (a chapter body). Values are text, integer or boolean and must match the field type; a strings field cannot be filtered.",
+                "additionalProperties": {
+                    "type": [
+                        "string",
+                        "integer",
+                        "boolean"
+                    ]
+                }
             }
+        },
+        "required": [
+            "action"
+        ],
+        "additionalProperties": false
+    }
         );
         expect(writer.tools.chapters.tags).toEqual(
             [
@@ -572,99 +622,99 @@ describe('core tool metadata', () => {
             ]
         );
         expect(writer.tools.chapters.description).toEqual(
-            "Manage the chapter tracker for this harness session (the `chapters` collection of the session store). Actions: \"add\" (requires title and summary; optional content, status and order), \"list\", \"get\" (requires id), \"update\" (requires id and at least one of title, summary, content, status, order; fields you omit are unchanged), and \"remove\" (requires id). Status is one of planned, draft or complete and defaults to planned; ids are stable strings returned by \"add\"; order is an optional integer sort position - a list returns ordered chapters first (ascending) and unordered ones in insertion order, so updating \"order\" IS the move. Records are shared by every agent in this harness, kept across turns, and cleared by reset. LIST AND MUTATION RESULTS CARRY SUMMARIES, NEVER THE BODY: \"content\" appears only in \"get\", so ten chapters never cost ten bodies. \"list\" returns ONE PAGE: { chapters, counts { total, planned, draft, complete }, page { offset, limit, hasMore, nextOffset?, budgetTruncated? only when the byte budget cut the page short of \"limit\" } } - 20 by default, at most 100, charged against the collection's own response budget in one pass over the whole answer, and still capped by the harness's 32,768-byte limit when a tool result is delivered. \"get\" and \"add\"/\"update\" return { chapter, counts } and \"remove\" returns { removed, counts }, with NO list. Any of those answers can also carry `budgetTruncated: true`: the byte budget withholds a BODY rather than truncating one, so a written chapter that came back as `{ id, rev }` is a chapter this answer had no budget left to echo - not a chapter whose fields were cleared - while `get`, the one read that pays for the body, is never cut. Every record carries `rev`, its content revision (starts at 1, bumps only when a field actually changes), plus who last edited it and when. There are no locks and no claims - any agent on any thread may write any chapter - so an update or a removal from an agent MUST send `expects: [{ id, rev }]` with the rev you read; a stale rev rejects the whole call AND returns the current chapter, and \"mergeDisjoint\": true applies your patch anyway when the concurrent change touched only fields you left out. Caps: 200 chapters, 200-character titles, 4000-character summary and content (lengths counted as UTF-16 code units, so one astral emoji is 2 of them). If this tool is what stops you, the same records are open through the `records` store tool (tags: records, store, collection)."
+            "Manage the chapter tracker for this harness session (the `chapters` collection of the session store). Actions: \"add\" (requires title and summary; optional content, status and order), \"list\", \"get\" (requires id), \"update\" (requires id and at least one of title, summary, content, status, order; fields you omit are unchanged), and \"remove\" (requires id). Status is one of planned, draft or complete and defaults to planned; ids are stable strings returned by \"add\"; order is an optional integer sort position - a list returns ordered chapters first (ascending) and unordered ones in insertion order, so updating \"order\" IS the move. Records are shared by every agent in this harness, kept across turns, and cleared by reset. LIST AND MUTATION RESULTS CARRY SUMMARIES, NEVER THE BODY: \"content\" appears only in \"get\", so ten chapters never cost ten bodies. \"list\" returns ONE PAGE: { chapters, counts { total, planned, draft, complete }, page { offset, limit, hasMore, nextOffset?, budgetTruncated? only when the byte budget cut the page short of \"limit\" } } - 20 by default, at most 100, charged against the collection's own response budget in one pass over the whole answer, and a SEPARATE bound caps what the harness can deliver: one tool result is held to 32,768 bytes of payload whatever the budget says, so an over-cap answer is trimmed at the delivery seam at a whole-record boundary rather than DISCARDED as a document - it still arrives with `page.hasMore` and `page.nextOffset` pointing at its first withheld row, `page.budgetTruncated`, and `deliveryBudgetBytes: 32768` naming the cap that fired. Raising the response budget cannot lift that cap - only a smaller `limit` can. \"get\" and \"add\"/\"update\" return { chapter, counts } and \"remove\" returns { removed, counts }, with NO list. Any of those answers can also carry `budgetTruncated: true`: the byte budget withholds a BODY rather than truncating one, so a written chapter that came back as `{ id, rev }` is a chapter this answer had no budget left to echo - not a chapter whose fields were cleared - while `get`, the one read that pays for the body, is never cut - a chapter with both texts full stays inside the 32,768-byte ceiling the harness applies to one answer. Every record carries `rev`, its content revision (starts at 1, bumps only when a field actually changes), plus who last edited it and when. There are no locks and no claims - any agent on any thread may write any chapter - so an update or a removal from an agent MUST send `expects: [{ id, rev }]` with the rev you read; a stale rev rejects the whole call AND returns the current chapter, and \"mergeDisjoint\": true applies your patch anyway when the concurrent change touched only fields you left out. Caps: 200 chapters, 200-character titles, 4000-character summary and content (lengths counted as UTF-16 code units, so one astral emoji is 2 of them). If this tool is what stops you, the same records are open through the `records` store tool (tags: records, store, collection)."
         );
 
         // locationManage: the small record shape, no summary/body split.
         expect(writer.tools.locations.parameters).toEqual(
             {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "add",
-                            "list",
-                            "get",
-                            "update",
-                            "remove"
-                        ],
-                        "description": "One of: add, list, get, update, remove."
-                    },
-                    "id": {
-                        "type": "string",
-                        "description": "Location id returned by \"add\". Required for get/update/remove."
-                    },
-                    "name": {
-                        "type": "string",
-                        "maxLength": 200,
-                        "description": "Location name for \"add\", or a replacement name for \"update\". Required for \"add\"; trimmed. Maximum 200 characters."
-                    },
-                    "description": {
-                        "type": "string",
-                        "maxLength": 4000,
-                        "description": "Location description for \"add\", or a replacement for \"update\". Required for \"add\"; trimmed. Maximum 4000 characters."
-                    },
-                    "notes": {
-                        "type": "string",
-                        "maxLength": 4000,
-                        "description": "Optional free-form notes for \"add\" or \"update\". Omitting the field leaves notes unchanged on update; an empty string clears them. Maximum 4000 characters."
-                    },
-                    "expects": {
-                        "type": "array",
-                        "description": "The revisions you READ, one { id, rev } per id this call updates or removes (required for those writes). A rev that no longer matches rejects the call and returns the current location.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Location id you read."
-                                },
-                                "rev": {
-                                    "type": "integer",
-                                    "minimum": 1,
-                                    "description": "The \"rev\" that record had when you read it, copied from an earlier result."
-                                }
-                            },
-                            "required": [
-                                "id",
-                                "rev"
-                            ],
-                            "additionalProperties": false
-                        }
-                    },
-                    "mergeDisjoint": {
-                        "type": "boolean",
-                        "description": "true applies a stale update anyway when every concurrent change since your read touched only fields your update does not set. It belongs to a PATCH: beside an action that sends none - \"list\", \"get\", \"remove\", or an \"add\" - the call is refused rather than accepting the flag and doing nothing with it."
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "For \"list\" only: 0-based index of the first location. Defaults to 0; use page.nextOffset from the previous page."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "description": "For \"list\" only: page size, 1-100. Defaults to 20."
-                    },
-                    "where": {
-                        "type": "object",
-                        "description": "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered. Values are text, integer or boolean and must match the field type.",
-                        "additionalProperties": {
-                            "type": [
-                                "string",
-                                "integer",
-                                "boolean"
-                            ]
-                        }
-                    }
-                },
-                "required": [
-                    "action"
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "add",
+                    "list",
+                    "get",
+                    "update",
+                    "remove"
                 ],
-                "additionalProperties": false
+                "description": "One of: add, list, get, update, remove."
+            },
+            "id": {
+                "type": "string",
+                "description": "Location id returned by \"add\". Required for get/update/remove."
+            },
+            "name": {
+                "type": "string",
+                "maxLength": 200,
+                "description": "Location name for \"add\", or a replacement name for \"update\". Required for \"add\"; trimmed. Maximum 200 characters."
+            },
+            "description": {
+                "type": "string",
+                "maxLength": 4000,
+                "description": "Location description for \"add\", or a replacement for \"update\". Required for \"add\"; trimmed. Maximum 4000 characters."
+            },
+            "notes": {
+                "type": "string",
+                "maxLength": 4000,
+                "description": "Optional free-form notes for \"add\" or \"update\". Omitting the field leaves notes unchanged on update; an empty string clears them. Maximum 4000 characters."
+            },
+            "expects": {
+                "type": "array",
+                "description": "The revisions you READ, one { id, rev } per id this call updates or removes (required for those writes). A rev that no longer matches rejects the call and returns the current location.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Location id you read."
+                        },
+                        "rev": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "The \"rev\" that record had when you read it, copied from an earlier result."
+                        }
+                    },
+                    "required": [
+                        "id",
+                        "rev"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "mergeDisjoint": {
+                "type": "boolean",
+                "description": "true applies a stale update anyway when every concurrent change since your read touched only fields your update does not set. It belongs to a PATCH: beside an action that sends none - \"list\", \"get\", \"remove\", or an \"add\" - the call is refused rather than accepting the flag and doing nothing with it."
+            },
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "For \"list\" only: 0-based index of the first location. Defaults to 0; use page.nextOffset from the previous page."
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "For \"list\" only: page size, 1-100. Defaults to 20."
+            },
+            "where": {
+                "type": "object",
+                "description": "For \"list\" only: equality filter { field: value }, AND across the keys. Applied BEFORE ordering and paging, so the page and its cursors move over the matching records and \"counts\" - facets and total - describe the FILTERED set; an unfiltered list still counts the whole collection. Any declared field may be filtered. Values are text, integer or boolean and must match the field type.",
+                "additionalProperties": {
+                    "type": [
+                        "string",
+                        "integer",
+                        "boolean"
+                    ]
+                }
             }
+        },
+        "required": [
+            "action"
+        ],
+        "additionalProperties": false
+    }
         );
         expect(writer.tools.locations.tags).toEqual(
             [
@@ -678,7 +728,7 @@ describe('core tool metadata', () => {
             ]
         );
         expect(writer.tools.locations.description).toEqual(
-            "Manage places and settings for this harness session (the `locations` collection of the session store). Actions: \"add\" (requires name and description; optional notes), \"list\", \"get\" (requires id), \"update\" (requires id and at least one of name, description, notes; fields you omit are unchanged), and \"remove\" (requires id). Ids are stable strings returned by \"add\", unique across every collection in the session. Omitting notes on \"update\" leaves them unchanged; an empty string clears them. Locations are shared by every agent in this harness, kept across turns, and cleared by reset. \"list\" returns ONE PAGE: { locations, counts { total }, page { offset, limit, hasMore, nextOffset?, budgetTruncated? only when the byte budget cut the page short of \"limit\" } } - 20 by default, at most 100, charged against the collection's own response budget in one pass over the whole answer, and still capped by the harness's 32,768-byte limit when a tool result is delivered. \"get\" and \"add\"/\"update\" return { location, counts } and \"remove\" returns { removed, counts }, with NO list. Any of those answers can also carry `budgetTruncated: true`: the byte budget withholds a BODY rather than truncating one, so a written location that came back as `{ id, rev }` is a location this answer had no budget left to echo - not a location whose fields were cleared - while `get`, the one read that pays for the body, is never cut. Every record carries `rev`, its content revision (starts at 1, bumps only when a field actually changes), plus who last edited it and when. There are no locks and no claims - any agent on any thread may write any location - so an update or a removal from an agent MUST send `expects: [{ id, rev }]` with the rev you read; a stale rev rejects the whole call AND returns the current location, and \"mergeDisjoint\": true applies your update anyway when the concurrent change touched only fields you left out. Caps: 200 locations, 200-character names, 4000-character descriptions and notes (lengths counted as UTF-16 code units, so one astral emoji is 2 of them). If this tool is what stops you, the same records are open through the `records` store tool (tags: records, store, collection)."
+            "Manage places and settings for this harness session (the `locations` collection of the session store). Actions: \"add\" (requires name and description; optional notes), \"list\", \"get\" (requires id), \"update\" (requires id and at least one of name, description, notes; fields you omit are unchanged), and \"remove\" (requires id). Ids are stable strings returned by \"add\", unique across every collection in the session. Omitting notes on \"update\" leaves them unchanged; an empty string clears them. Locations are shared by every agent in this harness, kept across turns, and cleared by reset. \"list\" returns ONE PAGE: { locations, counts { total }, page { offset, limit, hasMore, nextOffset?, budgetTruncated? only when the byte budget cut the page short of \"limit\" } } - 20 by default, at most 100, charged against the collection's own response budget in one pass over the whole answer, and a SEPARATE bound caps what the harness can deliver: one tool result is held to 32,768 bytes of payload whatever the budget says, so an over-cap answer is trimmed at the delivery seam at a whole-record boundary rather than DISCARDED as a document - it still arrives with `page.hasMore` and `page.nextOffset` pointing at its first withheld row, `page.budgetTruncated`, and `deliveryBudgetBytes: 32768` naming the cap that fired. Raising the response budget cannot lift that cap - only a smaller `limit` can. \"get\" and \"add\"/\"update\" return { location, counts } and \"remove\" returns { removed, counts }, with NO list. Any of those answers can also carry `budgetTruncated: true`: the byte budget withholds a BODY rather than truncating one, so a written location that came back as `{ id, rev }` is a location this answer had no budget left to echo - not a location whose fields were cleared - while `get`, the one read that pays for the body, is never cut - a location with all three texts full stays inside the 32,768-byte ceiling the harness applies to one answer. Every record carries `rev`, its content revision (starts at 1, bumps only when a field actually changes), plus who last edited it and when. There are no locks and no claims - any agent on any thread may write any location - so an update or a removal from an agent MUST send `expects: [{ id, rev }]` with the rev you read; a stale rev rejects the whole call AND returns the current location, and \"mergeDisjoint\": true applies your update anyway when the concurrent change touched only fields you left out. Caps: 200 locations, 200-character names, 4000-character descriptions and notes (lengths counted as UTF-16 code units, so one astral emoji is 2 of them). If this tool is what stops you, the same records are open through the `records` store tool (tags: records, store, collection)."
         );
     });
 

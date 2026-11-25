@@ -70,7 +70,12 @@ describe('stress: define / dispatch short-circuits', () => {
             name: 'notes2',
             fields: [{ key: 'q', type: 'text' }],
             maxRecords: 200,
-            responseBudgetBytes: 65536
+            // F7-4 (2026-11-25): the engine default again — 65,536 (64 KiB), which is the
+            // top of the configurable range and ABOVE the 32,768-byte delivery cap on
+            // purpose. F1-6 had moved this default to 24,576 to dodge the cap; the cap is
+            // now enforced at serve time (`clampToDeliveryCap`) and the default is the
+            // caller's request again.
+            responseBudgetBytes: 65_536
         });
         expect(both.collection).toBe('notes2');
         // A define answer and a describe answer now share a shape (both carry `definition`
@@ -95,7 +100,10 @@ describe('stress: define / dispatch short-circuits', () => {
             name: 'notes2',
             fields: [{ key: 'q', type: 'text' }],
             maxRecords: 200,
-            responseBudgetBytes: 65536
+            // F7-4 (2026-11-25): the engine default again — 65,536, the top of the configurable
+            // range, above the 32,768-byte delivery cap on purpose (the cap is enforced at
+            // serve time by `clampToDeliveryCap`, not by shrinking this number).
+            responseBudgetBytes: 65_536
         });
     });
 

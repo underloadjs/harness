@@ -13,7 +13,30 @@
 // never from arguments (task's rule, kept). `caller()` below is that context.
 
 import { describe, expect, it } from 'vitest';
-import { createRecordEngine, RECORD_ERROR_CODES } from './records';
+import {
+    createRecordEngine,
+    RECORD_DELIVERY_CAP_BYTES,
+    RECORD_ERROR_CODES,
+    RECORD_MAX_RESPONSE_BUDGET_BYTES,
+    RECORD_MIN_RESPONSE_BUDGET_BYTES,
+    RECORD_RESPONSE_BUDGET_BYTES
+} from './records';
+// The four built-in specs carry their own page budget (they are loaded by ./records.ts, which
+// cannot be their source without an import cycle), so F1-6 pins them where they live.
+import { CHAPTERS_COLLECTION } from './chapter';
+import { LOCATIONS_COLLECTION } from './location';
+import { PROFILES_COLLECTION } from './profile';
+import { TASKS_COLLECTION } from './task';
+// F1-6 pins the RELATION between this engine's page budget and the harness' delivery cap,
+// so the cap is imported rather than quoted from memory (./knowledge.test.ts:262 does the
+// same for the knowledge engine). F7-4 adds `RECORD_DELIVERY_CAP_BYTES` to that pair: the
+// engine's clamp target and the guard's cap are ONE number, and a test that carried its own
+// literal would not have caught the drift that caused the defect.
+import { MODEL_TOOL_RESULT_BUDGET_BYTES } from './result-budget';
+// The clamp measures in PAYLOAD bytes (escaped), which is the unit `boundToolResult` enforces
+// the cap in and NOT the same number as `JSON.stringify(...)`'s UTF-8 length. Every "does it
+// fit the delivery" assertion below uses this one (./payload-bytes.ts "WHY THIS EXISTS").
+import { modelPayloadBytes } from './payload-bytes';
 import type { RecordChange, RecordEntry, RecordsResult } from '../types';
 
 // One caller identity. `by` is what makes a write guarded and attributed; omit it for the
@@ -1621,10 +1644,12 @@ describe('records engine — reading a collection\'s own spec back (R6)', () => 
             { key: 'done', type: 'boolean', default: false, count: { key: 'done', complement: 'open' } }
         ],
         maxRecords: 7,
-        // `define` cannot set the page budget (readDefineInput allows name/fields/
-        // maxRecords only), so the verbatim answer here is the engine default — which is
-        // still the number the store enforces, and the caller had no way to know it.
-        responseBudgetBytes: 64 * 1024
+        // The verbatim answer here is the engine default, i.e. the number the store
+        // enforces: 64 KiB (`RECORD_RESPONSE_BUDGET_BYTES`, ./records.ts). F7-4 (2026-11-25)
+        // restored it after F1-6 had lowered it to 24,576 — the budget is the CALLER's
+        // request, and the 32,768-byte harness cap is enforced separately, at serve time, by
+        // `clampToDeliveryCap` (./records.ts).
+        responseBudgetBytes: 65_536
     };
 
     it('T6.1: describe returns the stored definition verbatim, caps included', async () => {
@@ -2947,7 +2972,10 @@ describe('records engine — a batch names every id it touched, whatever the cou
             name: 'probeg12',
             fields: [{ key: 'body', type: 'text', required: true, maxLength: 500 }],
             maxRecords: 200,
-            responseBudgetBytes: 65536
+            // F7-4 (2026-11-25): the engine default is 65,536 (64 KiB) again — F1-6 had
+            // lowered it to 24,576 to dodge the delivery cap, and the cap is now enforced at
+            // serve time by `clampToDeliveryCap` instead.
+            responseBudgetBytes: 65_536
         });
 
         // It is the SAME spec `describe` answers with, and it is a detached copy: widening a
@@ -3402,6 +3430,14 @@ describe('records engine — the change feed names its floor (0011)', () => {
 // `updatedThreadId` and every byte count pinned below was captured in that context.
 const wireBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), 'utf8');
 
+// The currency the DELIVERY cap is enforced in. `wireBytes` is the tool's own text; the
+// number `boundToolResult` compares against `MODEL_TOOL_RESULT_BUDGET_BYTES` is that text
+// after JSON escaping (`modelPayloadBytes`, ./payload-bytes.ts — the T3 finding is that the
+// first number under-counts the second by ~5% on an escape-heavy body). Every "does this
+// answer fit what the harness can deliver" assertion below uses THIS one, so the test asks
+// the same question the guard asks, in the same unit.
+const deliveryBytes = (value: unknown): number => modelPayloadBytes(JSON.stringify(value));
+
 // The complete offset walk of the `legacy` fixture the restore-softening pin uses, spelled
 // `id:a:b`. It is the pair that proves a stripped `sortable` costs nothing: the walk must be
 // identical on the engine that never saw the bad option and the one that restored it.
@@ -3706,35 +3742,53 @@ describe('records engine — the budget bounds every answer and every refusal na
             'thread-1'
         );
 
-        // 20 tasks of 3,600 characters against the built-in 65,536-byte budget: 17 fit, the
-        // other 3 are named in `addedIds` only, and the wrapper says so.
+        // M1's contract, unchanged: `page.budgetTruncated` and the envelope flag both reach
+        // the model. The ARITHMETIC is F7-4's: the built-in `tasks` budget is 65,536 again
+        // (core/task.ts), so the producer admits 17 of these 20 tasks of 3,600 characters and
+        // the DELIVERY CLAMP (`clampToDeliveryCap`, core/records.ts) stops the answer at 8
+        // rows, because 30,493 payload bytes is what fits the 32,768-byte cap. The other 12
+        // ids are still named in `addedIds`, and the cursor says where to read them.
         expect(seeded.addedIds).toHaveLength(20);
-        expect((seeded.tasks as RecordEntry[]).length).toBe(17);
+        expect((seeded.tasks as RecordEntry[]).length).toBe(8);
         expect(seeded.page).toEqual({
             offset: 0,
             limit: 20,
             hasMore: true,
             budgetTruncated: true,
-            nextOffset: 17
+            nextOffset: 8,
+            // F7-4's additive marker: this page was cut by the harness' delivery cap, not by
+            // the collection's 64 KiB budget. Raising `responseBudgetBytes` would not lengthen
+            // it; only a smaller `limit` would.
+            deliveryBudgetBytes: 32_768
         });
         expect(seeded.budgetTruncated).toBe(true);
-        expect(wireBytes(seeded)).toBe(63806);
+        // THE POINT, pinned in the currency the guard enforces in: the same answer measured
+        // 63,806 BYTES under the pre-F1-6 budget, i.e. it serialized past
+        // MODEL_TOOL_RESULT_BUDGET_BYTES and the guard REFUSED the whole document (no page,
+        // no cursor, `rejected: oversized-json`). 30,493 payload bytes — inside 32,768 by 2,275
+        // — is a page that arrives, parses, and can be paged from.
+        expect(wireBytes(seeded)).toBe(30_229);
+        expect(deliveryBytes(seeded)).toBe(30_493);
+        expect(deliveryBytes(seeded) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
 
         const read = await tasks(engine, { ids: seeded.addedIds as string[] }, 'author');
 
-        // An `ids` read of all 20 through the wrapper: same 17 rows, and the marker reaches
+        // An `ids` read of all 20 through the wrapper: same 8 rows, and the marker reaches
         // the model instead of dying in the envelope rebuild.
-        expect((read.tasks as RecordEntry[]).length).toBe(17);
+        expect((read.tasks as RecordEntry[]).length).toBe(8);
         expect(read.entry).toBeUndefined();
         expect(read.page).toEqual({
             offset: 0,
             limit: 20,
             hasMore: true,
-            nextOffset: 17,
-            budgetTruncated: true
+            nextOffset: 8,
+            budgetTruncated: true,
+            deliveryBudgetBytes: 32_768
         });
         expect(read.budgetTruncated).toBe(true);
-        expect(wireBytes(read)).toBe(63702);
+        expect(wireBytes(read)).toBe(30_125);
+        expect(deliveryBytes(read)).toBe(30_347);
+        expect(deliveryBytes(read) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
 
         const patched = await tasks(
             engine,
@@ -3743,13 +3797,548 @@ describe('records engine — the budget bounds every answer and every refusal na
             'thread-1'
         );
 
-        // The write branch: 17 rows plus the patched record in `entry`, and the answer still
-        // declares what it withheld. The `entry` allowance is why this can pass 65,536.
-        expect((patched.tasks as RecordEntry[]).length).toBe(17);
+        // The write branch: 7 page rows plus the patched record whole in `entry`. The clamp
+        // spends its budget in the documented charge order — the page, then the echoes — so
+        // the one thing this call exists to report (the record it just wrote) keeps its body,
+        // and the row that had to go is a row the cursor still hands back.
+        expect((patched.tasks as RecordEntry[]).length).toBe(7);
         expect((patched.entry as RecordEntry).text).toBe(`${chunk}!`.repeat(6));
         expect(patched.changedIds).toEqual(['1']);
         expect(patched.budgetTruncated).toBe(true);
-        expect(wireBytes(patched)).toBe(67477);
+        expect(patched.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            budgetTruncated: true,
+            nextOffset: 7,
+            deliveryBudgetBytes: 32_768
+        });
+        expect(wireBytes(patched)).toBe(30_164);
+        expect(deliveryBytes(patched)).toBe(30_392);
+        expect(deliveryBytes(patched) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
+    });
+
+    // -----------------------------------------------------------------------
+    // DEFECT F7-4 (2026-11-25) — THE THREE NUMBERS, separated by test.
+    //   1. the CONFIGURED budget (`responseBudgetBytes`, 1,024..65,536, the caller's choice);
+    //   2. the DELIVERY CAP (32,768 payload bytes, the harness' choice,
+    //      ./result-budget.ts:231 — over which a JSON tool result is DISCARDED,
+    //      ./result-budget.ts:557-578);
+    //   3. the CLAMP (`RECORD_DELIVERY_CAP_BYTES`, the cap re-applied by the engine at its own
+    //      delivery seam so the guard never gets the document in the first place).
+    // F1-6 collapsed 1 into 2 by lowering the budget; that refused previously valid `define`s,
+    // rewrote persisted values, and still left one big record over the cap. These pins keep the
+    // three apart and make each one checkable.
+    // -----------------------------------------------------------------------
+
+    // The relation F1-6 tried to enforce BY NUMBER is now enforced at serve time, so the
+    // numbers are free to be what the caller asked for. Pinned in the style of
+    // ./knowledge.test.ts:262, which pins the sibling engine's (different) choice.
+    it('F7-4: the configured budget sits ABOVE the delivery cap on purpose, and the cap is one imported number', () => {
+        // 2. The cap, and the clamp target: the SAME number from the SAME module. This is the
+        //    drift that made the old comment a lie — the engine quoted a cap it did not import.
+        expect(MODEL_TOOL_RESULT_BUDGET_BYTES).toBe(32_768);
+        expect(RECORD_DELIVERY_CAP_BYTES).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+
+        // 1. The configurable range: 1,024..65,536 — the range the engine shipped with before
+        //    F1-6 narrowed it, and the range every persisted document already satisfies.
+        expect(RECORD_MIN_RESPONSE_BUDGET_BYTES).toBe(1_024);
+        expect(RECORD_MAX_RESPONSE_BUDGET_BYTES).toBe(65_536);
+        expect(RECORD_RESPONSE_BUDGET_BYTES).toBe(65_536);
+
+        // THE DELIBERATE INVERSION, stated as an assertion so nobody "fixes" it back: the
+        // default is a caller's request, not a delivery promise, and 65,536 > 32,768.
+        expect(RECORD_RESPONSE_BUDGET_BYTES > RECORD_DELIVERY_CAP_BYTES).toBe(true);
+
+        // The four built-ins, which are the collections that actually flood a session. They
+        // declare 64 KiB each and rely on the clamp for the cap, like any `define`d collection.
+        expect([
+            TASKS_COLLECTION.responseBudgetBytes,
+            CHAPTERS_COLLECTION.responseBudgetBytes,
+            PROFILES_COLLECTION.responseBudgetBytes,
+            LOCATIONS_COLLECTION.responseBudgetBytes
+        ]).toEqual([65_536, 65_536, 65_536, 65_536]);
+    });
+
+    // AC1. No `define` that used to work is refused: the endpoints of the restored range
+    // define, echo verbatim, and the refusal is back to naming the range the schema states
+    // (1024-65536 in `tools/runtime/records.tool.ts`), not the one F1-6 narrowed it to.
+    it('F7-4: a `define` anywhere in the restored 1024..65536 range is accepted verbatim', async () => {
+        const engine = createRecordEngine();
+
+        for (const budget of [1_024, 24_577, 32_768, 65_536]) {
+            const defined = await run(engine, 'records', {
+                define: {
+                    name: `edge${budget}`,
+                    fields: [{ key: 'q', type: 'text' }],
+                    responseBudgetBytes: budget
+                }
+            });
+
+            // Echoed verbatim — including the two values F1-6 refused (24,577 and 32,768) and
+            // the ceiling itself. 24,577 is the exact value that used to answer `record-cap`.
+            expect(defined.definition).toEqual({
+                name: `edge${budget}`,
+                fields: [{ key: 'q', type: 'text' }],
+                maxRecords: 200,
+                responseBudgetBytes: budget
+            });
+        }
+
+        // Outside the range only at the ends, with the range quoted in the sentence.
+        expect(
+            (
+                await expectCode(
+                    run(engine, 'records', {
+                        define: { name: 'over', fields: [{ key: 'q', type: 'text' }], responseBudgetBytes: 65_537 }
+                    }),
+                    RECORD_ERROR_CODES.recordCap
+                )
+            ).message
+        ).toBe(
+            'record-cap: records "define".responseBudgetBytes is 65537; a page budget must be between 1024 and 65536 bytes.'
+        );
+
+        expect(
+            (
+                await expectCode(
+                    run(engine, 'records', {
+                        define: { name: 'under', fields: [{ key: 'q', type: 'text' }], responseBudgetBytes: 1_023 }
+                    }),
+                    RECORD_ERROR_CODES.recordCap
+                )
+            ).message
+        ).toBe(
+            'record-cap: records "define".responseBudgetBytes is 1023; a page budget must be between 1024 and 65536 bytes.'
+        );
+
+        // A budget above the cap is not merely tolerated, it is the CONFIGURED page size:
+        // a 65,536-budget collection still trims its page at the cap and says which bound
+        // fired. Pinned below in `F7-4: a configured budget over the cap still delivers inside
+        // it`; here the point is that the DEFINITION is not the thing that gets bent.
+    });
+
+    // AC2. A persisted budget comes back EXACTLY as stored. F1-6 rewrote 65,536 -> 24,576 on
+    // restore, which (a) lost information across a version with no error and (b) would have
+    // invalidated the `typecrate/harness` lane-compaction fixture, whose durable `state.json`
+    // carries 65,536 for every collection.
+    it('F7-4: a snapshot carrying 65536 restores it verbatim and re-saves it unchanged', async () => {
+        const writer = createRecordEngine();
+
+        await run(writer, 'records', { define: { name: 'asWritten', fields: [{ key: 'q', type: 'text' }] } }, 'author');
+        await run(writer, 'records', { collection: 'asWritten', entries: [{ q: 'kept' }] }, 'author');
+
+        const state = writer.snapshot() as unknown as {
+            collections: Record<string, { definition: { responseBudgetBytes: number } }>;
+        };
+
+        // Every stored definition, exactly as a document written under the original 64 KiB
+        // default has it — including a `define`d collection that took the default.
+        for (const collection of Object.values(state.collections)) collection.definition.responseBudgetBytes = 65_536;
+
+        const reader = createRecordEngine();
+
+        reader.restore(state as unknown as never);
+
+        expect(await run(reader, 'records', { collection: 'asWritten', describe: true }, 'reader')).toEqual({
+            entries: [],
+            counts: { total: 1 },
+            page: { offset: 0, limit: 20, hasMore: false },
+            storeRev: 1,
+            collection: 'asWritten',
+            definition: {
+                name: 'asWritten',
+                fields: [{ key: 'q', type: 'text' }],
+                maxRecords: 200,
+                // VERBATIM. Not the 24,576 F1-6 lowered it to.
+                responseBudgetBytes: 65_536
+            }
+        });
+
+        // And it does not migrate out on the next save: a restore that rewrites nothing is the
+        // difference between "the document is accepted as written" and "the document is
+        // silently edited by whatever the engine's current default happens to be".
+        const resaved = reader.snapshot() as unknown as {
+            collections: Record<string, { definition: { responseBudgetBytes: number } }>;
+        };
+
+        expect(Object.values(resaved.collections).map((collection) => collection.definition.responseBudgetBytes)).toEqual(
+            [65_536, 65_536, 65_536, 65_536, 65_536]
+        );
+
+        // What a restore still refuses is a number NO `define` could have produced: verbatim
+        // restore is not a widened validation that swallows a corrupt document.
+        const corrupt = writer.snapshot() as unknown as {
+            collections: Record<string, { definition: { responseBudgetBytes: number } }>;
+        };
+
+        corrupt.collections.tasks.definition.responseBudgetBytes = 65_537;
+
+        const broken = createRecordEngine();
+
+        expect(() => broken.restore(corrupt as unknown as never)).toThrow(/responseBudgetBytes/);
+    });
+
+    // -----------------------------------------------------------------------
+    // AC3 + AC4 — THE GUARANTEE, MEASURED. Everything above this line bounds the ANSWER
+    // against the caller's budget; this is the bound on the DELIVERED bytes. A records
+    // answer that exceeds 32,768 payload bytes is not a short answer, it is NO answer:
+    // `boundToolResult` refuses a JSON document past the cap (./result-budget.ts:557-578),
+    // which costs the page, the cursor and the write receipts at once. So the assertion
+    // every case below makes first is a measurement in the guard's own unit.
+    // -----------------------------------------------------------------------
+    it('F7-4: a page sized by a 64 KiB budget is delivered inside the cap, and still pages losslessly', async () => {
+        // The aggregate flood F1-6 named: 200 rows, none of them individually large.
+        const engine = createRecordEngine();
+
+        await run(
+            engine,
+            'records',
+            { define: { name: 'notes', fields: [{ key: 'q', type: 'text' }], responseBudgetBytes: 65_536 } },
+            'author'
+        );
+
+        for (let index = 0; index < 200; index += 1) {
+            await run(engine, 'records', { collection: 'notes', entries: [{ q: `n${index}`.padEnd(600, 'y') }] }, 'author', 'thread-1');
+        }
+
+        const page = await run(engine, 'records', { collection: 'notes', limit: 100 }, 'reader');
+
+        // MEASURED, not inferred from the constant: 32,730 of the 32,768 the guard allows,
+        // 44 whole rows of the 100 the caller asked for.
+        expect((page.entries as RecordEntry[]).length).toBe(44);
+        expect(deliveryBytes(page)).toBe(32_730);
+        expect(deliveryBytes(page) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
+
+        // AC4 — the page tells the truth about what it withheld, and the cursor resumes AT the
+        // first withheld row (offset 44), not past it.
+        expect(page.page).toEqual({
+            offset: 0,
+            limit: 100,
+            hasMore: true,
+            budgetTruncated: true,
+            nextOffset: 44,
+            deliveryBudgetBytes: 32_768
+        });
+        expect(page.budgetTruncated).toBe(true);
+
+        // LOSSLESS, proven by walking: every row the clamped page did not carry arrives on a
+        // later page, each page inside the cap, and the walk terminates.
+        const ids = new Set<string>(((page.entries as RecordEntry[]) ?? []).map((entry) => entry.id));
+        let offset = page.page.nextOffset as number;
+        let guard = 0;
+
+        while (guard < 20) {
+            const step = await run(engine, 'records', { collection: 'notes', offset, limit: 100 }, 'reader');
+
+            expect(deliveryBytes(step) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
+
+            for (const entry of step.entries as RecordEntry[]) ids.add(entry.id);
+
+            if ((step.page as Record<string, unknown>).hasMore !== true) break;
+
+            offset = (step.page as Record<string, number>).nextOffset as number;
+            guard += 1;
+        }
+
+        expect(ids.size).toBe(200);
+    });
+
+    it('F7-4: the SINGLE maximal record — 16 fields x 4000 chars, larger than the cap — is delivered inside it', async () => {
+        // F1's own residual, stated in F1's report and left unfixed: "the first row of each
+        // kind is always admitted", so one record near the field caps is bigger than any budget
+        // and a one-row page could still be discarded by the guard. The clamp is what closes
+        // it: rows the caller can page to go first, and only then the FIELDS of the row that
+        // cannot be split any further.
+        const engine = createRecordEngine();
+
+        await run(
+            engine,
+            'records',
+            {
+                define: {
+                    name: 'monsters',
+                    fields: Array.from({ length: 16 }, (_unused, index) => ({ key: `f${index}`, type: 'text' }))
+                }
+            },
+            'author'
+        );
+
+        await run(
+            engine,
+            'records',
+            {
+                collection: 'monsters',
+                entries: [
+                    Object.fromEntries(
+                        Array.from({ length: 16 }, (_unused, index) => [`f${index}`, `${index}`.padEnd(4000, 'x')])
+                    )
+                ]
+            },
+            'author',
+            'thread-1'
+        );
+
+        // (a) a ONE-ROW PAGE. The record serializes at ~64,300 bytes — twice the cap — and the
+        // delivered answer measures 32,505 payload bytes, i.e. it FITS, with the leading 9
+        // fields of the row delivered and the rest NAMED rather than silently gone.
+        const page = await run(engine, 'records', { collection: 'monsters' }, 'reader');
+
+        expect((page.entries as RecordEntry[]).length).toBe(1);
+        expect(deliveryBytes(page)).toBe(32_505);
+        expect(deliveryBytes(page) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
+
+        const delivered = page.entries as RecordEntry[];
+
+        // The identity keys survive (`id` to address it, `rev` for the next CAS token), and
+        // the withheld keys are exactly the ones the ledger names: nothing is emptied.
+        expect(Object.keys(delivered[0]).sort()).toEqual(
+            ['id', 'rev', 'f0', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7'].sort()
+        );
+        expect(delivered[0].rev).toBe(1);
+        expect(delivered[0].f0).toBe('0'.padEnd(4000, 'x'));
+        expect(page.fieldsWithheld).toEqual({
+            '1': ['updatedAt', 'updatedThreadId', 'updatedBy', 'f15', 'f14', 'f13', 'f12', 'f11', 'f10', 'f9', 'f8']
+        });
+        expect(page.budgetTruncated).toBe(true);
+        // `hasMore: false` is TRUE here — this is the only record — while the truncation flag
+        // still fires, because what was withheld was FIELDS of the delivered row, not rows.
+        expect(page.page).toEqual({ offset: 0, limit: 20, hasMore: false, budgetTruncated: true, deliveryBudgetBytes: 32_768 });
+
+        // (b) the same record through a SINGLE-ID read: `entry`, no page rows to trade, so the
+        // echo ladder trims it. Still inside the cap, still naming what it withheld, and the
+        // PAGE beside it keeps `hasMore: false` because no row was ever withheld.
+        const single = await run(engine, 'records', { collection: 'monsters', ids: ['1'] }, 'reader');
+
+        expect(deliveryBytes(single)).toBe(32_446);
+        expect(deliveryBytes(single) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
+        expect(Object.keys(single.entry as RecordEntry).sort()).toEqual(
+            ['id', 'rev', 'f0', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7'].sort()
+        );
+        expect(single.budgetTruncated).toBe(true);
+        expect(single.fieldsWithheld).toEqual({
+            '1': ['updatedAt', 'updatedThreadId', 'updatedBy', 'f15', 'f14', 'f13', 'f12', 'f11', 'f10', 'f9', 'f8']
+        });
+        expect(single.page).toEqual({ offset: 0, limit: 20, hasMore: false });
+
+        // (c) the WRITE echo of that same record — the case F1's report called out for the
+        // write path, where the body rides TWICE: the page row plus the singular `entry`.
+        // The engine's own 64 KiB budget admits one such row and the echo, so what reaches
+        // this clamp is ~96,700 bytes; what leaves measures 32,751.
+        const added = await run(
+            engine,
+            'records',
+            {
+                collection: 'monsters',
+                entries: [
+                    Object.fromEntries(
+                        Array.from({ length: 16 }, (_unused, index) => [`f${index}`, `${index}`.padEnd(4000, 'x')])
+                    )
+                ]
+            },
+            'author',
+            'thread-1'
+        );
+
+        expect(deliveryBytes(added)).toBe(32_751);
+        expect(deliveryBytes(added) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
+        // LADDER ORDER, pinned by the shape of the answer: the echo — prose the caller just
+        // wrote itself — collapses ALL the way to `{ id, rev }` (19 keys withheld), and only
+        // the row that survives carries fields (8 of them, 11 keys withheld). The receipts,
+        // `counts` and the store watermarks are never candidates, which is why the caller can
+        // still address what it just wrote.
+        expect(added.entry).toEqual({ id: '2', rev: 1 });
+        expect(Object.keys(added.entries as never[]).length).toBe(1);
+        expect(Object.keys((added.entries as RecordEntry[])[0]).sort()).toEqual(
+            ['id', 'rev', 'f0', 'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7'].sort()
+        );
+        expect(added.addedIds).toEqual(['2']);
+        expect(added.fieldsWithheld).toEqual({
+            '1': ['updatedAt', 'updatedThreadId', 'updatedBy', 'f15', 'f14', 'f13', 'f12', 'f11', 'f10', 'f9', 'f8'],
+            '2': [
+                'updatedAt',
+                'updatedThreadId',
+                'updatedBy',
+                'f15',
+                'f14',
+                'f13',
+                'f12',
+                'f11',
+                'f10',
+                'f9',
+                'f8',
+                'f7',
+                'f6',
+                'f5',
+                'f4',
+                'f3',
+                'f2',
+                'f1',
+                'f0'
+            ]
+        });
+        // The cursor is the ENGINE's, untouched: the second row was already withheld by the
+        // collection's 64 KiB budget, and the clamp reports that loss rather than overwriting
+        // it with its own arithmetic.
+        expect(added.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            nextOffset: 1,
+            budgetTruncated: true,
+            deliveryBudgetBytes: 32_768
+        });
+        expect(added.budgetTruncated).toBe(true);
+        expect(added.deliveryBudgetBytes).toBe(32_768);
+    });
+
+    it('F7-4: the clamp spends the cheapest loss first — the change feed gives way before any page row', async () => {
+        const engine = createRecordEngine();
+
+        await run(engine, 'records', { define: { name: 'notes', fields: [{ key: 'q', type: 'text' }] } }, 'author');
+
+        // 200 records, because `limit` tops out at 100 and only a 200-revision feed is large
+        // enough to force a real choice between the feed and the page.
+        for (let index = 0; index < 200; index += 1) {
+            await run(engine, 'records', { collection: 'notes', entries: [{ q: `n${index}`.padEnd(600, 'y') }] }, 'author', 'thread-1');
+        }
+
+        // THE CONTROL: the same page WITHOUT a feed. The collection's own 64 KiB budget admits
+        // 44 rows, and the clamp takes one more byte off than that is worth, stopping at 44 for
+        // 32,730 payload bytes.
+        const plain = await run(engine, 'records', { collection: 'notes', limit: 100 }, 'reader');
+
+        expect(deliveryBytes(plain)).toBe(32_730);
+        expect((plain.entries as RecordEntry[]).length).toBe(44);
+        expect('changesHasMore' in plain).toBe(false);
+
+        // THE SAME PAGE WITH THE FEED: 32,078 bytes, 43 rows, and a WHOLE 200-row feed
+        // withheld. The feed cost more than the page row it bought back — the ladder spends the
+        // loss a caller can recover from (`since`) before it spends page rows, which is the
+        // same priority the byte budget uses (./records.ts `project`).
+        const fed = await run(engine, 'records', { collection: 'notes', limit: 100, since: 0 }, 'reader');
+
+        expect(deliveryBytes(fed)).toBe(32_078);
+        expect(deliveryBytes(fed) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
+        expect((fed.entries as RecordEntry[]).length).toBe(43);
+        expect((fed.changes as RecordChange[])).toEqual([]);
+        // The feed reports ITS OWN loss, and only its own: `changesHasMore` is "more events
+        // exist past what this answer shows", which is exactly what a withheld feed means.
+        expect(fed.changesHasMore).toBe(true);
+        // `changesTruncated` is the RETENTION-FLOOR flag (./records.ts:999) — events gone
+        // for good. The clamp withheld rows that are still in the window, so this stays false:
+        // a reader that resumes from its own watermark loses nothing.
+        expect(fed.changesTruncated).toBe(false);
+        expect(fed.droppedEvents).toBe(0);
+        // The PAGE half: it did lose rows (44 → 43), so the page says so and its cursor counts
+        // the 43 that survived.
+        expect(fed.page).toEqual({
+            offset: 0,
+            limit: 100,
+            hasMore: true,
+            nextOffset: 43,
+            budgetTruncated: true,
+            deliveryBudgetBytes: 32_768
+        });
+        expect(fed.budgetTruncated).toBe(true);
+        expect(fed.deliveryBudgetBytes).toBe(32_768);
+    });
+
+    it('F7-4: a keyset walk across a clamped page resumes at the last DELIVERED id, not past it', async () => {
+        // `nextAfterId` is the seam R2/T2.1 built so a caller can switch page orders without
+        // losing records. A clamp that dropped rows and left the engine's cursor standing would
+        // have resumed AFTER the withheld rows and skipped them — silent data loss wearing a
+        // truthful-looking cursor.
+        const engine = createRecordEngine();
+
+        const chunk = 'x'.repeat(600);
+        const seeded = await tasks(engine, { tasks: Array.from({ length: 20 }, () => ({ text: chunk.repeat(6) })) }, 'author', 'thread-1');
+
+        expect((seeded.tasks as RecordEntry[]).length).toBe(8);
+
+        const ids: string[] = (seeded.tasks as RecordEntry[]).map((entry) => entry.id);
+        let afterId = '0';
+        let guard = 0;
+
+        for (;;) {
+            const step = await tasks(engine, { afterId, limit: 20 }, 'author', 'thread-1');
+
+            expect(deliveryBytes(step) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
+
+            for (const entry of step.tasks as RecordEntry[]) if (!ids.includes(entry.id)) ids.push(entry.id);
+
+            if ((step.page as Record<string, unknown>).hasMore !== true) break;
+
+            const page = step.page as Record<string, string>;
+
+            // The cursor is the MAXIMUM id actually on this page — not of the page the engine
+            // had loaded before the clamp trimmed it.
+            const delivered = (step.tasks as RecordEntry[]).map((entry) => Number(entry.id));
+
+            expect(Number(page.nextAfterId)).toBe(Math.max(...delivered));
+            afterId = page.nextAfterId;
+            guard += 1;
+
+            if (guard > 20) break;
+        }
+
+        // The walk saw all 20, in id order, and terminated.
+        expect(ids.sort((left, right) => Number(left) - Number(right))).toEqual(
+            Array.from({ length: 20 }, (_unused, index) => String(index + 1))
+        );
+    });
+
+    it('F7-4: an answer that fits the cap is byte-exact — the clamp never adds a marker to one', async () => {
+        // The additive contract: `deliveryBudgetBytes` and `fieldsWithheld` appear ONLY on a
+        // clamped answer. Every existing whole-object `page` assertion in these suites depends
+        // on this, and so does a caller that diffs answers between turns.
+        const engine = createRecordEngine();
+
+        await addTasks(engine, 3);
+
+        const read = await tasks(engine, {}, 'author', 'thread-1');
+
+        expect(deliveryBytes(read) <= RECORD_DELIVERY_CAP_BYTES).toBe(true);
+        expect('deliveryBudgetBytes' in (read.page as Record<string, unknown>)).toBe(false);
+        expect('deliveryBudgetBytes' in read).toBe(false);
+        expect('fieldsWithheld' in read).toBe(false);
+        expect('budgetTruncated' in read).toBe(false);
+        expect(read.page).toEqual({ offset: 0, limit: 20, hasMore: false });
+    });
+
+    // F1-6 (2026-11-25) — THE RELATION, pinned by number instead of by prose. The comment on
+    // `RECORD_RESPONSE_BUDGET_BYTES` has claimed since the F13 pass that the page budget stays
+    // under `MODEL_TOOL_RESULT_BUDGET_BYTES`, and the constant sat at 64 KiB against a
+    // 32,768-byte cap, so the claim was false — and silently so, because a JSON tool result
+    // past the cap is DISCARDED, not cut (./result-budget.ts:557-578): the caller loses the
+    // page AND the `page.nextOffset` it would have paged with. Pinned in the style of
+    // ./knowledge.test.ts:262, which pins the same relation for the sibling engine.
+    // F1-6 (2026-11-25) pinned the relation `page budget < delivery cap` by NUMBER, after the
+    // comment on `RECORD_RESPONSE_BUDGET_BYTES` had claimed it for a pass while the constant sat
+    // at 64 KiB against a 32,768-byte cap — a false claim, and silently so, because a JSON tool
+    // result past the cap is DISCARDED, not cut (./result-budget.ts:557-578), so the caller loses
+    // the page AND the `page.nextOffset` it would have paged with. F1 fixed that by narrowing the
+    // budget to 24,576; F7-4 fixes the same hazard at the delivery seam and restores the wider
+    // range, so the relation the pin asserts is now the OTHER one — the configured budget sits
+    // above the cap on purpose, and `clampToDeliveryCap` is what guarantees the delivered answer
+    // sits under it. Pinned in the style of ./knowledge.test.ts:262, which pins the sibling
+    // engine's relation.
+    it('F7-4: every budget and the cap it is clamped to, pinned by number', () => {
+        expect(MODEL_TOOL_RESULT_BUDGET_BYTES).toBe(32_768);
+        expect(RECORD_DELIVERY_CAP_BYTES).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(RECORD_RESPONSE_BUDGET_BYTES).toBe(65_536);
+        expect(RECORD_RESPONSE_BUDGET_BYTES > RECORD_DELIVERY_CAP_BYTES).toBe(true);
+
+        // The four built-ins are the collections that actually flood a session, and each one
+        // hardcoded its budget independently of the engine default — which is why F1 moving the
+        // constant alone changed them and why F7-4 restores them verbatim rather than scaling
+        // them: the clamp, not the number, is the guarantee.
+        expect([
+            TASKS_COLLECTION.responseBudgetBytes,
+            CHAPTERS_COLLECTION.responseBudgetBytes,
+            PROFILES_COLLECTION.responseBudgetBytes,
+            LOCATIONS_COLLECTION.responseBudgetBytes
+        ]).toEqual([65_536, 65_536, 65_536, 65_536]);
     });
 
     // M2 — the field options were read type-blind: `maxItems` on an `enum` or `values` on an
@@ -4231,7 +4820,10 @@ describe('records engine — the budget bounds every answer and every refusal na
                 { key: 'b', type: 'integer' }
             ],
             maxRecords: 10,
-            responseBudgetBytes: 65536
+            // The budget this collection was defined with, which F7-4 (2026-11-25) restored
+            // to the 65,536 engine default (F1-6 had moved the default to 24,576; the
+            // 32,768-byte delivery cap is enforced at serve time, not by this number).
+            responseBudgetBytes: 65_536
         });
         // `toEqual` reads an absent key and an `undefined` key alike, so the absence is
         // asserted directly: the stripped options are gone from the live definition, not

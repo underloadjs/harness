@@ -42,15 +42,22 @@ export const TASK_MAX_TEXT = 4000;
 export const TASKS_COLLECTION: RecordCollectionDefinition = {
     name: 'tasks',
     maxRecords: TASK_MAX_RECORDS,
-    // F13's real invariant is about the RELATION of the two budgets, and the old sentence
-    // for it is stale: the page is budgeted at 64 KiB while ./result-budget.ts caps one
-    // rendered tool result at MODEL_TOOL_RESULT_BUDGET_BYTES = 32,768 payload bytes, so the
-    // inner budget is the LARGER of the two — the 256 KiB this comment used to quote no
-    // longer exists. What still holds is the honest half: a page over the cap is never
-    // silently truncated behind a `hasMore: false` claim. It is REFUSED at the delivery seam
-    // (F-CUTTER) with a "re-run with narrower arguments" error the caller can act on. R8
-    // says the 64 KiB number itself is tunable; an agent that needs a page to arrive whole
-    // sets `responseBudgetBytes` at or below 32,768.
+    // THE CONFIGURED PAGE BUDGET — 64 KiB, the number this collection was born with.
+    // It is what the PRODUCER pages by: `project` stops the page at the last whole row
+    // that fits this many bytes and sets `page.budgetTruncated` (./records.ts:3466, stop at :3515).
+    //
+    // It is NOT the delivery guarantee, and F7-4 (2026-11-25) is why the two are kept
+    // apart. The harness delivers ONE tool result at 32,768 payload bytes
+    // (`MODEL_TOOL_RESULT_BUDGET_BYTES`, ./result-budget.ts:231) and REFUSES a JSON
+    // document past it (./result-budget.ts:557-578), so a 64 KiB page cannot reach the
+    // model whole — but the fix is the serve-time clamp in `clampToDeliveryCap`
+    // (./records.ts:739), not a lower number here. F1-6 lowered this to 24 KiB, which
+    // turned a previously valid `define` into a refusal, rewrote every persisted 65,536,
+    // and STILL left a single record (16 fields x 4,000 chars) overshooting the cap.
+    // So: the budget states what the caller asked for, the clamp states what the harness
+    // can carry, and a clamped answer says which bound fired
+    // (`page.deliveryBudgetBytes`). R8 keeps this number tunable, 1,024..65,536
+    // (`RECORD_MIN/MAX_RESPONSE_BUDGET_BYTES`, ./records.ts:186).
     responseBudgetBytes: 64 * 1024,
     wrapper: { tool: 'tasks', plural: 'tasks', singular: 'task', style: 'batch' },
     fields: [

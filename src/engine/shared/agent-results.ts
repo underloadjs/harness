@@ -18,6 +18,15 @@
 // nested block draw from that sequence too, so a conversation label, a legacy root
 // and a nested child can never share one text label.
 //
+// ONLY OWNERS DRAW (F6, 2026-11-25): a block whose run can never BE a durable
+// conversation — a threadFork branch, or a `delegate` placeholder whose child never
+// started — consumes NOTHING from that sequence and displays `UNADDRESSABLE_BLOCK_LABEL`
+// (`T?`) instead of an ordinal, because a label is an ADDRESS
+// (../core/thread.ts `resolveThreadAddressOf`) and a minted number no conversation
+// answers to both leaves a gap the user reads as a broken label and can collide with a
+// real name. A minted number is additionally skipped when this SAME record already
+// shows it for a conversation, so one turn can never print one address twice.
+//
 // A user can type `#IT1` in a NEW prompt to reference the completed result of a
 // prior block. The reference is resolved against the SERVER's recorded turns (not
 // the live agent transcript), and the completed `done` content is appended to the
@@ -81,6 +90,11 @@ export type AgentResultBlock = {
     // for a threadless legacy stream). Lookups also accept aliases the block used
     // earlier (e.g. `call:<callId>` after adoption).
     threadId?: string;
+    // The block's compact display label (`IT1`), or `UNADDRESSABLE_BLOCK_LABEL` (`T?`) when
+    // the run owns no addressable identity (a threadFork branch, a delegation whose child
+    // never started). Only a label matching `AGENT_REFERENCE_LABEL_PATTERN` can be bound as a
+    // reference or resolved by `findAgentResultBlock`; the fallback is display-only, and the
+    // run's real id stays on `threadId`.
     label: string;
     // The agent id that produced the block (never displayed raw by the UI).
     agent: string;
@@ -225,6 +239,38 @@ export const agentLabelParts = (value: unknown): AgentLabelParts | undefined => 
     return { label, code: label.slice(0, 2), ordinal };
 };
 
+// F6 (2026-11-25) — the honest identity of a block that owns NO addressable label.
+//
+// A block label is an ADDRESS, not a caption. `../core/thread.ts` `resolveThreadAddressOf`
+// matches a `<CODE><ordinal>` exactly and REFUSES an ambiguous one, and every door that
+// resolves a typed `#LABEL` (`normalizeAgentLabel` → `AGENT_REFERENCE_LABEL_PATTERN`,
+// `findAgentResultBlock`, `findLatestAgentResultBlock`, `readAgentResultReferenceList`)
+// accepts that grammar and nothing else. So a run that can never become a durable
+// conversation must not be shown a fabricated ordinal:
+//   - a threadFork BRANCH run (`../core/branch.ts` `createBranchId` mints `branch-N`, no
+//     conversation record is persisted for it, and the store's run→conversation join never
+//     holds it — ../../server/sessions.ts `liveThreadLabel`: "A branch invocation is never
+//     in the join map");
+//   - a `delegate` PLACEHOLDER whose child never started (the parent made the call and the
+//     record holds no child frames at all).
+// Measured on the operator's own session (Temp/fix-f3/replay-after.out, session
+// e513eed7): the block projection minted `IT13 IT14 IT15 IT16 IT17 IT18 IT19 WE12` for
+// exactly those runs, plus a SECOND `RR9` for a threadless block while `thread-57` owns
+// `RR9`, and the durable `IT` high-water sat at 20 with only IT1-IT8, IT12 and IT20 owned.
+// Those are the user's "IT13, IT15 … have no label, some are empty in total".
+//
+// WHY THIS TEXT: `T?` is the codebase's declared token for "identity not known" — the
+// frontend's `ui/threads.ts` `UNKNOWN_THREAD_LABEL` retires a thread row for the same
+// reason stated there (../frontend/ui/threads.ts:395, the loadscript client's roster strip):
+// "a retired id consumes NO per-agent ordinal and
+// cannot renumber a live conversation's name". Reusing the existing token keeps ONE unknown
+// shape across the roster strip, the transcript badge and the block descriptor instead of
+// inventing a second one. It deliberately fails `[A-Z]{2}\d+`, so it can never be parsed into
+// `AgentLabelParts`, never be bound as a reference, and never collide with a real name; the
+// block still carries its real id (`branch-N`, `call:<callId>`, `inline:<agent>`) for the UI
+// and for the engine's id-addressed doors (`threadRead`/`agentResult` take the id).
+export const UNADDRESSABLE_BLOCK_LABEL = 'T?';
+
 // Canonical identity used by the allocator: trimmed + lower-cased (identical to
 // `agentKeyOf` in ../frontend/ui/agent-color.ts).
 const agentKeyOf = (agent: string | undefined): string => (agent ?? '').trim().toLowerCase();
@@ -335,11 +381,24 @@ type ReplayBlock = {
     terminal: boolean;
     content: string | undefined;
     lastDone: string | undefined;
+    // F10 (R10.3): whether `label` is a conversation's OWN address (see `ProjectedBlock`).
+    // Set where the label is TAKEN (a join entry, `turn.threadLabel`), never where it is
+    // MINTED, so a minted ordinal cannot be mistaken for an owned address later.
+    ownsConversation: boolean;
 };
 
-// A projected block plus its non-wire alias list. Public helpers strip `aliases`,
-// but lookups use them so an old stable binding keeps working.
-type ProjectedBlock = AgentResultBlock & { aliases: string[] };
+// A projected block plus its non-wire fields. Public helpers strip `aliases` and
+// `ownsConversation`, but lookups use the aliases so an old stable binding keeps working.
+//
+// F10 (R10.3) `ownsConversation` is the PROVENANCE of the block's label, not another
+// display figure: true only when the label is an ADDRESS a persistent conversation owns
+// (the store's run→conversation join named it, or it is the turn's own `threadLabel`).
+// `collectAgentLabelCounters` is the one consumer — a label this projection MINTED for a
+// run the join never names is an ordinal no conversation answers to, and feeding it into
+// the durable per-code high-water is what inflated `WE:12 → WE:16` on the operator's
+// session (../server/sessions.ts `mergeLabelHighWater` is raise-only, so every inflated
+// number outlives the turn that minted it).
+type ProjectedBlock = AgentResultBlock & { aliases: string[]; ownsConversation: boolean };
 
 // Parse `delegate` arguments for the legacy placeholder: a delegation's
 // spawning call is the only evidence of the child block when its `thread` metadata
@@ -401,6 +460,72 @@ const blocksOfTurn = (
     // any rank can be the entry, and this value only decides which block is the root one.
     let entryAgent: string | undefined;
 
+    // F6: the conversation labels THIS record shows — the turn's own conversation label plus
+    // every join entry one of its own frames can reach. A per-run number minted in this turn
+    // may never land on one of those, or the same address prints twice in one turn (the
+    // second `RR9` measured beside `thread-57`'s real one). Only this record's labels are
+    // claimed: `turn.threadLabels` is a session-wide view, and claiming a name belonging to a
+    // conversation of another turn would renumber a block that is already on screen.
+    const claimed = new Set<string>();
+
+    const claim = (value: string | undefined): void => {
+        const parts = agentLabelParts(value);
+        if (parts !== undefined) claimed.add(parts.label);
+    };
+
+    claim(turn.threadLabel);
+
+    const join = turn.threadLabels;
+
+    if (join !== undefined) {
+        for (const event of turn.events) {
+            const frame = (event as { thread?: { id: string; epoch?: string } }).thread;
+            if (frame === undefined) continue;
+
+            // The SAME run-then-bare resolution `blockForThread` performs, so the claimed set
+            // is exactly the set of labels this projection can actually adopt — no more.
+            const runKey = invocationRunKeyOf(frame.id, frame.epoch);
+
+            claim(join[runKey] ?? (runKey === frame.id ? undefined : join[frame.id]));
+        }
+    }
+
+    // T14: an explicit CONVERSATION label always RESERVES its ordinal in the one per-code
+    // sequence, so a nested block of the same code can never be minted the number the
+    // conversation already shows. Extracted from `createBlock` because the ADOPTION path needs
+    // it too: a placeholder no longer carries a tentative mint of its own, so the reservation
+    // cannot piggyback on it any more.
+    const reserveConversationLabel = (label: string | undefined): void => {
+        if (label === undefined) return;
+
+        const parts = agentLabelParts(label);
+        if (parts === undefined) return;
+
+        labels.seed(new Map([[parts.code, parts.ordinal]]));
+    };
+
+    // Mint the next ordinal of this agent's code.
+    //
+    // `provisional` mints are EXEMPT from the collision skip on purpose: a `delegate`
+    // placeholder takes a number at the CALL frame (the order the UI allocates in, which is
+    // what keeps a chip and the wire prompt agreeing), and hands it back to the join the
+    // moment the child's own frame names its conversation. Skipping for a number that is about
+    // to be handed back would push the NEXT block's label up one for nothing.
+    const mintLabel = (agent: string | undefined, provisional: boolean): string => {
+        let label = labels.next(agent);
+
+        if (!provisional) {
+            // Bounded by construction: `next` strictly raises this code's ordinal, so the loop
+            // can only walk past the at-most-`claimed.size` names that are taken. The guard
+            // keeps that argument explicit rather than implicit.
+            for (let guard = claimed.size + 1; claimed.has(label) && guard > 0; guard--) {
+                label = labels.next(agent);
+            }
+        }
+
+        return label;
+    };
+
     const createBlock = (
         agent: string,
         threadId: string | undefined,
@@ -409,7 +534,16 @@ const blocksOfTurn = (
         // R8: an explicit CONVERSATION label. When present it is authoritative and
         // the allocator does not MINT a number for this block (a run, continuation
         // or nested invocation inside one conversation repeats the same label).
-        label?: string
+        label?: string,
+        // F6: how this block gets its identity when no conversation label is recorded.
+        options: {
+            // false = this run can never own a durable conversation (a threadFork branch),
+            // so it consumes NO per-agent ordinal and reads `UNADDRESSABLE_BLOCK_LABEL`.
+            reserveLabel?: boolean;
+            // true = a `delegate` placeholder's TENTATIVE number, re-named by the join when
+            // the child starts (see `mintLabel`).
+            provisional?: boolean;
+        } = {}
     ): ReplayBlock => {
         // T14: an explicit label still RESERVES its number in the sequence. The
         // projector chains one allocator across the conversation, and a nested
@@ -417,14 +551,15 @@ const blocksOfTurn = (
         // the conversation already shows (`RR1` root + `RR1` child). Raising the
         // counter also makes `collectAgentLabelCounters` report conversation labels,
         // so the server's durable counters and this sequence cannot diverge.
-        if (label !== undefined) {
-            const parts = agentLabelParts(label);
-            if (parts !== undefined) labels.seed(new Map([[parts.code, parts.ordinal]]));
-        }
+        reserveConversationLabel(label);
 
         const block: ReplayBlock = {
             agent,
-            label: label ?? labels.next(agent),
+            label:
+                label ??
+                (options.reserveLabel === false
+                    ? UNADDRESSABLE_BLOCK_LABEL
+                    : mintLabel(agent, options.provisional === true)),
             threadId,
             runtimeThreadId: undefined,
             callId,
@@ -433,7 +568,12 @@ const blocksOfTurn = (
             status: 'running',
             terminal: false,
             content: undefined,
-            lastDone: undefined
+            lastDone: undefined,
+            // F10 (R10.3): ONLY an explicit conversation label is an owned address. A number
+            // this allocator minted — for a threadless legacy run, a pending `delegate`
+            // placeholder, or any run the join never named — is a locally-consistent
+            // occurrence, not a conversation's name, and must not raise the durable water.
+            ownsConversation: label !== undefined
         };
 
         blocks.push(block);
@@ -501,19 +641,49 @@ const blocksOfTurn = (
         const conversationLabel =
             turn.threadLabels?.[runKey] ?? (runKey === thread.id ? undefined : turn.threadLabels?.[thread.id]);
 
+        // F6: a threadFork BRANCH run owns no conversation, so it gets no ordinal. The frame
+        // says so directly — `kind: 'fork' | 'autoanswer'` and/or `branchId`
+        // (../types/index.ts `HarnessThread`) — and every record that predates those fields
+        // still carries the generated `branch-N` invocation id itself
+        // (../core/branch.ts:142 `createBranchId`). No conversation record is persisted for a
+        // branch and the store's join never names one, so an ordinal minted here is a number
+        // NO block ever answers to.
+        const isBranchRun =
+            thread.branchId !== undefined ||
+            thread.kind === 'fork' ||
+            thread.kind === 'autoanswer' ||
+            thread.id.startsWith('branch-');
+
         const placeholder = thread.callId === undefined ? undefined : byCall.get(thread.callId);
         if (placeholder !== undefined && placeholder.runtimeThreadId === undefined) {
             placeholder.threadId = thread.id;
             placeholder.runtimeThreadId = thread.id;
             // R8: the child's CONVERSATION label replaces the provisional
             // per-invocation number the spawning call minted.
-            if (conversationLabel !== undefined) placeholder.label = conversationLabel;
+            if (conversationLabel !== undefined) {
+                placeholder.label = conversationLabel;
+                // F10 (R10.3): this label is now the CONVERSATION's own address (the store
+                // named it), so it is exactly the kind of number the durable high-water must
+                // keep. A block that only ever holds a minted number stays `false`.
+                placeholder.ownsConversation = true;
+                // T14 (F6): the ADOPTING path reserves the number it takes over. It used to be
+                // reserved implicitly by the placeholder's own tentative mint landing on the same
+                // value; with branch runs and never-started children no longer burning numbers,
+                // the seed has to be explicit or a later block could be minted `RR5` twice.
+                reserveConversationLabel(conversationLabel);
+            } else if (isBranchRun) {
+                // A branch frame that adopted a placeholder is the same live-only run: the
+                // tentative number goes back.
+                placeholder.label = UNADDRESSABLE_BLOCK_LABEL;
+            }
             byThread.set(runKey, placeholder);
             placeholder.started = true;
             return placeholder;
         }
 
-        const block = createBlock(event.agent, thread.id, thread.callId, [], conversationLabel);
+        const block = createBlock(event.agent, thread.id, thread.callId, [], conversationLabel, {
+            reserveLabel: !isBranchRun
+        });
         block.runtimeThreadId = thread.id;
         byThread.set(runKey, block);
         return block;
@@ -616,7 +786,18 @@ const blocksOfTurn = (
                         // the UI shows); the same string is kept as an alias after
                         // adoption so a reference bound now still resolves.
                         const key = `call:${event.call.id}`;
-                        const placeholder = createBlock(delegate.agent, key, event.call.id, [key]);
+
+                        // F6: `provisional` — this number belongs to a run that has not happened
+                        // yet. It keeps the allocation ORDER the UI allocates in (a chip and the
+                        // wire prompt must agree about a pending delegation, which is what
+                        // ./agent-results.test.ts and the frontend's blocks.test.ts pin), and it
+                        // is handed back at the end of the turn if the child never started
+                        // (see the `UNADDRESSABLE_BLOCK_LABEL` pass below) or re-named by the
+                        // join when it does.
+                        const placeholder = createBlock(delegate.agent, key, event.call.id, [key], undefined, {
+                            provisional: true
+                        });
+
                         placeholder.started = false;
                         byCall.set(event.call.id, placeholder);
                     }
@@ -683,6 +864,38 @@ const blocksOfTurn = (
         block.content = undefined;
     }
 
+    // F6 (the operator's `IT13`/`IT18`/`IT19`/`WE12` rows): a `delegate` placeholder whose
+    // child NEVER STARTED is not a run at all. The parent made the call, the record holds no
+    // child frames, and the only thing that settled the call is the parent's own
+    // `tool_result` (or the turn ending) — every such block in the measured session had ZERO
+    // characters. It keeps the honest unknown identity, so the phantom row cannot be typed as
+    // `#IT13` and cannot shadow a conversation's name, and
+    // `collectAgentLabelCounters` ignores the number it tentatively took.
+    //
+    // WHY ONLY A SETTLED TURN: while the turn is `running`/`queued` the child may still start
+    // and adopt a conversation label, and a chip can legitimately bind the pending block by its
+    // tentative number — that is exactly the state ./agent-results.test.ts ("resolves the
+    // stable call alias before AND after delegation adoption") and the frontend's
+    // blocks.test.ts pin, so a live pending delegation keeps showing its number.
+    //
+    // WHY `started === false` AND NOT `runtimeThreadId === undefined`: a LEGACY threadless
+    // child adopts its placeholder through `blockForLegacy` (started, no runtime id) and IS a
+    // real run with real content; it keeps its number. A placeholder that was blanked here has
+    // no run behind it to reference.
+    const turnSettled = turn.status !== 'queued' && turn.status !== 'running';
+
+    if (turnSettled) {
+        for (const block of blocks) {
+            if (block.started || block.callId === undefined) continue;
+
+            block.label = UNADDRESSABLE_BLOCK_LABEL;
+            // F10 (R10.3): a retired placeholder owns no address, and it is the ONE case where
+            // a label is TAKEN away after the mint, so the provenance flag is re-stamped here
+            // rather than trusted from creation.
+            block.ownsConversation = false;
+        }
+    }
+
     return blocks.map((block) => ({
         turnId: turn.id,
         ...(block.threadId === undefined ? {} : { threadId: block.threadId }),
@@ -690,15 +903,16 @@ const blocksOfTurn = (
         agent: block.agent,
         status: block.status,
         ...(block.status === 'done' && block.content !== undefined ? { content: block.content } : {}),
-        aliases: [...block.aliases]
+        aliases: [...block.aliases],
+        ownsConversation: block.ownsConversation
     }));
 };
 
-// Strip the internal alias list from a projected block before it leaves this
+// Strip the internal fields from a projected block before it leaves this
 // module. The wire/UI descriptor shape stays exactly {turnId, threadId?, label,
 // agent, status, content?}.
 const publicBlock = (block: ProjectedBlock): AgentResultBlock => {
-    const { aliases: _aliases, ...descriptor } = block;
+    const { aliases: _aliases, ownsConversation: _ownsConversation, ...descriptor } = block;
     return descriptor;
 };
 
@@ -711,13 +925,100 @@ const publicBlock = (block: ProjectedBlock): AgentResultBlock => {
 // caller must supply turns in recorded order; `turns.labels` values already on the
 // list are honoured, so computing a seed over a history that already carries seeds
 // yields the same counters a live replay would.
+//
+// F6 (2026-11-25): the water is the set of labels the projection ENDS UP SHOWING, plus
+// every start-counter a turn already records — NOT the end state of the allocator that
+// walked the events. The two differ for exactly the numbers that must NOT become durable:
+//   - a `delegate` placeholder's TENTATIVE mint, handed back to the join when the child's
+//     own frame named its conversation (or retired because the child never started);
+//   - a number a branch run or any other non-addressable block never displayed.
+// Feeding those back is how the operator's session reached `IT` high-water 20 with IT9-IT11
+// and IT13-IT19 owned by nothing: ../../server/sessions.ts `labelSeedOf` merges THIS map
+// into `labelHighWater`, so every mint was re-hydrated into the next turn's seed and every
+// later conversation. The chained allocator still mints the display numbers (it must stay
+// identical to `listAgentResultBlocks`, or a chip and the wire prompt disagree), and
+// `seed`-only-raises semantics are unchanged.
+//
+// F10 (R10.3, 2026-11-26) — the same rule, applied to the numbers a NON-owner displays.
+// F6 retired the phantoms that show `UNADDRESSABLE_BLOCK_LABEL`, but a run that keeps a
+// minted number while owning no conversation (`inline:<agent>`, a `call:<id>` child the join
+// never claimed) still pushed the durable water above every ordinal the join knows: measured
+// over all 10 turns of the operator's session, the join's `WE` water is 11, its persisted
+// `labelHighWater` reads 12, and this function returned 16 (WE13-WE16 owned by nothing).
+// So a MINTED label raises the counters only while it is at or below the highest ordinal the
+// supplied join names for that code; an owned conversation label and a recorded seed raise it
+// unconditionally, and a turn with NO join view (a legacy `/messages` record, where the
+// minted occurrence is the whole reference namespace) behaves exactly as it always did.
 export const collectAgentLabelCounters = (
     turns: readonly AgentResultTurn[]
 ): Map<string, number> => {
     const labels = createAgentLabels();
-    for (const turn of turns) blocksOfTurn(turn, labels);
+    const counters = new Map<string, number>();
 
-    return labels.counters();
+    const raise = (code: string, used: number): void => {
+        if (used > (counters.get(code) ?? 0)) counters.set(code, used);
+    };
+
+    // F10 (R10.3) — THE OWNER WATER of one record: the highest ordinal the store's join
+    // itself NAMES for each code. `AgentResultTurn.threadLabels` is handed out only when the
+    // session actually has labelled conversations (../server/sessions.ts:8501-8517
+    // `hasThreadLabels`), so an absent view is the legacy `/messages` shape, where a minted
+    // occurrence is the ONLY reference namespace there is and keeps raising the water exactly
+    // as it always did.
+    const ownerWaterOf = (join: Readonly<Record<string, string>> | undefined): Map<string, number> | undefined => {
+        if (join === undefined) return undefined;
+
+        const water = new Map<string, number>();
+
+        for (const value of Object.values(join)) {
+            const parts = agentLabelParts(value);
+            if (parts === undefined || parts.ordinal <= (water.get(parts.code) ?? 0)) continue;
+
+            water.set(parts.code, parts.ordinal);
+        }
+
+        return water;
+    };
+
+    for (const turn of turns) {
+        // A turn's RECORDED start counters are durable state the next turn continues from even
+        // when the turn itself displays nothing (a queued turn, or one whose every block reads
+        // `UNADDRESSABLE_BLOCK_LABEL`). Dropping them would let a deleted conversation's
+        // ordinal come back into use.
+        if (turn.labels !== undefined) {
+            for (const [code, used] of Object.entries(turn.labels)) raise(code, used);
+        }
+
+        const ownerWater = ownerWaterOf(turn.threadLabels);
+
+        for (const block of blocksOfTurn(turn, labels)) {
+            // `UNADDRESSABLE_BLOCK_LABEL` (and any other non-grammar text) parses to nothing,
+            // which is precisely why it reserves nothing.
+            const parts = agentLabelParts(block.label);
+            if (parts === undefined) continue;
+
+            // F10 (R10.3) — THE ONE RULE: a number this projection MINTED for a run the join
+            // never names belongs to NO conversation, so it may never become durable. Measured
+            // on the operator's session, exactly those numbers are `WE13`-`WE16` (a threadless
+            // `inline:<agent>` stream and a `call:<id>` child that never earned a conversation
+            // row), and they are the reason `labelHighWater.WE` read 12 while the join only
+            // ever named WE11: ../server/sessions.ts `mergeLabelHighWater` only ever RAISES,
+            // so a minted orphan is immortal. The display keeps minting them (a run still needs
+            // SOME local identity to be citable within its own turn), and an owned conversation
+            // label — `block.ownsConversation`, i.e. a label the join or `turn.threadLabel`
+            // handed over — still raises, as does every recorded seed above.
+            if (
+                !block.ownsConversation &&
+                ownerWater !== undefined &&
+                parts.ordinal > (ownerWater.get(parts.code) ?? 0)
+            )
+                continue;
+
+            raise(parts.code, parts.ordinal);
+        }
+    }
+
+    return counters;
 };
 
 // List every block across turns, oldest turn first and each turn's blocks in

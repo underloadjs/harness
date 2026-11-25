@@ -16,6 +16,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // The entries are read as TEXT by the F12 construction check below, so the assertion is
 // about the shipped source, not about a fixture copy of it.
 import { readFile } from 'node:fs/promises';
+// F7-4's byte pins below are stated in the SAME currency the delivery guard bills in: the
+// escaped payload of the exact string `serialize()` hands `boundDelivery` (./harness.ts:1369).
+import { modelPayloadBytes } from './core/payload-bytes';
+import { MODEL_TOOL_RESULT_BUDGET_BYTES } from './core/result-budget';
 import { agent, harness, tool } from './index';
 import type {
     Agent,
@@ -653,7 +657,9 @@ describe('record tools read surface: describe, the bare name list, and where', (
                     { key: 'kind', type: 'enum', values: ['note', 'task'], count: true }
                 ],
                 maxRecords: 7,
-                responseBudgetBytes: 64 * 1024
+                // The engine default the caller omitted (64 KiB — F1-6 had lowered it to
+                // 24,576 and F7-4 restored it; delivery is clamped to 32,768 separately).
+                responseBudgetBytes: 65_536
             }
         });
 
@@ -1045,5 +1051,196 @@ describe('a multi-record mutation names the ids it wrote (issue 0008)', () => {
         expect(Object.keys(oneAdd)).toEqual(['tasks', 'counts', 'page', 'storeRev', 'entry', 'addedIds']);
         expect(oneAdd.addedIds).toEqual(['3']);
         expect(oneAdd.entry).toEqual(taskRow('3', 'Three', 1));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F7-4 (2026-11-25) — the delivery cap, measured at the seam that actually bills.
+//
+// The four built-in collections are sized by a 64 KiB page budget (./core/{task,chapter,
+// profile,location}.ts), which is DELIBERATELY above the harness's own limit:
+// MODEL_TOOL_RESULT_BUDGET_BYTES, 32,768 payload bytes, over which `boundDelivery` REFUSES a
+// JSON result outright — "oversized tool result: … rewrite the call" — rather than cutting it
+// (./core/result-budget.ts:557-578, and the harness.ts:196-204 correction). A refused result
+// loses the page AND the cursor with it, so the caller cannot even retry its way forward.
+//
+// What makes "a delivered record answer never exceeds the cap" TRUE is not a smaller budget:
+// it is `clampToDeliveryCap` at the engine's delivery seam (./core/records.ts), which trims
+// the delivered answer and re-derives its cursors. These are the measurements that pin that —
+// through `executeTool`, the host door the server's Tools tab uses (./harness.ts:220-222),
+// which runs the SAME guard the model-facing path does.
+//
+// Byte figures here are `modelPayloadBytes(JSON.stringify(answer))`, the guard's own measure.
+// The UTF-8 wire count is smaller (the first page below is 29,894 on the wire and 30,084 in
+// the payload), and pinning the smaller number would leave the guard's measure unverified.
+// ---------------------------------------------------------------------------
+describe('a delivered record answer never crosses the harness delivery cap (F7-4)', () => {
+    const deliveredBytes = (answer: unknown): number => modelPayloadBytes(JSON.stringify(answer));
+
+    // ASCII filler, one byte per character, so the byte figures below do not depend on which
+    // letter a row was padded with — only on how many characters it holds.
+    const filler = (index: number): string => String.fromCharCode(97 + (index % 26));
+
+    it('F7-4: a `tasks` page the 64 KiB budget sized past the cap arrives inside it, cursor and all', async () => {
+        const writer = quiet(brain(scripted([])));
+
+        for (let index = 0; index < 20; index += 1) {
+            await writer.executeTool('tasks', { tasks: [{ text: `t${index}`.padEnd(3_600, filler(index)) }] });
+        }
+
+        // `limit: 100` with a 65,536-byte budget admits ~18 rows of 3,600 characters — twice
+        // what the cap holds — so the answer that reaches the guard is the clamp's, not the
+        // engine's. It had to survive the guard at all: before the clamp this call THREW.
+        const page = (await writer.executeTool('tasks', { limit: 100 })) as Record<string, any>;
+
+        expect(deliveredBytes(page)).toBe(30_084);
+        expect(deliveredBytes(page) <= MODEL_TOOL_RESULT_BUDGET_BYTES).toBe(true);
+        expect(page.tasks.map((row: Record<string, unknown>) => row.id)).toEqual(['1', '2', '3', '4', '5', '6', '7', '8']);
+        // `counts` is the whole store, not the delivered slice — a caller that sees 8 rows must
+        // still be able to tell it asked for 20.
+        expect(page.counts).toEqual({ total: 20, completed: 0, pending: 20 });
+        expect(page.budgetTruncated).toBe(true);
+        // THE MARKER: which bound fired. `budgetTruncated` alone would read like the
+        // collection's own 64 KiB budget, and raising that budget would change nothing.
+        expect(page.deliveryBudgetBytes).toBe(32_768);
+        // The cursor is RE-DERIVED: the engine had `nextOffset: 18`, and a page that resumed
+        // there would silently skip rows 9-17.
+        expect(page.page).toEqual({
+            offset: 0,
+            limit: 100,
+            hasMore: true,
+            nextOffset: 8,
+            budgetTruncated: true,
+            deliveryBudgetBytes: 32_768
+        });
+        // Only ROWS were withheld — no delivered row lost a field — so the key that names a
+        // field omission stays absent.
+        expect('fieldsWithheld' in page).toBe(false);
+
+        // And the truncation is recoverable: walking the cursors the clamp left behind
+        // delivers all 20 ids, exactly once each, in three pages of 8, 8 and 4.
+        const walk: string[] = [];
+        let offset = 0;
+
+        for (;;) {
+            const next = (await writer.executeTool('tasks', { limit: 100, offset })) as Record<string, any>;
+
+            expect(deliveredBytes(next) <= MODEL_TOOL_RESULT_BUDGET_BYTES).toBe(true);
+            (next.tasks as Record<string, unknown>[]).forEach((row) => walk.push(String(row.id)));
+
+            if (next.page.hasMore !== true) break;
+
+            offset = next.page.nextOffset as number;
+        }
+
+        expect(walk).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15', '16', '17', '18', '19', '20']);
+    });
+
+    it('F7-4: the `records` tool surface takes the restored 1,024..65,536 budget range again', async () => {
+        // AC1 at the DOOR the agent uses, not just inside the engine: F1-6 narrowed this schema
+        // to 1,024..24,576, which turned a `define` that used to work (any value from 24,577 to
+        // 65,536, including the 64 KiB every built-in collection was born with) into a refusal.
+        const writer = quiet(brain(scripted([])));
+
+        for (const responseBudgetBytes of [1_024, 24_577, 32_768, 65_536]) {
+            const defined = (await writer.executeTool('records', {
+                define: {
+                    name: `range${responseBudgetBytes}`,
+                    fields: [{ key: 'q', type: 'text' }],
+                    responseBudgetBytes
+                }
+            })) as Record<string, any>;
+
+            // Echoed verbatim — the tool fills in what the caller OMITS, and stores exactly what
+            // it accepts (./core/records.test.ts pins both halves at the engine surface).
+            expect(defined.definition).toEqual({
+                name: `range${responseBudgetBytes}`,
+                fields: [{ key: 'q', type: 'text' }],
+                maxRecords: 200,
+                responseBudgetBytes
+            });
+        }
+
+        // One past the ceiling is still a REFUSAL, and the message names the ceiling: the range
+        // is the caller's request, and a bound it cannot express is a fact about its call.
+        await expect(
+            writer.executeTool('records', {
+                define: { name: 'wide', fields: [{ key: 'q', type: 'text' }], responseBudgetBytes: 65_537 }
+            })
+        ).rejects.toThrow('$.define.responseBudgetBytes must be <= 65536.');
+    });
+
+    it('F7-4: an answer that fits the cap is untouched by it — no marker, no flag, no re-derived cursor', async () => {
+        const writer = quiet(brain(scripted([])));
+
+        for (let index = 0; index < 20; index += 1) {
+            await writer.executeTool('tasks', { tasks: [{ text: `t${index}`.padEnd(3_600, filler(index)) }] });
+        }
+
+        const one = (await writer.executeTool('tasks', { limit: 1 })) as Record<string, any>;
+
+        expect(deliveredBytes(one)).toBe(3_883);
+        expect(Object.keys(one)).toEqual(['tasks', 'counts', 'page', 'storeRev']);
+        expect(one.page).toEqual({ offset: 0, limit: 1, hasMore: true, nextOffset: 1 });
+    });
+
+    it('F7-4: an action wrapper is clamped too, and its keyset cursor names the last row DELIVERED', async () => {
+        // `chapters` and `profiles` are ACTION wrappers whose page rides under the collection's
+        // plural key (./core/{chapter,profile}.ts), so the clamp reaches them through
+        // `wrapper.plural`, not through the engine surface's `entries` (./core/records.ts,
+        // `clampToDeliveryCap`). Each collection gets its own harness: the record engine minted
+        // ids from ONE sequence per session, so a shared store would shift every id pin below.
+        const writer = quiet(brain(scripted([])));
+
+        // `content` is `getOnly` and never rides a list (./core/chapter.ts:58), so the
+        // 3,900-character SUMMARY is what floods a chapters page.
+        for (let index = 0; index < 30; index += 1) {
+            await writer.executeTool('chapters', { action: 'add', title: `c${index}`, summary: `c${index}`.padEnd(3_900, 'z') });
+        }
+
+        const chapters = (await writer.executeTool('chapters', { action: 'list', limit: 100 })) as Record<string, any>;
+
+        expect(deliveredBytes(chapters)).toBe(32_688);
+        expect(deliveredBytes(chapters) <= MODEL_TOOL_RESULT_BUDGET_BYTES).toBe(true);
+        expect(chapters.chapters.map((row: Record<string, unknown>) => row.id)).toEqual(['1', '2', '3', '4', '5', '6', '7', '8']);
+        expect(chapters.counts).toEqual({ total: 30, planned: 30, draft: 0, complete: 0 });
+        expect(chapters.budgetTruncated).toBe(true);
+        expect(chapters.deliveryBudgetBytes).toBe(32_768);
+        // `nextAfterId` is the R2/T2.1 cursor for a sortable collection, and it is RECOMPUTED
+        // against the rows that survived: the collection's own 64 KiB budget loaded more rows
+        // than the cap holds, so its cursor named a row this clamp withheld — and a caller that
+        // switched page orders by following it would have skipped everything in between.
+        expect(chapters.page).toEqual({
+            offset: 0,
+            limit: 100,
+            hasMore: true,
+            nextOffset: 8,
+            nextAfterId: '8',
+            budgetTruncated: true,
+            deliveryBudgetBytes: 32_768
+        });
+        // No delivered row lost a FIELD here — only rows were withheld — so the key that names
+        // a field omission stays absent, on the wrapper path as on the engine surface.
+        expect('fieldsWithheld' in chapters).toBe(false);
+
+        const profileHost = quiet(brain(scripted([])));
+
+        for (let index = 0; index < 12; index += 1) {
+            await profileHost.executeTool('profiles', { action: 'add', name: `p${index}`, description: `p${index}`.padEnd(3_900, 'v') });
+        }
+
+        const profiles = (await profileHost.executeTool('profiles', { action: 'list', limit: 100 })) as Record<string, any>;
+
+        expect(deliveredBytes(profiles)).toBe(32_696);
+        expect(profiles.profiles.map((row: Record<string, unknown>) => row.id)).toEqual(['1', '2', '3', '4', '5', '6', '7', '8']);
+        expect(profiles.counts).toEqual({ total: 12 });
+        expect(profiles.page).toEqual({
+            offset: 0,
+            limit: 100,
+            hasMore: true,
+            nextOffset: 8,
+            budgetTruncated: true,
+            deliveryBudgetBytes: 32_768
+        });
     });
 });

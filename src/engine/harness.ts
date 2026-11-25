@@ -197,8 +197,12 @@
 //
 // Model-facing output cap (R10): every serialized tool result AND tool error is
 // bounded by the run's per-turn ledger (`createToolResultTurnBudget`, which applies
-// `boundToolResult`'s per-result cap and then the aggregate per-turn cap; 256 KiB and
-// 512 KiB of UTF-8, core/result-budget.ts). Small outputs are byte-exact; a large one
+// `boundToolResult`'s per-result cap and then the aggregate per-turn cap; 32 KiB (32,768)
+// and 96 KiB (98,304) of MODEL-FACING PAYLOAD bytes — the JSON-escaped measure of
+// `core/payload-bytes.ts`, not raw UTF-8, which is the measure that used to be quoted here
+// and under-counted every escaped body by ~5% — core/result-budget.ts: `MODEL_TOOL_RESULT_BUDGET_BYTES`
+// and `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES`, both DERIVED from token figures, so this
+// sentence names the consequence rather than a literal that drifted). Small outputs are byte-exact; a large one
 // that is PLAIN TEXT becomes a small envelope with a head preview, a tail preview and a
 // note naming what was cut and how to re-fetch it, and a large one that is a JSON
 // DOCUMENT is REFUSED outright (`rejected` on the bounded result, F-CUTTER) because a cut
@@ -749,6 +753,47 @@ const resolveForkTimeoutMs = (value: unknown, fallback: number): number =>
     typeof value === 'number' && Number.isFinite(value)
         ? Math.max(1, Math.floor(value))
         : fallback;
+
+// F8 (2026-11-25, delegate-diagnostics report) — THE SENTENCE A TURN-CAPPED RUN IS REPORTED WITH.
+//
+// THE TRAP THIS NAMES, as the field report put it: `maxTurns: 1` failed a child that needed a
+// tool in 3,278 ms, and the message named only the count. Nothing about that run was wrong except
+// the caller's arithmetic. `maxTurns` counts MODEL REQUESTS, and the guard that raises this error
+// (`run.iteration >= turnLimit`, checked BEFORE the increment — the `turnLimit` computation in
+// `runAgentCore`, below) spends one of those requests on the ANSWER. The number a caller writes
+// as N therefore buys N-1 tool rounds, and `maxTurns: 1` — legal, and exactly the value a caller
+// reaches for when it wants a cheap answer — leaves a child ZERO tool rounds: the first tool call
+// it makes is the turn the cap fires on.
+//
+// WHAT CHANGED IS THE TEXT, AND ONLY THE PER-CHILD BRANCH. Same guard, same bound, same `turn-cap`
+// stamp, same default (unset means the harness-wide `maxIterations`, unarmed unless a host names
+// one). The `maxIterations` branch keeps its sentence BYTE-FOR-BYTE — that bound belongs to the
+// host and a model cannot widen it, so the number is all the caller can act on — while the
+// caller-set branch keeps the "the maxTurns this run was given" clause that tells "my cap" from
+// "the session's cap" and appends the N ⇒ N-1 consequence, which is the part that makes the next
+// call correct instead of merely shorter.
+const turnCapErrorOf = (name: string, limit: number, isCallerCap: boolean): string => {
+    // STRESS REPORT #17 (2026-11-14) fixed the count and the pluralisation of this clause; it is
+    // unchanged here, so `/requested tools on … without answering/` pins keep matching.
+    const spent = limit === 1 ? 'its single model turn' : `all ${limit} model turns`;
+    const head = `Agent "${name}" requested tools on ${spent} without answering`;
+
+    if (!isCallerCap) return `${head}.`;
+
+    // The rounds a cap of `limit` actually leaves, spelled out beside the rule that produced it.
+    const rounds = limit - 1;
+    // THE NOUN ONLY — the number is printed in front of it, so it appears exactly once.
+    const roundNoun = rounds === 1 ? 'tool round' : 'tool rounds';
+
+    return (
+        `${head}, the maxTurns this run was given (${limit}). maxTurns caps model REQUESTS, not `
+        + `tool rounds, and the child's answer has to be one of them, so N turns allow at most `
+        + `N-1 tool rounds: ${limit} ${limit === 1 ? 'turn' : 'turns'} = ${rounds} ${roundNoun}`
+        + (rounds === 0
+              ? ' — at maxTurns: 1 a child gets no tool round at all, and must answer without calling one.'
+              : `, and its answer had to land on turn ${limit}.`)
+    );
+};
 
 // THE ONE WALL-CLOCK TIMER IN THIS FILE, and the only place a thread may be ended by a
 // clock (policy 2026-11-09 T5.5; `src/harness.delegation.test.ts` asserts this shape).
@@ -5051,14 +5096,34 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // Listing. Every configured agent appears (even with no results), so a model
     // can see who exists before anything has run.
+    //
+    // DEFECT F1-1 (2026-11-25, from the delegates/threads stress review) — `truncated`
+    // now means what the tool's own description says it means: SOME agent has more
+    // retained invocations than the 5 this page lists for it. It is therefore a
+    // PER-AGENT fact (`visible.length < recent.length`), folded in while the per-agent
+    // rows are built. The retired expression (`records.length > listed`) was a GLOBAL
+    // row-count comparison, so it also fired for rows that are retained but belong to no
+    // agent's list at all — the soft-delete case
+    // `src/engine/harness.thread-runtime.test.ts` reported (the retired-row pin that
+    // asserts `hiddenResults: 2`, at :2106-2121): every per-agent answer is
+    // `invocationCount: 0` / `results: []` beside `truncated: true`, a flag the caller
+    // cannot act on because the overflow it names never entered any list. That global
+    // fact is real and is NOT dropped: it gets its own field, `hiddenResults`, so the
+    // two are readable apart.
     const agentManageView = (): unknown => {
             const records = [...invocationRecords.values()];
             let listed = 0;
+            // Per-agent overflow only (see the block comment above).
+            let truncated = false;
 
             const agentsView = Object.entries(agents).map(([name, brain]) => {
                 const recent = recordsForAgent(name);
                 const visible = recent.slice(0, AGENT_MANAGE_LIST_PER_AGENT);
                 listed += visible.length;
+
+                // `invocationCount` is the RETAINED count for this agent, so a count above
+                // the per-agent cap is exactly the condition the flag documents.
+                if (visible.length < recent.length) truncated = true;
 
                 return {
                     name,
@@ -5073,12 +5138,33 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             return {
                 agents: agentsView,
+                // GLOBAL facts, unchanged in meaning: both count the WHOLE retention ring
+                // (`AGENT_RESULT_RETENTION`, ./core/agent-limits.ts:25), not the rows this
+                // page lists. The ring holds rows of every agent, and a row whose
+                // conversation was released stays in the ring while `recordsForAgent`
+                // retires it from every list (`recordIsInactiveOwned`, above).
+                // CORRECTED 2026-11-26 (F1-1 review) — this is NOT "never a sum" of the
+                // per-agent `invocationCount`s, and the sentence claiming that contradicted
+                // the code beside it: `invocationCount` is the ring count for one agent
+                // (`recordsForAgent`), so the sum of those counts is the exact FLOOR of
+                // `totalResults`, and the only rows it cannot name are the ones retired with
+                // a released conversation. So `totalResults == sum(invocationCount) + retired
+                // rows`: equal while nothing is retired, strictly greater while any remain.
+                // The same rule is published on the tool description
+                // (./tools/runtime/agentManage.tool.ts) and in knowledge.md.
                 totalResults: records.length,
                 activeResults: records.filter((record) => record.status === 'running').length,
+                // Retained rows that appear in NO per-agent list, ≥ 0 — exactly
+                // `totalResults` minus the rows listed above, which is why one field covers
+                // both causes. Two causes, both honest and neither one an overflow this
+                // caller can page past: the rows past the 5-row per-agent cap, and the rows
+                // retired with a released conversation. Every one of them is still readable
+                // by id with `agentResult`.
+                hiddenResults: records.length - listed,
                 // True when at least one agent has more retained invocations than
                 // this listing shows. Full text is always retrievable by id via
                 // agentResult while the record is retained.
-                truncated: records.length > listed
+                truncated
             };
     };
 
@@ -5499,6 +5585,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         agent: string;
         limit: number;
         startedAt: number;
+        // F8 (2026-11-25): the dispatch notes this call raised (`scope.tools` names that resolve
+        // to nothing). Carried HERE so the `toolCancel` door — the one door whose answer REPLACES
+        // the envelope this call computed — reports the same fact the live call would have. The
+        // key is only present when there is something to say, exactly as in the envelope.
+        notes?: string[];
     };
 
     const delegateCallTraces = new Map<string, DelegateCallTrace>();
@@ -5570,7 +5661,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             answer
         );
 
-        return { ...envelope, callCancelled: true };
+        return {
+            ...envelope,
+            callCancelled: true,
+            // F8 (2026-11-25): the dispatch note this call raised, reprinted on the one door whose
+            // answer REPLACES the envelope the call computed. Absent when the call had none, so a
+            // released delegation is byte-for-byte what it was.
+            ...(trace.notes === undefined ? {} : { notes: trace.notes })
+        };
     };
 
     // D1/D2 — the record a delegation's OWN child wrote, ADDRESSED BY VALUE.
@@ -5605,6 +5703,48 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         return owned;
+    };
+
+    // F8 (2026-11-25, delegate-diagnostics report) — THE CALLER-FACING NOTE FOR AN ALLOWLIST
+    // NAME THAT RESOLVES TO NOTHING.
+    //
+    // THE GAP, precisely. A misspelled `scope.tools` entry was never a contract violation and
+    // is still not one: the allowlist behaved exactly as written, the child never saw the name,
+    // and `toolRequest` answered it under `forbidden` with the allowed list. The only defect is
+    // that the CALLER was told nothing — a typo is indistinguishable, from the parent's side,
+    // from a capability this harness genuinely does not have. This helper is the least invasive
+    // honest channel for that fact: one additive, conditional envelope entry (`notes`, see
+    // ./types/index.ts `HarnessDelegationResult`), no new door, no new failure mode, and no
+    // change to a single grant.
+    //
+    // WHY A NOTE RATHER THAN A REFUSAL: refusing the call would make a cosmetic typo fatal to a
+    // delegation that is otherwise correctly specified, and the harness's established treatment
+    // of a guessed tool name is a readable answer, not a throw (`launchToolCall` answers an
+    // unknown call with "is not registered. Available tools: …" and lets the run continue).
+    //
+    // THE HINT HAS TO BE TRUE — the same discipline as the unknown-tool answer in
+    // `launchToolCall` (:11071): `toolRequest` is a registered name the operator of THIS
+    // conversation can switch off, and pointing a model at a catalogue it cannot query turns a
+    // clean "no such name" into a discovery loop.
+    const delegateScopeNotesOf = (scope?: { tools?: readonly string[] }): string[] => {
+        const unknown = unrecognisedScopeToolsOf(scope?.tools);
+
+        if (unknown.length === 0) return [];
+
+        const granted = recognisedScopeToolsOf(scope?.tools);
+        const single = unknown.length === 1;
+
+        return [
+            `scope.tools named ${unknown.join(', ')}: this harness has no tool by ${
+                single ? 'that name' : 'those names'
+            }, so nothing is granted for ${single ? 'it' : 'them'}. ` +
+                (granted.length === 0
+                    ? 'This child was scoped to no tool that resolves.'
+                    : `The child's scope is the names that do resolve: ${granted.join(', ')}.`) +
+                (isToolWithheld(TOOL_REQUEST)
+                    ? ''
+                    : ` Check the spelling against the ${TOOL_REQUEST} catalogue.`)
+        ];
     };
 
     // Bounded delegation (R4). Registered only when SOME agent has a lower-ranked peer
@@ -5782,6 +5922,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const limit = delegatePageLimitOf(parameters);
 
+        // F8 (2026-11-25): this call's dispatch diagnostics, computed BEFORE the child runs so
+        // BOTH doors this function owns — the answered envelope and the unfinished one — carry
+        // them. Read-only: `parameters.scope.tools` is handed to the child exactly as written
+        // below, so an unrecognised name is still simply not granted.
+        const notes = delegateScopeNotesOf(parameters?.scope);
+        const scopeNotes: Pick<HarnessDelegationResult, 'notes'> = notes.length === 0 ? {} : { notes };
+
         const startedAt = Date.now();
         let message: HarnessAssistantMessage;
 
@@ -5807,7 +5954,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                       identity: carried,
                       agent: target,
                       limit,
-                      startedAt
+                      startedAt,
+                      // F8: the dispatch notes travel with the call so the released-call door can
+                      // reprint them (see `DelegateCallTrace.notes`).
+                      ...scopeNotes
                   };
 
         if (trace !== undefined) delegateCallTraces.set(callTraceKey(trace.scope, trace.callId), trace);
@@ -5967,15 +6117,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             const timedOut = timeoutController.signal.aborted;
 
-            return unfinishedDelegateEnvelopeOf(
-                record,
-                target,
-                limit,
-                startedAt,
-                timedOut
-                    ? `Delegation to "${target}" exceeded its ${timeoutMs}ms timeout and was stopped.`
-                    : unfinishedDelegateErrorOf(record, target, error)
-            );
+            return {
+                ...unfinishedDelegateEnvelopeOf(
+                    record,
+                    target,
+                    limit,
+                    startedAt,
+                    timedOut
+                        ? `Delegation to "${target}" exceeded its ${timeoutMs}ms timeout and was stopped.`
+                        : unfinishedDelegateErrorOf(record, target, error)
+                ),
+                // F8: a child that never answered still gets its caller the dispatch fact the
+                // answered door would have carried — the typo is the same typo either way, and the
+                // cap/timeout failure is not the place a caller would think to look for it.
+                ...scopeNotes
+            };
         } finally {
             // No timer means nothing was armed; the disarm closure is a no-op for the
             // unbounded path (and `vi.getTimerCount()` stays 0 for it).
@@ -6024,7 +6180,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // The elapsed time is this delegation's own measurement, so it stays honest
             // without a ledger record: the child's number when there is one, otherwise the
             // wall clock this call actually spent.
-            durationMs: record?.durationMs ?? Math.max(0, Date.now() - startedAt)
+            durationMs: record?.durationMs ?? Math.max(0, Date.now() - startedAt),
+            // F8 (2026-11-25): ADDITIVE and CONDITIONAL — the key is absent whenever there is
+            // nothing to report, which is every call whose `scope.tools` names resolve (i.e. every
+            // call written before this field existed). Grant semantics are unchanged: the note
+            // only NAMES the entries the allowlist refused to grant.
+            ...scopeNotes
         };
     };
 
@@ -6201,6 +6362,71 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // refused, and the child looped between the two answers.
     const isToolInScope = (name: string, scope?: readonly string[]): boolean =>
         scope === undefined || scope.includes(name) || isScopeEscapeHatch(name);
+
+    // F8 (2026-11-25, delegate-diagnostics report) — WHICH `scope.tools` ENTRIES RESOLVE TO
+    // NOTHING. Read-only: this decides what the caller is TOLD, never what the child is GIVEN
+    // (`isToolInScope` above stays the only grant predicate).
+    //
+    // THE MEASUREMENT. An allowlist entry that no tool answers to has always granted nothing,
+    // by construction: the three consumers of `isToolInScope` (the `declared` filter below, the
+    // launch gate in `launchToolCall`, and `requestToolsFor`) only ever match names of
+    // RESOLVED definitions, so a typo matches no definition and disappears — the child gets its
+    // documented `forbidden` answer when it asks, and the caller got no signal at all.
+    //
+    // THE RULE FOR "RECOGNISED": the name is a key of the live registry (`tools`, :1901 — the
+    // same map the launch gate resolves through at :11061). Deliberately NOT `declared(...)`,
+    // which is the set a request SHAPES:
+    //   - a registered-but-searchable tool (holds no `maxEnabledTools` slot yet) is a REAL name
+    //     a scope may name — inside the scope, `toolRequest` still enables it (the pin at
+    //     src/harness.delegation.test.ts "keeps the in-scope toolRequest answer byte-for-byte
+    //     historical in a scoped run"), so calling it a typo would be a lie;
+    //   - a name the operator switched off (`withheldTools`, :2495) is likewise a real name,
+    //     withheld by a session switch rather than misspelled;
+    //   - `toolRequest` itself is always recognised: the scope can never close that door
+    //     (`isScopeEscapeHatch`), so naming it is a no-op, not a miss.
+    // Duplicate entries are reported ONCE, in the order the caller wrote them, and a non-string
+    // entry (only the unvalidated host path can send one) is named by its `typeof` rather than
+    // dropped, so the diagnostic never swallows an entry the way the allowlist does.
+    const unrecognisedScopeToolsOf = (scope?: readonly string[]): string[] => {
+        if (scope === undefined) return [];
+
+        const listed: string[] = [];
+        const seen = new Set<string>();
+
+        for (const entry of scope) {
+            const label = typeof entry === 'string' ? `"${entry}"` : `<${typeof entry}>`;
+
+            if (seen.has(label)) continue;
+
+            if (typeof entry === 'string' && (isScopeEscapeHatch(entry) || Object.prototype.hasOwnProperty.call(tools, entry)))
+                continue;
+
+            seen.add(label);
+            listed.push(label);
+        }
+
+        return listed;
+    };
+
+    // The names of a `scope.tools` allowlist that DO resolve, in the caller's own order and
+    // deduped — the part of the sentence that says what the child actually got, so the note is
+    // not just a complaint. Same recognition rule as `unrecognisedScopeToolsOf`.
+    const recognisedScopeToolsOf = (scope?: readonly string[]): string[] => {
+        if (scope === undefined) return [];
+
+        const listed: string[] = [];
+        const seen = new Set<string>();
+
+        for (const entry of scope) {
+            if (typeof entry !== 'string' || seen.has(entry)) continue;
+            if (!isScopeEscapeHatch(entry) && !Object.prototype.hasOwnProperty.call(tools, entry)) continue;
+
+            seen.add(entry);
+            listed.push(`"${entry}"`);
+        }
+
+        return listed;
+    };
 
     // The tools a request may declare: every core tool first (file tools, a
     // configured search, and the harness-owned set), then everything discovered
@@ -6852,7 +7078,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     // The roster as the MODEL sees it (W19, 2026-11-17; the plane rule restated by W22): the same rows, and
-    // the same BARE ids it has always published, minus `epoch`. That token is the minting-process
+    // the same BARE ids it has always published, minus `epoch` — and, since the F1-2 fix below, minus an
+    // `ownerThreadId` on an `origin:'agent'` row, which the model has no door to act on. That token is the minting-process
     // discriminator (`../types/index.ts` `HarnessThreadRecord.epoch`, written beside the `invocationId` by
     // the run that mints it): every plane that resolves a run reads it from the durable record — the ledger
     // (`./harness.ts` `invocationRecordOfInvocationId`), the block projection
@@ -6871,6 +7098,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const bare = { ...row };
 
             delete bare.epoch;
+
+            // DEFECT F1-2 (2026-11-25) — a SECOND projection-only strip, for the same reason.
+            // An `origin: 'agent'` row is an agent's standing DEFAULT conversation; the
+            // `ownerThreadId` its record carries is the first-wins adoption link the run-start
+            // site writes (`src/engine/harness.ts:15591`, beside the `record.epoch` stamp at
+            // :15577), and it exists so
+            // `threadFamilyOf` step 4 can put that default in the adopting family (the link is
+            // read from the RECORD there, never from this page). It is not a model address: the
+            // model cannot act on it (`threadDelete` refuses every `agent:` default, and no door
+            // takes an owner id), so advertising it made the description's "absent for a
+            // top-level thread" sentence false for the other top-level kind. Removing it HERE
+            // changes only the projection — `bare` is a detached copy, and the write and the
+            // lineage walk both keep the record's link.
+            if (row.origin === 'agent') delete bare.ownerThreadId;
 
             return bare;
         })
@@ -7138,8 +7379,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // already in flight, `started` begins one on a conversation with no run in hand, and
         // `resumed` continues a run that was cut short with its turns RETAINED; `appended` is
         // retired. What keys each value is spelled out on `HarnessThreadMessageResult.delivered`
-        // (src/types/index.ts:3153) and in the block above - the point of the third value is that
-        // a cut-short stop is reported differently from a fresh start, never that the interruption
+        // (src/engine/types/index.ts:4154) and in the block above - the point of the third value is
+        // that a cut-short stop is reported differently from a fresh start, never that the interruption
         // went unnoticed (the cause stays on the row as `stopReason`).
         //
         // B4/C1: `note` is the one optional field, and it exists for exactly one
@@ -14269,7 +14510,6 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // budget, with no log line and no account.
                     recordOwedAbandonments(run);
                     scheduler.abandonScope(run.scope);
-                    const limit = turnLimit;
                     // IT19 R3: the ONE cause this exit has to stamp on the RUN rather than on an
                     // abort reason — exhaustion throws a plain HarnessError and never touches a
                     // signal, so nothing downstream could tell `turn-cap` apart from a provider
@@ -14282,28 +14522,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // because the observable fact ("this run was not allowed another model turn") is
                     // the same whichever bound bit, and the error text already names which.
                     run.stopReason = 'turn-cap';
+                    // THE MESSAGE, one helper (`turnCapErrorOf`, module scope above): the
+                    // harness-wide branch keeps its historical sentence byte-for-byte, and the
+                    // caller-set branch states the N ⇒ N-1 consequence beside the bound that bit,
+                    // which is the arithmetic a caller otherwise has to discover by burning a
+                    // child. `turnLimit === maxIterations` is unchanged as the discriminator, so
+                    // "my cap" and "the session's cap" stay distinguishable from the text alone.
                     throw new HarnessError(
                         run.autoAnswer
                             ? 'The owner fork did not answer in one tool-free response; actionRequest accepts no tools.'
-                            : // The number in the message is the bound that actually stopped
-                              // the run, and a caller-set `maxTurns` says so explicitly — a
-                              // model that hit its own budget needs to know that widening it
-                              // is its choice, not the harness's.
-                              //
-                              // STRESS REPORT #17 (2026-11-14): the old sentence said
-                              // "requested tools MORE THAN ${limit} times", which over-reported
-                              // by one — the guard above fires when `run.iteration` REACHES the
-                              // bound, so the child requested tools exactly `limit` times — and
-                              // it mis-pluralised (`1 times`, `the 1 turns`). The count now
-                              // states what happened and agrees in number with its noun; the
-                              // `limit === maxIterations` test that decides whether the per-run
-                              // suffix appears is unchanged, so "my cap" and "the session's cap"
-                              // are still distinguishable from the text alone.
-                              `Agent "${brain.name}" requested tools on ${
-                                  limit === 1 ? 'its single model turn' : `all ${limit} model turns`
-                              } without answering${
-                                  limit === maxIterations ? '' : `, the maxTurns this run was given`
-                              }.`
+                            : // THE DISCRIMINATOR IS UNCHANGED (`turnLimit === maxIterations` is
+                              // the old `limit === maxIterations`), so every sentence that read
+                              // "the session's cap" before still reads exactly that.
+                              turnCapErrorOf(brain.name, turnLimit, turnLimit !== maxIterations)
                     );
                 }
 

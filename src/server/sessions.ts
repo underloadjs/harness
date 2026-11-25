@@ -4158,6 +4158,15 @@ export class SessionStore {
                 const marked = this.applyInactiveLedger(session, session.core);
                 const capped = this.capThreadRecords(marked);
 
+                // F3/S4 (2026-11-25): the write side of the SAME one-authority reconciliation
+                // `ensureThreadLabels` performs for reads. Without it a row the runtime handle
+                // cannot reach (a soft-deleted row `harness.thread()` refuses) is re-snapshotted
+                // with its retired name on every following write, and the persisted document —
+                // the copy `harness.restore()` re-seeds the records from after a restart — keeps
+                // disagreeing with the map forever. Runs BEFORE the early return below, so the
+                // capped and the uncapped path are both covered.
+                this.reconcileThreadLabelRecords(session, capped);
+
                 if (capped === marked) return capped;
 
                 // The cap retired rows, so their ledger entries go with them. Without this the
@@ -8840,6 +8849,54 @@ export class SessionStore {
             if (record.origin !== 'host') continue;
 
             this.ensureThreadLabel(session, record.id, record.agent);
+        }
+
+        // F3/S4 (2026-11-25): every name this pass allocated (or adopted) is now pushed back onto
+        // the RUNTIME row copies, so a row and the map stop being able to disagree.
+        this.reconcileThreadLabelRecords(session);
+    }
+
+    // F3/S4 (2026-11-25) — REPAIR-ON-READ for the ONE label pair that can still drift: the
+    // runtime's committed row copy (`core.threads[].label`) vs the store's allocation map
+    // (`session.threadLabels`, the documented authority — see `mirrorThreadLabel`).
+    //
+    // WHY IT IS STILL A DEFECT EVEN THOUGH THE MAP ALREADY OWNS EVERY SERVED SURFACE. Every read
+    // path resolves the display name THROUGH the map (`threadRoster` overrides `label` with
+    // `ensureThreadLabel`, and `../api-reads.ts` `threadRowOf` builds its row field by field from
+    // the label the caller resolved in `../api.ts` `labelOf`, which is a map read), so the API
+    // never shows the copy. What the copy drives instead is the MODEL side of the product:
+    // `../harness.ts` `modelThreadRosterOf` publishes `HarnessThreadRecord.label`, and
+    // `../core/thread.ts` `resolveThreadAddressOf` accepts a `#WE6`-style reference by matching it.
+    // A row wearing a retired name therefore answers a `#` reference the store would resolve to a
+    // DIFFERENT conversation — the disagreement the operator's dump measures (3 of 70 rows of
+    // session `e513eed7…`: `thread-6` `WE1`/map `WE2`, `thread-40` `WE3`/`WE10`, `thread-42`
+    // `RH1`/`RH4`) and the class `sessions.ts` :8591 and :8625 already cite.
+    //
+    // WHY `mirrorThreadLabel` ALONE DOES NOT CLOSE IT. The mirror needs a live handle it can call
+    // `setThreadLabel` on, and it deliberately refuses a conversation `harness.thread()` does not
+    // return — the ordinary state of a SOFT-DELETED (retained) row, which is exactly where the
+    // drift survived. Repairing the committed copy here is the half the handle cannot reach.
+    //
+    // THIS IS A REPAIR-ON-READ, NOT A MIGRATION: it runs inside `ensureThreadLabels`, the one pass
+    // every read already takes, touches only a row whose label differs, and writes no session file
+    // by itself — the next ordinary checkpoint simply persists the name the map has held all
+    // along. A session that is merely loaded and never written keeps its bytes.
+    private reconcileThreadLabelRecords(session: Session, core: HarnessSnapshot = session.core): void {
+        if (!this.threadsSupported(session) || session.threadLabels.size === 0) return;
+
+        for (const row of core.threads ?? []) {
+            const label = session.threadLabels.get(row.id);
+
+            // No allocation for this conversation (an `agent:<name>` default that never ran, or a
+            // row the store never named) and nothing to reconcile; a row that already wears the
+            // map's name is left alone, which is what keeps a steady session writing nothing.
+            if (label === undefined || row.label === label) continue;
+
+            // Authority travels map → record first (the documented one-way mirror), so the runtime's
+            // own address resolution stops answering to the retired name; then the committed copy
+            // the persisted document is written from is corrected for the rows no handle reaches.
+            this.mirrorThreadLabel(session, row.id, label);
+            row.label = label;
         }
     }
 

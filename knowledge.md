@@ -1940,8 +1940,11 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   nextOffset? | afterId? + nextAfterId?, budgetTruncated? }, storeRev, entry?,
   removed? | removedIds?, addedIds? | changedIds? | noopIds? }` (20 items by default, hard
   maximum 100, and a 64 KiB page budget charged against the serialized items themselves and not
-  the JSON around them — `src/core/records.ts:2758-2769` — which stops at the first item that
-  would cross it, while the first item of a non-empty page always lands). `tasks` is the current
+  the JSON around them — `src/core/records.ts:3511-3522` — which stops at the first item that
+  would cross it, while the first item of a non-empty page always lands). That number is the CALLER'S
+   request, not a delivery promise: what a delivered answer is actually held to is a SECOND,
+   separate bound (the serve-time clamp below), and an answer trimmed by it says so as
+   `deliveryBudgetBytes: 32768`. `tasks` is the current
   page — including right after an add, a
   patch or a removal — and is a defensive copy, so mutating a
   result can never mutate the session list. `entry` is present when ONE record answers
@@ -1960,8 +1963,8 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   caller order) and `noopIds` (every id whose patch wrote nothing) are each emitted
   **whenever that kind of write happened at all — at any count, and independently of each
   other**, so a batch of one add plus one patch names BOTH ids while `entry` stays out
-  (`src/core/records.ts:3336-3362`, mirrored key-for-key by the wrapper at
-  `toWrapperResult`, `:3827-3834`; pinned at `src/core/records.test.ts:2531-2558` and
+  (`src/core/records.ts:4175-4194`, mirrored key-for-key by the wrapper at
+  `toWrapperResult`, `:4722-4729`; pinned at `src/core/records.test.ts:2531-2558` and
   `src/harness.task.test.ts:399-417`). A caller branches on which KEY is present, never on
   a count: an empty list means the key is absent, each key keeps one stable type (an array
   of ids), and an id is in `changedIds` or in `noopIds`, never both. `entry` is
@@ -1972,8 +1975,8 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   (`src/harness.task.test.ts:438-440`). `counts` always describes the WHOLE
   collection, never the page. Caps: 200 tasks and 4000 characters of text each
   (`TASK_MAX_RECORDS`/`TASK_MAX_TEXT`, `src/core/task.ts:35-36`). The whole description —
-  this key set included — is pinned byte-for-byte by `src/harness.metadata.test.ts:307-309`
-  against `src/tools/runtime/tasks.tool.ts:47`.
+  this key set included — is pinned byte-for-byte by `src/harness.metadata.test.ts:388-389`
+  against `src/tools/runtime/tasks.tool.ts:61`.
 - **Two cursors, deliberately different.** `offset` is an index; `afterId` is a
   keyset cursor over the numeric ids ("everything after id 7"), which cannot skip or
   repeat a record when another agent deletes one mid-walk. The walk runs in **id
@@ -1987,17 +1990,17 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   at, fields?, itemRev? }`, where an `update` names WHICH fields moved and never their VALUES and
   an `add`/`remove` names nothing beyond the id, so the feed says what to re-read and the read
   supplies the values (`RecordChange`) — at most `RECORD_MAX_CHANGES_IN_RESULT` = 50 entries,
-  `src/core/records.ts:166`,
+  `src/core/records.ts:244`,
   and no further than `responseBudgetBytes` allows once the WHOLE serialized page has been
-  charged against it, `:2880-2891`), `changesHasMore` (**the page was cut**: this answer carries
+  charged against it, `:3633-3644`), `changesHasMore` (**the page was cut**: this answer carries
   fewer events than exist above `since`, measured against the whole post-`since` set, by the
-  50-entry cap OR by the byte budget — `:2899` — which withholds later events and loses
+  50-entry cap OR by the byte budget — `:3652` — which withholds later events and loses
   nothing the reader was owed), `changesTruncated` (**the retention floor**: the retained
   window no longer covers `since + 1`, so the reader never saw part of the gap —
-  `:2900-2906`), `oldestAvailableRev` (the floor itself: the oldest revision this
+  `:3626-3628`, `:3659`), `oldestAvailableRev` (the floor itself: the oldest revision this
   collection's window can still show) and `droppedEvents` (its SIZE —
   `max(0, oldestAvailableRev - since - 1)`, the events strictly BELOW the floor that are gone
-  for good, `:2907-2922`). **What `responseBudgetBytes` bounds is the ANSWER, and it is charged
+  for good, `:3660-3677`). **What `responseBudgetBytes` bounds is the ANSWER, and it is charged
   in one order: the page first, then the bodies this call echoes back.** Before R-0012 the budget
   stopped at the page and everything else was appended free, which made the size of a response a
   function of the caller's arithmetic rather than of the cap: patching the record at the head of
@@ -2008,33 +2011,73 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   loop's rule — whole rows only, the first row of each KIND always admitted, everything after it
   charged against what the answer already costs — and what no longer fits is WITHHELD rather than
   dropped: an `ids` read stops at the last whole body and hands back `page.nextOffset`, and an
-  `entry`/`removed` body collapses to `{ id, rev }`. Whatever this number allows, a TOOL result
-  delivered to a model is capped AGAIN by the harness at `tool_result_bytes` = 32,768
-  (`src/engine/shared/harness-api.ts`), so a collection budgeted above that is trimmed a second
-  time on the way out. The page loop charges `JSON.stringify(entry)` plus one
+  `entry`/`removed` body collapses to `{ id, rev }`. What that number states is the CALLER'S
+  request; what the harness can put on the wire is a SECOND, SEPARATE bound, and F7-4 (2026-11-25)
+  is the pass that made the engine say so instead of remembering it. One tool result is held to
+  `MODEL_TOOL_RESULT_BUDGET_BYTES` = 32,768 payload bytes (`src/core/result-budget.ts:231`, DERIVED
+  from `MODEL_TOOL_RESULT_BUDGET_TOKENS`; published as `tool_result_bytes`,
+  `src/engine/shared/harness-api.ts:231`), and the records engine mirrors THAT constant as
+  `RECORD_DELIVERY_CAP_BYTES` (`src/core/records.ts:236`) — imported, never retyped, which is the
+  drift F7-4 closed: this budget had written the cap down from memory. `clampToDeliveryCap` (`:739`)
+  applies it at the ONE delivery seam, the tail of `runCall` (`:4953`), AFTER `toWrapperResult` has
+  rebuilt the envelope, so it holds of `records`, the four wrappers, the manual `executeTool` path
+  and a lane replica's routed `executeRecords` alike. It trims at WHOLE-RECORD boundaries, cheapest
+  loss first — trailing `changes` rows, then write-echo bodies, then trailing PAGE rows, then
+  trailing FIELDS of the last surviving row — and it RECOMPUTES `page.hasMore` / `page.nextOffset` /
+  `page.nextAfterId` against the rows that survived, so a clamped page resumes AT its first withheld
+  row rather than past it. WHICH bound bit is readable: a plain `budgetTruncated` /
+  `page.budgetTruncated` means the collection's own budget did the cutting, and `deliveryBudgetBytes:
+  32768` beside it means the harness cap did (`:770-781`) — so raising `responseBudgetBytes` is
+  provably not the lever, a smaller `limit` is. The row too big to carry whole arrives with its
+  leading fields and every cut key NAMED in `fieldsWithheld` (`:794-806`), never as an empty page and
+  never as a cleared field. Keeping the two bounds apart matters because the generic cutter cannot
+  negotiate: past the cap `boundToolResult` REFUSES a JSON document it cannot fit
+  (`src/core/result-budget.ts:557-578`) — no page, no cursor, no receipts, a `failed` call. That is
+  exactly the loss F1-6 (2026-11-25) tried to avoid by lowering the default to 24,576, and the cure
+  was worse: 24,576 refused `define`s that used to work, rewrote every 65,536 document this engine
+  had itself written (the `typecrate/harness` lane-compaction fixture among them), and still could
+  not deliver one big record inside the cap, because the fitters always admit the first row of each
+  KIND. So the range and the default are back: 1,024–65,536 (`RECORD_MIN/MAX_RESPONSE_BUDGET_BYTES`,
+  `:223-224`), default 65,536 (`RECORD_RESPONSE_BUDGET_BYTES`, `:231`) and 65,536 declared by all
+  four built-in specs (`src/core/task.ts:61`, `src/core/profile.ts:44`, `src/core/chapter.ts:51`,
+  `src/core/location.ts:28`) — deliberately ABOVE the cap, because the budget is what the producer
+  pages BY and the clamp is what the harness CARRIES. A `define` outside 1,024..65,536 is still
+  REFUSED, not clamped (`:4503-4511`), and a persisted budget restores VERBATIM:
+  `readCollectionDefinition` validates it against that same range instead of lowering it
+  (`:1795-1814`), so no stored session is quietly rewritten on upgrade. The page loop charges `JSON.stringify(entry)` plus one
   separator per record against the budget, stops at the first record that would cross it, and
-  always admits the first record of a non-empty page (`:2758-2769`). The feed is the LAST thing
+  always admits the first record of a non-empty page (`:3511-3534`). The feed is the LAST thing
   added, because the page the caller asked for is authoritative and "a feed that only reported
-  'more exist' after every 4 KiB page would be useless" (`:2709-2710`, `:2877-2879`); its trim loop
+  'more exist' after every 4 KiB page would be useless" (`:3630-3632`, `:3633`); its trim loop
   seeds `used` with `JSON.stringify(result)` — the page answer so far, `counts`, `page`, `storeRev`
   and `oldestAvailableRev` included — and then charges only the event payloads, so the feed's own
   keys (`"changes":[…]`, `changesHasMore`, `changesTruncated`, `droppedEvents`) are written AFTER
   the loop and never charged at all, and the first retained event lands whatever it weighs
-  (`:2880-2922`). A feed-bearing answer therefore ends up a small FIXED amount over the declared
+  (`:3633-3644`). A feed-bearing answer therefore ends up a small FIXED amount over the declared
   budget — roughly 80 bytes of key names and brackets, plus at most one whole event past where the
   trim stopped — and that overshoot does not depend on how many events were dropped, because
   `droppedEvents` sizes what the retention WINDOW lost while the byte budget only withholds events
   that are still retained (the `changesHasMore: true` / `changesTruncated: false` case just below).
-  Next to the one real whole-answer cap — `boundToolResult` in `core/result-budget.ts`,
-  `MODEL_TOOL_RESULT_BUDGET_BYTES` = 256 KiB, which bounds the serialized text of every model-facing
-  result and every tool error — the overshoot is noise at the default 65536; it is a `define`d 1024
-  budget where a caller that reads the number as an exact response ceiling gets bitten. No records
-  or tasks test measures bytes, so nothing in the suite pins the total size of a feed-bearing
-  response. The two booleans are not one signal and neither is the number:
+  Next to the cap a DELIVERED answer is measured against — `clampToDeliveryCap`, whose target is
+  `boundToolResult`'s own `MODEL_TOOL_RESULT_BUDGET_BYTES` = 32,768 bytes (32 KiB, DERIVED from
+  `MODEL_TOOL_RESULT_BUDGET_TOKENS`; the 256 KiB this paragraph used to quote is the value that
+  constant stopped being), which bounds the serialized text of every model-facing result and every
+  tool error — the feed's fixed overshoot is what makes the CONFIGURED number an approximation and
+  not a ceiling: at the 65,536 default a full page routinely sits ABOVE the cap, so on a large
+  answer the clamp is the routine trimmer and `deliveryBudgetBytes` is the key that says so, while a
+  `define`d 1,024 budget overshoots for the same structural reason (the first row of each KIND and
+  the feed's own key names land whatever they weigh). A caller that reads `responseBudgetBytes` as an
+  exact response ceiling is therefore bitten at both ends — too big and the clamp trims it, too small
+  and the answer still lands a little over the number. The delivered-size guarantee is measured, not
+  left to prose: `src/core/records.test.ts` carries a `deliveryBytes` meter (`:3435-3439`) and pins
+  the escaped size of every clamped shape — page (`:4011`), one oversized record with
+  `fieldsWithheld` (`:4089-4120`), a write echo (`:4144-4156`), a feed-bearing answer (`:4222-4244`)
+  — and `src/harness.records.test.ts` measures the same through the wrapper tools (`:1105-1118`,
+  `:1208-1224`). What stays unmeasured is the OVERSHOOT of an answer that fits under the cap. The two booleans are not one signal and neither is the number:
   `changesHasMore: true` with `changesTruncated: false` and `droppedEvents: 0` is a reader
   that simply has more to read (`src/core/records.test.ts:3196-3230`), and a reader parked at
   `since = floor − 1` loses nothing even though the window has trimmed behind it
-  (`src/core/records.test.ts:3256-3260`). `windowFloor` (`:1517-1525`) is the only source of
+  (`src/core/records.test.ts:3256-3260`). `windowFloor` (`:2205-2213`) is the only source of
   the floor and has two branches a consumer cannot derive from the messages: an EMPTY window
   reports `storeRev + 1` — nothing at or below `storeRev` survives, whether the window was
   trimmed to nothing or this is the epoch floor a re-`define` inherits — while a non-empty one
@@ -2049,29 +2092,29 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   separate truncation field: `oldestAvailableRev` says where to resume, `droppedEvents` says
   how much was lost. Outside a feed there is no gap to size, so `droppedEvents` appears ONLY
   beside `changes`; `oldestAvailableRev` also rides EVERY projected result of one collection
-  on the un-wrapped `records` surface — reads and mutations alike, `:2841-2859` — while the
+  on the un-wrapped `records` surface — reads and mutations alike, `:3610-3612` — while the
   `define`/`drop`/`describe`/bare-name answers are separate literals that carry neither key
   (`src/core/records.test.ts:3166-3181` for the plain read, `src/harness.records.test.ts:639-655`
   for `describe`, `:722-727` for the bare name, and the `define` key set at
   `src/core/records.test.ts:2926-2933`). Through the `tasks` wrapper BOTH feed
   keys ride ONLY beside `changes`, because the batch projection rebuilds the envelope key by
-  key and the wrapper's page envelope is pinned byte-for-byte (`:3837-3857`,
+  key and the wrapper's page envelope is pinned byte-for-byte (`:4740-4761`,
   `src/core/records.test.ts:3185-3189`); a `since` read whose feed came back empty still
   carries both (`src/core/records.test.ts:3295-3299`). The window is PER COLLECTION
   (Decision B), so a task reader is never woken by chapter edits. A `since` ahead of
   `storeRev` is an error, and those five keys are absent from every other result — including
   the store-wide observation plane, which publishes the same floor beside its own BOOLEAN
-  `reset` and never grows `droppedEvents` (`:4143-4172`,
+  `reset` and never grows `droppedEvents` (`:5086-5106`,
   `src/core/records.test.ts:3349-3365`, and see
   [Session records](#session-records)).
 - Validation names the offending field with a quoted, balanced path, labelled by the
-  TOOL name (the engine's `callLabelOf`, `src/core/records.ts:279-280`):
+  TOOL name (the engine's `callLabelOf`, `src/core/records.ts:367-368`):
   `tasks "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`
-  (`src/core/records.ts:1538`);
+  (`src/core/records.ts:2363`);
   the harness turns the throw into a recoverable tool result.
 - **The model-facing contract lives in `src/tools/runtime/tasks.tool.ts`**
    (`TASKS_METADATA`: description + JSON Schema; the registration flags are a SEPARATE
-   literal at `:174`, still `core`/always-declared, order 60), and
+   literal at `:207`, still `core`/always-declared, order 60), and
    `src/core/metadata.ts` is only the compatibility aggregation over those entries. The
    two must stay in step, and this boundary is deliberate: the schema's
    `pattern: '^[0-9]+$'` on `afterId` (`:133`) is DECLARATIVE — the shared validator
@@ -2313,7 +2356,8 @@ feed per collection. The `*Manage` names are gone (Decision J).
 `page` is `{ offset, limit, hasMore, nextOffset? }`: 20 records by default, hard
 maximum 100 per call, and a 64 KiB budget charged on the serialized records themselves — the first
 record always lands and the `counts`/`page` envelope around them is not counted
-(`src/core/records.ts:2758-2769`) — so a model reads a long cast one bounded page at a time
+(`src/core/records.ts:3511-3534`) — which is the PRODUCER's bound; the delivered answer is held to
+32,768 payload bytes by the serve-time clamp (see the records engine's budget bullet) — so a model reads a long cast one bounded page at a time
 (`nextOffset` is omitted when `hasMore` is false).
 Caps: 200 records per tool, 200-character names/titles, 4000-character descriptions,
 summaries, chapter bodies and notes, and at most 32 profile traits of 200 characters.
@@ -2952,7 +2996,7 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 
 | Tool | Input | Result |
 |---|---|---|
-| `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` — plus `startedAt`/`ageMs` on a RUNNING row and nowhere else (see the age bullet below) — top-level `truncated` is the LISTING flag (some agent has more retained invocations than this view shows), NOT a text cut; see the listing bullet below |
+| `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, hiddenResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` — plus `startedAt`/`ageMs` on a RUNNING row and nowhere else (see the age bullet below) — top-level `truncated` is the PER-AGENT LISTING flag (some agent has more retained invocations than the 5 its own entry shows), NOT a text cut, and `hiddenResults` is the separate global count of retained rows that appear in no agent's list at all (`totalResults` is the whole retained ring: the sum of the per-agent `invocationCount`s PLUS every row retired with a transcript that was dropped, so that sum is its floor and it grows past the sum only while retired rows remain) — see the listing bullet below |
 | `agentResult` | `{ agent, invocationId?, offset?, limit? }` | `{ agent, invocationId, kind, status, content, contentLength, offset, limit, hasMore, nextOffset? }` — for a failed/cancelled run `content` is the paged partial answer and `error` (plus `cancelledAtMessage` when the run appended anything) comes with it; a RUNNING row answers `{ agent, invocationId, kind, status, content: '', contentLength: 0, offset: 0, limit, hasMore: false }` plus `startedAt`/`ageMs`, never a streamed partial; `status: 'empty'` with empty `content` only when NOTHING has finished for that agent to select (no completed AND no failed/cancelled record — an agent whose only finished runs failed selects the newest of those, per the selector bullet below) |
 
 - **Identity.** `invocationId` is the run id for a root run and the thread id for
@@ -3116,8 +3160,16 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   `totalResults` counts every retained record in the session (running included), and
   `activeResults` counts the `running` ones — all three are COUNTING fields, never
   continuations, and nothing about the listing changes what is stored. Top-level
-  `truncated` is `records.length > listed`: at least one agent has more retained
-  invocations than this view shows. The ids that do NOT appear here are not lost — the
+  `truncated` is PER-AGENT — `visible.length < recent.length` for at least one listed agent, i.e.
+  someone has more retained invocations than the `AGENT_MANAGE_LIST_PER_AGENT` = 5 rows this view
+  shows (`src/engine/harness.ts` `agentManageView`) — and NOT the global row comparison it used to
+  be (`records.length > listed`, which also fired when every agent was inside its cap and rows were
+  hidden for a different reason, so a released conversation left the page answering
+  `invocationCount: 0`, `results: []`, `truncated: true`). The global fact keeps its own field:
+  `hiddenResults` = `totalResults - listed`, the retained rows that appear in NO agent's list, from
+  either cause — the overflow past the 5-row cap, or rows retired with a released conversation
+  (`recordIsInactiveOwned`, same file) — which is why `truncated: false` and `hiddenResults > 0`
+  are a normal pair. Neither flag is a loss: every row it names stays readable by id. The ids that do NOT appear here are not lost — the
   caller already holds them, because every door that STARTS a run reports its own
   identity in its envelope (`delegate`'s `invocationId`, `threadFork`'s `branchId`, which
   doubles as the invocation id, and the terminal envelope a cancelled call carries), and
@@ -3141,11 +3193,12 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   pinned by `src/harness.agent-results.test.ts` and
   `src/harness.creation.test.ts`.
 - **Paging, not silent truncation.** `agentResult` defaults to 4000 characters per
-  page and caps `limit` at 8000 (far below the 256 KiB serialized tool-result bound
-  `MODEL_TOOL_RESULT_BUDGET_BYTES` even with JSON escaping — the "64 KiB" this line
-  used to cite was that constant's value before `core/result-budget.ts` raised it 4x;
-  the current figure is stated where the cap itself is documented, `boundToolResult`
-  in the `### API` section's R13 note). `nextOffset` pages
+  page and caps `limit` at 8000, which sits AT the serialized tool-result bound
+  `MODEL_TOOL_RESULT_BUDGET_BYTES` = 32,768 payload bytes rather than far under it: 8,000 characters
+  are 32,000 bytes of prose and JSON escaping can still carry a full page past the cap. (The "256
+  KiB" and "64 KiB" this line has quoted across its corrections are that constant's earlier values
+  — 64 KiB was raised 4x to 256 KiB, and 256 KiB was cut 8x to the current 32,768.) The figure is
+  stated where the cap itself is documented, `boundToolResult` in the `### API` section's R13 note. `nextOffset` pages
   the remainder, so a long
   result is read in full instead of being cut by `boundToolResult`. Offsets are
   UTF-16 code-unit indices; both page edges are moved to a surrogate-pair boundary
@@ -3205,7 +3258,7 @@ list (`enableAllTools`, see [Tool discovery](#tool-discovery)).
 | Export | Call | Result |
 |---|---|---|
 | `syntax` | `({ code, language: string })` — validated free name: `javascript`/`js`, `typescript`/`ts`, `tsx`, `jsx`, `json`, `python`/`py`/`python3` (trimmed, case-folded, a leading dot allowed) | `boolean`; an unsupported language, a non-string `code`, a missing interpreter, and a cancelled or timed-out Python run are all ERRORS, never a verdict |
-| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines?, maxBytes?, lossy?, numbered? })[])` — non-empty, ≤100 | a `toolText()` **envelope**, not a plain value: `{ content: { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, budgetGranted?, error? }], truncated, bytes, wireBytes, contentBudget, budgetPool, modelBytes, skipped, note? }, __toolText: <projection> }` — `unwrapToolResult` hands the object to a programmatic caller (the server's manual-execute answer included) and the prose to the transcript. Per-file defaults `startLine 1`, `startColumn 0`, `startByte null`, **`maxLines 2000`, `maxBytes 65536`** — deliberately SMALL, because a read feeds a context window; ceilings 20000 lines / 262144 bytes, and an explicit value outside them is refused, never clamped. `maxBytes` is charged in **escaped wire bytes** — the unit `wireBytes` counts, not the raw bytes `bytes` reports — so a newline-heavy window stops with `bytes` well under the allowance and `limit: 'maxBytes'`. `limit` names WHICH governor cut a window (`'maxLines'` / `'maxBytes'` / `'budget'` / `null` for EOF), `budgetPool` (always present) is what the batch had left to split once the result's and every entry's scaffolding and the note reserve were taken, `budgetGranted` names the allowance an entry was actually scanned against and appears only when that batch share was smaller than its own `maxBytes`, and `lineCount` (the `wc -l` figure) appears only once EVERY line has been counted to a PROVEN end — a window stopped mid-file carries none, and a size-less pseudo-file publishes a count only after a walk actually reached its end. A truncated entry's `nextByte` is always STRICTLY PAST the offset its own window started at, so paging terminates, and `nextColumn` is counted from the PHYSICAL start of `nextLine` (never from a seek), so `{ startLine: nextLine, startColumn: nextColumn }` resumes exactly — including through a line longer than `maxBytes`. A `startColumn` past the end of `startLine` lands on the NEXT line and the entry reports the line it actually returned. The off-the-end axes answer differently: `startByte` at or past EOF is `ERANGE` (exactly AT EOF included), `startLine === lineCount + 1` is a legal empty window ONLY when the last line is terminated — the newline is what creates the position past it, so `'a\nb\n'` accepts `startLine: 3` and `'a\nb'` refuses it — `startLine` past that is `ERANGE`, and a 0-byte file answers ANY `startLine` with the empty window and `lineCount: 0`. `sizeBytes` is `number \| null`, and `null` means the size is not a filesystem fact — a FIFO, socket or device, or a regular file whose `st_size === 0` a read contradicts (`/proc`, `/sys`) — and neither `0` nor `null` is ever treated as EOF: such a target resumes from its own `nextByte` instead of answering `ERANGE`, and its `startLine` is settled against a real EOF rather than answered from byte 0. `numbered: true` is PER FILE — the `123: ` gutter lands on that file's model copy only and is charged against that file's `maxBytes` at the padded width the projection pads to. The 256 KiB budget is measured on the **serialized** result and water-filled by demand, so `modelBytes <= wireBytes <= contentBudget` always holds and the continuation fields survive the harness cap — the `note`'s own size is reserved before the split, and it appears only for a file of `65536` bytes or more whose window was cut (up to 2 paths named, the rest counted). A missing path, directory, permission denial, or **binary content** keeps its own ordered entry with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'ERANGE' \| 'EAGAIN' \| 'ENOTDIR' \| 'ELOOP' \| 'ENAMETOOLONG' \| 'ESPIPE' \| 'ETIMEDOUT' \| 'ECANCELED' \| 'EIO', rawCode?, message }` — a CLOSED 14, so an errno the tool does not promise is folded onto `EIO` with its untouched name in `rawCode` — and consumes no budget: ENOENT names up to 3 near-miss siblings (`FILE_READ_SUGGESTION_MAX`) or the nearest existing ancestor, EISDIR previews up to 12 entries (`FILE_READ_PREVIEW_MAX`), an `ERANGE` seek past EOF names the file's size or line count, `EAGAIN` is a FIFO with no writer (every FIFO is opened `O_NONBLOCK`, which is what replaced the kernel-level hang), `ESPIPE` is a `startByte` on a target with no file offset, and `ETIMEDOUT` is this tool's own per-file 10 000 ms I/O deadline (`FILE_READ_IO_DEADLINE_MS`, injectable through `FileReadLimits` / `DEFAULT_FILE_READ_LIMITS`) — one unresponsive mount costs one entry, never the batch; a CANCELLED call is the opposite and rejects the whole CALL with `ECANCELED` (the 14th code, and the only one of the 14 that never lands on an entry), because the caller's signal is checked before every syscall; that rejection carries `details: { rawCode, path }` with the reason the host passed to `abort()` as `rawCode` (the published rule: present because it differs from `code`) and the same object as its `cause`, and it is authored by `tools/files/cancellation.ts`, which replaced the old answer of "whatever the signal happened to carry" (measured: a `DOMException` named `AbortError` whose `code` is the NUMBER 20, not a string errno and not a member of this set); `lossy: true` substitutes U+FFFD for undecodable bytes instead of reporting EBINARY (the entry then says `lossy: true`; a NUL is still binary). Only a malformed request or a cancelled call (`ECANCELED`, see the cancellation clause above) rejects the call. The NUL check is WINDOW-scoped and the invalid-UTF-8 check CHUNK-scoped; neither is whole-file validation. A `startByte` inside a run of UTF-8 continuation bytes longer than any code point is `EBINARY` naming that offset — the alignment probe stays bounded and used to report EOF on giving up, which read as "the file ends here" over a file with readable bytes before the run. A readable file whose share of the envelope was consumed by the per-entry reserves gets the smallest window the floor allows — ONE code point, `limit: 'budget'`, `budgetGranted: 0`, and a cursor that still advances — never `EIO` |
+| `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines?, maxBytes?, lossy?, numbered? })[])` — non-empty, ≤100 | a `toolText()` **envelope**, not a plain value: `{ content: { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, budgetGranted?, error? }], truncated, bytes, wireBytes, contentBudget, budgetPool, modelBytes, skipped, note? }, __toolText: <projection> }` — `unwrapToolResult` hands the object to a programmatic caller (the server's manual-execute answer included) and the prose to the transcript. Per-file defaults `startLine 1`, `startColumn 0`, `startByte null`, **`maxLines 2000`, `maxBytes 16384`** — deliberately SMALL, because a read feeds a context window; ceilings 20000 lines / 262144 bytes, and an explicit value outside them is refused, never clamped. `maxBytes` is charged in **escaped wire bytes** — the unit `wireBytes` counts, not the raw bytes `bytes` reports — so a newline-heavy window stops with `bytes` well under the allowance and `limit: 'maxBytes'`. `limit` names WHICH governor cut a window (`'maxLines'` / `'maxBytes'` / `'budget'` / `null` for EOF), `budgetPool` (always present) is what the batch had left to split once the result's and every entry's scaffolding and the note reserve were taken, `budgetGranted` names the allowance an entry was actually scanned against and appears only when that batch share was smaller than its own `maxBytes`, and `lineCount` (the `wc -l` figure) appears only once EVERY line has been counted to a PROVEN end — a window stopped mid-file carries none, and a size-less pseudo-file publishes a count only after a walk actually reached its end. A truncated entry's `nextByte` is always STRICTLY PAST the offset its own window started at, so paging terminates, and `nextColumn` is counted from the PHYSICAL start of `nextLine` (never from a seek), so `{ startLine: nextLine, startColumn: nextColumn }` resumes exactly — including through a line longer than `maxBytes`. A `startColumn` past the end of `startLine` lands on the NEXT line and the entry reports the line it actually returned. The off-the-end axes answer differently: `startByte` at or past EOF is `ERANGE` (exactly AT EOF included), `startLine === lineCount + 1` is a legal empty window ONLY when the last line is terminated — the newline is what creates the position past it, so `'a\nb\n'` accepts `startLine: 3` and `'a\nb'` refuses it — `startLine` past that is `ERANGE`, and a 0-byte file answers ANY `startLine` with the empty window and `lineCount: 0`. `sizeBytes` is `number \| null`, and `null` means the size is not a filesystem fact — a FIFO, socket or device, or a regular file whose `st_size === 0` a read contradicts (`/proc`, `/sys`) — and neither `0` nor `null` is ever treated as EOF: such a target resumes from its own `nextByte` instead of answering `ERANGE`, and its `startLine` is settled against a real EOF rather than answered from byte 0. `numbered: true` is PER FILE — the `123: ` gutter lands on that file's model copy only and is charged against that file's `maxBytes` at the padded width the projection pads to. The 32 KiB call envelope (`FILE_READ_WIRE_BUDGET`) is measured on the **serialized** result and water-filled by demand, so `modelBytes <= wireBytes <= contentBudget` always holds and the continuation fields survive the harness cap — the `note`'s own size is reserved before the split, and it appears only for a file of `65536` bytes or more whose window was cut (up to 2 paths named, the rest counted). A missing path, directory, permission denial, or **binary content** keeps its own ordered entry with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'ERANGE' \| 'EAGAIN' \| 'ENOTDIR' \| 'ELOOP' \| 'ENAMETOOLONG' \| 'ESPIPE' \| 'ETIMEDOUT' \| 'ECANCELED' \| 'EIO', rawCode?, message }` — a CLOSED 14, so an errno the tool does not promise is folded onto `EIO` with its untouched name in `rawCode` — and consumes no budget: ENOENT names up to 3 near-miss siblings (`FILE_READ_SUGGESTION_MAX`) or the nearest existing ancestor, EISDIR previews up to 12 entries (`FILE_READ_PREVIEW_MAX`), an `ERANGE` seek past EOF names the file's size or line count, `EAGAIN` is a FIFO with no writer (every FIFO is opened `O_NONBLOCK`, which is what replaced the kernel-level hang), `ESPIPE` is a `startByte` on a target with no file offset, and `ETIMEDOUT` is this tool's own per-file 10 000 ms I/O deadline (`FILE_READ_IO_DEADLINE_MS`, injectable through `FileReadLimits` / `DEFAULT_FILE_READ_LIMITS`) — one unresponsive mount costs one entry, never the batch; a CANCELLED call is the opposite and rejects the whole CALL with `ECANCELED` (the 14th code, and the only one of the 14 that never lands on an entry), because the caller's signal is checked before every syscall; that rejection carries `details: { rawCode, path }` with the reason the host passed to `abort()` as `rawCode` (the published rule: present because it differs from `code`) and the same object as its `cause`, and it is authored by `tools/files/cancellation.ts`, which replaced the old answer of "whatever the signal happened to carry" (measured: a `DOMException` named `AbortError` whose `code` is the NUMBER 20, not a string errno and not a member of this set); `lossy: true` substitutes U+FFFD for undecodable bytes instead of reporting EBINARY (the entry then says `lossy: true`; a NUL is still binary). Only a malformed request or a cancelled call (`ECANCELED`, see the cancellation clause above) rejects the call. The NUL check is WINDOW-scoped and the invalid-UTF-8 check CHUNK-scoped; neither is whole-file validation. A `startByte` inside a run of UTF-8 continuation bytes longer than any code point is `EBINARY` naming that offset — the alignment probe stays bounded and used to report EOF on giving up, which read as "the file ends here" over a file with readable bytes before the run. A readable file whose share of the envelope was consumed by the per-entry reserves gets the smallest window the floor allows — ONE code point, `limit: 'budget'`, `budgetGranted: 0`, and a cursor that still advances — never `EIO` |
 | `write` | `(files: { path, content }[])` — non-empty, ≤100 (`FILE_WRITE_MAX_TARGETS`) | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected by file identity, NUL content rejected (read would refuse it). Serialized per file against a concurrent `edit` on the same path. Each file is PUBLISHED ATOMICALLY (`publishAtomically`, shared with `edit`): the payload goes into a staging file created next to the RESOLVED target (`realWriteTarget`, so the rename stays on one device), the existing file's mode is copied onto it (`existingMode` + `chmod`), and a same-directory rename swaps the directory ENTRY — so a reader sees the whole previous content or the whole new content, never a prefix, and a failure before the rename leaves the target exactly as it was with the staging file removed. What that trade buys, stated plainly: the target gets a NEW inode, so an already-open handle, a hard link, `uid`/`gid` and xattrs keep describing the OLD file (the mode travels, ownership does not); a read-only FILE is now overwritable, because only the DIRECTORY's permissions gate the rename; a DANGLING symlink is still HONORED, exactly as the in-place write honored it — the link survives and its missing end is created, so `path` names the link and not a new regular file (the parent directory and mode are the link's own, not the resolved directory's); a NON-REGULAR target is now refused with a stated error (`EISDIR` for a directory, `EOPNOTSUPP` for a FIFO/socket/device) instead of having the rename clobber it — and the same is true of a non-regular link TARGET, which an in-place write would have happily followed; and no `fsync` was added, so the power-loss durability boundary is the one in-place writing already had |
 | `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty, ≤100 (`FILE_EDIT_MAX_TARGETS`, and the same `maxItems: 100` is published in the schema) | ordered `{ path, replacements, bytes, match? }[]`; exact-first matching (typographic and trailing-whitespace fallbacks), all preflighted before the first write, each file written once. `match` names a fallback tier and can ONLY be `'typographic'` or `'trailing-whitespace'` — there is no ending-related value; the trailing-whitespace tier matches WHOLE LINES, so an edit that came through it replaces those whole lines and the trailing whitespace inside the region goes with them. Line endings: an LF-only `newString` adopts the endings of the matched region, while a `newString` containing `\r` is ENDING-EXPLICIT and is written VERBATIM, byte for byte (`edit.tool.ts` `verbatim`), so an explicit `\r\n` is never rewritten into the file's endings — converting endings is an `oldString`/`newString` pair that differs only in `\r`, which matches exact bytes. A target whose bytes are not valid UTF-8, or that holds a NUL, is refused with `EBINARY` naming the byte offset during the preflight (`decodeEditSource` / `firstInvalidUtf8Byte`), rewriting nothing — it used to round-trip a Latin-1 file as U+FFFD and report success. The result is PUBLISHED EXACTLY LIKE `write` does (`publishAtomically('edit', ...)`): staged beside the resolved target, mode copied, renamed over the directory ENTRY — so the inode and its mode do NOT survive, an already-open handle or hard link keeps describing the OLD bytes, and a failure before the rename leaves the previous bytes exactly as they were with the stage removed. A target over `FILE_EDIT_MAX_BYTES` (8 MiB) is refused DURING THE PREFLIGHT with `EFBIG` and its `details.limit`, naming the entry — the ceiling is what keeps N fallback scans linear — and it is checked BEFORE the empty-array check, so `edits: []` can only ever mean an empty file and the tool can never report a vacuous success. A malformed entry — non-array/empty array, non-string field, or an UNKNOWN property — is refused with `EINVSTATE` plus the dotted `details.field` (`edits[0].replaceAl`), before any filesystem change, instead of reaching `undefined.replaceAll` as an unhandled TypeError; note the refusal is an unknown FIELD, not an unknown ERROR code — an invented `code` in an op is a different bug and still lands on the closed published set. A file whose current bytes already equal the result is reported `changed: false` and is NOT republished: no stage, no rename, no new inode, so a no-op does not churn a hot file's identity. That flag is the only `false` `changed` can ever hold — when a fallback tier produced byte-identical output the call still errors, because that means the model reproduced the region without changing it. Read-match-write is one per-file critical section (`./tools/files/lock.ts`), so a concurrent call re-reads the winner's bytes and fails with "no match" instead of clobbering the other's change — unless the winner happened to produce exactly what the loser wanted, which is the `changed: false` no-op above |
 | `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` - non-empty, ≤100 (`FILES_MAX_OPS`) | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` → `{ path, entries, truncated, nextOffset, offset, limit, bytes, starved?, note?, error? }` (ONE page of `dir/entry`, directories end with `/` — including a symlink that resolves to one, since "walkable" is what the slash means — non-recursive; `limit` defaults to 200 and is CLAMPED into 1..1000, `offset` is clamped to ≥0, and neither is ever rejected, which is why the published schema carries NO `minimum`/`maximum` on those two fields — a schema bound would be enforced before `execute` and turn the runtime clamp into a dead branch; the 64 KiB `FILES_CONTENT_BUDGET` of entry text is ONE mutable allowance threaded through every list op in the CALL, so an op whose turn arrives after it is spent answers `entries: []` with `truncated: true` and `nextOffset` naming its own offset while entries remain past it, and `nextOffset` is `null` when nothing was withheld); duplicate or aliased spellings of one directory in a `path` array are walked ONCE, first spelling wins (`dedupePaths` by `fileIdentity`); `move`/`copy` → `{ path, to, kind, bytes, replaced? }` — `replaced: { path, kind, entries }` shows up ONLY when an existing destination was removed to make room, and it is the receipt's account of what that cost: `kind` names what stood there, `entries` counts the IMMEDIATE entries of a replaced directory or is `null` when the listing itself failed, so "unknown" is never read as "empty" (a file or a symlink costs no tree and reports 0) — an existing destination is refused unless `overwrite`, a real DIRECTORY destination additionally needs `replaceDirectory: true` (a symlink destination does not: replacing it costs the link alone), and a destination that IS the source or lies INSIDE it is refused BEFORE any filesystem change (`selfOrContained`: resolved text first, then real identity, so a symlinked alias is caught) — that guard is what stops `copy X → X` with `overwrite: true` from deleting the tree and reporting success, and `copyDirectory` additionally stops at `FILES_COPY_MAX_DEPTH` (64) levels; a symlink inside a copied tree is copied AS a symlink (target string verbatim, 0 bytes) while a symlinked directory used as the SOURCE is still followed at the top level; `delete` → `{ path, removed, recursive }` (a NON-EMPTY directory needs `recursive`, an EMPTY directory is removed without it, a DANGLING symlink is deletable because the path is examined with `lstat` before anything follows it, and a missing path needs `force` and is then reported `removed: false, skipped: true`; a NON-EMPTY directory without `recursive` is a `files-delete-non-empty` refusal that counts what is in there); `mkdir` → `{ path, created }`, creating parents, reporting an existing directory as `created: false`, and REFUSING whatever else stands there — `files-mkdir-not-a-directory` for a plain file or a symlink that resolves to a non-directory (its `details` carry `kind` and `targetExists`), `files-mkdir-dangling-link` for a symlink whose target is gone — because `mkdir` never replaces anything: `replaceDirectory` is a move/copy permission and nothing else. A failed list entry carries its own `error: { code, message, details? }` and does NOT void the directories that could be read — the surviving entries stay in the receipt, the `code` comes from the closed set `ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`EIO`/`EXDEV` (the exported `FILES_ERROR_CODES` carries a 7th member, `ECANCELED`, and it is the CALL-level cancellation answer, never an entry's) (`filesFailureOf` folds every other raw Node errno — `ENAMETOOLONG`, `ELOOP`, `ERR_FS_EISDIR`, `ENOTEMPTY` — onto `EIO`, because a caller switches on `code` and cannot switch on a set the tool never promises) while the raw errno stays in `rawCode` — the message alone is not an interface, and it gets re-prefixed when the receipt travels through an MCP boundary; a failed mutation rejects the call and names the operations already applied (there is no rollback), with machine-readable `details`: `{ op, path, applied, appliedCount, rollback: false, failure: { code, details } }`, so an `EXDEV` rename and an `EACCES` on the same operand are distinguishable, and the batch-level `code` is the refusal's OWN code when it has one (`files-source-missing`, `files-source-is-destination`, `files-destination-inside-source`, `files-destination-contains-source`, `files-destination-exists`, `files-destination-directory`, `files-delete-missing`, `files-delete-non-empty`, `files-mkdir-not-a-directory`, `files-mkdir-dangling-link`) and only otherwise the generic `files-operation-failed`. Operations run in array order against the state each one finds, and mutations hold the same per-file locks as `write`/`edit` (`./tools/files/lock.ts`) |
@@ -3249,11 +3302,14 @@ Implementation notes worth keeping:
   default window it did not ask for.
 - **`read` is bounded by TWO numbers on each axis: a DEFAULT that is a context budget, and a
   CEILING that is the transport envelope.** A window starts at a 1-based `startLine`; per file
-  the defaults are `maxLines 2000` (`FILE_READ_DEFAULT_MAX_LINES`) and `maxBytes 65536`
-  (`FILE_READ_DEFAULT_MAX_BYTES`), and the ceilings an explicit argument may ask for are 20000
-  lines (`FILE_READ_MAX_LINES`) and 262 144 bytes (`FILE_READ_MAX_BYTES` =
-  `FILE_READ_WIRE_BUDGET` = `MODEL_TOOL_RESULT_BUDGET_BYTES`, held equal by an assertion in
-  `read.test.ts` rather than an import so the preset compiles with no captured dependency).
+  the defaults are `maxLines 2000` (`FILE_READ_DEFAULT_MAX_LINES`) and `maxBytes 16384`
+  (`FILE_READ_DEFAULT_MAX_BYTES`, deliberately HALF the call envelope so one file can be cut by its
+  own allowance and still leave room for a sibling), and the ceilings an explicit argument may ask
+  for are 20000 lines (`FILE_READ_MAX_LINES`) and 262 144 bytes (`FILE_READ_MAX_BYTES`, the
+  per-file CEILING). The equality an assertion in `read.test.ts` holds — rather than an import, so
+  the preset compiles with no captured dependency — is the other one: `FILE_READ_WIRE_BUDGET` =
+  `MODEL_TOOL_RESULT_BUDGET_BYTES` = 32,768, which is why a read that fills its envelope survives
+  the harness cap byte for byte.
   An explicit value outside `[1, ceiling]` is REFUSED, not clamped — a silent clamp of
   `maxBytes: 10000000` down to the envelope would report `limit: "budget"` for a request the
   caller believed was unlimited, and `limit` is the field that decides whether to ask again.
@@ -3281,7 +3337,7 @@ Implementation notes worth keeping:
   window from the model's remaining context) is deliberately absent: a tool that guesses how
   much context is left invites the misjudgement the compaction tools exist to prevent.
   Both knobs are PER FILE because "I want this one file, generously" is one argument; the
-  shared 256 KiB aggregate is still allocated by DEMAND (every readable file gets an equal
+  shared 32 KiB aggregate (`FILE_READ_WIRE_BUDGET`) is still allocated by DEMAND (every readable file gets an equal
   share, files needing less hand the difference back to the files actually cut, passes are
   capped). `limit` therefore has three values, and each one has a different remedy:
   `'maxLines'` → raise `maxLines`; `'maxBytes'` → raise `maxBytes`, the only knob that widens
@@ -3447,8 +3503,9 @@ Implementation notes worth keeping:
   all four test files, and by `read.test.ts`'s H2 pin that the whole call is rejected rather than
   answered with whichever entries had landed.
 - **`read` reports the pool, not just its own spend, and its cuts respect code points.** The
-  call-wide envelope is `FILE_READ_WIRE_BUDGET` (256 KiB of ESCAPED WIRE bytes), `maxBytes` is the
-  only knob that widens ONE file (default 65 536, schema maximum 262 144) and is charged in that
+  call-wide envelope is `FILE_READ_WIRE_BUDGET` (32 KiB — 32,768 ESCAPED WIRE bytes, the same number
+  as `MODEL_TOOL_RESULT_BUDGET_BYTES`), `maxBytes` is the
+  only knob that widens ONE file (default 16 384, schema maximum 262 144) and is charged in that
   same wire unit, and `budgetPool` reports what was ACTUALLY left for content once the per-entry
   reserves were taken: 40 paths against that envelope is a pool of about 5 KiB per file no matter
   what `maxBytes` asked for, and without the number a caller can see its batch was cut but cannot
@@ -4655,7 +4712,15 @@ With `threadDelete` added the generated `core/tool-manifest.ts` carried 32 descr
     span) stops being reachable until a run mints the link again.
 - **`threadList` returns the family roster**, newest last, with `currentThreadId`
   naming the caller's own thread; a threadless caller gets every thread in the
-  session, as before. A RELEASED thread is absent by construction — but released means
+  session, as before. THE MODEL PAGE IS A PROJECTION (`modelThreadRosterOf`,
+  `src/harness.ts`): it strips `epoch` (W19) and, since F1-2 (2026-11-25), the
+  `ownerThreadId` of any `origin: 'agent'` row — a default conversation's first-wins adoption
+  link is what `threadFamilyOf` step 4 walks to put that default in the adopting family, so it
+  lives on the RECORD (and on the host seam, `harness.threads()`), while the model page omits it
+  for BOTH top-level kinds: the model has no door that takes an owner id, and `threadDelete`
+  refuses every `agent:` default outright. Nothing about the write or the lineage walk changed —
+  the strip is a detached copy — and `threadRead` still answers from the full record.
+  A RELEASED thread is absent by construction — but released means
   MARKED, not destroyed (IT19 R2, 2026-11-15): `purgeThread` sets `inactive`/`inactiveAt` and
   the record, its transcript and its invocation rows are RETAINED, so the roster and `actOn`
   stop naming it while a host can still read it by id, and every AGENT door refuses it with its
@@ -4793,7 +4858,17 @@ With `threadDelete` added the generated `core/tool-manifest.ts` carried 32 descr
   `turn-cap`, `budget-exhausted`, `api-error`, `retries-exhausted`, `provider-network` or
   `parent-closed` — takes an
   agent `threadSend`, and that send reports `"resumed"` because the retained turns continue the
-  same conversation instead of opening a fresh one. A thread the HOST stopped (`user-stopped`),
+  same conversation instead of opening a fresh one. THE PRECONDITION IS BOTH HALVES OF ONE TEST
+  (F1-4, 2026-11-25, restated because the tool prose used to omit half of it): `resumed` requires
+  the row to sit at `status === 'stopped'` **and** `isResumableStopReason(stopReason)` —
+  `src/harness.ts:7068`, applied at `:7346` — so an `idle` row that still carries a `stopReason`
+  from its last run (a `turn-cap`, a `timeout`, a child its parent abandoned) answers `"started"`.
+  That is not the interruption going unnoticed: `stopReason` stays on the row for any reader, and
+  the two receipts name the OPERATION performed (a resumed stop vs a fresh run), not whether a
+  transcript was ever cut short. Widening `"resumed"` to every interrupted row was weighed and
+  REJECTED for moving a documented receipt for no extra information
+  (`src/engine/types/index.ts:4083-4106`), and this pass changed no behaviour — wording only.
+  A thread the HOST stopped (`user-stopped`),
   one a plugin parked (`plugin-parked`), and one stopped with NO recorded cause are refused —
   only a host `sendThreadInput` revives those. An INACTIVE target is refused too, ahead of any
   status branch: its record and transcript are retained for a host read, but it is off the
@@ -5878,8 +5953,9 @@ implementation per name — which is the invariant this whole layer exists to pr
   `Tool "search" is not registered`. Nothing in the built-ins throws: a usage
   mistake, an unregistered tool, or a rejected tool call returns
   `{ content, isError: true }`; `executeCommand` is the only thrower. Bodies share the
-  model's 256 KiB budget (`MODEL_TOOL_RESULT_BUDGET_BYTES` — the "64 KiB" this line
-  used to name was that constant's value before `core/result-budget.ts` raised it 4x)
+  model's 32,768-payload-byte budget (`MODEL_TOOL_RESULT_BUDGET_BYTES`; the "256 KiB" this line
+  used to name is the value `core/result-budget.ts` cut 8x, and the "64 KiB" before that was the
+  value it was raised 4x FROM)
   but append a plain
   `… truncated: …` marker (`capText`), because a command result is human-facing.
 - **Ordering and asymmetric collisions (`src/harness.ts`).** built-ins →
@@ -7503,19 +7579,26 @@ can fix.
 wrapper (`{ "ops": [{ op: 'list', path: 'src' }] }`) - and a wrong type is a `{ ok: false }` tool error with a
   JSON path instead of an implementation crash. `null` is normalized to `{}`.
 - Result and error TEXT share the model-facing per-result cap (`boundToolResult` in
-  `src/core/result-budget.ts`, 256 KiB, applied AFTER the `unwrapToolResult` peel of the
+  `src/core/result-budget.ts`, 32,768 payload bytes = 32 KiB — DERIVED from
+  `MODEL_TOOL_RESULT_BUDGET_TOKENS`, and the 256 KiB this line used to state is the value that
+  constant stopped being — applied AFTER the `unwrapToolResult` peel of the
   `toolUi()` / `toolMedia()` / `toolText()` brands, so panels stay on their own limit, media
   rides on the message, and a tool that declared its own prose is measured on THAT text
   rather than on the escaped JSON of its result object). A result that fits is returned byte-for-byte unchanged; a result
-  that does not is returned as the parsed truncation envelope
-  `{ truncated, originalBytes, budgetBytes, note, content, tail }` — `content` is the HEAD
+  that does not and does NOT parse comes back as the truncation envelope
+  `{ truncated, originalBytes, budgetBytes, note, content, tail }`, while one that does not and DOES
+  parse is REFUSED rather than sliced (`rejected: { reason: 'oversized-json', originalBytes,
+  budgetBytes, message }`, `src/core/result-budget.ts:557-578`) — a structure cut in the middle is
+  not that structure — `content` is the HEAD
   preview, `tail` the end of the original text, and `note` says how many bytes were cut,
   which cap bit, and which call to re-run to get them back — so the HTTP body stays valid
   JSON with an explicit marker rather than a half-written document (the manual route has no
-  transcript call to name, so its note says only "the tool call"). This is a
+  transcript call to name, so its note says only "the tool call", and an oversized JSON document
+  there answers `ok: false` with the refusal message). This is a
   post-serialization cap: it bounds the wire/context cost, **not** the process's peak
   memory (the tool's own budget has to do that). The MODEL path also bounds the SUM of one
-  turn's results — `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES` (512 KiB) through the run's
+  turn's results — `MODEL_TOOL_RESULTS_PER_TURN_BUDGET_BYTES` (98,304 bytes = 96 KiB, three full
+  results; the 512 KiB this line used to state is the value `result-budget.ts` replaced) through the run's
   `createToolResultTurnBudget`, which spills the results that no longer fit through the same
   envelope and NEVER drops one, because a request must answer every `tool_calls[]` entry.
   A manual call has no turn, so the per-result cap is all it applies.

@@ -43,8 +43,12 @@
 //     re-validated against the agent roster. A snapshot naming a departed agent
 //     restores and reports it unchanged.
 //   - store-level bounds are engine-owned (Decision G / F13): 200 entries per
-//     collection by default, and a page budget below the outer model-facing cap so a
-//     page can never report `hasMore: false` while the envelope truncates it.
+//     collection by default, and NOTHING a page reports may survive the harness'
+//     delivery cap unread: the configured `responseBudgetBytes` trims pages at the
+//     producer, and `clampToDeliveryCap` trims the finished answer to
+//     MODEL_TOOL_RESULT_BUDGET_BYTES (32,768 payload bytes) at the delivery seam,
+//     re-deriving the cursor each time — so a page can never report `hasMore: false`
+//     while the envelope truncates it.
 //     Field-level caps are the TOOL's (R6) — an escalation to `records` is the
 //     documented way to get more room, which is only true of collections an agent
 //     did not declare.
@@ -84,7 +88,9 @@
 //                                         `context.harness.runtime.executeRecords(NAME, context)`
 //   - ../harness.ts                       — one store closure per harness; `reset()` clears it;
 //                                           snapshot()/restore() persist it
-//   - ./result-budget.ts                  — MODEL_TOOL_RESULT_BUDGET_BYTES (256 KiB), the outer cap
+//   - ./result-budget.ts                  — MODEL_TOOL_RESULT_BUDGET_BYTES (32,768 payload
+//                                         bytes), the outer cap: imported, and enforced a
+//                                         second time here by `clampToDeliveryCap` (:739)
 //   - ./snapshot-validation.ts            — the strict readers this module's restore uses
 //   - ../server/workers/lane-authority.ts — routes a lane's wrapper write here (Decision A)
 
@@ -125,6 +131,15 @@ import {
     TASKS_NAME
 } from './metadata';
 import { tool } from './tool';
+// F7-4 — the delivery clamp is enforced in the SAME currency the delivery guard caps in
+// (the JSON-escaped payload bytes of the rendered result), so it measures with the guard's
+// own measure rather than a look-alike (`utf8ByteLength` under-counts an escaped body by
+// ~5%, ./payload-bytes.ts "WHY THIS EXISTS").
+import { modelPayloadBytes } from './payload-bytes';
+// The outer cap itself, imported rather than re-declared: the clamp target and the cap
+// `boundToolResult` enforces are ONE number, and ./branch.ts + ./tool-source.ts already
+// reach core/ this way (./result-budget.ts imports nothing from core/, so this stays one-way).
+import { MODEL_TOOL_RESULT_BUDGET_BYTES } from './result-budget';
 import {
     readSnapshotArray,
     readSnapshotId,
@@ -145,17 +160,80 @@ import { TASKS_COLLECTION } from './task';
 //
 // The numbers a wrapper may NOT lower and an agent may not exceed without saying
 // so. R8: the byte budgets exist to stop a non-deterministic agent flooding its own
-// context window — they are tunable, not load-bearing. What IS load-bearing is that
-// the page budget stays below MODEL_TOOL_RESULT_BUDGET_BYTES (256 KiB), because an
-// inner page that claims `hasMore: false` while the outer envelope truncates it is a
-// lie the model cannot detect.
+// context window — they are tunable, not load-bearing. What IS load-bearing is the
+// RELATION between what a page promises and what the harness can deliver: an inner page
+// that claims `hasMore: false` while the outer envelope truncates it is a lie the model
+// cannot detect (the same rule ./knowledge.ts:140 states for the sibling engine; this
+// engine's half of it is M10's `page.budgetTruncated`).
+//
+// THREE NUMBERS, stated separately because DEFECT F1-6 (2026-11-25) merged the first two:
+//   1. THE CONFIGURED BUDGET — `responseBudgetBytes`, per collection: the engine default
+//      `RECORD_RESPONSE_BUDGET_BYTES` fills it in, and a `define` may set any value in
+//      RECORD_MIN_RESPONSE_BUDGET_BYTES..RECORD_MAX_RESPONSE_BUDGET_BYTES (1,024..65,536).
+//      It is what the PRODUCER pages by: `project` (:3466) stops at the last whole row
+//      that fits and sets `page.budgetTruncated`.
+//   2. THE DELIVERY CAP — MODEL_TOOL_RESULT_BUDGET_BYTES, 32,768 payload bytes
+//      (./result-budget.ts:231, DERIVED from 8,192 tokens x 4 bytes; the "256 KiB" older
+//      comments of this repo still quote is the value it replaced). `boundToolResult`
+//      REFUSES a JSON document over the cap (./result-budget.ts:557-578, F-CUTTER): the
+//      caller gets a refusal sentence and no page and no cursor. A harness constant an
+//      agent may not configure.
+//   3. THE CLAMP — `RECORD_DELIVERY_CAP_BYTES`, which IS number 2 (imported, never a copy
+//      of it), applied to the finished answer at the single delivery seam every record tool
+//      passes through (`runCall`, :4925).
+//
+// WHY A CLAMP RATHER THAN A LOWER BUDGET (DEFECT F7-4, 2026-11-25). F1-6 "fixed" the
+// overshoot by moving number 1 under number 2 (64 KiB -> 24 KiB, and the four built-in
+// specs with it). That made a previously valid `define` (say 32,768) a REFUSAL, silently
+// rewrote every persisted 65,536, and still did not bound delivery: the fitters always
+// admit the first row of each kind, so one record near the field caps
+// (RECORD_MAX_FIELDS x RECORD_MAX_TEXT = 16 x 4,000 chars) is bigger than any page budget
+// by construction and was discarded by the guard anyway — F1's own stated residual. A
+// budget is a CONTEXT choice the caller owns; the cap is a DELIVERY fact the harness owns.
+// So the budget is restored to whatever the caller asked for (and restores verbatim), and
+// the answer the harness delivers is clamped to what it can carry.
+//
+// THE CLAMP RULE, in one place (`clampToDeliveryCap`, :739): the cheapest loss goes first,
+// where a loss is CHEAP when the caller can get it back. Trailing CHANGE-FEED rows go
+// first (they resume from the caller's own `since`), then write-echo BODIES (they collapse
+// toward `{ id, rev }`, the vocabulary the tool description already publishes), then
+// trailing PAGE ROWS — the content the caller asked for, so last among the losses a cursor
+// can recover, and their `nextOffset`/`nextAfterId` are RECOMPUTED to the rows that
+// survived. Only then come the FIELDS of the row that cannot be split further, which is
+// what closes the single-maximal-record case; every withheld key is NAMED in
+// `fieldsWithheld`, so an absent field stays a NAMED omission, never a cleared value.
+// `budgetTruncated` / `changesHasMore` / `hasMore` /
+// 32768` beside them says WHICH bound bit — the harness cap rather than the collection's
+// own budget. The guarantee, pinned by measurement in ./records.test.ts and
+// ./harness.records.test.ts: a delivered records answer never exceeds 32,768 payload bytes.
 export const RECORD_MAX_RECORDS = 200;
 export const RECORD_MIN_RECORDS = 1;
 export const RECORD_MAX_TEXT = 4000;
 export const RECORD_MAX_ITEMS = 32;
 export const RECORD_LIST_DEFAULT_LIMIT = 20;
 export const RECORD_LIST_MAX_LIMIT = 100;
-export const RECORD_RESPONSE_BUDGET_BYTES = 64 * 1024;
+
+// The range a `define` may set `responseBudgetBytes` to, and the range a persisted
+// document may carry. 1,024 is the smallest page worth metering (below it a single row
+// cannot fit and every read reports `budgetTruncated`); 65,536 is the number this engine
+// shipped with before F1-6 lowered it, which is exactly why it is the ceiling again —
+// raising the ceiling is what makes a persisted 65,536 restore VERBATIM instead of being
+// quietly rewritten (`:1808-1811`), and it keeps the `typecrate/harness` lane-compaction
+// fixture (which carries 65,536) a document the engine accepts as written.
+export const RECORD_MIN_RESPONSE_BUDGET_BYTES = 1_024;
+export const RECORD_MAX_RESPONSE_BUDGET_BYTES = 65_536;
+
+// The default a `define` that names no budget gets, and the budget all four built-in
+// collections declare. It is deliberately ABOVE the delivery cap: it is what the caller
+// asked for, not what the harness can carry. A collection asking for 64 KiB gets pages
+// trimmed at 64 KiB by the producer and at 32,768 bytes by the clamp, and the answer
+// says which one fired (`deliveryBudgetBytes`).
+export const RECORD_RESPONSE_BUDGET_BYTES = RECORD_MAX_RESPONSE_BUDGET_BYTES;
+
+// The clamp target — the delivery guard's own cap, imported so the clamp and the guard
+// cannot drift apart (the drift is DEFECT F7-4: this engine's budget claimed a relation
+// to a cap it quoted from memory).
+export const RECORD_DELIVERY_CAP_BYTES = MODEL_TOOL_RESULT_BUDGET_BYTES;
 
 // Per-collection change window (Decision B). 200 retained events, at most 50 handed
 // back per call, both FIFO. Sizing note from the old task store, still true and now
@@ -518,6 +596,13 @@ const cloneDefinition = (
 // record for the reason that holds everywhere: a page that returns nothing but promises
 // `hasMore` is a loop that never terminates, and a write that comes back with no content
 // at all is unreadable.
+//
+// WHAT THIS NO LONGER MEANS, since F7-4 (2026-11-25): "the first row is always admitted"
+// is a rule about the CALLER's budget, not about the wire. A first row admitted past
+// `MODEL_TOOL_RESULT_BUDGET_BYTES` used to be discarded by the delivery guard (the
+// residual F1 stated in its own report), and these fitters are not the place to fix it —
+// a budget is what the caller asked for. `clampToDeliveryCap` (:739) is the backstop, and
+// it is the only code in this module allowed to drop the last row's FIELDS.
 
 // What one row costs inside a JSON array, the joining separator included.
 const rowBytes = (row: unknown): number => Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
@@ -600,6 +685,264 @@ const echoMeter = (budget: number, used: number) => {
             return truncated;
         }
     };
+};
+
+// ---------------------------------------------------------------------------
+// DEFECT F7-4 (2026-11-25) — THE DELIVERY CLAMP
+// ---------------------------------------------------------------------------
+//
+// Everything above this line bounds the answer against `definition.responseBudgetBytes`,
+// which is the CALLER's context choice. Nothing above it bounds the answer against what the
+// harness can actually put on the wire: `MODEL_TOOL_RESULT_BUDGET_BYTES` (32,768 payload
+// bytes), over which `boundToolResult` REFUSES a JSON document outright
+// (./result-budget.ts:557-578) — no page, no cursor, no receipts, a `failed` call.
+//
+// THE GUARANTEE THIS FUNCTION EXISTS TO MAKE TRUE: the value `runCall` hands back is never
+// larger than the cap, whatever the collection's configured budget says. It is a guarantee,
+// not a sizing heuristic, because the configured budget CANNOT be the guarantee: the fitters
+// always admit the first row of each kind (`fitRowsToBudget` :615, `echoMeter` :657), so one
+// record near the field caps — `RECORD_MAX_FIELDS` (16) x `RECORD_MAX_TEXT` (4,000 chars) —
+// is ~64,000 characters of prose and overshoots every legal budget, including the 1,024-byte
+// floor. That was F1's own stated residual; here it is closed by measurement, and pinned by
+// measurement in ./records.test.ts and ./harness.records.test.ts.
+//
+// THE CHEAPEST LOSS GOES FIRST, where cheap means the caller can get it back:
+//   1. trailing `changes` rows  — resumable from the reader's own `since` watermark, and
+//      `changesHasMore` is the flag that already means it (`project`, :3466);
+//   2. WRITE-ECHO BODIES        — the caller just wrote that content itself, so it is the
+//      answer's least-needed prose. Trailing keys come off the last `removed` body, then
+//      the earlier ones, then the singular echo, collapsing toward `{ id, rev }` — the same
+//      degradation `echoMeter` publishes, taken one field at a time instead of all at once;
+//   3. trailing PAGE ROWS       — the content the caller actually asked for, so it is last
+//      among the losses a cursor can recover. `hasMore`, `nextOffset` and `nextAfterId` are
+//      RECOMPUTED against the rows that survive, which is the whole point: a clamped page
+//      that left its engine-computed cursor in place would resume PAST the rows the clamp
+//      withheld and turn a truncation into silent data loss (the F13 rule — an inner page
+//      the outer envelope contradicts is a lie the model cannot detect);
+//   4. trailing FIELDS of the last surviving row — the single-record residual. One record
+//      can be bigger than the cap by construction, and a record delivered with its leading
+//      fields beats a record not delivered at all. Every withheld key is NAMED
+//      (`fieldsWithheld`), because an absent field must never read as a cleared one
+//      (`copyEntry`'s rule, :467).
+//
+// WHAT SEPARATES THE TWO BOUNDS: `deliveryBudgetBytes: 32768`, beside `budgetTruncated`,
+// says the HARNESS CAP withheld this — a caller that sees it knows raising its collection's
+// `responseBudgetBytes` changes nothing, while a plain `budgetTruncated` says the
+// collection's own budget did the trimming. It is additive: it appears only on a clamped
+// answer, and nothing that used to fit changes byte for byte.
+//
+// NEVER TOUCHED: the id receipts (`addedIds`/`changedIds`/`noopIds`/`removedIds`), `counts`,
+// `storeRev`, `oldestAvailableRev`, `droppedEvents`, and a `definition` echo. They are the
+// keys a caller needs in order to narrow the NEXT call, and they are bounded by engine caps
+// (16 fields, 200 records, 200 ids) rather than by record content — the same reasoning
+// `echoMeter` gives for refusing to meter the id lists (:657).
+const clampToDeliveryCap = (
+    definition: RecordCollectionDefinition | undefined,
+    value: unknown
+): unknown => {
+    if (!isRecord(value)) return value;
+
+    // The exact currency of the cap: the escaped payload the provider is billed for, of the
+    // exact string `serialize()` hands `boundDelivery` (../harness.ts:1326).
+    let bytes = modelPayloadBytes(JSON.stringify(value));
+
+    // Small answers are EXACT — the same rule `boundWithReason` applies at :557, and the
+    // reason every existing byte-for-byte assertion in these suites keeps passing untouched.
+    if (bytes <= RECORD_DELIVERY_CAP_BYTES) return value;
+
+    const envelope = value;
+    const wrapper = definition?.wrapper;
+    // Where this envelope carries its page rows: `entries` on the un-wrapped `records`
+    // surface, the collection's plural under a wrapper (both wrapper styles — `tasks`' batch
+    // shape and `chapters`' `list` shape put the page under the plural key).
+    const rowsKey = wrapper === undefined ? 'entries' : wrapper.plural;
+    // And its single-record echo: `entry`, or the wrapper's singular (`task`, `chapter`).
+    const entryKey = wrapper === undefined ? 'entry' : wrapper.singular;
+    const page = isRecord(envelope.page) ? (envelope.page as Record<string, unknown>) : undefined;
+    // Keyset mode is the one that reports `afterId`; it walks in id order, so its cursor is
+    // the last delivered id rather than an offset (./records.ts R2/T2.1).
+    const keyset = page !== undefined && typeof page.afterId === 'string';
+    // Record id -> the field keys this clamp withheld from it. Attached on the FIRST
+    // withhold, then mutated in place, so every later measurement of the envelope already
+    // counts the marker it carries.
+    const ledger: Record<string, string[]> = {};
+
+    // A content loss. `budgetTruncated` is the envelope-level "this answer withheld
+    // something it owes you" flag (../types/index.ts:2391), and the page carries its own
+    // copy only when the PAGE is what lost content.
+    const markContent = (pageTouched: boolean): void => {
+        envelope.budgetTruncated = true;
+        envelope.deliveryBudgetBytes = RECORD_DELIVERY_CAP_BYTES;
+
+        if (!pageTouched || page === undefined) return;
+
+        page.budgetTruncated = true;
+        page.deliveryBudgetBytes = RECORD_DELIVERY_CAP_BYTES;
+    };
+
+    // A feed loss. `budgetTruncated` deliberately does NOT cover it — the feed reports through
+    // `changesHasMore` (../types/index.ts:2389), and `changesTruncated` is a DIFFERENT signal
+    // this clamp must never set: it is the RETENTION-FLOOR flag, true only when the FIFO window
+    // has dropped events for good (./records.ts:3653-3659). Withholding feed rows that are
+    // still retained is a size cut, exactly like the entry cap and the byte budget, so only
+    // `changesHasMore` moves — a reader that pages from its own watermark loses nothing.
+    const markFeed = (): void => {
+        envelope.changesHasMore = true;
+        envelope.deliveryBudgetBytes = RECORD_DELIVERY_CAP_BYTES;
+    };
+
+    const noteField = (row: RecordEntry, key: string): void => {
+        const owner = String(row.id);
+        const keys = ledger[owner] ?? [];
+
+        // DEDUPLICATED. One record can appear twice in an answer — as a page row AND as the
+        // singular write echo — and both copies lose keys under the same heading. A ledger that
+        // read `["f7","f7"]` would make the caller count a loss it can only read once, so each
+        // withheld key is named exactly once per record.
+        if (!keys.includes(key)) keys.push(key);
+
+        ledger[owner] = keys;
+
+        if (envelope.fieldsWithheld === undefined) envelope.fieldsWithheld = ledger;
+    };
+
+    // Withholds ONE trailing key from a delivered record, collapsing it toward `{ id, rev }`.
+    // `id` and `rev` are never candidates: the first is how the caller addresses the record
+    // again and the second is the CAS token for its next write. Key order is `id`, declared
+    // fields, `rev`, then the attribution tail (`copyEntry`'s key order, :467), so this drops
+    // `updatedAt`/`updatedBy` before it touches any stored field — attribution first, prose
+    // last, and always from the end so the leading fields a caller reads stay in place.
+    const withholdField = (candidate: unknown): boolean => {
+        if (!isRecord(candidate)) return false;
+
+        const droppable = Object.keys(candidate).filter((key) => key !== 'id' && key !== 'rev');
+
+        if (droppable.length === 0) return false;
+
+        const key = droppable[droppable.length - 1];
+
+        delete candidate[key];
+        noteField(candidate as unknown as RecordEntry, key);
+
+        return true;
+    };
+
+    // 1 — one trailing change-feed row.
+    const dropChange = (): boolean => {
+        const changes = envelope.changes;
+
+        if (!Array.isArray(changes) || changes.length === 0) return false;
+
+        changes.pop();
+        markFeed();
+
+        return true;
+    };
+
+    // 2 — one trailing key of a write echo, tail-first across `removed` then the singular
+    // echo. An action wrapper's `get` moves its `getOnly` bodies to top-level keys, but every
+    // built-in caps those bodies at 4,000 characters, so no wrapper answer can reach the cap
+    // through one of them — only a `define`d collection can, and a `define`d collection has
+    // no wrapper. Hence no special case for the top-level body keys.
+    const trimEcho = (): boolean => {
+        const removed = envelope.removed;
+
+        if (Array.isArray(removed)) {
+            for (let index = removed.length - 1; index >= 0; index -= 1) {
+                if (withholdField(removed[index])) {
+                    markContent(false);
+
+                    return true;
+                }
+            }
+        }
+
+        if (withholdField(envelope[entryKey])) {
+            markContent(false);
+
+            return true;
+        }
+
+        return false;
+    };
+
+    // 3 — one trailing page row, and the cursor re-derived from what is left.
+    const dropRow = (): boolean => {
+        const rows = envelope[rowsKey];
+
+        // Never an empty page: `project` keeps the first row for the reason that holds here
+        // too — rows the caller can get from the next page beat no rows plus a promise. If
+        // the last remaining row alone is still too big, step 4 trims it.
+        if (page === undefined || !Array.isArray(rows) || rows.length < 2) return false;
+
+        const kept = rows as RecordEntry[];
+
+        kept.pop();
+
+        // The withheld row still exists, so a page that was `hasMore: false` when the clamp
+        // found it cannot stay false, and every cursor has to point at the row AFTER the
+        // last delivered one.
+        page.hasMore = true;
+
+        if (keyset) {
+            page.nextAfterId = String(kept[kept.length - 1].id);
+        } else {
+            page.nextOffset = Number(page.offset) + kept.length;
+
+            // R2/T2.1's sortable-collection bonus: `nextAfterId` is the MAXIMUM id of the
+            // rows actually delivered, not of the rows the engine had loaded. Left as it was,
+            // it would name a row this clamp withheld, and a caller that switched to `afterId`
+            // there would skip everything between.
+            if (typeof page.nextAfterId === 'string') {
+                let maxId = Number(kept[0].id);
+
+                for (const row of kept) {
+                    const id = Number(row.id);
+
+                    if (id > maxId) maxId = id;
+                }
+
+                page.nextAfterId = String(maxId);
+            }
+        }
+
+        markContent(true);
+
+        return true;
+    };
+
+    // 4 — one trailing field of the last surviving row (or of the lone echo, which step 2
+    // already owns; this step is about the page row that `dropRow` refuses to drop).
+    const trimRow = (): boolean => {
+        const rows = envelope[rowsKey];
+
+        if (!Array.isArray(rows) || rows.length === 0) return false;
+
+        const kept = rows as RecordEntry[];
+
+        if (!withholdField(kept[kept.length - 1])) return false;
+
+        markContent(true);
+
+        return true;
+    };
+
+    // One degradation per pass, then re-measure, so the answer loses the MINIMUM the cap
+    // requires rather than everything the ladder can reach. Termination is structural: a
+    // step that reports success strictly reduced the serialized text, and a pass in which no
+    // step can proceed breaks here. The residue that can still sit over the cap is a
+    // control echo — a `define`/`describe` spec or the collection name list — whose size is
+    // bounded by the engine's own caps, not by record content; that is stated rather than
+    // hidden, and no record body is ever the reason.
+    for (;;) {
+        const progressed = dropChange() || trimEcho() || dropRow() || trimRow();
+
+        bytes = modelPayloadBytes(JSON.stringify(envelope));
+
+        if (!progressed || bytes <= RECORD_DELIVERY_CAP_BYTES) break;
+    }
+
+    return envelope;
 };
 
 // ---------------------------------------------------------------------------
@@ -1448,12 +1791,26 @@ const readCollectionDefinition = (
                       min: RECORD_MIN_RECORDS,
                       max: RECORD_MAX_RECORDS
                   }),
+        // F7-4 (2026-11-25) — a DOCUMENT restores VERBATIM. F1-6 lowered an out-of-range
+        // budget here instead of refusing it, reasoning that losing a whole session store over
+        // a page size is the worse failure; that was only needed because F1-6 had LOWERED the
+        // ceiling to 24,576, which put documents this engine itself wrote outside the range —
+        // all four built-ins carried 65,536, and so does the `typecrate/harness`
+        // lane-compaction fixture (tests/fixtures/lane-compaction/durable/state.json). With
+        // the range back at RECORD_MIN_RESPONSE_BUDGET_BYTES..RECORD_MAX_RESPONSE_BUDGET_BYTES
+        // (1,024..65,536), every number a previous engine wrote is IN range, so there is
+        // nothing to lower: a stored budget comes back exactly as stored and re-saves
+        // unchanged. What is still refused is what was always refused — a value outside the
+        // range, i.e. a document this engine could not have written. The delivery cap is NOT
+        // this range's upper bound and does not need to be: an over-cap budget yields an
+        // over-cap ANSWER, and the clamp in `runCall` trims that to fit (header at :196,
+        // `clampToDeliveryCap` at :739).
         responseBudgetBytes:
             raw.responseBudgetBytes === undefined
                 ? RECORD_RESPONSE_BUDGET_BYTES
                 : readSnapshotInteger(raw.responseBudgetBytes, `${label}.responseBudgetBytes`, {
-                      min: 1024,
-                      max: RECORD_RESPONSE_BUDGET_BYTES
+                      min: RECORD_MIN_RESPONSE_BUDGET_BYTES,
+                      max: RECORD_MAX_RESPONSE_BUDGET_BYTES
                   })
     };
 
@@ -4064,8 +4421,9 @@ export const createRecordEngine = (): RecordEngine => {
         // which is what makes define { name, fields } a complete call (Decision C).
         //
         // 'responseBudgetBytes' was RESTORED-only: `readCollectionDefinition` validated it
-        // on a snapshot (`:1140-1146`, min 1024 / max RECORD_RESPONSE_BUDGET_BYTES) and
-        // `describe` reported it, but no agent could SET it — so the one number that
+        // on a snapshot (`readCollectionDefinition`, :1698, floor 1024 and ceiling 65,536 — the range this
+        // engine shipped before F1-6 narrowed it — and `describe` reported it, but no agent
+        // could SET it — so the one number that
         // decides when a page starts losing records (M10's `budgetTruncated`) was readable
         // and not writable from the tool surface. Admitted here as optional; the range is
         // enforced by the shared validator below, so a bad value is refused, not clamped.
@@ -4118,10 +4476,20 @@ export const createRecordEngine = (): RecordEngine => {
                           return cap;
                       })()
                   }),
-            // M10 companion — the page budget, settable from the tool surface for the
-            // first time. Same refuse-don't-clamp rule as `maxRecords`, and the same
-            // 1024..RECORD_RESPONSE_BUDGET_BYTES range the snapshot path already enforced
-            // (`:1140-1146`), so a `define` and a `restore` of the same number agree.
+            // M10 companion — the page budget, settable from the tool surface. Same
+            // refuse-don't-clamp rule as `maxRecords`, and the SAME 1024..65536 range the
+            // snapshot path enforces (`readCollectionDefinition`, :1699) — the range this
+            // engine shipped with before F1-6 narrowed it to 24,576, which is exactly why it
+            // is the range again: a `define` that used to work must not become a refusal, and
+            // a persisted 65,536 must restore verbatim (F7-4).
+            //
+            // THE RANGE IS THE CALLER'S REQUEST, NOT A DELIVERY PROMISE. A budget above
+            // `RECORD_DELIVERY_CAP_BYTES` (32,768) is therefore ACCEPTED: the producer pages by
+            // the number the caller asked for, and the finished answer is trimmed to the cap by
+            // `clampToDeliveryCap` (:739) with `deliveryBudgetBytes` naming which bound bit.
+            // Values outside 1024..65536 are still refused rather than clamped — the agent chose
+            // a number, and a bound it cannot express is a fact about its call, not about the
+            // store.
             ...(raw.responseBudgetBytes === undefined
                 ? {}
                 : {
@@ -4132,10 +4500,13 @@ export const createRecordEngine = (): RecordEngine => {
                               { min: 1 }
                           );
 
-                          if (budget < 1024 || budget > RECORD_RESPONSE_BUDGET_BYTES) {
+                          if (
+                              budget < RECORD_MIN_RESPONSE_BUDGET_BYTES ||
+                              budget > RECORD_MAX_RESPONSE_BUDGET_BYTES
+                          ) {
                               throw recordError(
                                   RECORD_ERROR_CODES.recordCap,
-                                  `${label} "define".responseBudgetBytes is ${budget}; a page budget must be between 1024 and ${RECORD_RESPONSE_BUDGET_BYTES} bytes.`
+                                  `${label} "define".responseBudgetBytes is ${budget}; a page budget must be between ${RECORD_MIN_RESPONSE_BUDGET_BYTES} and ${RECORD_MAX_RESPONSE_BUDGET_BYTES} bytes.`
                               );
                           }
 
@@ -4573,7 +4944,13 @@ export const createRecordEngine = (): RecordEngine => {
                 notifyStore('mutate', affected, capture);
             }
 
-            return result;
+            // DEFECT F7-4 — the ONE delivery seam. Every record tool body (`records` and the
+            // four wrappers), the manual `executeTool` path, and a lane replica's routed
+            // `executeRecords` all end here, so clamping this value — AFTER `toWrapperResult`
+            // has rebuilt the envelope, which is the value that actually goes on the wire —
+            // is what makes "a delivered records page can never exceed 32,768 bytes" true of
+            // the delivered bytes rather than of a constant. See `clampToDeliveryCap` (:739).
+            return clampToDeliveryCap(definition, result);
         } finally {
             feedCapture = undefined;
         }

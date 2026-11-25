@@ -39,6 +39,15 @@ export const CHAPTER_MAX_ORDER = 1_000_000;
 export const CHAPTERS_COLLECTION: RecordCollectionDefinition = {
     name: 'chapters',
     maxRecords: CHAPTER_MAX_RECORDS,
+    // THE CONFIGURED PAGE BUDGET — 64 KiB (the number this collection was born with):
+    // what the page PRODUCER budgets, not what the harness delivers. The delivery cap is
+    // 32,768 payload bytes (`MODEL_TOOL_RESULT_BUDGET_BYTES`, ./result-budget.ts:231), and
+    // a page over it is trimmed SERVE-TIME by `clampToDeliveryCap` (./records.ts:739),
+    // which re-derives the page cursor and flags `page.deliveryBudgetBytes` — so the
+    // answer arrives whole and parsable with its truncation stated, instead of being
+    // discarded by the delivery guard. F1-6's alternative (lowering this to 24 KiB) was
+    // reverted by F7-4 because it refused previously valid `define`s and rewrote persisted
+    // budgets. Same reasoning as ./task.ts:42-57.
     responseBudgetBytes: 64 * 1024,
     wrapper: { tool: 'chapters', plural: 'chapters', singular: 'chapter', style: 'action' },
     fields: [

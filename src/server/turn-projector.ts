@@ -662,6 +662,24 @@ type SectionRecord = {
 const isConversationRoot = (meta: NonNullable<HarnessEvent['thread']>): boolean =>
     meta.parentId === undefined && meta.callId === undefined && meta.kind === undefined && meta.branchId === undefined;
 
+// F3/S1 (2026-11-25) — THE ONE RULE FOR "THIS ROW IS A DELEGATION THAT NEVER RAN", stated once so
+// every door that could retire the row uses the SAME predicate:
+//   - `settle()` (see the sweep at the end of this closure) removes it when the turn ends over it;
+//   - the parent's `tool_result` for the spawning call removes it when the CALL returns first,
+//     which is what actually happens in the field (every `delegate` envelope of turn `caaa372e…`
+//     is terminal, so the sweep never saw those five rows — they were already terminal).
+//
+// The three clauses are each load-bearing, and together they are EXACT:
+//   - `placeholder` — only a row minted by a `delegate` call is in question; an adopted child, a
+//     branch row and an `inline:<agent>` flow describe a run that produced frames;
+//   - no `section.invocationId` — the row was never given a run identity (`adoptPlaceholder`,
+//     `createChild` and the root binding are the only three writers, :1586/:1406/:1482);
+//   - no nodes — nothing of its own was ever recorded on it, so removing it cannot lose a byte of
+//     the turn: the `delegate` STEP stays on the parent's row with its args, its result and (for an
+//     abandoned call) its own preview, which is the copy the reader acts on.
+const isUnrunPlaceholder = (record: SectionRecord): boolean =>
+    record.placeholder && record.section.invocationId === undefined && record.section.nodes.length === 0;
+
 // T-W8 (2026-11-17) — THE RESTART DISCRIMINATOR, stated once so every door asks the same
 // question the same way.
 //
@@ -1514,8 +1532,39 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         return record;
     };
 
-    const queuedPlaceholder = (agent: string): SectionRecord | undefined =>
-        sections.find((record) => record.placeholder && record.agent === agent);
+    // F3/S1 (2026-11-25) — WHICH placeholder a frame adopts is resolved by the SPAWNING CALL ID
+    // first, and only then by agent order.
+    //
+    // WHY THE CALL ID COMES FIRST. A turn holds two live delegations to the SAME agent all the
+    // time: measured on the operator's own document (turn `caaa372e…` of session `e513eed7…`,
+    // Temp/agenttools/probe-calls.ts output), `call_d190b40e…` spawned invocation 85 and
+    // `call_2632e067…` spawned invocation 86, both agent `research`, 14 ms apart. An agent-only
+    // match answers "which row is this run?" with "the oldest un-adopted row of that agent", which
+    // is a GUESS about something the record states exactly: the child's own frames name
+    // `thread.callId` and the row was minted under that same id (`placeholder.spawnCallId`,
+    // the `tool_call` handler). Matching it keeps one delegation per row under ANY arrival order,
+    // which is what a live fold and a cold replay both need (the ONE RULE at the top of this file).
+    //
+    // WHY THE AGENT-ONLY FALLBACK STAYS. A producer that names no spawn call id on the child's
+    // frames (a hand-written reporter, the threadless legacy stream, a runtime that threads the
+    // parent but not the call) has nothing to match WITH. Dropping the fallback there would turn
+    // every such child into a SECOND row beside a contentless placeholder — the defect this rule
+    // exists to avoid — so the fallback keeps spawning order (calls are recorded before the child
+    // they spawn, and the runtime starts children in call order), which is deterministic for a
+    // replay of the same frames.
+    //
+    // An id match that names a DIFFERENT agent is not a match: the row belongs to the delegation
+    // whose `delegate` args named that agent, so the lookup falls through to the order scan rather
+    // than adopting a foreign row.
+    const queuedPlaceholder = (agent: string, callId?: string): SectionRecord | undefined => {
+        if (callId !== undefined) {
+            const exact = byCall.get(callId);
+
+            if (exact !== undefined && exact.placeholder && exact.agent === agent) return exact;
+        }
+
+        return sections.find((record) => record.placeholder && record.agent === agent);
+    };
 
     // R18/T18: adopt a delegated conversation's id for sections that were folded BEFORE
     // the store could record the join, and emit the `section:set` patch for it.
@@ -1683,6 +1732,30 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
 
                     return placeholder;
                 }
+            } else if (!isConversationRoot(meta)) {
+                // F3/S1 (2026-11-25) — A CHILD-SHAPED FRAME THAT NAMES NO SPAWN CALL ID STILL
+                // BELONGS TO THE DELEGATION ITS PARENT'S `delegate` CALL OPENED.
+                //
+                // Before this branch the frame fell straight through to `createChild`, so a
+                // producer that names the parent (`thread.parentId`) but not the call left TWO
+                // rows behind one delegation: the running child, and the placeholder — which no
+                // frame ever adopts, so it keeps `agentLabel: ''`, no `invocationId`, no
+                // `startedAt` and no nodes. That pair is the "delegated task / no id chip / empty
+                // in total" row the user reported (5 of the 32 rows of turn `caaa372e…` are
+                // exactly that shape: Temp/fix-f3/replay.out).
+                //
+                // The guard is the same discriminator the router already trusts
+                // (`isConversationRoot`): a frame with no parent / call / kind / branch is the
+                // TURN'S OWN conversation, and a conversation-root frame that arrives while the
+                // root row belongs to another agent falls through here too — swallowing a
+                // delegation placeholder for it would mis-parent a host-thread run.
+                const placeholder = queuedPlaceholder(event.agent);
+
+                if (placeholder !== undefined) {
+                    adoptPlaceholder(placeholder, meta, ops);
+
+                    return placeholder;
+                }
             }
 
             return createChild(meta, event.agent, ops);
@@ -1705,6 +1778,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         }
 
         if (event.type === 'start') {
+            // F3/S1: no second argument by design — a THREADLESS frame names no spawn call id, so
+            // this door can only ever use the agent-order fallback the legacy plane has always had.
             const placeholder = queuedPlaceholder(event.agent);
 
             if (placeholder !== undefined) {
@@ -3186,31 +3261,62 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     const child = byCall.get(callId);
 
                     if (child !== undefined && child !== record && !child.terminal) {
-                        child.terminal = true;
-                        patchSection(
-                            child,
-                            {
-                                state: outcome === 'completed' ? 'done' : outcome === 'cancelled' ? 'cancelled' : 'error',
-                                ...(stamp === undefined ? {} : { endedAt: stamp })
-                            },
-                            ops
-                        );
+                        // F3/S1 (2026-11-25) — THE SPAWNING CALL RETURNED AND THE CHILD NEVER SPOKE.
+                        // `isUnrunPlaceholder` is the store's own exactness test (see its declaration):
+                        // this row is a `delegate` call that was opened, never adopted by a single
+                        // frame of the run it requested, and carries nothing of its own. The parent's
+                        // result is the LAST evidence that could still arrive for it, so the row is
+                        // REMOVED here — the same decision `settle()` already makes when the turn ends
+                        // over such a row, moved to the frame that proves it.
+                        //
+                        // WHY THIS IS THE USER-VISIBLE DEFECT. Settling the row instead (the previous
+                        // behaviour) paints a card with `agentLabel: ''`, no `invocationId`, no
+                        // `threadId`, no `startedAt`, no nodes and no context blocks: five of the 32
+                        // rows of turn `caaa372e…` are exactly that (Temp/fix-f3/replay.out), and the
+                        // tile renders them as the label-less "delegated task" row with no metrics the
+                        // operator screenshotted. It also makes the row immortal on a cold replay,
+                        // because `settle()` skips an already-terminal record.
+                        //
+                        // NOTHING IS LOST: the `delegate` step itself lives on the PARENT row (the
+                        // `tool_call`/`tool_result` pair above settled it with its args, its state and
+                        // its result), and a child that did run is never matched here — its first frame
+                        // took the row's `invocationId`, and its content took its nodes.
+                        //
+                        // EDGE CASE (pinned): a CONTROL outcome is NOT a clean return. `cancelled` /
+                        // `rejected` / `failed` is a state the parent's card does not repeat on the
+                        // child, and turn-projector.test.ts:634-643 pins the cancelled row, so only a
+                        // completed result — or a legacy result carrying no `outcome` and no error —
+                        // retires the never-ran placeholder; a control outcome keeps the settle below.
+                        if (isUnrunPlaceholder(child) && (outcome === 'completed' || outcome === undefined)) {
+                            removeSection(child, ops);
+                        } else {
+                            child.terminal = true;
 
-                        // F1 (review, 2026-11-19) — THE ONE TERMINAL EDGE `settle()` NEVER SEES.
-                        // A child CANCELLED by its parent's result for the spawn call emits no
-                        // `error` frame of its own (../harness.ts:9618 `if (run.aborted &&
-                        // run.parent)`), so this branch — not the child's `error` handler and not
-                        // the turn's `settle()` sweep — is the frame that ends that row. Without
-                        // the clear below the settled section keeps `toolProgress: { phase:
-                        // 'tool-composition', … }`, which contradicts the field contract
-                        // (../shared/turn-display.ts:1145-1147 "can never outlive the attempt that
-                        // produced it") and is USER-VISIBLE while the parent keeps streaming: the
-                        // tile's `composingProgressOf()` scans the nested sections
-                        // (../frontend/ui/turns.ts:4758-4770), so the parent's meta line prints
-                        // `composing 2 tool calls · 4,096 chars` for a child that stopped composing
-                        // several minutes earlier. Same dedupe rule as every other clear: a row
-                        // that never painted costs no op (AC5-d).
-                        paintToolProgress(child, IDLE_TOOL_PROGRESS, ops);
+                            patchSection(
+                                child,
+                                {
+                                    state: outcome === 'completed' ? 'done' : outcome === 'cancelled' ? 'cancelled' : 'error',
+                                    ...(stamp === undefined ? {} : { endedAt: stamp })
+                                },
+                                ops
+                            );
+
+                            // F1 (review, 2026-11-19) — THE ONE TERMINAL EDGE `settle()` NEVER SEES.
+                            // A child CANCELLED by its parent's result for the spawn call emits no
+                            // `error` frame of its own (../harness.ts:9618 `if (run.aborted &&
+                            // run.parent)`), so this branch — not the child's `error` handler and not
+                            // the turn's `settle()` sweep — is the frame that ends that row. Without
+                            // the clear below the settled section keeps `toolProgress: { phase:
+                            // 'tool-composition', … }`, which contradicts the field contract
+                            // (../shared/turn-display.ts:1145-1147 "can never outlive the attempt that
+                            // produced it") and is USER-VISIBLE while the parent keeps streaming: the
+                            // tile's `composingProgressOf()` scans the nested sections
+                            // (../frontend/ui/turns.ts:4758-4770), so the parent's meta line prints
+                            // `composing 2 tool calls · 4,096 chars` for a child that stopped composing
+                            // several minutes earlier. Same dedupe rule as every other clear: a row
+                            // that never painted costs no op (AC5-d).
+                            paintToolProgress(child, IDLE_TOOL_PROGRESS, ops);
+                        }
                     }
                 }
 
@@ -3789,13 +3895,20 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // cold replay end with the SAME set of segments).
         syncSteerBlocks(undefined, ops);
 
-        for (const record of sections) {
+        // F3/S1: iterated over a SNAPSHOT, because `removeSection` splices `sections` in place and
+        // a live `for…of` over an array that shrinks skips the record after every removal — leaving
+        // a second never-ran placeholder open and un-settled (a shape the live run never showed,
+        // since the tool_result door above retires those rows first, but a hand-written reporter
+        // with two abandoned delegations hits it).
+        for (const record of [...sections]) {
             if (record.terminal) continue;
 
             record.terminal = true;
-            // A placeholder row that was never adopted describes a delegation that
-            // never ran; dropping it is exact, and it is why `section:remove` exists.
-            if (record.placeholder && record.section.nodes.length === 0 && record.section.invocationId === undefined) {
+            // A placeholder row that was never adopted describes a delegation that never ran;
+            // dropping it is exact, and it is why `section:remove` exists. F3/S1: the SAME
+            // predicate the spawning call's `tool_result` uses (see `isUnrunPlaceholder`), so the
+            // two doors cannot disagree about which row is a phantom.
+            if (isUnrunPlaceholder(record)) {
                 removeSection(record, ops);
 
                 continue;
