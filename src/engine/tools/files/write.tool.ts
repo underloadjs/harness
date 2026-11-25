@@ -169,6 +169,12 @@
 // list does not have to be parsed out of the sentence. The message keeps naming both,
 // because the message is the half that reaches a model.
 //
+// ONE failure is a STABLE state rather than a fault, and is coded as such (F9): when a
+// component of a target's PARENT path is an existing file, the parent mkdir cannot
+// succeed at any retry rate. That case is folded to `ENOTDIR` with the remedy `files`
+// gives for the identical syscall — see `parentMkdirRefusal` below — instead of the raw
+// EEXIST/ENOTDIR prose with no next step.
+//
 // CANCELLATION IS A CODED REFUSAL, NOT A SILENT WRITE
 // ---------------------------------------------------
 // `context.signal` (src/types/index.ts:2349-2364) is observed: once at the top of the call
@@ -428,6 +434,74 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
     return prepared;
 };
 
+// F9 — the parent-mkdir failure whose cause is a FILE standing where a folder has to be.
+//
+// `mkdir(parent, { recursive: true })` in the write loop is the one syscall there whose
+// failure can be a STABLE state: if any component of the parent path is an existing
+// regular file, no retry and no `recursive` flag can create a directory inside it.
+// Measured against this Node (Temp/toolfix-writedit/probe-mkdir.ts): a parent component
+// that is a file answers `ENOTDIR: not a directory, mkdir '<x>'`, and a path whose LEAF
+// is an existing file answers `EEXIST: file already exists, mkdir '<x>'`; the EEXIST form
+// is also what other platforms answer for the parent-component case. Both state the same
+// fact, so both get the same answer here.
+//
+// Uncoded, that state reached the caller as Node's prose inside the per-target envelope
+// ("write failed on <x>: EEXIST: file already exists, mkdir '<x>'. Writes already
+// completed: …") with NO next step, while the two tools that can observe the identical
+// state already advise: `files` routes its mkdir failures through `mkdirRemedy`
+// (./files.tool.ts:978-987, rendered by `filesFailureLine` at ./files.tool.ts:1585) and
+// `read` answers ENOTDIR with a remedy of its own (./read.tool.ts:4532-4536). `write` is
+// the tool literally creating a directory inside that path, so it takes `files`' sentence
+// verbatim — it is advice about exactly this syscall — and adds the action this tool
+// offers. `read`/`files`/`write` now answer one state with one code and one remedy.
+//
+// The fold is deliberately narrow: only a `syscall === 'mkdir'` errno of EEXIST or
+// ENOTDIR is re-coded, so a staging-create, chmod, rename or cancellation failure keeps
+// the classification `publishErrorCode` gives it (./atomic-publish.ts:433-442). `ENOTDIR`
+// is already in FILE_WRITE_ERROR_CODES because FILE_PUBLISH_ERROR_CODES carries it
+// (./atomic-publish.ts:94-120) — no new code is published — and `rawCode` follows the
+// package rule of naming the raw errno ONLY when the fold moved away from it, which is
+// also how `files` renders that pairing in prose via `failureCodeLabel`
+// (./files.tool.ts:909-910).
+// The remedy text: `files`' ENOTDIR mkdir sentence verbatim (./files.tool.ts:985), plus the
+// one action this tool can offer that `files` cannot (it has no target path to move).
+const PARENT_MKDIR_REMEDY =
+    'A component of that path is a file, not a folder; the directory cannot be created inside it. Delete that file, or write the target under a path whose parents are folders';
+
+// Returns the coded refusal for that mkdir state, or `undefined` for every other failure
+// (which keeps the existing `publishErrorCode` fold). The caller feeds the three fields
+// straight into the per-target envelope, so the "Writes already completed: …" contract
+// (write.test.ts:651-676) is untouched by this classification.
+const parentMkdirRefusal = (
+    error: unknown
+): { code: FileWriteErrorCode; rawCode?: string; reason: string } | undefined => {
+    const errno = error as { code?: unknown; syscall?: unknown } | undefined;
+    const raw = typeof errno?.code === 'string' ? errno.code : '';
+    const syscall = typeof errno?.syscall === 'string' ? errno.syscall : '';
+
+    if (syscall !== 'mkdir' || (raw !== 'EEXIST' && raw !== 'ENOTDIR')) return undefined;
+
+    // Node's message already states the errno and the location that `code`/`rawCode`
+    // carry, so only the reason survives — the same reduction ./files.tool.ts's
+    // `reasonOf` makes (./files.tool.ts:861-887), keeping the syscall NAME in parentheses
+    // because "mkdir" is not inferable from the code. A path containing a single quote
+    // defeats the anchored match and keeps Node's tail: degraded, still accurate.
+    let prose = error instanceof Error ? error.message : String(error);
+    if (prose.startsWith(`${raw}: `)) prose = prose.slice(raw.length + 2);
+    prose = prose.replace(/, mkdir '(?:[^']*)'$/, ' (mkdir)');
+
+    // `code` first (so a caller that greps for `ENOTDIR on` keeps matching) and the folded
+    // errno in parentheses right behind it, exactly as `files` composes its failure lines.
+    const code: FileWriteErrorCode = 'ENOTDIR';
+    const label = raw === code ? code : `${code} (${raw})`;
+
+    return {
+        code,
+        ...(raw === code ? {} : { rawCode: raw }),
+        reason: `${label}: ${prose}. ${PARENT_MKDIR_REMEDY}`
+    };
+};
+
 // Authoritative registration/details for this preset (T13): the catalogue keeps
 // a synchronous data projection for lazy enumeration and a consistency test
 // asserts the two stay equal. Edit the metadata HERE.
@@ -563,11 +637,18 @@ export const write = tool<FileWriteParameters, FileWriteResult>({
                         // period, so the old interpolation glued the two sentences together
                         // ("...open '/x' Writes already completed: none.").
                         const completedPaths = written.map((entry) => entry.path);
-                        const { code, rawCode } = publishErrorCode(error);
-                        const reason = (error instanceof Error ? error.message : String(error)).replace(
-                            /[\s.]+$/,
-                            ''
-                        );
+                        // F9: a parent mkdir that failed because a path component is a FILE
+                        // gets its own code + remedy (see `parentMkdirRefusal`); everything
+                        // else — a staging create, chmod, rename, or a cancellation — keeps
+                        // the shared publish fold exactly as it was.
+                        const refusal = parentMkdirRefusal(error);
+                        const { code, rawCode } = refusal ?? publishErrorCode(error);
+                        // A classified refusal brings its own composed reason (code, folded
+                        // errno in parentheses, remedy); anything else is Node's bare message
+                        // with the trailing-period strip described above.
+                        const reason =
+                            refusal?.reason ??
+                            (error instanceof Error ? error.message : String(error)).replace(/[\s.]+$/, '');
                         const where = completedPaths.length === 0 ? 'none' : completedPaths.join(', ');
 
                         throw new HarnessError(

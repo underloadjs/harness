@@ -12,6 +12,9 @@
 //     last position leaves the first file untouched;
 //   - a filesystem error part-way through is reported honestly: the completed paths
 //     are named and there is no claim of a transaction or rollback;
+//   - F9: the case where a target's PARENT path runs through an existing FILE is coded
+//     `ENOTDIR` with the remedy `read` and `files` already give for that state (folded
+//     from mkdir's raw EEXIST/ENOTDIR), inside that same partial-failure wrapper;
 //   - M10 (atomic publish): each file is staged in its own directory and renamed into
 //     place, so a concurrent reader never observes a partial file, a FAILED entry
 //     leaves its own target with its previous content, the file mode survives the
@@ -658,18 +661,40 @@ describe('write', () => {
 
         const failing = join(blocker, 'child.txt');
 
-        await expect(
+        const failure = await failureOf(() =>
             write([
                 { path: completed, content: 'written' },
                 { path: failing, content: 'never' }
             ])
-        ).rejects.toThrow(
+        );
+
+        // The wrapper contract, unchanged by the F9 fold below: failed target, the list of
+        // writes that really landed, and the explicit no-rollback claim.
+        expect(failure.message).toMatch(
             new RegExp(
                 `^write failed on ${escapeRegExp(failing)}: .* Writes already completed: ${escapeRegExp(
                     completed
                 )}\\. No rollback was performed\\.$`
             )
         );
+
+        // F9: the `.*` above used to hide Node's raw `EEXIST: file already exists, mkdir
+        // '<x>'` with no next step, while `read` (./read.tool.ts:4532-4536) and `files`
+        // (./files.tool.ts:978-987) answer this same state with ENOTDIR plus a remedy.
+        // Pinned in full now — the mkdir target here is `blocker` ITSELF (the parent of
+        // `failing`), and mkdir of an existing regular file answers EEXIST on every
+        // platform, so the folded label, the reason and the remedy are all exact.
+        expect(failure.code).toBe('ENOTDIR');
+        expect(failure.name).toBe('ENOTDIR');
+        expect(failure.message).toBe(
+            `write failed on ${failing}: ENOTDIR (EEXIST): file already exists (mkdir). ` +
+                'A component of that path is a file, not a folder; the directory cannot be created inside it. ' +
+                'Delete that file, or write the target under a path whose parents are folders. ' +
+                `Writes already completed: ${completed}. No rollback was performed.`
+        );
+        // `rawCode` is present because the fold moved away from it (EEXIST -> ENOTDIR), and
+        // `failedPath`/`completedPaths` keep the shape M11 published.
+        expect(failure.details).toEqual({ failedPath: failing, completedPaths: [completed], rawCode: 'EEXIST' });
 
         // The first file really is on disk: the message is the truth, not a guess.
         await expect(readTextFile(completed, 'utf8')).resolves.toBe('written');
@@ -1055,6 +1080,45 @@ describe('write - the published refusals and disclosures (L5, L6, M9, M11, H6)',
         expect(loopStats.isSymbolicLink()).toBe(true);
         await expect(stagingEntries(workdir)).resolves.toEqual([]);
     });
+
+    it.runIf(process.platform !== 'win32')(
+        'answers a file in a PARENT path as ENOTDIR, with no folded rawCode',
+        async () => {
+            // F9, one level DEEPER than the batch test above: the mkdir target is
+            // `blocker/deep`, whose PARENT component is the file, so Node reports the raw
+            // errno as ENOTDIR rather than EEXIST (measured on this host with
+            // Temp/toolfix-writedit/probe-mkdir.ts and probe-f9.ts). `code` IS the real errno
+            // there, so `rawCode` is absent — the published rule the ELOOP test above pins,
+            // shown from the other side of the fold, and the remedy sentence is identical
+            // either way.
+            //
+            // Windows is excluded because a recursive mkdir reports that shape as ENOENT
+            // there, where `files`' ENOENT advice (./files.tool.ts:978-987) is the applicable
+            // sentence and no fold applies — the fold keys on an EEXIST/ENOTDIR from `mkdir`.
+            const dir = join(workdir, 'parent-is-file');
+            const blocker = join(dir, 'blocker');
+            await mkdir(dir, { recursive: true });
+            await writeTextFile(blocker, 'not a directory', 'utf8');
+
+            const failing = join(blocker, 'deep', 'child.txt');
+            const failure = await failureOf(() => write([{ path: failing, content: 'never' }]));
+
+            expect(failure.code).toBe('ENOTDIR');
+            expect(failure.name).toBe('ENOTDIR');
+            expect(failure.message).toBe(
+                `write failed on ${failing}: ENOTDIR: not a directory (mkdir). ` +
+                    'A component of that path is a file, not a folder; the directory cannot be created inside it. ' +
+                    'Delete that file, or write the target under a path whose parents are folders. ' +
+                    'Writes already completed: none. No rollback was performed.'
+            );
+            expect(failure.details).toEqual({ failedPath: failing, completedPaths: [] });
+            expect((failure.details as { rawCode?: string }).rawCode).toBeUndefined();
+
+            // The file that blocked the mkdir is untouched and nothing was staged next to it.
+            await expect(readTextFile(blocker, 'utf8')).resolves.toBe('not a directory');
+            await expect(stagingEntries(dir)).resolves.toEqual([]);
+        }
+    );
 
     it('refuses a cancelled call with ECANCELED before touching the filesystem', async () => {
         // Cancellation used to be invisible to this tool: `context.signal` was never read, so

@@ -422,7 +422,10 @@
 // below for exactly which off-the-end offsets are errors and which are legal).
 // Directory, permission and binary reads previously rejected the whole
 // batch and destroyed the content of every other file in it. A failed entry consumes
-// no content budget, so the readable files in the same call keep their full share.
+// no content budget, so the readable files in the same call keep their full share —
+// SHARE, not SURVIVAL: a failure the error allowance cannot afford halts the request-order
+// prefix walk, and a readable path behind that halt is FOLDED like the failures after it
+// (see "THE WALK" in PHASE 2 and `FILE_READ_ERROR_ENTRY_BUDGET_BYTES`).
 //
 // WHY A SEEK PAST EOF IS AN ERROR AND NOT AN EMPTY WINDOW (D10, D11-line)
 // -----------------------------------------------------------------------
@@ -748,16 +751,31 @@ export const FILE_READ_MAX_TARGETS = 100;
 // The most individual failed entries one result enumerates. Beyond this the entries
 // are folded into the declared line, however much room is left: 24 messages of any
 // wording is already more "not found" verdicts than a caller can act on per call.
+//
+// Reaching this count HALTS the request-order prefix walk (see `slotNeed` in PHASE 2)
+// rather than skipping the entry and carrying on, so everything behind it folds too —
+// readable paths included. The same is true of the byte allowance below.
 export const FILE_READ_ERROR_ENTRY_MAX = 24;
 
-// The most of the envelope the enumerated failed entries may take. A quarter, so a
-// batch that is entirely failures still cannot crowd the readable files out of the
-// result, and so 40 failures and 400 failures cost the SAME order of magnitude:
-// measured, a failed path costs 1 040 bytes across the two views (3 003 + 1 500 = 4 503
-// for a 1 200-character name), so this budget admits roughly 7 of them and the rest are
-// declared — a batch of 40 short missing paths enumerates 5 at `wireBytes` 3 485 and
-// folds the last 35 into one line, where the pre-fold tool spent 33 786 bytes (839 per
-// entry, 1 018 past the envelope) spelling every one out.
+// The most of the envelope the ENUMERATED failed entries may take: a quarter. What that
+// quarter bounds is the COST of the error messages one result publishes, not which paths
+// survive it. The cost claim is what it buys — 40 failures and 400 failures cost the
+// SAME order of magnitude: measured, a failed path costs 1 040 bytes across the two views
+// (3 003 + 1 500 = 4 503 for a 1 200-character name), so this budget admits roughly 7 of
+// them and the rest are declared — a batch of 40 short missing paths enumerates 5 at
+// `wireBytes` 3 485 and folds the last 35 into one line, where the pre-fold tool spent
+// 33 786 bytes (839 per entry, 1 018 past the envelope) spelling every one out.
+//
+// What it does NOT buy is immunity for a readable path. The walk prices slots in REQUEST
+// ORDER and stops at the first one it cannot afford, and a failed entry the allowance
+// refuses is unaffordable by definition — so a failures-prefix folds everything behind it,
+// readable paths included. Measured (Temp/toolfix-read/probe.ts: 25 long-name failures in
+// front of one readable file): 2 error entries are enumerated, the readable file folds with
+// them, and the result costs 3 072 `wireBytes` of a 32 768-byte envelope — ~29 KiB unspent,
+// because the content pool is split only across the slots the prefix reached. The quarter
+// therefore guarantees that such a batch is CHEAP and DECLARED, never that the readable
+// file is in it; `foldLine` names which allowance fired so the caller is not told the
+// envelope was out of bytes when it was the error reserve that was out of room.
 export const FILE_READ_ERROR_ENTRY_BUDGET_BYTES = Math.floor(FILE_READ_WIRE_BUDGET / 4);
 
 // The smallest window a readable path is enumerated for. Below this the entry is
@@ -1110,7 +1128,10 @@ export type FileReadEntry = {
     error?: FileReadEntryError;
 };
 
-// The ordered batch result. `files` has exactly one entry per requested path.
+// The ordered batch result. `files` has exactly one entry per requested path, with ONE
+// exception (the fold): the walk stops at the first path whose reserve the batch cannot pay
+// and `omitted` counts the tail behind it, so `files` is always a PREFIX of `paths` in the
+// caller's own order — never a selection — and `files.length + omitted === paths.length`.
 export type FileReadResult = {
     files: FileReadEntry[];
     // True when at least one entry is truncated (line limit or content budget).
@@ -1144,9 +1165,11 @@ export type FileReadResult = {
     modelBytes: number;
     // How many entries reported an `error` instead of content.
     skipped: number;
-    // How many of the requested paths this call could NOT answer at all, because the
-    // envelope cannot pay even one honest window for every path in the batch (see the
-    // constants section "THE BATCH-WIDTH ARITHMETIC"). The paths are enumerated in request
+    // How many of the requested paths this call could NOT answer at all, because the walk
+    // could not pay even one honest window for every path in the batch — the envelope
+    // running out, or the failed paths using up the reserve for their messages (see the
+    // constants section "THE BATCH-WIDTH ARITHMETIC" and `FoldGate`, which is the reason
+    // clause the fold line publishes). The paths are enumerated in request
     // order, so these are exactly the LAST `omitted` entries of the caller's `paths`
     // array; `files.length + omitted` is always the number of paths requested.
     //
@@ -1983,13 +2006,38 @@ const batchLine = (files: readonly FileReadEntry[], proseBytes: number): string 
 // cost — the same property `batchLine` relies on, and what lets
 // `FILE_READ_FOLD_LINE_MARGIN_BYTES` price it exactly rather than estimate it. Every
 // number in it is capped by `FILE_READ_MAX_TARGETS` (2 digits) or by the envelope
-// (5-6 digits), so the widest line this template can emit is ~210 bytes.
-const foldLine = (requestedCount: number, omittedCount: number): string => {
+// (5-6 digits), so the widest line this template can emit is ~210 bytes. The reason
+// clause is the one exception to a fixed shape: it names whichever ceiling fired (see
+// `FoldGate` below), and every variant is written SHORTER than the envelope clause, so
+// the 210-byte worst case — and the margin that prices it — stays the envelope's.
+//
+// Which ceiling made the PHASE 2 walk stop (see `walk` there): the whole-envelope
+// reserve, the error allowance's BYTE budget, or the error allowance's ENTRY count. The
+// walk reports the gate because the fold line has to name the gate that actually fired:
+// "this 32 768-byte envelope cannot answer them all" is a false explanation for a fold
+// caused by the 8 192-byte error reserve, and the caller's remedy differs — re-requesting
+// the omitted paths in another call helps for both, but only the second one is fixed by
+// asking for FEWER missing paths.
+type FoldGate = 'envelope' | 'errorBytes' | 'errorCount';
+
+// The reason clause for each gate. All three are written to cost NO MORE than the
+// envelope clause (45 bytes), so the widest line this template can emit — and therefore
+// `FILE_READ_FOLD_LINE_MARGIN_BYTES` — is unchanged by the variants. ASCII, no `"`, no
+// backslash, no newline, like the rest of the line.
+const FOLD_REASONS: Record<FoldGate, string> = {
+    envelope: `this ${FILE_READ_WIRE_BUDGET}-byte envelope cannot answer them all`,
+    errorBytes: `the ${FILE_READ_ERROR_ENTRY_BUDGET_BYTES}-byte failed-path allowance is full`,
+    errorCount: `only ${FILE_READ_ERROR_ENTRY_MAX} failed paths are named per call`
+};
+
+// `gate` only matters when `omittedCount > 0`: a batch that folded nothing emits nothing
+// here, and the gate the walk happened to end on is never published.
+const foldLine = (requestedCount: number, omittedCount: number, gate: FoldGate): string => {
     if (omittedCount === 0) return '';
 
     return (
-        `read: folded - ${omittedCount} of ${requestedCount} requested paths were not read because this ` +
-        `${FILE_READ_WIRE_BUDGET}-byte envelope cannot answer them all; the omitted paths are the last ` +
+        `read: folded - ${omittedCount} of ${requestedCount} requested paths were not read because ` +
+        `${FOLD_REASONS[gate]}; the omitted paths are the last ` +
         `${omittedCount} in the order requested, re-request them in another call\n`
     );
 };
@@ -2275,12 +2323,127 @@ const binaryMessage = (path: string): string =>
 const binaryAtMessage = (path: string, offset: number): string =>
     `read refused "${path}": byte ${offset} is inside a run of UTF-8 continuation bytes longer than any code point, so no whole character starts there (invalid UTF-8). read reads UTF-8 text only; seek to a byte before the run, or to one after it.`;
 
+// ---------------------------------------------------------------------------
+// WHERE A STRICT DECODE GAVE UP (F8)
+// ---------------------------------------------------------------------------
+// `TextDecoder({ fatal: true })` reports a bad byte by THROWING, and its TypeError carries
+// no position, so this tool used to fill the gap with the offset it had on hand — the
+// CALLER's own window start. With one bad byte at absolute 20, windows opened at 0, 1, 5
+// and 11 each echoed their own start back, and the documented remedy ("seek past N")
+// advanced exactly one byte per call. The scan below names the byte instead, in the shape
+// `edit` already publishes (edit.tool.ts:1150 `firstInvalidUtf8Byte`, reported as
+// "invalid UTF-8 at offset N"), and it runs ONLY on the rejection path — a file that
+// decodes pays nothing for it.
+//
+// The table is the one `edit` uses too (edit.tool.ts:1127), so the two tools cannot
+// disagree about which bytes are text: E0 restricted to A0..BF and ED to 80..9F (no
+// overlongs, no surrogates), F0 to 90..BF and F4 to 80..8F (nothing past U+10FFFF), and
+// C0, C1, F5..FF plus a bare continuation are not lead bytes at all.
+const utf8ContinuationRange = (lead: number): [number, number] | null => {
+    if (lead >= 0xc2 && lead <= 0xdf) return [0x80, 0xbf];
+    if (lead === 0xe0) return [0xa0, 0xbf];
+    if (lead >= 0xe1 && lead <= 0xec) return [0x80, 0xbf];
+    if (lead === 0xed) return [0x80, 0x9f];
+    if (lead >= 0xee && lead <= 0xef) return [0x80, 0xbf];
+    if (lead === 0xf0) return [0x90, 0xbf];
+    if (lead >= 0xf1 && lead <= 0xf3) return [0x80, 0xbf];
+    if (lead === 0xf4) return [0x80, 0x8f];
+    return null;
+};
+
+// How many CONTINUATION bytes a lead byte declares. Only meaningful for the leads the
+// table above accepts (C2..DF -> 1, E0..EF -> 2, F0..F4 -> 3); the fallback is the widest
+// case, which is what the tail probe below wants when it meets a byte that is >= 0xC0 and
+// not a valid lead anyway.
+const utf8SequenceLength = (lead: number): number => (lead >= 0xf0 ? 3 : lead >= 0xe0 ? 2 : 1);
+
+// The ABSOLUTE offset of the first byte `bytes` (whose first byte lives at `start`) holds
+// a strict decoder rejects, or null when it holds none. Two deliberate differences from
+// the whole-buffer scan `edit` runs:
+//   - a sequence that runs off the END of `bytes` is NOT an error here. The scan feeds the
+//     decoder `stream: true`, so a trailing partial sequence is PENDING at a chunk
+//     boundary, not invalid, and the flush at EOF is what settles it — reporting it would
+//     name a bad byte in ordinary UTF-8 whose character happens to straddle 64 KiB.
+//   - a broken sequence is reported at its LEAD byte (same convention as
+//     edit.tool.ts:1144-1148), because the lead is the byte the caller has to seek past to
+//     get clear of the sequence, and it is the offset `binaryAtMessage` already names.
+// The FIRST rejection wins: a window holding several bad bytes names the earliest one.
+const firstRejectedUtf8Byte = (bytes: Buffer, start: number): number | null => {
+    let index = 0;
+
+    while (index < bytes.length) {
+        const lead = bytes[index]!;
+
+        if (lead < 0x80) {
+            index += 1;
+            continue;
+        }
+
+        const range = utf8ContinuationRange(lead);
+        if (range === null) return start + index;
+
+        const extra = utf8SequenceLength(lead);
+        // Truncated at the end of what this read covered: pending, not invalid (above).
+        if (index + extra >= bytes.length) return null;
+
+        for (let offset = 1; offset <= extra; offset += 1) {
+            const byte = bytes[index + offset]!;
+            if (byte < range[0] || byte > range[1]) return start + index;
+            // Only the FIRST continuation is range-restricted; the rest just have to be
+            // continuations, exactly as the decoder's table has it.
+            range[0] = 0x80;
+            range[1] = 0xbf;
+        }
+
+        index += extra + 1;
+    }
+
+    return null;
+};
+
+// The incomplete sequence a decoded chunk ends on, in ABSOLUTE terms: the bytes of the
+// partial sequence and the file offset of its LEAD byte, or null when the chunk ends on a
+// code-point boundary. That is exactly what the streaming decoder is holding, so the NEXT
+// chunk's search has to start from it: a bad byte at the very start of chunk 2 belongs to a
+// sequence that BEGAN in chunk 1, and a scan that assumed otherwise would name a byte that
+// is not the first invalid one.
+//
+// O(1) per chunk, and it can be: the decoder just accepted this whole chunk, so everything
+// before the tail is valid, and a UTF-8 code point is at most four bytes — walking back at
+// most three bytes either finds the lead of the open sequence or proves the chunk ended on
+// a boundary.
+const utf8PendingTail = (bytes: Buffer, length: number, start: number): { bytes: Buffer; lead: number } | null => {
+    for (let back = 1; back <= MAX_CODE_POINT_BYTES - 1 && back <= length; back += 1) {
+        const index = length - back;
+        const byte = bytes[index]!;
+
+        // ASCII: this chunk ends on a complete character, so nothing is pending.
+        if (byte < 0x80) return null;
+        // A continuation byte: the sequence opened further back, so keep walking. Running
+        // off the top of the loop means the last three bytes are all continuations, which
+        // can only be a complete four-byte sequence whose lead is four back.
+        if ((byte & 0xc0) === 0x80) continue;
+
+        // A lead byte with `back` bytes available: the sequence is complete when it fits.
+        if (utf8SequenceLength(byte) + 1 <= back) return null;
+
+        // COPIED, not `subarray`: the caller hands this back after the next `ioRead` has
+        // overwritten the shared chunk buffer, and a view would then be a snapshot of
+        // whichever file came next. One to three bytes, and only on a chunk that ends
+        // mid-character.
+        return { bytes: Buffer.from(bytes.subarray(index, length)), lead: start + index };
+    }
+
+    return null;
+};
+
 // The rejection for a strict decode that actually SAW the bad bytes (the window landed on
-// them rather than merely seeking next to them). It names the first byte the failing read
-// covered, so the caller can seek past it, and points at `lossy` as the way to see the
-// window anyway.
+// them rather than merely seeking next to them). `offset` is the ABSOLUTE file offset of
+// the first byte that cannot decode — found by `firstRejectedUtf8Byte` (F8), never the
+// caller's own `startByte` echoed back — so "seek past it" is a remedy that actually
+// advances, and `lossy` stays the way to see the window anyway.
 const binaryDecodeMessage = (path: string, offset: number): string =>
-    `read refused "${path}": the bytes from ${offset} on in this window are not valid UTF-8. read reads UTF-8 text only; pass lossy: true to get the window with U+FFFD for the bytes that cannot decode, or seek past ${offset}.`;
+    `read refused "${path}": the first byte of this window that cannot decode is ${offset}, the start of the first sequence that is not valid UTF-8. read reads UTF-8 text only; pass lossy: true to get the window with U+FFFD for the bytes that cannot decode, or seek past ${offset}.`;
 
 // A seek the target cannot honour (H2). A pipe, socket or terminal has no file offset —
 // a positional read there is ESPIPE — so `startByte` is not a meaningless value to ignore,
@@ -3850,6 +4013,10 @@ const scanFile = async (
 
     const buffer = Buffer.allocUnsafe(READ_CHUNK_BYTES);
     let readOffset = windowStart.offset;
+    // F8: the partial sequence the strict decoder is carrying into the next chunk (null on
+    // a code-point boundary). O(1) to maintain and read only when a decode throws, so the
+    // cost lands on the rejection path — see `utf8PendingTail`.
+    let pending: { bytes: Buffer; lead: number } | null = null;
     // Whether this pass read the file to its end. Only then is the whole-file line
     // count knowable from what was already counted (see `lineCount` on the entry).
     let reachedEnd = false;
@@ -3881,14 +4048,26 @@ const scanFile = async (
         try {
             text = decoder.decode(buffer.subarray(0, bytesRead), { stream: true });
         } catch {
-            // The byte that broke the strict decode is somewhere in the bytes this window
-            // pulled, so the offset published is the first byte this read covered — a lower
-            // bound, and still the number that makes "seek past it" actionable. Before M1's
-            // message work the offset was missing entirely.
-            throw new HarnessError(binaryDecodeMessage(request.path, chunkStart));
+            // F8: name the byte that actually broke the strict decode. The tail the decoder
+            // carried in from the PREVIOUS chunk is prepended — so a sequence that began at
+            // the end of chunk N-1 and fails on the first byte of chunk N is still reported
+            // at ITS lead byte — and the scan starts at that lead, or at this chunk's first
+            // byte when nothing was carried. The concat and the one pass over the chunk are
+            // paid only by a file that is being refused. If the scan somehow finds nothing
+            // (the scanner and the decoder disagree), `chunkStart` is the old, conservative
+            // answer: a lower bound, still a byte the caller can act on.
+            const chunk = buffer.subarray(0, bytesRead);
+            const probe = pending === null ? chunk : Buffer.concat([pending.bytes, chunk]);
+            const rejected = firstRejectedUtf8Byte(probe, pending?.lead ?? chunkStart);
+
+            throw new HarnessError(binaryDecodeMessage(request.path, rejected ?? chunkStart));
         }
 
         noteTwin(buffer.subarray(0, bytesRead), true);
+
+        // The decoder took this chunk whole, so the only thing it can be holding is a
+        // partial sequence at its end (F8).
+        pending = utf8PendingTail(buffer, bytesRead, chunkStart);
 
         state.stopped = consumeText(state, text);
     }
@@ -3900,10 +4079,12 @@ const scanFile = async (
         try {
             tail = decoder.decode();
         } catch {
-            // The pending bytes at the very end of the file are what failed here, and
-            // `state.scanOffset` is the first byte after everything this window consumed:
-            // the offset the caller would have to seek past.
-            throw new HarnessError(binaryDecodeMessage(request.path, state.scanOffset));
+            // The bytes that failed here are the ones the decoder was still holding: a
+            // sequence the END OF THE FILE cut short, whose first byte is the lead F8
+            // tracks. `state.scanOffset` is that same offset by construction — the scanner
+            // stopped consuming exactly where the unconsumed sequence began — so it stays
+            // as the fallback for any shape the tail probe could not see.
+            throw new HarnessError(binaryDecodeMessage(request.path, pending?.lead ?? state.scanOffset));
         }
 
         // Flushing the twin is what catches a truncated sequence at the END of the file,
@@ -4798,13 +4979,19 @@ export const readFileBatch = async (
     // trade; folding is the honest one (the ceiling is now the batch WIDTH, not the
     // envelope).
     //
-    // THE WALK. Prices each slot in request order and stops at the first one the envelope
-    // cannot afford; everything after it is folded. It runs a SECOND time holding back
-    // `FILE_READ_FOLD_LINE_MARGIN_BYTES` if the first pass had to fold anything, so the
-    // declaration of the fold is paid for rather than discovered. The second pass can only
-    // fold MORE paths (strictly more reserve, same needs), which is what keeps this
-    // monotone and terminating — the same fixed-point argument the `wireBytes` loop below
-    // makes about digit growth.
+    // THE WALK. Prices each slot in request order and stops at the first one it cannot
+    // afford; everything after it is folded. THREE ceilings can be the one that stops it,
+    // and the walk reports WHICH one (`FoldGate`) so the fold line can name it: the 24-entry
+    // error count, the 8 192-byte error allowance, or the 32 768-byte envelope. All three
+    // HALT the walk rather than skipping the slot — a failed entry has no cheaper version
+    // to keep, and the prefix rule cannot reach past a refusal — which is why a failures
+    // prefix folds a readable path behind it with most of the envelope unspent. It runs a
+    // SECOND time holding back `FILE_READ_FOLD_LINE_MARGIN_BYTES` if the first pass had to
+    // fold anything, so the declaration of the fold is paid for rather than discovered. The
+    // second pass can only fold MORE paths (strictly more reserve, same needs), which is
+    // what keeps this monotone and terminating — the same fixed-point argument the
+    // `wireBytes` loop below makes about digit growth. Its gate is the one published: it is
+    // the ceiling that stopped the walk that decided this batch's `cut`.
     //
     // WHY A PREFIX AND NOT A SELECTION: request order is the only order this tool
     // promises (an unreadable path "stays IN ORDER" in the published description), and
@@ -4822,8 +5009,11 @@ export const readFileBatch = async (
     // What one slot costs in both views plus the cheapest body that is still an answer,
     // or `null` when the batch can no longer afford to enumerate this slot at all (in
     // which case everything from here on folds — a failed entry always pays its full
-    // message, so there is no cheaper version of it to keep enumerating).
-    const slotNeed = (slot: ScanSlot, errorSpend: number, errorCount: number): number | null => {
+    // message, so there is no cheaper version of it to keep enumerating). The second
+    // element of the pair is WHICH ceiling refused it, and it is only set when the first
+    // is `null`; a readable slot is never refused by the error allowance, so the only gate
+    // it can ever stop the walk on is `envelope` (decided by the caller below).
+    const slotNeed = (slot: ScanSlot, errorSpend: number, errorCount: number): [number | null, FoldGate | null] => {
         const shell = slot.overhead + slot.projectionReserve;
 
         if (slot.handle === null) {
@@ -4834,10 +5024,15 @@ export const readFileBatch = async (
             // ~25 KiB of the envelope sat unspent — the reserve has to mirror what the
             // response actually serializes, or the fold is a guess (measured: a 60-character
             // missing path costs 662 bytes of entry JSON + ~370 bytes of projection line).
-            if (errorCount >= FILE_READ_ERROR_ENTRY_MAX) return null;
-            if (errorSpend + shell > FILE_READ_ERROR_ENTRY_BUDGET_BYTES) return null;
+            //
+            // The count is checked FIRST because it is the harder ceiling: at 24 named
+            // failures the batch stops taking error entries whatever bytes remain, and a
+            // fold line blaming the envelope for that would send the caller to re-request
+            // paths that no envelope setting would admit in one call.
+            if (errorCount >= FILE_READ_ERROR_ENTRY_MAX) return [null, 'errorCount'];
+            if (errorSpend + shell > FILE_READ_ERROR_ENTRY_BUDGET_BYTES) return [null, 'errorBytes'];
 
-            return shell;
+            return [shell, null];
         }
 
         // A readable path: the floor's escape headroom (same expression as `floorReserve`
@@ -4850,21 +5045,26 @@ export const readFileBatch = async (
         // applies.
         const wanted = Math.min(FILE_READ_MIN_ENTRY_CONTENT_BYTES, slot.request.maxBytes);
 
-        if (slot.size.known === null) return shell + floor + wanted;
+        if (slot.size.known === null) return [shell + floor + wanted, null];
 
-        return shell + floor + Math.max(0, Math.min(wanted, slot.size.known - (slot.request.startByte ?? 0)));
+        return [shell + floor + Math.max(0, Math.min(wanted, slot.size.known - (slot.request.startByte ?? 0))), null];
     };
 
-    const walk = (foldMargin: number): number => {
+    const walk = (foldMargin: number): { cut: number; gate: FoldGate } => {
         let spend = walkShell + foldMargin;
         let errorSpend = 0;
         let errorCount = 0;
 
         for (let index = 0; index < slots.length; index += 1) {
             const slot = slots[index];
-            const need = slotNeed(slot, errorSpend, errorCount);
+            const [need, refused] = slotNeed(slot, errorSpend, errorCount);
 
-            if (need === null || spend + need > FILE_READ_WIRE_BUDGET) return index;
+            // The error allowance said no to this failed entry: the fold decided here is
+            // THAT allowance's, not the envelope's (F2), and it is decided before the
+            // envelope test below because the two are independent ceilings.
+            if (need === null) return { cut: index, gate: refused ?? 'errorBytes' };
+
+            if (spend + need > FILE_READ_WIRE_BUDGET) return { cut: index, gate: 'envelope' };
 
             spend += need;
 
@@ -4874,13 +5074,17 @@ export const readFileBatch = async (
             }
         }
 
-        return slots.length;
+        // Nothing folded, so the gate is never published (see `foldLine`); `envelope` is
+        // just the value that costs nothing to name.
+        return { cut: slots.length, gate: 'envelope' };
     };
 
-    const firstCut = walk(0);
+    const firstPass = walk(0);
     // Only a batch that actually folded pays the declaration margin; a batch that did not
-    // fold keeps every byte of it for content.
-    const cut = firstCut === slots.length ? slots.length : walk(FILE_READ_FOLD_LINE_MARGIN_BYTES);
+    // fold keeps every byte of it for content. When it did fold, the second pass is the
+    // decision — margin included — so its gate is the one the fold line names.
+    const decision = firstPass.cut === slots.length ? firstPass : walk(FILE_READ_FOLD_LINE_MARGIN_BYTES);
+    const cut = decision.cut;
 
     // Everything the response can spend on content lives on this list and nowhere else.
     const enumerated = slots.slice(0, cut);
@@ -5070,7 +5274,7 @@ export const readFileBatch = async (
     const summary = batchLine(files, contentWireBytes(body));
     // The fold declaration goes FIRST: a caller scanning the projection for an answer to
     // its own path must not conclude the tool ignored it (P-2).
-    const fold = foldLine(slots.length, omitted);
+    const fold = foldLine(slots.length, omitted, decision.gate);
     const projection = `${fold}${summary}${body}`;
 
     // `modelBytes` is now the ESCAPED length of the projection (T3): the exact number of

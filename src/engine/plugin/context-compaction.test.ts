@@ -651,16 +651,21 @@ const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', strea
 // THE FIGURE, derived rather than read back. `brain()` declares no tools and the harness is
 // built without `presets: false`, so the catalogue is the shipped preset set plus the runtime
 // set: 11 entries — `toolRequest` 2,396 B, `tasks` 10,224 B, `read` 4,249 B, `write` 2,202 B,
-// `edit` 5,294 B, `glob` 3,618 B, `grep` 5,417 B, `threadList` 3,818 B, `threadRead` 7,476 B,
-// `threadSend` 4,515 B, `threadDelete` 3,929 B = 53,128 serialized bytes
+// `edit` 5,438 B, `glob` 3,618 B, `grep` 5,417 B, `threadList` 3,818 B, `threadRead` 7,476 B,
+// `threadSend` 4,515 B, `threadDelete` 3,929 B = 53,272 serialized bytes
 // (`toolSchemaPayloadBytes(request.tools)` of a live request; probe
 // `Temp/coding-w1/probe-compaction-floor.ts`, reproduced by
 // `Temp/coding-w2/probe-delegation-floor.ts`, and RE-MEASURED 2026-11-18 for the rank-model
 // entry/rank vocabulary). The +40 bytes against the figures this header carried before are the
 // rank rewording of the `toolRequest` description (+28 B) and of `threadDelete` (+12 B):
 // `core/context-estimate.ts` and `plugin/context-compaction.plugin.ts` are byte-identical, so the
-// estimator moved not one line — only the model-facing declaration text grew. 53,128 / 4 = 13,282
-// tokens EXACTLY.
+// estimator moved not one line — only the model-facing declaration text grew. 53,272 / 4 = 13,318
+// tokens EXACTLY. The +144 bytes against the 53,128 this header carried through 2026-11-25 are the
+// `edit` entry's published `bytes` sentence (+144 B on that entry alone — F6,
+// ../tools/files/edit.tool.ts:1479): the `files` tool grew by 362 B in the same wave and moves
+// NOTHING here, because `files` is not one of the 11 entries a default harness declares, and
+// `read`/`write` are byte-identical. That clause was written to land on exactly 144 bytes — a
+// multiple of 4 — so the argument below still holds and only this constant moves.
 //
 // THE OTHER MOVEMENT IN THE SAME DIRECTION, and every `+1`/`+9` delta below comes from it: since
 // T5 (2026-11-17) the estimator counts SERIALIZED PAYLOAD BYTES (`core/payload-bytes.ts`
@@ -673,9 +678,14 @@ const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', strea
 // that pins each one; they are arithmetic, not drift.
 //
 // WHY THE ADDITION IS EXACT, which is what lets a pin stay `CATALOGUE + n`. The catalogue byte
-// count is a multiple of 4, so `ceil((53128 + transcriptBytes) / 4)` = 13,282 +
+// count is a multiple of 4, so `ceil((53272 + transcriptBytes) / 4)` = 13,318 +
 // `ceil(transcriptBytes / 4)`: the transcript figure every comment in this file already derives
-// keeps its exact value and simply rides on top of the constant. The same holds for the trigger
+// keeps its exact value and simply rides on top of the constant — which is what the F6 description
+// growth cost: this constant, and nothing else that is asserted. The three billed figures of the
+// summarize-flow assertions are now written as `CATALOGUE + 520` / `+ 75,879` / `+ 633` instead of
+// the bare 13,802 / 89,161 / 13,915 they used to be, so they ride too. Every other literal below is
+// a transcript-scale figure the constant carries unchanged, and where a comment states a billed
+// total it spells the CURRENT `CATALOGUE + n` sum. The same holds for the trigger
 // arithmetic, and that is what keeps the fixtures honest — the effective limit, the
 // `REGROWTH_RATIO` margin (`max(1, floor(effective * 0.05))`) and every "under the limit" premise
 // below are keyed on the SAME figure, so a case whose point is "this conversation is smaller than
@@ -693,12 +703,14 @@ const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', strea
 // than a pass (the `minTokens` case at :4599 moved to `CATALOGUE + 100` for exactly that reason).
 // And it is the floor of the WRITER-ONLY ROSTER only: a roster with a delegating agent registers
 // the runtime's `delegate` tool as well, 7,702 more serialized bytes, so that harness's catalogue
-// is 60,830 bytes = 15,207.5 tokens — NOT a multiple of 4 any more, so the delegate case rounds
-// that floor UP to 15,208 (probe `Temp/coding-x1/probe-x6.ts`, re-measured 2026-11-18: the +346
-// bytes against the 60,484 this header carried is the rank rewording of the `delegate` entry
-// (+306 B) plus the same +40 this constant already carries). The delegate case uses
-// `DELEGATE_FLOOR`, not this constant, and says so.
-const CATALOGUE = 13_282;
+// is 60,974 bytes = 15,243.5 tokens — NOT a multiple of 4 any more, so its true floor rounds
+// UP to 15,244 (probe `Temp/coding-x1/probe-x6.ts`, re-measured 2026-11-18 for the +346 bytes of
+// rank rewording against the 60,484 an older header carried, and +144 again for F6 on top). The
+// delegate case uses `DELEGATE_FLOOR` (:4103), not this constant, and says so: that constant is
+// still the 15,208 the case caps its conversation with (`DELEGATE_FLOOR + 520`), the +36 is well
+// inside that margin, and the case asserts no exact estimate, so the F6 growth moved its prose
+// and nothing it pins.
+const CATALOGUE = 13_318;
 
 // The settings an operator would type in the Plugins pane, as a stored document. Every key
 // this plugin reads may appear; anything it does NOT store falls back to its DECLARED
@@ -1439,7 +1451,7 @@ describe('context-compaction shrink plan (planCompactionRequest)', () => {
     // rows above plus a constant: 861 transcript tokens and a 1,000-token floor is 1,861 billed,
     // pass A's 210 becomes 1,210 and the digest-and-tail's 198 becomes 1,198.
     //
-    // THE CONTRAST IS THE DEFECT. A 1,250-token rung against a 13,282-token catalogue and a
+    // THE CONTRAST IS THE DEFECT. A 1,250-token rung against a 13,318-token catalogue and a
     // 2,438-token transcript (the live session's shape, `Temp/d1/report.md`) used to read "the
     // transcript is already under target", return the request UNCHANGED, and send the identical
     // 400 out on every later turn of the session.
@@ -4049,11 +4061,11 @@ describe('context-compaction summarize flow (T9)', () => {
     // and the budget fell under the smallest sendable request (pinned in the
     // `overflow-reactive trigger` cases above).
     //
-    // The 300,000-character BIG_SEED (75,441 transcript tokens against a 13,282-token floor) is
+    // The 300,000-character BIG_SEED (75,441 transcript tokens against a 13,318-token floor) is
     // kept because these two cases pin "the retry is strictly smaller", and a transcript that
-    // dwarfs the catalogue makes the number dramatic: 89,161 billed down to 13,915. At the 2,100-
+    // dwarfs the catalogue makes the number dramatic: 89,197 billed down to 13,951. At the 2,100-
     // character `SEED` every other case here uses (526 transcript tokens) the ladder now cuts too —
-    // to 13,915 billed, the digest plus the verbatim tail — which is the same request either way
+    // to 13,951 billed, the digest plus the verbatim tail — which is the same request either way
     // where the provider is concerned, and the give-up line is what tells the operator the floor is
     // the problem rather than the transcript.
     const BIG_SEED = 'x'.repeat(300_000);
@@ -4066,14 +4078,21 @@ describe('context-compaction summarize flow (T9)', () => {
 
     // THE DELEGATING ROSTER'S FLOOR, which is NOT `CATALOGUE`. A roster with a delegating agent
     // registers one more runtime tool — the `delegate` entry, 7,702 serialized bytes = 1,925.5
-    // tokens — so every request that harness sends carries a 60,830-byte catalogue: 15,207.5
-    // tokens, which this constant rounds UP to 15,208 (probe `Temp/coding-x1/probe-x6.ts`, the
-    // same method that derived `CATALOGUE`, which it reproduces at 53,128 bytes for a writer-only
-    // roster). The delegate case below caps its conversation with `DELEGATE_FLOOR + 520` so its
+    // tokens — so every request that harness sends carries a 60,974-byte catalogue: 15,243.5
+    // tokens, so its TRUE floor rounds UP to 15,244 (probe `Temp/coding-x1/probe-x6.ts`, the
+    // same method that derived `CATALOGUE`, which it reproduces at 53,272 bytes for a writer-only
+    // roster — 53,128 plus the 144-byte F6 clause on the `edit` entry). The delegate case below
+    // caps its conversation with `DELEGATE_FLOOR + 520` so its
     // transcript budget and its crossing margin stay the numbers every sibling case uses.
     //
-    // THE ONE TOKEN THIS COSTS: the writer-only catalogue is a multiple of 4 (53,128 B), so its
-    // siblings state an exact `CATALOGUE + n`; the delegating catalogue is not (60,830 B), so the
+    // THE CONSTANT BELOW IS THAT CAP, NOT THAT FLOOR: it still reads 15,208, 36 tokens under the
+    // true figure after F6. The case is a CAP test — it asserts a crossing, never an exact estimate
+    // — and 15,208 + 520 sits 484 tokens above the true floor, so the dead-run guard below stays
+    // satisfied and the case is green either way; moving the cap to the new floor would move the
+    // transcript budget every sibling compares against for no extra truth.
+    //
+    // THE ONE TOKEN THIS COSTS: the writer-only catalogue is a multiple of 4 (53,272 B), so its
+    // siblings state an exact `CATALOGUE + n`; the delegating catalogue is not (60,974 B), so the
     // crossing this block measures sits one token either side of the 6 its siblings state. The
     // rounding is UP, which is the side that keeps the dead-run guard honest: an understated floor
     // would cap the conversation BELOW the request's irreducible size and the pass would refuse.
@@ -4534,11 +4553,11 @@ describe('context-compaction summarize flow (T9)', () => {
         // spliced them out, so the retry measured the same size and stayed cooled).
         // The retry is a 2,010-character prompt because of the size of that margin: the
         // CATALOGUE + 520 ceiling this block runs under makes it
-        // `max(1, floor(13,802 × 0.05)) = 690` tokens, and the only rows that can grow the
+        // `max(1, floor(13,838 × 0.05)) = 691` tokens, and the only rows that can grow the
         // projection are the 438 tokens of instruction the failed pass left on the record plus
         // the new prompt. The second boundary therefore measures CATALOGUE + 1,466
         // (2,100 + 2 + 1,752 + 2,010 = 5,864 payload bytes) against the mark
-        // CATALOGUE + 526 + 690 = CATALOGUE + 1,216, and re-arms on 940 tokens of growth.
+        // CATALOGUE + 526 + 691 = CATALOGUE + 1,217, and re-arms on 940 tokens of growth.
         // Re-captured from an actual run: the second instruction is in flight (still
         // included — it is what the model was just shown), and the block that pass compacted
         // (SEED, both prompts, the first instruction) is switched off by it. The answer is
@@ -4627,21 +4646,21 @@ describe('context-compaction summarize flow (T9)', () => {
         // prompt and the instruction the provider never saw an answer to (issue 0036 R1 keeps
         // them), and `retry now` is what the host is asking about now: 300,000 + 2 + 1,752 + 9 =
         // 301,763 payload bytes = 75,441 transcript tokens, so the boundary estimate is
-        // CATALOGUE + 75,441 = 88,723 and the request the pass builds is one instruction larger,
+        // CATALOGUE + 75,441 = 88,759 and the request the pass builds is one instruction larger,
         // 303,515 bytes = 75,879 transcript tokens.
         //
         // THE RUNG IS NOW A BUDGET THE PROVIDER COULD ACTUALLY MEET, and that is the fix. Two
-        // things changed on 2026-11-17. The rung budget `13,282 + floor(0.85 × 75,441) = 77,406`
+        // things changed on 2026-11-17. The rung budget `CATALOGUE + floor(0.85 × 75,441) = 77,442`
         // — the floor, plus the ratio across the 75,441 tokens of transcript this pass can
         // actually remove (R6 took the ratio off the catalogue it cannot remove) — is CLAMPED to
-        // the 13,802 fit line: 85% of an over-limit size is still over the limit, so an unclamped
+        // the 13,838 fit line: 85% of an over-limit size is still over the limit, so an unclamped
         // rung asks the ladder to stop at a number the provider would refuse. And the ladder
-        // measures the BILLED figure, catalogue and all: 13,282 + 75,879 = 89,161 over a 13,802
+        // measures the BILLED figure, catalogue and all: CATALOGUE + 75,879 = 89,197 over a 13,838
         // budget, where the old transcript-only measure read 75,879 against a 75,414 target, walked
         // the whole ladder, and sent the refused request out again byte-identical. Pass A
-        // (269 + 2 + 269 + 9 + 1,752 = 2,301 bytes = 576 transcript tokens, 13,858 billed) is still
+        // (269 + 2 + 269 + 9 + 1,752 = 2,301 bytes = 576 transcript tokens, 13,894 billed) is still
         // 56 over, so the ladder drops the three head units behind one digest: 771 + 9 + 1,752 =
-        // 2,532 bytes = 633 tokens, 13,915 billed — the smallest request it may send, 75,246 tokens
+        // 2,532 bytes = 633 tokens, 13,951 billed — the smallest request it may send, 75,246 tokens
         // under the one that was refused.
         const next = await writer.sendThreadInput(thread.id, 'retry now');
 
@@ -4662,16 +4681,18 @@ describe('context-compaction summarize flow (T9)', () => {
         );
 
         // All three figures are billed request size, and `floorTokens` is printed with them so the
-        // line answers "why did it stop at 13,915 when the ceiling is 13,802?" without a second
-        // tool: 13,282 of that request is the catalogue, the instructions and the harness turns,
-        // which no transcript pass can shrink.
+        // line answers "why did it stop at 13,951 when the ceiling is 13,838?" without a second
+        // tool: 13,318 of that request is the catalogue, the instructions and the harness turns,
+        // which no transcript pass can shrink. They are written as `CATALOGUE + <the transcript
+        // figure the comment above derives>` — the header's rule — so the F6 description growth
+        // moved these with the constant instead of stranding it as a magic number.
         expect(shrinkReport?.data).toEqual({
             mode: 'summarize',
             threadId: thread.id,
             stage: 'shrink',
-            target: 13802,
-            from: 89161,
-            to: 13915,
+            target: CATALOGUE + 520,
+            from: CATALOGUE + 75_879,
+            to: CATALOGUE + 633,
             floorTokens: CATALOGUE,
             dropped: 3,
             clipped: 2,
@@ -4871,11 +4892,11 @@ describe('context-compaction summarize flow (T9)', () => {
             // REQUEST 2 — the armed boundary, one fetch. Same arithmetic the scripted case above
             // pins (the transcript, the estimate and the rung are identical): BIG_SEED + PROMPT +
             // the instruction the provider never saw an answer to + `retry now` = 301,763 payload
-            // bytes = 75,441 transcript tokens on top of the CATALOGUE floor = an 88,723 boundary
-            // estimate. The rung budget (13,282 + floor(0.85 × 75,441) = 77,406) is clamped to the
-            // 13,802 fit line, and the ladder measures
-            // 13,282 + 75,879 = 89,161 billed, so the ladder keeps going past pass A (13,858
-            // billed, 56 over) and drops the three head units behind one digest: 13,915 billed, the
+            // bytes = 75,441 transcript tokens on top of the CATALOGUE floor = an 88,759 boundary
+            // estimate. The rung budget (CATALOGUE + floor(0.85 × 75,441) = 77,442) is clamped to the
+            // 13,838 fit line, and the ladder measures
+            // CATALOGUE + 75,879 = 89,197 billed, so the ladder keeps going past pass A (13,894
+            // billed, 56 over) and drops the three head units behind one digest: 13,951 billed, the
             // smallest request it may send and 75,246 under what the gateway refused.
             const next = await writer.sendThreadInput(thread.id, 'retry now');
 
@@ -4898,9 +4919,9 @@ describe('context-compaction summarize flow (T9)', () => {
                 mode: 'summarize',
                 threadId: thread.id,
                 stage: 'shrink',
-                target: 13802,
-                from: 89161,
-                to: 13915,
+                target: CATALOGUE + 520,
+                from: CATALOGUE + 75_879,
+                to: CATALOGUE + 633,
                 floorTokens: CATALOGUE,
                 dropped: 3,
                 clipped: 2,
@@ -5164,7 +5185,7 @@ describe('context-compaction summarize flow (T9)', () => {
         const stored: Record<string, number | string | boolean> = {
             // The ceiling has to be a figure a compaction pass could REACH, or the case would
             // measure the wrong refusal: X1 (2026-11-17) added the dead-run guard, and a 100-token
-            // ceiling under a 13,282-token catalogue is unreachable by clipping no matter what
+            // ceiling under a 13,318-token catalogue is unreachable by clipping no matter what
             // `minTokens` says. `CATALOGUE + 100` puts the ceiling just above the floor, so the
             // transcript is the term that crosses and the floor is the only thing that stops the
             // pass — which is what this case is named for.

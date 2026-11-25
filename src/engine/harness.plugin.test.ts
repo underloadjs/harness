@@ -306,15 +306,18 @@ describe('turn.before interception', () => {
         expect(hooks[0].messages).toEqual([{ role: 'user', content: 'ABCDEFGH' }]);
         // 8 bytes of projected transcript, PLUS the tool catalogue this round declares: a
         // default harness (`presets` on, no explicit tool switches) offers 7 declarations,
-        // and `toolSchemaPayloadBytes` of the request's own `tools` is 33,394 serialized
-        // payload bytes — a constant 8,349-token floor the transcript can never show. The
+        // and `toolSchemaPayloadBytes` of the request's own `tools` is 33,538 serialized
+        // payload bytes — a constant 8,385-token floor the transcript can never show. The
         // round has no `usage` anchor yet, so it is priced blind at
-        // ceil((8 + 33,394) / 4) = 8,351; it read 2 while the estimate counted the
+        // ceil((8 + 33,538) / 4) = 8,387; it read 2 while the estimate counted the
         // transcript alone, which is the number the measured provider refusal proved wrong
         // (../core/context-estimate.ts "THE TOOL-CATALOGUE FLOOR", src/harness.ts
         // `toolSchemaBytes`). Re-derive with:
         //   Math.ceil((8 + toolSchemaPayloadBytes(seen[0].tools)) / 4).
-        expect(hooks[0].estimatedTokens).toBe(8351);
+        // THE +144 BYTES against the 33,394/8,351 this pin carried are the `edit` entry's
+        // published `bytes` sentence (../tools/files/edit.tool.ts's F6 clause): a declared
+        // description is priced here byte for byte, so the floor moved +36 tokens.
+        expect(hooks[0].estimatedTokens).toBe(8387);
         expect(hooks[0].iteration).toBe(1);
         expect(hooks[0].agent).toBe('writer');
         // The callable root runs in the entry agent's DEFAULT conversation.

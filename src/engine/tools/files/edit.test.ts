@@ -29,7 +29,11 @@
 //   - at most 100 entries per call, the cap `read`, `write` and `files` publish;
 //   - the result is one entry per requested edit, in request order, naming the path
 //     that entry asked for and reporting replacements + the file's final byte size
-//     (entries sharing a file therefore report the same size).
+//     (entries sharing a file therefore report the same size);
+//   - the published DESCRIPTION is pinned as text, because it is the contract a model
+//     reads — including F6's clause stating that shared-file entries report the same
+//     final size, and F7's refusal message, which now names the empty-oldString exception
+//     it enforces instead of only the rule.
 //
 // Line endings are pinned from both sides on purpose. A LF-only newString adopts the
 // endings of the file (the documented default); a newString that contains a carriage
@@ -1593,7 +1597,8 @@ describe('edit - the preflight (L5, L9, M12, M9, H6)', () => {
         // M12: the empty needle names exactly one place — the start of a file with no text —
         // and it is the only way an empty file can be edited at all, since no non-empty
         // oldString can match it. Against a file with text the same needle matches between
-        // every pair of characters, so it keeps the message this tool has always used.
+        // every pair of characters, so it is refused — and the F7 pin below is what that
+        // refusal has to say.
         const empty = join(workdir, 'empty-insert.txt');
         await writeTextFile(empty, '', 'utf8');
 
@@ -1607,7 +1612,20 @@ describe('edit - the preflight (L5, L9, M12, M9, H6)', () => {
 
         const failure = await failureOf(() => edit([{ path: full, oldString: '', newString: 'x' }]));
 
-        expect(failure.message).toBe('edit requires a non-empty oldString.');
+        // F7: the refusal used to stop at "edit requires a non-empty oldString.", which hid
+        // the exception the schema and the published description both grant — an empty
+        // oldString IS accepted against an EMPTY file — and left the caller no next call. The
+        // message now states the rule it enforces, why this file does not qualify, and the
+        // two calls that do what was meant. Pinned verbatim: it is the contract a model reads.
+        expect(failure.message).toBe(
+            'edit requires a non-empty oldString. An empty oldString is accepted only against an EMPTY file, ' +
+                'where it names the one place text can go; this file has text, so an empty oldString would match everywhere. ' +
+                'Pass a non-empty oldString that names the text to change (add replaceAll: true to change every match), ' +
+                'or use write to replace the whole file.'
+        );
+        // Still a malformed REQUEST rather than a filesystem state, so it stays codeless
+        // (./edit.tool.ts:1327-1330) — only the prose grew.
+        expect(failure.code).toBeUndefined();
         expect(failure.details).toEqual({ target: full, reason: 'empty-needle-on-non-empty-file' });
         await expect(readTextFile(full, 'utf8')).resolves.toBe('text\n');
     });
@@ -1637,6 +1655,15 @@ describe('edit - the preflight (L5, L9, M12, M9, H6)', () => {
         expect(description).toContain('is refused with a code rather than replaced by one');
         expect(description).toContain('EFBIG');
         expect(description).toContain('{ path, replacements, bytes, match?, changed? }');
+        // F6: the shared-file rule the RESULT TYPE already states (./edit.tool.ts:345-347 —
+        // a file is written once, so entries naming it report the same final size) was missing
+        // from the published description, and the description is the half a model reads. One
+        // clause, pinned so it cannot be trimmed back out. The wording is not free-form: those
+        // bytes are priced into ../../plugin/context-compaction.test.ts's `CATALOGUE` floor, and
+        // this exact phrasing is 144 bytes, which keeps that floor a whole number of tokens.
+        expect(description).toContain(
+            'where `bytes` is the size of the file after this call, so entries that name the SAME file report that same final size - a file is written only once'
+        );
         // T14: the cancelled-call refusal is published in the same breath as the other codes,
         // pinned as text for the same reason — the description IS the contract a model reads,
         // and `ECANCELED` is now a code this tool can answer with (./cancellation.ts).

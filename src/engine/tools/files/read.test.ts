@@ -73,6 +73,7 @@ import {
     FILE_READ_MAX_TARGETS,
     FILE_READ_NOTE_MAX_PATHS,
     FILE_READ_NOTE_MIN_BYTES,
+    FILE_READ_ERROR_ENTRY_BUDGET_BYTES,
     FILE_READ_WIRE_BUDGET
 } from './read.tool';
 import type { FileReadEntry, FileReadLimits, FileReadResult } from './read.tool';
@@ -817,7 +818,14 @@ describe('read', () => {
             nextColumn: null,
             nextByte: null,
             bytes: 0,
-            sizeBytes: 6
+            sizeBytes: 6,
+            // The count the walk counted on the way to the boundary, published rather than
+            // hidden: the walk that proved line 4 is the empty position at EOF also proved
+            // there are exactly 3 lines. `startLine: lineCount + 1` is the documented
+            // legal-at-EOF request (knowledge.md "the empty window at EOF"), so the answer
+            // is an empty window WITH this count and no error — and `startLine: 5`, one past
+            // it, is the ERANGE above that names the same 3.
+            lineCount: 3
         });
 
         // One line further and the file is exhausted: the empty window is a legitimate
@@ -1055,18 +1063,28 @@ describe('read', () => {
             Array.from({ length: 100 }, (_, index) => seed(`fold/tiny-${String(index).padStart(3, '0')}.txt`, `t${index}\n`))
         );
 
-        const cases: { label: string; paths: { path: string }[] }[] = [
+        // Which ceiling the fold line is allowed to blame, per shape (F2). The walk prices
+        // slots in request order and stops at the first one it cannot afford, so a batch of
+        // failures halts at the 8 192-byte error allowance with most of the envelope still
+        // unspent, while a batch of readable files halts on the envelope itself. The fold
+        // line has to name the one that fired — and only that one.
+        const foldReasons = {
+            envelope: `because this ${FILE_READ_WIRE_BUDGET}-byte envelope cannot answer them all`,
+            errors: `because the ${FILE_READ_ERROR_ENTRY_BUDGET_BYTES}-byte failed-path allowance is full`
+        };
+
+        const cases: { label: string; gate: keyof typeof foldReasons; paths: { path: string }[] }[] = [
             // 1. forty unreadable paths with SHORT names (the short "no such file" message:
             //    the parent directory exists, so there is no did-you-mean or preview clause);
-            { label: '40 ENOENT, short paths', paths: shortMissing.map((path) => ({ path })) },
+            { label: '40 ENOENT, short paths', gate: 'errors', paths: shortMissing.map((path) => ({ path })) },
             // 2. a hundred of them;
-            { label: '100 ENOENT, short paths', paths: wideMissing.map((path) => ({ path })) },
+            { label: '100 ENOENT, short paths', gate: 'errors', paths: wideMissing.map((path) => ({ path })) },
             // 3. and a hundred READABLE three-byte files, which is the shape that used to
             //    return 100 entries with a content pool of 0.
-            { label: '100 readable tiny files', paths: tiny.map((path) => ({ path })) }
+            { label: '100 readable tiny files', gate: 'envelope', paths: tiny.map((path) => ({ path })) }
         ];
 
-        for (const { label, paths } of cases) {
+        for (const { label, gate, paths } of cases) {
             const result = await read(paths);
             const text = await projection(paths);
 
@@ -1101,9 +1119,20 @@ describe('read', () => {
             // If it folded, the fold is the FIRST thing the model reads, and it names the
             // same count the machine view declares.
             if ((result.omitted ?? 0) > 0) {
-                expect(text.split('\n')[0], `${label}: the fold is declared first`).toContain(
+                const declared = text.split('\n')[0];
+
+                expect(declared, `${label}: the fold is declared first`).toContain(
                     `read: folded - ${result.omitted} of ${paths.length} requested paths were not read`
                 );
+                // F2: and the reason clause names the ceiling that ACTUALLY stopped the
+                // walk. Blaming the envelope for a fold the error allowance caused is the
+                // wrong remedy — splitting the batch or raising `maxBytes` cannot help when
+                // the reserve that ran out is the one for failed paths.
+                expect(declared, `${label}: the fold names the gate that fired`).toContain(foldReasons[gate]);
+                expect(
+                    declared,
+                    `${label}: the fold does not blame the ceiling that did not fire`
+                ).not.toContain(gate === 'envelope' ? foldReasons.errors : foldReasons.envelope);
             } else {
                 expect(text).not.toContain('read: folded');
             }
@@ -2170,6 +2199,11 @@ describe('read', () => {
         const text = await projection(files.map((path) => ({ path, maxBytes: 1 })));
 
         expect(text.split('\n')[0]).toContain(`read: folded - ${batch.omitted} of 100 requested paths were not read`);
+        // F2: THIS fold really is the envelope's — 100 readable paths, no failed entry in
+        // the batch, so the error allowance never fired and the reason clause says so.
+        expect(text.split('\n')[0]).toContain(
+            `because this ${FILE_READ_WIRE_BUDGET}-byte envelope cannot answer them all`
+        );
     });
 
     it('refuses a NUL only on the page that contains it', async () => {
@@ -2399,6 +2433,173 @@ describe('read', () => {
         const aligned = (await read([{ path: accents, startByte: 4 }])).files[0];
 
         expect([aligned.content, aligned.startByteAligned, aligned.bytes]).toEqual(['\n', 5, 1]);
+    });
+
+    it('names the failed-path allowance as the reason when the allowance folds the batch (F2)', async () => {
+        // F2. The fold line used to blame `FILE_READ_WIRE_BUDGET` for EVERY fold, and for
+        // this shape that is simply false. The walk prices slots in REQUEST ORDER and stops
+        // at the first one it cannot afford; a failed entry the 8 192-byte error allowance
+        // cannot pay for is unaffordable by definition (its message IS its answer), so the
+        // walk halts there with most of the 32 768-byte envelope unspent and folds the whole
+        // remainder. Measured on this fixture: 40 failures enumerate 4 error entries and fold
+        // the rest at ~3.6 KiB of wire — the envelope was nowhere near full.
+        //
+        // Why the wording is the fix, and the fold mechanics are not: the prefix rule is what
+        // makes "the omitted paths are the last N in the order requested" exactly true, so a
+        // readable path behind the halt folds with the failures. The caller cannot see that
+        // from a count, and a reason clause that blames the envelope sends it to raise
+        // `maxBytes` or split a batch that neither of those helps. Here the remedy is fewer
+        // FAILED paths, and the pair below is what proves the clause means that: the same
+        // batch with the readable file FIRST reads it complete, and BOTH orders name the
+        // allowance, because the gate is the ceiling that fired and not the accident of which
+        // path happened to be readable.
+        const lines = join(workdir, 'lines.txt');
+        const clauses = {
+            envelope: `because this ${FILE_READ_WIRE_BUDGET}-byte envelope cannot answer them all`,
+            errors: `because the ${FILE_READ_ERROR_ENTRY_BUDGET_BYTES}-byte failed-path allowance is full`
+        };
+
+        for (const failures of [20, 25, 40]) {
+            const missing = Array.from(
+                { length: failures },
+                (_, index) => join(workdir, 'fold', `missing-${String(index).padStart(2, '0')}.txt`)
+            );
+
+            const behind = await readBoth([...missing, { path: lines }]);
+            const inFront = await readBoth([{ path: lines }, ...missing]);
+
+            for (const [label, view] of [
+                ['file last', behind],
+                ['file first', inFront]
+            ] as const) {
+                const { result, text } = view;
+                const declared = text.split('\n')[0];
+
+                expect(declared, `${failures} failures, ${label}: the fold is the first line`).toContain(
+                    `read: folded - ${result.omitted} of ${failures + 1} requested paths were not read`
+                );
+                expect(declared, `${failures} failures, ${label}: names the allowance that fired`).toContain(
+                    clauses.errors
+                );
+                expect(declared, `${failures} failures, ${label}: does not blame the envelope`).not.toContain(
+                    clauses.envelope
+                );
+                // The prefix rule is untouched by the wording: the omission is still exactly
+                // the tail of the request.
+                expect(
+                    result.files.length + (result.omitted ?? 0),
+                    `${failures} failures, ${label}: the request is accounted for`
+                ).toBe(failures + 1);
+                expect(result.omitted, `${failures} failures, ${label}: something folded`).toBeGreaterThan(0);
+            }
+
+            // THE ORDER HALF. Behind the halt the readable path is not in `files` at all —
+            // every enumerated entry is one of the failures — and in front of it the same
+            // file is enumerated and reads COMPLETE, all 11 893 bytes of it, `lineCount` and
+            // all. The two batches differ by exactly that one entry.
+            expect(
+                behind.result.files.every((entry) => entry.error?.code === 'ENOENT'),
+                `${failures} failures, file last: only failures are enumerated`
+            ).toBe(true);
+            expect(
+                behind.result.files.some((entry) => entry.path === lines),
+                `${failures} failures, file last: the readable path folded with the failures`
+            ).toBe(false);
+
+            expect(inFront.result.files[0].path, `${failures} failures, file first: the file is enumerated`).toBe(lines);
+            expect(inFront.result.files[0]).toMatchObject({
+                bytes: Buffer.byteLength(LINES_1300, 'utf8'),
+                truncated: false,
+                limit: null,
+                nextByte: null,
+                lineCount: 1_300
+            });
+
+            // The error allowance is what both orders ran out of, and the readable path does
+            // not touch that reserve — so the same number of failures is affordable either
+            // way, and the only difference between the two batches is the file itself.
+            expect(inFront.result.files.length, `${failures} failures: one extra entry, the readable file`).toBe(
+                behind.result.files.length + 1
+            );
+            expect(inFront.result.omitted, `${failures} failures: one fewer folded path`).toBe(
+                (behind.result.omitted ?? 0) - 1
+            );
+        }
+    });
+
+    it('names the FIRST byte that cannot decode, not the caller\'s own window start (F8)', async () => {
+        // F8. The strict decoder's TypeError carries no position, and the message used to fill
+        // the gap with the offset it had on hand — the CALLER's `startByte`. For one bad byte
+        // at absolute 20 that made the windows opened at 0, 1, 5 and 11 each echo their own
+        // start back ("the bytes from 5 on ... seek past 5"), so the documented remedy advanced
+        // exactly ONE byte per call and the caller walked 20 calls to get past one byte. The
+        // offset published now is the byte the decode actually rejected, found by the same
+        // shape of scan `edit` already reports (edit.tool.ts:1150, "invalid UTF-8 at offset N").
+        const message = (path: string, offset: number): string =>
+            `read refused "${path}": the first byte of this window that cannot decode is ${offset}, the start of the ` +
+            'first sequence that is not valid UTF-8. read reads UTF-8 text only; pass lossy: true to get the window ' +
+            `with U+FFFD for the bytes that cannot decode, or seek past ${offset}.`;
+
+        // `a` x 20, then 0xFF at 20, then `b` x 10.
+        const oneBad = await seedBytes(
+            'decode-offset.bin',
+            Buffer.concat([Buffer.alloc(20, 0x61), Buffer.from([0xff]), Buffer.alloc(10, 0x62)])
+        );
+
+        // Every window that reaches the bad byte names IT, whatever it started at: the
+        // answer no longer depends on where the caller happened to stand.
+        for (const startByte of [0, 1, 5, 11, 20]) {
+            expect(
+                (await read([{ path: oneBad, startByte }])).files[0].error,
+                `startByte ${startByte} names the byte that failed, not its own offset`
+            ).toEqual({ code: 'EBINARY', message: message(oneBad, 20) });
+        }
+
+        // THE POINT OF NAMING IT: the remedy advances in ONE call. Seek past the offset the
+        // message gave and the rest of the file is ordinary text.
+        const past = (await read([{ path: oneBad, startByte: 21 }])).files[0];
+
+        expect([past.content, past.bytes, past.error]).toEqual(['b'.repeat(10), 10, undefined]);
+
+        // Several bad bytes in one window: the EARLIEST is the one named, from either side of
+        // it. 0xFE at 20 is not a lead byte at all; the `C3 28` at 25 — the Latin-1 `Ã(` pair,
+        // and the fixture this file already seeds two bytes of — is later, and must not move
+        // the number.
+        const manyBad = await seedBytes(
+            'decode-first.bin',
+            Buffer.concat([
+                Buffer.alloc(20, 0x61),
+                Buffer.from([0xfe]),
+                Buffer.alloc(4, 0x61),
+                Buffer.from([0xc3, 0x28]),
+                Buffer.alloc(4, 0x61)
+            ])
+        );
+
+        for (const startByte of [0, 18]) {
+            expect(
+                (await read([{ path: manyBad, startByte }])).files[0].error?.message,
+                `startByte ${startByte} names the first invalid byte`
+            ).toBe(message(manyBad, 20));
+        }
+
+        // THE EDGE THAT DOES NOT MOVE (scope deliberately not widened): a multi-byte sequence
+        // the FILE ends in the middle of. That is not a byte in the middle of the text — it is
+        // the last character, truncated — and the offset named is the LEAD byte of the sequence,
+        // 10, which is what the EOF flush reported before this fix too. The answer is pinned
+        // from both sides of the window start so a future change to the flush cannot start
+        // echoing the request again.
+        const truncated = await seedBytes(
+            'decode-tail.bin',
+            Buffer.concat([Buffer.alloc(10, 0x61), Buffer.from([0xe4, 0xb8])])
+        );
+
+        for (const startByte of [0, 5]) {
+            expect(
+                (await read([{ path: truncated, startByte }])).files[0].error?.message,
+                `a truncated final sequence is named at its lead byte (startByte ${startByte})`
+            ).toBe(message(truncated, 10));
+        }
     });
 
     it('charges maxBytes in escaped bytes while bytes stays raw', async () => {

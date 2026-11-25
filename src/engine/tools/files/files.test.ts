@@ -12,7 +12,16 @@
 //     getting a fresh 64 KiB. Paging itself is unchanged; what the page cannot show is
 //     DISCLOSED: `starved: true` plus the op that spent the allowance, a `note` naming the
 //     entry a long name stranded, and a `note` for an `offset` at or past the end, so an
-//     empty page can never be read as "this folder is empty";
+//     empty page can never be read as "this folder is empty". F1 widened that marker to the
+//     NEAR MISS as well (a remainder too small to buy the next entry is the same stranded
+//     page as a spent budget) and made the note state the bytes actually left;
+//   - the envelope's `bytes` counts ONLY this call's list entry text (F10): a move/copy
+//     receipt carries its own `bytes`, in file PAYLOAD units, and is deliberately never summed
+//     into that total, because one number in two units cannot be read — the published
+//     description states the unit, and the pin keeps description and code together. The
+//     description likewise publishes the delete rule the refusal has always enforced (F4: a
+//     symlink to a NON-EMPTY directory is refused without `recursive`, because `recursive`
+//     then removes the LINK and leaves the tree);
 //   - a list path naming one directory several ways walks it ONCE (compared by real
 //     identity, ./identity.ts), and one directory that cannot be read costs only itself:
 //     the listings already collected survive, and the failure is that entry's own
@@ -52,7 +61,9 @@
 //     gates replace-vs-EEXIST, `replaceDirectory` gates removing a destination DIRECTORY
 //     and the tree under it (a file taking a directory name, or a directory replacing a
 //     NON-EMPTY one; an empty destination with a directory source, and any symlink
-//     destination, still need only `overwrite`), `recursive` gates a NON-EMPTY directory (an empty one, and
+//     destination, still need only `overwrite`, while a FILE onto an empty destination
+//     directory still needs `replaceDirectory` and — F5 — now says so without claiming a
+//     WHOLE tree is at stake), `recursive` gates a NON-EMPTY directory (an empty one, and
 //     a dangling symlink, delete without either flag), and `force` turns a missing delete
 //     into a reported no-op. The refusal names the SHAPE it refused, because `recursive`
 //     does different things to each: a real directory loses its whole tree, a symlink
@@ -365,6 +376,15 @@ describe('files metadata', () => {
             description:
                 'delete: allow removing a real directory that is not empty, together with everything under it. For a symlink it removes the LINK only — the directory it points at and its contents always stay. Defaults to false.'
         });
+        // F4: the description's delete sentence stated the link-only rule but not the GATE in
+        // front of it, so a model reading only the description had no way to predict that
+        // deleting a symlink to a NON-EMPTY directory is refused at all (./delete refuses it
+        // precisely because `recursive` then removes the link and leaves the tree). The
+        // `recursive` parameter and the file header already carried the rule; the published
+        // description is the half a model actually reads.
+        expect(metadata.description as string).toContain(
+            'a symlink to a NON-EMPTY directory is refused without it too - `recursive` then removes the LINK and leaves that tree exactly as it was'
+        );
     });
 
     it('publishes replaceDirectory in the schema, the runtime field list, and the description together', async () => {
@@ -414,7 +434,18 @@ describe('files metadata', () => {
         expect(description).toContain('`kind` is what stands at the DESTINATION afterwards - `file`, `directory`, or `symlink`');
         // M2 / EXTRA-3 / L8: the three receipt fields that exist to stop an empty page from being
         // misread are part of the published contract, not implementation detail.
-        expect(description).toContain('plus `starved: true` and a `note` when an earlier list op of the same call already spent the shared entry budget');
+        // F1: the published gate has to cover the NEAR MISS as well — a budget with 10 bytes
+        // left strands a page exactly like a spent one — otherwise the prose is narrower than
+        // the flag, which is the defect.
+        expect(description).toContain(
+            'plus `starved: true` and a `note` when an earlier list op of the same call already spent the shared entry budget, or left less of it than one entry costs'
+        );
+        expect(description).toContain('and the note states the bytes that were left');
+        // F10: `bytes` is ONE unit (list entry text), and a caller that is not told so reads a
+        // copy's payload bytes as if they had been charged against `contentBudget`.
+        expect(description).toContain(
+            '`bytes` counts the list entry text this call returned, while mutation receipts carry their own `bytes` and are not summed into it'
+        );
         expect(description).toContain(
             'a `note` also says when a page stopped early because one long name did not fit the remaining budget, or when an `offset` is past the end of the listing'
         );
@@ -577,6 +608,10 @@ describe('files list', () => {
         // M2 pin (this wave): an empty page that is NOT an answer about this directory is
         // marked `starved: true`, and the note names the op that spent the allowance, so the
         // caller does not read "no entries" as "this folder is empty".
+        //
+        // F1 reword (kept pin, same scenario, same `starved: true`): the note now states the
+        // remainder that was ACTUALLY left — 0 here — instead of only claiming "already
+        // spent", because the same sentence has to stay true for the near-miss case below.
         expect(result.results[1]).toEqual({
             op: 'list',
             path: `shared/b/${chain}`,
@@ -587,12 +622,134 @@ describe('files list', () => {
             limit: 200,
             bytes: 0,
             starved: true,
-            note: `This list op found the call's ${FILES_CONTENT_BUDGET}-byte entry budget already spent: the list at "shared/a/${chain}" (offset 0) charged ${FILES_CONTENT_BUDGET} of it, so no entry here could be returned and nextOffset 0 has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
+            note: `This list op could not take an entry from the call's ${FILES_CONTENT_BUDGET}-byte entry budget: the list at "shared/a/${chain}" (offset 0) had already charged ${FILES_CONTENT_BUDGET} of it, leaving 0 — less than one entry's cost — so no entry here could be returned and nextOffset 0 has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
         });
         // The envelope is the sum of what the ops charged, and can never exceed the cap.
         expect(result.bytes).toBe(FILES_CONTENT_BUDGET);
         expect(result.bytes).toBe(result.results.reduce((total, entry) => total + (entry.bytes ?? 0), 0));
         expect(result.contentBudget).toBe(FILES_CONTENT_BUDGET);
+    });
+
+    // F1 (this wave): the gate was `remainingAtStart === 0`, which describes only one shape of
+    // a stranded page. An entry costs its whole prefixed name (here 1024 bytes), so the
+    // ORDINARY end of a nearly-full budget is a handful of bytes left that cannot buy the next
+    // entry either — and that case answered `entries: [], truncated: true` with NO marker, the
+    // exact false "this folder is empty" the marker exists to prevent. The gate is now "the
+    // budget could not afford the next entry", and the note states the remainder instead of
+    // claiming the budget was fully spent (which was untrue for the near miss).
+    it('marks an empty page starved when what is left cannot buy the next entry, not only at zero', async () => {
+        // Provable arithmetic, same construction as the pin above: `near/a` (6) + eight
+        // 100-character levels (8 x 101) + '/' = 815 bytes of prefix, so a 209-character leaf
+        // is exactly a 1024-byte entry, 199 is 1014, and 208 is 1023. 63 x 1024 + 1014 =
+        // 65,526 leaves 10; 63 x 1024 + 1023 = 65,535 leaves 1.
+        const chain = [0, 1, 2, 3, 4, 5, 6, 7]
+            .map((level) => `d${level}`.padEnd(100, 'z'))
+            .join('/');
+        const leaf = (index: number, length: number): string =>
+            `n${String(index).padStart(3, '0')}${'y'.repeat(length - 4)}`;
+        const pageOf = (side: string, count: number, length: number): string[] =>
+            Array.from({ length: count }, (_, index) => `near/${side}/${chain}/${leaf(index, length)}`);
+        const seedSide = async (side: string, count: number, length: number): Promise<void> => {
+            for (const entry of pageOf(side, count, length)) await seed(entry, 'x');
+        };
+
+        // The 64th entry of each side is the short one, and code-point order puts `n063`
+        // after `n062`, so it is the LAST entry the first page emits.
+        const shortA = `near/a/${chain}/${leaf(63, 199)}`;
+        const shortC = `near/c/${chain}/${leaf(63, 208)}`;
+
+        await seedSide('a', 63, 209);
+        await seed(shortA, 'x');
+        await seedSide('b', 2, 209);
+        await seedSide('c', 63, 209);
+        await seed(shortC, 'x');
+        await seedSide('d', 2, 209);
+        // A short name for the gate's OTHER side: 10 bytes left is starvation only relative to
+        // the entry this op was about to emit, never an absolute "the budget is gone".
+        await seed('e/f', 'x');
+
+        const charged = 63 * 1024 + 1014;
+
+        expect(charged).toBe(FILES_CONTENT_BUDGET - 10);
+
+        // 1. Ten bytes left — the near miss the old gate let through.
+        const near = await files([
+            { op: 'list', path: `near/a/${chain}` },
+            { op: 'list', path: `near/b/${chain}` }
+        ]);
+
+        // The first page is CLEAN (every entry fit, nothing was withheld), so the remainder it
+        // leaves is the second op's whole story.
+        expect(near.results[0]).toEqual({
+            op: 'list',
+            path: `near/a/${chain}`,
+            entries: [...pageOf('a', 63, 209), shortA],
+            truncated: false,
+            nextOffset: null,
+            offset: 0,
+            limit: 200,
+            bytes: charged
+        });
+        expect(near.results[1]).toEqual({
+            op: 'list',
+            path: `near/b/${chain}`,
+            entries: [],
+            truncated: true,
+            nextOffset: 0,
+            offset: 0,
+            limit: 200,
+            bytes: 0,
+            starved: true,
+            note: `This list op could not take an entry from the call's ${FILES_CONTENT_BUDGET}-byte entry budget: the list at "near/a/${chain}" (offset 0) had already charged ${charged} of it, leaving 10 — less than one entry's cost — so no entry here could be returned and nextOffset 0 has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
+        });
+        // The remainder the note quotes is the caller's own arithmetic (`contentBudget -
+        // bytes`), so the sentence can be checked against the envelope it arrived in.
+        expect(near.bytes).toBe(charged);
+        expect(near.contentBudget).toBe(FILES_CONTENT_BUDGET);
+
+        // 2. One byte left — the last entry of the first page DID fit, and the next page is
+        // still stranded. This is the boundary of the widened gate: `remaining < nextEntry`.
+        const last = await files([
+            { op: 'list', path: `near/c/${chain}` },
+            { op: 'list', path: `near/d/${chain}` }
+        ]);
+
+        expect(last.results[0]).toMatchObject({
+            entries: [...pageOf('c', 63, 209), shortC],
+            truncated: false,
+            bytes: FILES_CONTENT_BUDGET - 1
+        });
+        expect(last.results[1]).toEqual({
+            op: 'list',
+            path: `near/d/${chain}`,
+            entries: [],
+            truncated: true,
+            nextOffset: 0,
+            offset: 0,
+            limit: 200,
+            bytes: 0,
+            starved: true,
+            note: `This list op could not take an entry from the call's ${FILES_CONTENT_BUDGET}-byte entry budget: the list at "near/c/${chain}" (offset 0) had already charged ${FILES_CONTENT_BUDGET - 1} of it, leaving 1 — less than one entry's cost — so no entry here could be returned and nextOffset 0 has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
+        });
+
+        // 3. The same 10 bytes left, against an entry they can buy: the page is returned, and
+        // stays the exact clean receipt shape — no `starved`, no `note`.
+        const fits = await files([
+            { op: 'list', path: `near/a/${chain}` },
+            { op: 'list', path: 'e' }
+        ]);
+
+        expect(fits.results[1]).toEqual({
+            op: 'list',
+            path: 'e',
+            entries: ['e/f'],
+            truncated: false,
+            nextOffset: null,
+            offset: 0,
+            limit: 200,
+            bytes: 'e/f'.length
+        });
+        expect(fits.bytes).toBe(charged + 'e/f'.length);
     });
 
     it('keeps the listings it did get when one requested directory cannot be read', async () => {
@@ -1077,6 +1234,46 @@ describe('files move and copy', () => {
 
         expect(moved.results[0]).toMatchObject({ kind: 'directory', bytes: 0 });
         expect((await readdir(join(workdir, 'tree-moved'))).sort()).toEqual(['a.txt', 'nested']);
+    });
+
+    // F10 (this wave): the envelope's `bytes` counts ONLY this call's list entry text — a
+    // move/copy receipt carries a `bytes` of its own (file PAYLOAD), and one number holding
+    // both units is unreadable whichever way it is read. The published description now defines
+    // it; this pins that the definition describes the code, in both directions: a mutation-only
+    // call totals 0 against `contentBudget`, and a mixed call totals exactly the list receipt.
+    it('totals the envelope bytes in list-entry units, never mixing in a mutation payload', async () => {
+        await seed('bytesum/payload.txt', 'payload');
+
+        const copyOnly = await files([{ op: 'copy', from: 'bytesum/payload.txt', to: 'bytesum/copy.txt' }]);
+
+        // The receipt still reports the 7 bytes it wrote, and the envelope reports no entry
+        // text at all — `contentBudget` printed beside it is the LIST cap, and nothing in this
+        // call charged it.
+        expect(copyOnly.results[0]).toMatchObject({ op: 'copy', bytes: 7 });
+        expect(copyOnly.bytes).toBe(0);
+        expect(copyOnly.contentBudget).toBe(FILES_CONTENT_BUDGET);
+
+        await rm(join(workdir, 'bytesum/copy.txt'), { force: true });
+
+        const mixed = await files([
+            { op: 'copy', from: 'bytesum/payload.txt', to: 'bytesum/copy.txt' },
+            { op: 'list', path: 'bytesum' }
+        ]);
+
+        expect(mixed.results[1]).toEqual({
+            op: 'list',
+            path: 'bytesum',
+            entries: ['bytesum/copy.txt', 'bytesum/payload.txt'],
+            truncated: false,
+            nextOffset: null,
+            offset: 0,
+            limit: 200,
+            bytes: 'bytesum/copy.txt'.length + 'bytesum/payload.txt'.length
+        });
+        // 35, not 42: the copy's 7 payload bytes stay out of this total on purpose, which is
+        // exactly the sentence the description now carries.
+        expect(mixed.bytes).toBe('bytesum/copy.txt'.length + 'bytesum/payload.txt'.length);
+        expect(mixed.bytes).toBe((mixed.results[1] as { bytes: number }).bytes);
     });
 
     it('refuses to copy or move a path onto itself instead of deleting the source', async () => {
@@ -1595,6 +1792,87 @@ describe('files move and copy', () => {
             `destination "${manyPath}" is a directory that could not be listed (its entries are counted as unknown, which is treated as non-empty)`
         );
         expect((await readdir(many)).sort()).toEqual(['a.txt', 'b']);
+    });
+
+    // F5 (this wave): the same refusal said "holds 0 entries … and replacing it removes that
+    // WHOLE tree" for an EMPTY destination directory. The gate is right — a non-directory
+    // source taking a directory's name still needs `replaceDirectory` — but the sentence
+    // exaggerated the casualty (an empty directory holds no tree), which is the failure mode
+    // this file keeps hitting: a caller that is told a tree is at stake starts doubting whether
+    // one has already been deleted. The `> 0` and unlistable branches above keep the alarming
+    // wording byte-for-byte, because there a tree really is the casualty.
+    it('refuses a file onto an EMPTY destination directory without inventing a tree to lose', async () => {
+        await seed('empty5/one.txt', 'aaa');
+        await dir('empty5/empty');
+
+        const fromPath = posix(join(workdir, 'empty5/one.txt'));
+        const toPath = posix(join(workdir, 'empty5/empty'));
+
+        const refusalFor = async (overwrite: boolean) =>
+            rejectionOf(
+                files([
+                    {
+                        op: 'move',
+                        from: 'empty5/one.txt',
+                        to: 'empty5/empty',
+                        ...(overwrite ? { overwrite: true } : {})
+                    }
+                ])
+            );
+
+        const bare = await refusalFor(false);
+        const flagged = await refusalFor(true);
+
+        // The machine half is unchanged by the wording fix: same code, the count it measured
+        // (0, not null), and only the flags still missing.
+        expect(bare.code).toBe(FILES_REFUSAL_CODES.destinationDirectory);
+        expect(bare.details?.failure?.details).toEqual({
+            path: fromPath,
+            to: toPath,
+            kind: 'directory',
+            entries: 0,
+            sourceKind: 'file',
+            requiredFlags: ['overwrite', 'replaceDirectory']
+        });
+        expect(flagged.details?.failure?.details).toEqual({
+            path: fromPath,
+            to: toPath,
+            kind: 'directory',
+            entries: 0,
+            sourceKind: 'file',
+            requiredFlags: ['replaceDirectory']
+        });
+        expect(bare.message).toContain(
+            `files move refused: destination "${toPath}" is an EMPTY directory, so nothing under it is at stake - only its own name, which the source "${fromPath}" would take because it is not a directory. ` +
+                `Pass a "to" INSIDE it (for example "${toPath}/name"), or pass overwrite: true and replaceDirectory: true to take the name and remove the empty directory.`
+        );
+        expect(flagged.message).toContain(
+            'or pass replaceDirectory: true to take the name and remove the empty directory.'
+        );
+        expect(flagged.message).not.toContain('overwrite: true and replaceDirectory');
+        // The overstatement itself is what is pinned absent: nothing here holds a tree, and the
+        // non-empty branch above still owns that sentence.
+        expect(bare.message).not.toContain('WHOLE tree');
+        expect(bare.message).not.toContain('holds 0 entries');
+        // Both refusals changed nothing: the file is still a file, the directory is still empty.
+        expect(await readTextFile(join(workdir, 'empty5/one.txt'), 'utf8')).toBe('aaa');
+        expect(await readdir(join(workdir, 'empty5/empty'))).toEqual([]);
+
+        // The advice the new sentence gives is real: with the flags it names, the call is
+        // accepted, and the receipt still reports the empty directory it removed.
+        const accepted = await files([
+            { op: 'move', from: 'empty5/one.txt', to: 'empty5/empty', overwrite: true, replaceDirectory: true }
+        ]);
+
+        expect(accepted.results[0]).toEqual({
+            op: 'move',
+            path: fromPath,
+            to: toPath,
+            kind: 'file',
+            bytes: 3,
+            replaced: { path: toPath, kind: 'directory', entries: 0 }
+        });
+        expect(await readTextFile(join(workdir, 'empty5/empty'), 'utf8')).toBe('aaa');
     });
 
     it('reports what an overwrite replacement removed', async () => {

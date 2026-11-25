@@ -126,19 +126,26 @@
 //     the oversized value first and turn the clamp below into a dead branch — the
 //     promise would only hold for a host calling the tool object directly;
 //   - FILES_CONTENT_BUDGET (64 KiB) of UTF-8 entry text is an AGGREGATE budget
-//     shared by every list op in the CALL (`bytes` reports what the call consumed,
-//     `contentBudget` the fixed cap). It is threaded through the ops as one mutable
-//     `{ remaining }`, so the second op in a call starts where the first one stopped.
+//     shared by every list op in the CALL (`bytes` reports the entry text the call
+//     returned, `contentBudget` the fixed cap). A mutation receipt's own `bytes` counts
+//     FILE payload, a different unit, so it is never summed into that total — the
+//     published description says the same, because the envelope otherwise reads as
+//     though a copy had charged the listing budget. It is threaded through the ops as
+//     one mutable `{ remaining }`, so the second op in a call starts where the first one
+//     stopped.
 //     A page stops BEFORE the entry that would cross it, so no entry is ever split,
-//     and an op whose turn arrives with the budget already spent answers
-//     `entries: []`, `truncated: true`, `nextOffset: <its own offset>` — a cursor that
-//     points at the entry that did not fit, never one that silently advances past it.
-//     That empty page is ALSO marked, because `entries: []` beside `truncated: true`
+//     and an op whose turn arrives with too little of the budget left to buy even the
+//     next entry — all of it spent, or a handful of bytes left behind one long name —
+//     answers `entries: []`, `truncated: true`, `nextOffset: <its own offset>` — a cursor
+//     that points at the entry that did not fit, never one that silently advances past
+//     it. That empty page is ALSO marked, because `entries: []` beside `truncated: true`
 //     alone reads like a listing rather than like a call that never got its turn:
-//     `starved: true` says an EARLIER list op of this call charged the whole budget, and
-//     `note` names that op (its path, offset and charge) plus how to get a real answer —
-//     the budget stays call-wide ON PURPOSE (it is the published contract, and per-op
-//     budgets let N list ops charge N x 64 KiB), so the fix is visibility, not a new cap;
+//     `starved: true` says this call had already charged so much of the budget that this
+//     op could not afford a single entry, and `note` names the op that charged it (its
+//     path, offset and charge), states the remainder actually left, and says how to get a
+//     real answer — the budget stays call-wide ON PURPOSE (it is the published contract,
+//     and per-op budgets let N list ops charge N x 64 KiB), so the fix is visibility, not
+//     a new cap;
 //   - `truncated` is true when entries exist beyond this page and `nextOffset`
 //     locates them; pass it back as that entry's `offset`. An entry whose own
 //     UTF-8 size exceeds the whole budget can never be paged, so the call is
@@ -146,11 +153,13 @@
 //     advances.
 //   - `note` is the "why is this page short/empty" field, present in exactly three
 //     situations (all of them previously silent):
-//       1. a budget cut — the page stopped at an entry that no longer fits, and the
-//          sequence is code-point SORTED, so one long name can strand usable budget
+//       1. a budget cut — a NON-empty page stopped at an entry that no longer fits, and
+//          the sequence is code-point SORTED, so one long name can strand usable budget
 //          behind it: the note quotes that name, its size, and what was left. Paging
 //          itself is unchanged (resuming in a NEW call is the remedy);
-//       2. `starved: true` (the bullet above) — the note names the earlier op;
+//       2. `starved: true` (the bullet above) — an EMPTY page for that same budget reason,
+//          whether nothing is left or only a remainder too small for the next entry: the
+//          note names the op that took the budget and states the bytes that remain;
 //       3. an `offset` at or past the end of the sequence — indistinguishable from an
 //          exhausted listing before, so the note says plainly that the listing has N
 //          entries and the empty page means "end of sequence", not a failure. It stays
@@ -529,11 +538,13 @@ export type FilesOperationResult = {
     // move/copy ONLY, and only when an existing destination was removed to make room:
     // exactly what that removal cost (see ./FilesReplacedEntry).
     replaced?: FilesReplacedEntry;
-    // list ONLY: this op could not emit a single entry because an EARLIER list op of the
-    // same call had already charged the whole FILES_CONTENT_BUDGET (M2). The call-wide
-    // budget is the published contract, so the fix is this marker plus `note`, not a
-    // per-op allowance; `truncated: true` beside a non-advancing `nextOffset` was the only
-    // (weak) hint before.
+    // list ONLY: this op could not emit a single entry because the CALL had already
+    // charged so much of the shared FILES_CONTENT_BUDGET that the next entry did not fit
+    // (M2, F1). "So much" includes the near miss — a handful of bytes left is as fatal to
+    // an entry costing tens of them as a spent budget is, and both used to answer an
+    // unmarked empty page. The call-wide budget is the published contract, so the fix is
+    // this marker plus `note`, not a per-op allowance; `truncated: true` beside a
+    // non-advancing `nextOffset` was the only (weak) hint before.
     starved?: true;
     // list ONLY: why this page is short or empty when an empty page could mean several
     // different things — a budget cut that one long name caused, a starvation this call
@@ -543,8 +554,11 @@ export type FilesOperationResult = {
     error?: FilesOperationError;
 };
 
-// The ordered result. `bytes` is what the call charged against the shared list
-// budget; `contentBudget` is the fixed cap it was subject to.
+// The ordered result. `bytes` is the ENTRY TEXT this call returned — the sum of the list
+// receipts' `bytes`, i.e. what the call charged against the shared list budget;
+// `contentBudget` is the fixed cap it was subject to. A move/copy receipt's own `bytes`
+// counts file PAYLOAD instead, so it is deliberately NOT summed in: one number holding two
+// units would be unreadable either way (see the `bytes` clause of the description).
 export type FilesResult = {
     results: FilesOperationResult[];
     bytes: number;
@@ -1142,23 +1156,36 @@ const copyDirectory = async (
 // `entries` array — and had three DIFFERENT causes with three different remedies, all of
 // them previously invisible: an earlier op of the same call ate the budget (M2), one long
 // name stranded it (EXTRA-3), or the offset is past the end of the sequence (L8).
+//
+// `starved` is PASSED IN rather than recomputed here (F1): the flag and this prose are the
+// same claim about the same op, and the defect was exactly one of them being narrower than
+// the other. One gate, decided by the caller against the list loop's real semantics, keeps
+// `starved: true` and the starvation note from ever disagreeing.
 const listNote = (args: {
     offset: number;
     pageLength: number;
     windowLength: number;
     total: number;
+    starved: boolean;
     remainingAtStart: number;
     remainingAtCut: number;
     withheld?: { entry: string; size: number };
     consumer?: { path: string; offset: number; bytes: number };
 }): string | undefined => {
-    // M2 — STARVATION. Nothing of this listing could be emitted, and the reason is an
-    // earlier op of THIS call, not anything about this directory. Naming that op is the
-    // whole point: `entries: []` beside `truncated: true` reads like an answer.
-    if (args.pageLength === 0 && args.windowLength > 0 && args.remainingAtStart === 0) {
+    // M2 — STARVATION. Nothing of this listing could be emitted, and the reason is the
+    // budget this call already committed, not anything about this directory. Naming the op
+    // that took it is the whole point: `entries: []` beside `truncated: true` reads like an
+    // answer.
+    //
+    // F1: the sentence states the remainder that was ACTUALLY left. A budget with 0 bytes
+    // left and one with 10 bytes left are the same outcome for this op (neither can return
+    // an entry), but not the same fact, and the old text claimed "already spent / charged
+    // the whole 65536" even when a remainder was still sitting there — a number the caller
+    // could disprove from the envelope it was handed.
+    if (args.starved) {
         return args.consumer === undefined
-            ? `The call's ${FILES_CONTENT_BUDGET}-byte entry budget was already spent before this list op ran, so no entry of this listing could be returned and nextOffset ${args.offset} has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
-            : `This list op found the call's ${FILES_CONTENT_BUDGET}-byte entry budget already spent: the list at "${args.consumer.path}" (offset ${args.consumer.offset}) charged ${args.consumer.bytes} of it, so no entry here could be returned and nextOffset ${args.offset} has not advanced. Ask for this listing in a separate call, or list a narrower directory.`;
+            ? `The call's ${FILES_CONTENT_BUDGET}-byte entry budget had only ${args.remainingAtStart} left when this list op ran — less than one entry's cost — so no entry of this listing could be returned and nextOffset ${args.offset} has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
+            : `This list op could not take an entry from the call's ${FILES_CONTENT_BUDGET}-byte entry budget: the list at "${args.consumer.path}" (offset ${args.consumer.offset}) had already charged ${args.consumer.bytes} of it, leaving ${args.remainingAtStart} — less than one entry's cost — so no entry here could be returned and nextOffset ${args.offset} has not advanced. Ask for this listing in a separate call, or list a narrower directory.`;
     }
 
     // EXTRA-3 — the page stopped at an entry that no longer fits. Paging itself is kept
@@ -1309,6 +1336,28 @@ const runList = (
                 budget.consumer = { path: toPosixPath(request.path), offset: request.offset, bytes };
             }
 
+            // F1 — the STARVATION GATE, and the one place its meaning is decided (the note
+            // receives this boolean instead of re-deriving it, so the flag and the prose
+            // cannot drift apart again).
+            //
+            // It has to mean exactly: an empty page, entries that existed, and the budget
+            // being the reason nothing was emitted. The old `remainingAtStart === 0` read
+            // the loop as if only a fully spent budget could strand a page, and the loop
+            // does not work that way — an entry costs the whole prefixed name (typically
+            // 24-450 bytes), so the ordinary outcome of a nearly-full budget is a handful of
+            // bytes left that cannot buy the NEXT entry either. That case returned
+            // `entries: [], truncated: true` with no marker at all, which is the false
+            // "this folder is empty" the marker exists to prevent.
+            //
+            // Why `window[0]` and not `min(all entries)`: the loop above BREAKS on the first
+            // entry that does not fit (it never skips one and keeps going), so the entry that
+            // decides an empty page is always the first one in the window. A `min` over the
+            // whole window would be a WEAKER gate here — the sequence is code-point sorted,
+            // not size sorted, so a cheap entry can hide behind the expensive one the loop
+            // stopped at, and the page would still be empty for a budget reason.
+            const firstEntryBytes = window.length === 0 ? 0 : Buffer.byteLength(window[0], 'utf8');
+            const starved = page.length === 0 && window.length > 0 && remainingAtStart < firstEntryBytes;
+
             const consumed = request.offset + page.length;
             const truncated = consumed < entries.length;
             const note = listNote({
@@ -1316,21 +1365,22 @@ const runList = (
                 pageLength: page.length,
                 windowLength: window.length,
                 total: entries.length,
+                starved,
                 remainingAtStart,
                 remainingAtCut: budget.remaining,
                 withheld,
                 consumer: budget.consumer
             });
-            const starved = page.length === 0 && window.length > 0 && remainingAtStart === 0;
 
             return {
                 op: 'list' as const,
                 path: toPosixPath(request.path),
                 entries: page,
                 truncated,
-                // An op that arrives to a spent budget answers an EMPTY page pointing at
-                // its own offset: the entry that did not fit is still the next one, so a
-                // caller that frees budget (or pages a smaller path) can ask again.
+                // An op that arrives to a budget that cannot afford the next entry answers an
+                // EMPTY page pointing at its own offset: the entry that did not fit is still
+                // the next one, so a caller that frees budget (or pages a smaller path) can
+                // ask again. This holds whether the remainder is 0 bytes or 10.
                 nextOffset: truncated ? consumed : null,
                 offset: request.offset,
                 limit: request.limit,
@@ -1783,18 +1833,35 @@ const runMutation = async (request: PreparedOperation): Promise<FilesOperationRe
     const replacingTree = destinationIsTree && (!sourceIsTree || destinationEntries === null || destinationEntries > 0);
 
     if (destinationExists && replacingTree && !request.replaceDirectory) {
+        // F5: `destinationEntries === 0` can only reach this refusal through a NON-directory
+        // source (with 0 entries the gate above reduces to `!sourceIsTree`), and the sentence
+        // written for a destination that HOLDS a tree is not true of an empty one: "holds 0
+        // entries … and replacing it removes that WHOLE tree" tells the caller a tree is at
+        // stake when nothing but the directory's own name is, which is the same overstatement
+        // that made a model distrust its own eyes the last time a refusal exaggerated.
+        //
+        // The GATE is untouched — an empty destination directory still needs the flag, because
+        // taking its name is a decision `overwrite` does not cover — and the `> 0` and
+        // unlistable branches keep the alarming wording byte-for-byte on purpose: there a real
+        // tree IS the casualty, and the loud sentence is what stopped a model from believing a
+        // tree had already been deleted.
+        const emptyDestination = destinationEntries === 0;
+        // `overwrite` is never re-advised to a caller that already passed it.
+        const missingFlags = request.overwrite ? '' : 'overwrite: true and ';
+        const example = `${toPosixPath(toPath)}/${sourceIsTree ? 'inner' : 'name'}`;
+
         throw new HarnessError(
-            `files ${op} refused: destination "${toPath}" is a directory that ${
-                destinationEntries === null
-                    ? 'could not be listed (its entries are counted as unknown, which is treated as non-empty)'
-                    : `holds ${destinationEntries} ${destinationEntries === 1 ? 'entry' : 'entries'}`
-            }, and replacing it removes that WHOLE tree. ${
-                sourceIsTree
-                    ? 'The source is a directory too, so the call swaps one tree for the other.'
-                    : `The source "${toPosixPath(fromPath)}" is not a directory, so it would take the directory's name and its contents would be gone.`
-            } Pass a "to" INSIDE that directory (for example "${toPosixPath(toPath)}/${sourceIsTree ? 'inner' : 'name'}"), or pass ${
-                request.overwrite ? '' : 'overwrite: true and '
-            }replaceDirectory: true to remove the tree and take its name.`,
+            emptyDestination
+                ? `files ${op} refused: destination "${toPath}" is an EMPTY directory, so nothing under it is at stake - only its own name, which the source "${toPosixPath(fromPath)}" would take because it is not a directory. Pass a "to" INSIDE it (for example "${example}"), or pass ${missingFlags}replaceDirectory: true to take the name and remove the empty directory.`
+                : `files ${op} refused: destination "${toPath}" is a directory that ${
+                      destinationEntries === null
+                          ? 'could not be listed (its entries are counted as unknown, which is treated as non-empty)'
+                          : `holds ${destinationEntries} ${destinationEntries === 1 ? 'entry' : 'entries'}`
+                  }, and replacing it removes that WHOLE tree. ${
+                      sourceIsTree
+                          ? 'The source is a directory too, so the call swaps one tree for the other.'
+                          : `The source "${toPosixPath(fromPath)}" is not a directory, so it would take the directory's name and its contents would be gone.`
+                  } Pass a "to" INSIDE that directory (for example "${example}"), or pass ${missingFlags}replaceDirectory: true to remove the tree and take its name.`,
             {
                 code: FILES_REFUSAL_CODES.destinationDirectory,
                 details: {
@@ -2065,7 +2132,7 @@ const copyFileWithSize = async (fromPath: string, toPath: string, progress: Copy
 export const FILES_METADATA: PresetToolMetadata = {
     name: 'files',
     description:
-        'Manage files and folders: list, move, copy, delete, and mkdir in ONE call, applied in the order given. Pass an array of operations, each `{ op, ... }`: list takes `path` (one directory or several, default the working directory) plus `offset`/`limit`; move and copy take `from` and `to` plus `overwrite` (default false, so an existing destination is an EEXIST error, not a silent replace) and `replaceDirectory` (default false, move/copy only; REQUIRED whenever replacing the destination would delete a TREE - a file moved or copied onto a directory name, or a directory onto a NOT-EMPTY directory - because `overwrite` permits removing the NAME at `to`, not the contents under it, and a call that omits it is refused with the number of entries at stake and changes nothing; an EMPTY destination directory with a directory source needs only `overwrite`, and a destination that is a symlink needs only `overwrite` because the link, never anything under its target, is what goes); a destination that is the source, inside it, or an ancestor of it is refused before anything moves, and a copy stops at a depth of 64 directory levels; delete takes `path` plus `recursive` (a non-empty directory without it is refused; for a symlink it removes the link only, never the target or its contents) and `force` (a missing path becomes `removed: false, skipped: true` instead of an error); mkdir takes `path` and creates missing parents, reporting an existing directory (or a symlink that reaches one) as `created: false`, and refusing a name held by a DANGLING symlink with the remedy for that shape. Returns `{ results, bytes, contentBudget }` with ONE ordered receipt per op: list gives `{ entries, truncated, nextOffset, offset, limit, bytes }`, plus `starved: true` and a `note` when an earlier list op of the same call already spent the shared entry budget (an empty page that is NOT an answer about the directory), move/copy give `{ path, to, kind, bytes }` where `kind` is what stands at the DESTINATION afterwards - `file`, `directory`, or `symlink`: a moved link stays a link and reports 0 bytes, while a copy of a live link writes the payload under it, and a copy of a dangling one writes the link - plus `replaced: { path, kind, entries }` whenever the call removed an existing destination, so the tree it deleted is visible in the receipt rather than only in the message; delete gives `{ path, removed, recursive }`, and mkdir gives `{ path, created }`. Entry names are prefixed with the directory they came from, directories end with "/", and listings are sorted by code point, so paging is deterministic; a `note` also says when a page stopped early because one long name did not fit the remaining budget, or when an `offset` is past the end of the listing. Every entry is validated before anything runs, so a malformed call changes nothing; a failing mutation rejects the call, names the ops already applied AND states what this op left behind (a half-copied tree with its top-level entries, or a destination its own `overwrite` had already removed while the source stayed), and there is NO rollback, while a failing list entry reports its own `error: { code, rawCode?, message }` without failing the batch. A cancelled call rejects the same way with `ECANCELED`, naming the operation it stopped on and the ops already applied. Cross-device moves report `EXDEV` rather than copying behind your back, and the message names the two calls to send instead ({ "op": "copy" }, then { "op": "delete" }). Symlinks are handled differently per verb, on purpose: move renames the link, top-level copy dereferences a live link and preserves a dangling one, links inside a copied tree are preserved, delete removes the link only, and each result says which happened. Use read/write/edit for content and glob/grep for searching.',
+        'Manage files and folders: list, move, copy, delete, and mkdir in ONE call, applied in the order given. Pass an array of operations, each `{ op, ... }`: list takes `path` (one directory or several, default the working directory) plus `offset`/`limit`; move and copy take `from` and `to` plus `overwrite` (default false, so an existing destination is an EEXIST error, not a silent replace) and `replaceDirectory` (default false, move/copy only; REQUIRED whenever replacing the destination would delete a TREE - a file moved or copied onto a directory name, or a directory onto a NOT-EMPTY directory - because `overwrite` permits removing the NAME at `to`, not the contents under it, and a call that omits it is refused with the number of entries at stake and changes nothing; an EMPTY destination directory with a directory source needs only `overwrite`, and a destination that is a symlink needs only `overwrite` because the link, never anything under its target, is what goes); a destination that is the source, inside it, or an ancestor of it is refused before anything moves, and a copy stops at a depth of 64 directory levels; delete takes `path` plus `recursive` (a non-empty directory without it is refused; for a symlink it removes the link only, never the target or its contents, and a symlink to a NON-EMPTY directory is refused without it too - `recursive` then removes the LINK and leaves that tree exactly as it was) and `force` (a missing path becomes `removed: false, skipped: true` instead of an error); mkdir takes `path` and creates missing parents, reporting an existing directory (or a symlink that reaches one) as `created: false`, and refusing a name held by a DANGLING symlink with the remedy for that shape. Returns `{ results, bytes, contentBudget }` - `bytes` counts the list entry text this call returned, while mutation receipts carry their own `bytes` and are not summed into it - with ONE ordered receipt per op: list gives `{ entries, truncated, nextOffset, offset, limit, bytes }`, plus `starved: true` and a `note` when an earlier list op of the same call already spent the shared entry budget, or left less of it than one entry costs (an empty page that is NOT an answer about the directory, and the note states the bytes that were left), move/copy give `{ path, to, kind, bytes }` where `kind` is what stands at the DESTINATION afterwards - `file`, `directory`, or `symlink`: a moved link stays a link and reports 0 bytes, while a copy of a live link writes the payload under it, and a copy of a dangling one writes the link - plus `replaced: { path, kind, entries }` whenever the call removed an existing destination, so the tree it deleted is visible in the receipt rather than only in the message; delete gives `{ path, removed, recursive }`, and mkdir gives `{ path, created }`. Entry names are prefixed with the directory they came from, directories end with "/", and listings are sorted by code point, so paging is deterministic; a `note` also says when a page stopped early because one long name did not fit the remaining budget, or when an `offset` is past the end of the listing. Every entry is validated before anything runs, so a malformed call changes nothing; a failing mutation rejects the call, names the ops already applied AND states what this op left behind (a half-copied tree with its top-level entries, or a destination its own `overwrite` had already removed while the source stayed), and there is NO rollback, while a failing list entry reports its own `error: { code, rawCode?, message }` without failing the batch. A cancelled call rejects the same way with `ECANCELED`, naming the operation it stopped on and the ops already applied. Cross-device moves report `EXDEV` rather than copying behind your back, and the message names the two calls to send instead ({ "op": "copy" }, then { "op": "delete" }). Symlinks are handled differently per verb, on purpose: move renames the link, top-level copy dereferences a live link and preserves a dangling one, links inside a copied tree are preserved, delete removes the link only, and each result says which happened. Use read/write/edit for content and glob/grep for searching.',
     tags: [
         'files',
         'list',
@@ -2299,6 +2366,10 @@ export const files = tool<FilesParameters, FilesResult>({
                 if (operation.op === 'list') {
                     const listed = await runList(operation, budget);
 
+                    // F10: this is the ONLY contribution to the envelope's `bytes`, on
+                    // purpose — a move/copy receipt carries `bytes` too, but it counts file
+                    // payload, so summing it in would print one number in two units (the
+                    // published description states the rule).
                     bytes += listed.bytes ?? 0;
                     results.push(listed);
                     continue;
