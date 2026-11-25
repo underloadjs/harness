@@ -199,8 +199,12 @@
 // bounded by the run's per-turn ledger (`createToolResultTurnBudget`, which applies
 // `boundToolResult`'s per-result cap and then the aggregate per-turn cap; 256 KiB and
 // 512 KiB of UTF-8, core/result-budget.ts). Small outputs are byte-exact; a large one
-// becomes a small, valid JSON envelope with a head preview, a tail preview and a note
-// naming what was cut and how to re-fetch it. The cap is post-serialization, so it
+// that is PLAIN TEXT becomes a small envelope with a head preview, a tail preview and a
+// note naming what was cut and how to re-fetch it, and a large one that is a JSON
+// DOCUMENT is REFUSED outright (`rejected` on the bounded result, F-CUTTER) because a cut
+// JSON document is un-parsable and therefore worth less than nothing. `boundDelivery`
+// turns either outcome into the transcript text, and a refusal outranks the arm's own
+// outcome: it turns a COMPLETED and a CANCELLED arm into a FAILED one. The cap is post-serialization, so it
 // bounds conversation cost, not the process's peak memory; UI panels are bounded
 // separately (core/tool-ui.ts).
 //
@@ -6414,6 +6418,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // the aggregate per-turn cap. Reset at the top of `requestTurn`, so one
         // window covers exactly the deliveries of one turn (the loop drains the
         // mailbox before the next request). See core/result-budget.ts.
+        //
+        // F-CUTTER: an oversized JSON DOCUMENT is booked at the size of its refusal
+        // sentence (~400 bytes), never at the size of the discarded body, so one huge
+        // page can no longer spend the window and the deliveries behind it still arrive.
         turnResultBudget: ToolResultTurnBudget;
         // T6 (D-3, 2026-11-17) — THE DELIVERY WINDOW THE NEXT REQUEST IS RELIEVED FOR.
         //
@@ -10125,8 +10133,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // envelope can say what to re-run. Every delivery site uses it, so the transcript,
     // the `tool_result` event and the `tool.after` payload all carry byte-identical
     // text (a client and a reload must agree).
-    const boundDelivery = (run: RunState, call: HarnessToolCall, content: string): string =>
-        run.turnResultBudget.commit(content, { source: { name: call.name, callId: call.id } }).content;
+    //
+    // F-CUTTER — it also reports whether the budget REFUSED the value instead of cutting
+    // it. An oversized JSON DOCUMENT is never delivered as slices (a middle-cut document
+    // is not that document: `JSON.parse` fails on both previews and the keys in the hole
+    // are silently gone), so the site gets the refusal sentence plus the flag, and the
+    // only outcome it may report is `failed`. The flag changes no byte of the text path:
+    // `content` is whatever the budget decided to deliver, and every consumer below still
+    // inserts and emits the same string.
+    const boundDelivery = (
+        run: RunState,
+        call: HarnessToolCall,
+        content: string
+    ): { content: string; rejected: boolean } => {
+        const bounded = run.turnResultBudget.commit(content, { source: { name: call.name, callId: call.id } });
+
+        return { content: bounded.content, rejected: bounded.rejected !== undefined };
+    };
 
     // T6 (D-3, 2026-11-17) — REQUEST-ONLY RELIEF FOR THE WEIGHT A RUN RECEIVED BETWEEN REQUESTS.
     //
@@ -10352,7 +10375,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // keeps AC4 of 0029 honest: no identity is invented for work the runtime never saw.
             const releasedResult = released === undefined ? undefined : releasedDelegateResultOf(released);
 
-            content = boundDelivery(
+            // F-CUTTER: the released delegate envelope is a JSON document, so a big one
+            // is now REFUSED rather than delivered as two unparseable halves. A refusal
+            // outranks this door's `cancelled` classification: what the caller is being
+            // told is "your answer was discarded", which is a failure to retry with
+            // narrower arguments, not a control outcome to accept. The historical
+            // sentences (both spellings) are prose and cannot be refused, so every
+            // existing cancellation pin keeps its byte-for-byte text and outcome.
+            const cancelledDelivery = boundDelivery(
                 run,
                 call,
                 releasedResult !== undefined
@@ -10361,7 +10391,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                       ? `Tool call "${call.name}" (${call.id}) was cancelled before it completed; no result is available.`
                       : `Tool call "${call.name}" (${call.id}) was cancelled before it completed; its branch "${branchId}" still holds what it produced — read it with threadRead "${branchId}" or agentResult by that id.`
             );
-            outcome = 'cancelled';
+
+            content = cancelledDelivery.content;
+            outcome = cancelledDelivery.rejected ? 'failed' : 'cancelled';
         } else if (task.failed) {
             // `toErrorInfo` is total (see util/errors.ts): a compiled tool may throw
             // a primitive/object/proxy, and this failure reporter must never throw
@@ -10396,13 +10428,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                       ? `${clipPrefix(failedPartial, FORK_PARTIAL_PREVIEW_CHARS)}…`
                       : failedPartial;
 
+            // The failure sentence is prose, so the JSON rule cannot fire here; `.content`
+            // is the historical text (or its head/tail envelope, pinned in
+            // ./harness.budget.test.ts) and the outcome is already `failed`.
             content = boundDelivery(
                 run,
                 call,
                 preview === undefined
                     ? `Tool "${call.name}" failed: ${toErrorInfo(task.error).message}`
                     : `Tool "${call.name}" failed: ${toErrorInfo(task.error).message} — its branch "${failedBranchId}" still holds what it produced: "${preview}" — read it with threadRead "${failedBranchId}" or agentResult by that id.`
-            );
+            ).content;
             outcome = 'failed';
         } else {
             // A tool can RESOLVE successfully with a value the harness cannot put on
@@ -10425,20 +10460,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // Tools that did not (every tool but `read`) still get `serialize(...)`,
                 // byte-for-byte as before.
                 const unwrapped = unwrapToolResult(task.result);
-                content = boundDelivery(
-                    run,
-                    call,
-                    unwrapped.text ?? serialize(unwrapped.content)
-                );
+                // F-CUTTER — THE door the finding is about: a tool answering with a JSON
+                // document bigger than the model-facing cap. The document is REFUSED, and
+                // a value that never reached the model is a FAILED call: `isError` is
+                // derived from this outcome (core/tool-outcome.ts), and the refusal
+                // sentence — both sizes, the narrowing that fits, the write-safety
+                // warning — is the one string the transcript, the `tool_result` event and
+                // `tool.after` all carry. The human half survives: `toolUi` panels and
+                // `toolMedia` bytes travel on their own bounded channels, never as capped
+                // text, so a refusal costs the model a document and costs the UI nothing.
+                const delivered = boundDelivery(run, call, unwrapped.text ?? serialize(unwrapped.content));
+
+                content = delivered.content;
                 panels = unwrapped.panels;
                 media = unwrapped.media;
-                outcome = 'completed';
+                outcome = delivered.rejected ? 'failed' : 'completed';
             } catch (error) {
+                // Prose again (the serialization-failure sentence), so it cannot be
+                // refused; `.content` is that sentence or its envelope, unchanged.
                 content = boundDelivery(
                     run,
                     call,
                     `Tool "${call.name}" completed but its result could not be serialized: ${toErrorInfo(error).message}`
-                );
+                ).content;
                 outcome = 'failed';
             }
         }
@@ -10709,6 +10753,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // which is exactly issue 0019's second failing case.
         if (record.status === 'cancelled' && answer.length === 0) return undefined;
 
+        // `.content` because this door has no outcome to reclassify: it inserts a
+        // `completed` account (or a labelled system entry), and F-CUTTER's refusal of an
+        // oversized delegate envelope is already the honest text — the account says the
+        // child's page was discarded and names the call to re-run, which is exactly what
+        // a caller reading a debt settlement needs. Byte-identity holds: this same string
+        // is what gets inserted and what the next request replays.
         return boundDelivery(
             run,
             { id: debt.callId, name: debt.name, arguments: '{}' },
@@ -10725,7 +10775,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     answer
                 )
             )
-        );
+        ).content;
     };
 
     // Pay every debt this conversation owes, at the top of its next turn — BEFORE the mailbox
@@ -10843,7 +10893,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         outcome: HarnessToolOutcome,
         withDuration = false
     ): Promise<void> => {
-        const content = boundDelivery(run, call, raw);
+        // `.content`: `raw` is a sentence the harness wrote itself (a validation refusal,
+        // a control acknowledgement), so it is either under the cap or prose that gets the
+        // ordinary envelope. Either way the text below is what the transcript, the event
+        // and any later reader share (F-CUTTER changed the oversized-JSON rule, and a
+        // harness-authored sentence can never trigger it).
+        const content = boundDelivery(run, call, raw).content;
         // T1.2 — same single writer. A rejection/cancel is persisted as the key the
         // delivery classified; a `completed` acknowledgement writes none.
         insertToolMessage(run.agent, call, content, run.branch === undefined, undefined, outcome);

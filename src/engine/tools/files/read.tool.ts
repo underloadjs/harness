@@ -1701,8 +1701,10 @@ const ENTRY_VALUE_RESERVE = 200;
 // `.length` UNDER-states the cost by 2 bytes per CJK character (3 UTF-8 bytes against 1
 // code unit) and by 2 more per astral character (4 UTF-8 bytes against the 2 code units a
 // surrogate pair occupies) — the reserve then buys content that does not fit, and
-// `wireBytes` crosses the 256 KiB envelope, which is the failure `boundToolResult`
-// turns into a truncated JSON envelope that destroys `nextByte`/`nextLine`.
+// `wireBytes` crosses the 32 KiB envelope (FILE_READ_WIRE_BUDGET = 32,768, the same
+// figure as MODEL_TOOL_RESULT_BUDGET_BYTES — the 256 KiB this sentence used to quote is
+// gone), which is the failure `boundToolResult` turns into a truncated JSON envelope
+// that destroys `nextByte`/`nextLine`.
 // `ENTRY_SHELL`/`RESULT_SHELL` below need no such conversion: their every character
 // is ASCII, where the two measures agree by construction.
 const entryErrorWire = (code: string, message: string, rawCode?: string): number =>

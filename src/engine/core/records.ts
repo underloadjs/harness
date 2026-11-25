@@ -228,8 +228,18 @@ export const RECORD_ERROR_CODES = {
     // A field whose value has the wrong type, an unknown enum value, or a missing
     // required value.
     invalidField: 'invalid-field',
-    // A field over its character / item cap, naming the actual size and the limit.
+    // A field over its character cap — a text body, or ONE entry of a `strings` array —
+    // naming the actual size and the limit. Finding 5 split the three violations that
+    // used to share this one code: a caller that has to branch on a cap rejection cannot
+    // tell "shorten the text" from "drop some entries" from "the number is out of range"
+    // while all three answer `field-too-long`.
     fieldTooLong: 'field-too-long',
+    // Finding 5 — a `strings` write with more ENTRIES than `maxItems`. Counted on the
+    // NORMALIZED list (finding 3), so the number it names is the number that would store.
+    fieldTooManyItems: 'field-too-many-items',
+    // Finding 5 — an `integer` write outside the magnitude bound its field declares.
+    // A range violation is not a length violation, and the fix sentences differ.
+    fieldOutOfRange: 'field-out-of-range',
     // An id this call names that the collection does not have.
     unknownRecord: 'unknown-record',
     // An identified caller patched or removed a record without reading it first.
@@ -283,6 +293,63 @@ const callLabelOf = (definition: RecordCollectionDefinition): string =>
 // `strings` caps its ELEMENTS; the array itself is capped by `maxItems`.
 const fieldCapOf = (field: RecordFieldDefinition): number | undefined =>
     field.type === 'text' || field.type === 'strings' ? field.maxLength : undefined;
+
+// Finding 2 — which field types ACTUALLY CONSUME each declared option. The map is built
+// from the CONSUMERS, not from the prose:
+//   - `maxLength` — `fieldCapOf` above (text and strings), the `strings` per-element cap
+//     in `normalizeFieldValue`, and the text cap in the same function;
+//   - `maxItems` — the `strings` branch of `normalizeFieldValue` only;
+//   - `max` — the `integer` branch's magnitude bound only;
+//   - `values` — the `enum` branch's closed set (and the `enum` facet in `countsOf`).
+// A key outside its list used to be ACCEPTED, echoed by `describe`, and inert: a caller
+// that declared `{ type: 'text', maxItems: 3 }` believed an array cap existed on a field
+// that can never hold an array, and `{ type: 'enum' }`-shaped `values` on a text field
+// was dropped outright. That is the same defect `getOnly` and `sortable` already refuse
+// (`… is only valid on a <type> field.`), so it gets the same sentence. Because the map
+// is EXCLUSIVE, a key the type does not consume on ANY branch — including on a `boolean`
+// field — is refused rather than ignored. Every built-in spec (task, chapter, profile,
+// location) satisfies it, which is the cross-check that the map matches the engine
+// rather than the reviewer's guess.
+const FIELD_OPTION_TYPES: Readonly<
+    Record<'maxLength' | 'maxItems' | 'max' | 'values', { readonly types: readonly string[]; phrase: string }>
+> = {
+    maxLength: { types: ['text', 'strings'], phrase: 'a text or strings field' },
+    maxItems: { types: ['strings'], phrase: 'a strings field' },
+    max: { types: ['integer'], phrase: 'an integer field' },
+    values: { types: ['enum'], phrase: 'an enum field' }
+};
+
+// Answers "may this option be stored on a field of `type`?" and enforces the answer.
+//
+//   - STRICT (a `define`, or a code declaration): an inapplicable option throws with the
+//     sentence the map fixes, and the whole call is refused — the caller is told, not
+//     silently handed an inert cap.
+//   - RESTORE (`sanitize: true`, i.e. `readStoredCollection`): an inapplicable option is
+//     STRIPPED — the key is left out of the stored definition — and the answer is `false` so
+//     the caller skips the parse. A live session can hold a snapshot written before this
+//     refusal existed (the stress fixtures and every pre-fix `define` do), and bricking that
+//     session's restore over an option the engine never enforced is worse than the misreport
+//     the refusal fixes. Stripping cannot change behaviour for the very reason the option was
+//     a finding: nothing ever read the key.
+//
+// Returns TRUE when the option applies and must therefore be parsed and kept. Pre-existing
+// off-type refusals (`getOnly`, `sortable`, `count: true`) are NOT part of this channel —
+// they refused a restore before this change too, so they stay strict.
+const refuseOrStripInapplicableOption = (
+    label: string,
+    option: keyof typeof FIELD_OPTION_TYPES,
+    type: string,
+    sanitize: boolean
+): boolean => {
+    if (FIELD_OPTION_TYPES[option].types.includes(type)) return true;
+
+    if (sanitize) return false;
+
+    throw recordError(
+        RECORD_ERROR_CODES.definitionInvalid,
+        `${label}.${option} is only valid on ${FIELD_OPTION_TYPES[option].phrase}.`
+    );
+};
 
 // True for the keys every entry owns and a field may therefore never claim.
 const RESERVED_ENTRY_KEYS: readonly string[] = ['id', 'rev', 'updatedBy', 'updatedThreadId', 'updatedAt'];
@@ -431,6 +498,109 @@ const cloneDefinition = (
     // serves this collection", so it rides verbatim when the collection has one.
     ...(definition.wrapper === undefined ? {} : { wrapper: { ...definition.wrapper } })
 });
+
+// ---------------------------------------------------------------------------
+// R-0012 — the response-budget fitters
+// ---------------------------------------------------------------------------
+//
+// `definition.responseBudgetBytes` is ONE budget per response, and three different keys
+// can spend it: the projected page (`project`), the bodies of an `ids` read, and the
+// echoes a write answers with. Before R-0012 only the first two were charged at all, and
+// never against each other — patching the record at the head of a page put the same body
+// in the response twice (a 1,024-byte budget returned 60,409 bytes), an `ids` read added
+// every body it named after the page was already trimmed, and a removal echoed the whole
+// deleted record. All three now measure the same unit — `JSON.stringify` bytes plus one
+// for the `,` that joins the row, which is what `project` and the change feed already
+// charge — so a row costs the same number wherever it appears.
+//
+// THE RULE THEY SHARE, stated once: whole rows only, and the FIRST row is always
+// admitted even when it alone exceeds the budget. `project` already keeps the first
+// record for the reason that holds everywhere: a page that returns nothing but promises
+// `hasMore` is a loop that never terminates, and a write that comes back with no content
+// at all is unreadable.
+
+// What one row costs inside a JSON array, the joining separator included.
+const rowBytes = (row: unknown): number => Buffer.byteLength(JSON.stringify(row), 'utf8') + 1;
+
+// Keeps the longest whole-row PREFIX of `rows` that still fits, given `used` bytes of
+// response already paid for, and reports how many rows it left out. `used` is passed in
+// rather than assumed: the page, the `ids` rows and the write echoes each know what the
+// envelope costs at their point in the answer, and one running number is what keeps the
+// budget honest across the whole response instead of per key.
+const fitRowsToBudget = <T extends RecordEntry>(
+    rows: readonly T[],
+    budget: number,
+    used: number
+): { kept: T[]; withheld: number } => {
+    const kept: T[] = [];
+    let bytes = used;
+
+    for (const row of rows) {
+        const size = rowBytes(row);
+
+        if (kept.length > 0 && bytes + size > budget) {
+            return { kept, withheld: rows.length - kept.length };
+        }
+
+        kept.push(row);
+        bytes += size;
+    }
+
+    return { kept, withheld: 0 };
+};
+
+// The meter for a WRITE's echoes — the singular `entry` and the `removed` bodies —
+// charged out of what `definition.responseBudgetBytes` has left once `project` has spent
+// the page and the change feed it carries.
+//
+// A row that no longer fits is WITHHELD, not deleted: it collapses to `{ id, rev }`, and
+// those are exactly the two keys the caller needs for its NEXT write
+// (`expects: [{ id, rev }]`). The body is ABSENT rather than emptied — `text: ''` would
+// state a fact about the record that is not true, which is the same reasoning
+// `copyEntry` gives for dropping a `getOnly` field from a projection instead of blanking
+// it. So "the response has no body" never reads as "the field was cleared".
+//
+// ONE allowance per KIND, because each kind is the only place its own fact appears:
+// `entry` is how a one-record write shows its content, and `removed[0]` is the only
+// record a multi-record removal echoes with a body. Everything after those pays.
+//
+// `used` IS THE ENVELOPE WITHOUT THE ECHOES — the caller seeds it from the response before
+// `entry` and `removed` are attached (D-A, independent review). Seeding it afterwards made the
+// singular body count twice: once inside the baseline and again through `admit(copy, first)`,
+// so the budget left for the removal bodies was one entry-row short and fitted content was
+// withheld with a `budgetTruncated` flag the response had not earned.
+const echoMeter = (budget: number, used: number) => {
+    let bytes = used;
+    let truncated = false;
+
+    const admit = (copy: RecordEntry, first: boolean): RecordEntry => {
+        const size = rowBytes(copy);
+
+        if (first || bytes + size <= budget) {
+            bytes += size;
+
+            return copy;
+        }
+
+        const slim = { id: copy.id, rev: copy.rev } as RecordEntry;
+
+        bytes += rowBytes(slim);
+        truncated = true;
+
+        return slim;
+    };
+
+    return {
+        // The singular echo: always admitted, whatever the page cost.
+        fitOne: (copy: RecordEntry): RecordEntry => admit(copy, true),
+        // The removal list: the first body is admitted, the rest fit or slim.
+        fitList: (copies: readonly RecordEntry[]): RecordEntry[] =>
+            copies.map((copy, index) => admit(copy, index === 0)),
+        get truncated(): boolean {
+            return truncated;
+        }
+    };
+};
 
 // ---------------------------------------------------------------------------
 // Argument readers (engine-wide — the wrappers no longer own copies of these)
@@ -742,18 +912,33 @@ const readExpects = (label: string, value: unknown): Map<string, number> => {
 //     length rather than sliced — silently storing something shorter than the caller
 //     wrote is the worse failure;
 //   - a non-required text accepts '' , which is how `notes`/`content` get CLEARED;
-//   - `strings` entries are trimmed and de-duplicated. The RAW array length is
-//     checked against `maxItems` BEFORE de-duplication, so a flood of duplicates is
-//     rejected too; a blank entry is an error rather than a silent drop, because the
+//   - `strings` entries are trimmed and de-duplicated. `maxItems` is checked against the
+//     NORMALIZED list (finding 3), so it measures the array that would actually store,
+//     and an accepted write whose normalization dropped input entries says so through
+//     `droppedEntries`; a blank entry is an error rather than a silent drop, because the
 //     stored record would then differ from what the model sent;
 //   - `enum` values are checked against the closed set, so a typo cannot create a
 //     value the counts do not know about;
 //   - `integer` values must be safe integers within `max`.
+//
+// Every length in this file is counted in UTF-16 CODE UNITS (`String.prototype.length`),
+// which is what a cap written in JavaScript enforces and what the refusal names. For
+// text outside the BMP (an emoji, an exotic script) one visible character is TWO code
+// units, so a `maxLength: 4000` field holds ~2,000 emoji — the tool descriptions say
+// "UTF-16 code units" for exactly that reason (finding 11 documents the count rather
+// than changing it, because every stored cap and every persisted snapshot is in these
+// units already).
 const normalizeFieldValue = (
     label: string,
     field: RecordFieldDefinition,
     value: unknown,
-    index?: number
+    index?: number,
+    // Finding 3 — the out-param `readPlan` passes for a WRITE: the per-field count of
+    // input entries normalization dropped. It is an out-param rather than a second return
+    // value because three call sites (`readEntryInput`, a `default` check, and a snapshot
+    // restore) read the RETURN as the value itself, and a wrapper object there would mean
+    // re-plumbing all three for one receipt.
+    drops?: Record<string, number>
 ): unknown => {
     const at = index === undefined ? '' : `entry ${index + 1} `;
 
@@ -779,9 +964,14 @@ const normalizeFieldValue = (
         const max = field.max;
 
         if (max !== undefined && Math.abs(value as number) > max) {
+            // Finding 5 — its own code, and a sentence that names the BOUND kind. This
+            // used to answer `field-too-long` with "the limit is 10", which reads like a
+            // length cap on a value that has no length; the field name is already in the
+            // sentence, and the signed magnitude is stated so a negative overflow is
+            // obvious (`-99` against `max: 10`).
             throw recordError(
-                RECORD_ERROR_CODES.fieldTooLong,
-                `${label} "${field.key}" is ${value}; the limit is ${max}.`
+                RECORD_ERROR_CODES.fieldOutOfRange,
+                `${label} "${field.key}" is ${value}; its magnitude limit is ${max}.`
             );
         }
 
@@ -811,17 +1001,22 @@ const normalizeFieldValue = (
 
         const raw = value as unknown[];
         const maxItems = field.maxItems ?? RECORD_MAX_ITEMS;
+        const cap = fieldCapOf(field);
 
-        if (raw.length > maxItems) {
-            throw recordError(
-                RECORD_ERROR_CODES.fieldTooLong,
-                `${label} "${field.key}" has ${raw.length} entries; the limit is ${maxItems}.`
-            );
-        }
-
+        // Finding 3 — NORMALIZE FIRST, COUNT AFTER. The `maxItems` check used to run on
+        // the RAW array, ahead of trim / per-item length / de-duplication, so it measured
+        // a list that was never going to be stored: `["x","x","  x  ","y",""]` was refused
+        // for "5 entries" against `maxItems: 3` when it normalizes to 2, while
+        // `["x","x","  x  "]` (also 3 raw) passed and stored ONE entry with nothing said.
+        // The pipeline order itself is unchanged — blank/type refusal, trim, per-item cap,
+        // first-wins de-duplication — only the count moved behind it.
         const items: string[] = [];
 
         for (const [itemIndex, item] of raw.entries()) {
+            // A blank entry stays a REFUSAL, never a silent drop (finding 3 keeps the
+            // blank/required semantics exactly): a stored array that differs from what the
+            // model sent is the failure this whole branch is built to avoid, and '' is not
+            // a value anyone means.
             if (typeof item !== 'string' || item.trim().length === 0) {
                 throw recordError(
                     RECORD_ERROR_CODES.invalidField,
@@ -830,16 +1025,41 @@ const normalizeFieldValue = (
             }
 
             const text = item.trim();
-            const cap = fieldCapOf(field);
 
             if (cap !== undefined && text.length > cap) {
+                // Length violation of ONE entry: this stays `field-too-long` (finding 5),
+                // because the fix is the same one a text body's is — shorten it. Finding 11 —
+                // the count is `String.prototype.length`, i.e. UTF-16 CODE UNITS, and the
+                // sentence now says so: a reader who counted 2,100 emoji and is told their
+                // body is "4,200 characters" retries against a number they cannot reproduce.
                 throw recordError(
                     RECORD_ERROR_CODES.fieldTooLong,
-                    `${label} "${field.key}" entry ${itemIndex + 1} is ${text.length} characters; the limit is ${cap}.`
+                    `${label} "${field.key}" entry ${itemIndex + 1} is ${text.length} characters, counted as UTF-16 code units; the limit is ${cap}.`
                 );
             }
 
             if (!items.includes(text)) items.push(text);
+        }
+
+        if (items.length > maxItems) {
+            // The count is the NORMALIZED one — the number that would have stored — and
+            // when it differs from what the caller sent, the message says which is which,
+            // so the refusal cannot read as arithmetic the caller cannot reproduce.
+            const collapsed =
+                items.length === raw.length ? '' : ` after trimming and de-duplication (${raw.length} sent)`;
+
+            throw recordError(
+                RECORD_ERROR_CODES.fieldTooManyItems,
+                `${label} "${field.key}" has ${items.length} entries${collapsed}; the limit is ${maxItems}.`
+            );
+        }
+
+        // Finding 3 — an ACCEPTED write that still dropped input (a duplicate, or an entry
+        // that trims onto an earlier one) used to be invisible: the response echoed the
+        // shorter array and the caller had to diff it against what it sent. The count goes
+        // in the out-param `readPlan` owns, and it leaves the response as `droppedEntries`.
+        if (drops !== undefined && items.length < raw.length) {
+            drops[field.key] = (drops[field.key] ?? 0) + (raw.length - items.length);
         }
 
         return items;
@@ -871,9 +1091,17 @@ const normalizeFieldValue = (
     const cap = fieldCapOf(field);
 
     if (cap !== undefined && text.length > cap) {
+        // Finding 11 — the unit, stated. `text.length` is UTF-16 CODE UNITS, not grapheme
+        // characters and not code points, so an astral-plane emoji (one 🎬 = two code units)
+        // fills a `maxLength: 4000` body at 2,000 of them. The refusal used to report the
+        // code-unit count under the word "characters", which is a number the reader cannot
+        // reproduce by counting what they typed, and the fix it recommends ("shorten it")
+        // then looks off by half. The cap itself is unchanged — re-counting in code points
+        // would silently double every astral body's allowance and move a published limit —
+        // only the sentence now names what was measured.
         throw recordError(
             RECORD_ERROR_CODES.fieldTooLong,
-            `${label} "${field.key}" is ${text.length} characters; the limit is ${cap}. Shorten it and retry.`
+            `${label} "${field.key}" is ${text.length} characters, counted as UTF-16 code units; the limit is ${cap}. Shorten it and retry.`
         );
     }
 
@@ -907,11 +1135,14 @@ const BUILTIN_WRAPPER_TOOLS: readonly string[] = BUILTIN_RECORD_COLLECTIONS.map(
 
 // Validates and normalizes ONE field spec. Reachable from three sides — a code
 // declaration, a `define` call, and a snapshot restore — so the checks live here once
-// rather than three times.
+// rather than three times. `sanitize` is the RESTORE mode (see
+// `refuseOrStripInapplicableOption`): only the never-enforced options are stripped there,
+// every other check keeps its exact refusal.
 const readFieldDefinition = (
     label: string,
     value: unknown,
-    seen: Set<string>
+    seen: Set<string>,
+    sanitize = false
 ): RecordFieldDefinition => {
     const raw = readSnapshotRecord(value, label);
     const keys = Object.keys(raw);
@@ -991,21 +1222,24 @@ const readFieldDefinition = (
 
     if (raw.required === true) field.required = true;
 
-    if (raw.maxLength !== undefined) {
+    // Finding 2 — each cap is refused BEFORE it is parsed, naming the type that would have
+    // consumed it. The range checks (`readSnapshotInteger`) still run after, so an
+    // applicable-but-out-of-range number keeps its existing refusal.
+    if (raw.maxLength !== undefined && refuseOrStripInapplicableOption(label, 'maxLength', type as string, sanitize)) {
         field.maxLength = readSnapshotInteger(raw.maxLength, `${label}.maxLength`, {
             min: 1,
             max: RECORD_MAX_TEXT
         });
     }
 
-    if (raw.maxItems !== undefined) {
+    if (raw.maxItems !== undefined && refuseOrStripInapplicableOption(label, 'maxItems', type as string, sanitize)) {
         field.maxItems = readSnapshotInteger(raw.maxItems, `${label}.maxItems`, {
             min: 1,
             max: RECORD_MAX_ITEMS
         });
     }
 
-    if (raw.max !== undefined) {
+    if (raw.max !== undefined && refuseOrStripInapplicableOption(label, 'max', type as string, sanitize)) {
         field.max = readSnapshotInteger(raw.max, `${label}.max`, { min: 1 });
     }
 
@@ -1031,6 +1265,16 @@ const readFieldDefinition = (
         }
 
         field.sortable = true;
+    }
+
+    // Finding 2 — `values` beside a NON-enum type used to be dropped outright: this
+    // branch only ran for an `enum`, so the option was neither refused, nor stored, nor
+    // echoed. A refusal is the honest answer, because the caller believes it declared a
+    // closed value set that nothing enforces. On a restore the option is simply stripped,
+    // which is exactly what the old code did — and only the `enum` branch below ever reads
+    // `raw.values`, so dropping is automatic once the refusal is skipped.
+    if (raw.values !== undefined) {
+        refuseOrStripInapplicableOption(label, 'values', type as string, sanitize);
     }
 
     if (type === 'enum') {
@@ -1112,7 +1356,8 @@ const readFieldDefinition = (
 const readCollectionDefinition = (
     label: string,
     value: unknown,
-    existing?: ReadonlySet<string>
+    existing?: ReadonlySet<string>,
+    sanitize = false
 ): RecordCollectionDefinition => {
     const raw = readSnapshotRecord(value, label);
     // The bounds and the wrapper are harness-supplied and may be omitted by an agent
@@ -1149,8 +1394,42 @@ const readCollectionDefinition = (
 
     const seen = new Set<string>();
     const fields = entries.map((entry, index) =>
-        readFieldDefinition(`${label}.fields[${index}]`, entry, seen)
+        readFieldDefinition(`${label}.fields[${index}]`, entry, seen, sanitize)
     );
+
+    // Finding 4 — a collection has ONE ascending sort key. `orderedFor` and `project` each
+    // take the FIRST field with `sortable: true`, so a second one was accepted, echoed by
+    // `describe`, and inert: the author's sort key lost to an earlier field with no
+    // message, and `afterId` paging walks ID order regardless, which made the surprise
+    // worse (only the OFFSET page honoured the winner). The check needs sibling
+    // visibility, so it lives here rather than in `readFieldDefinition`, which sees one
+    // field at a time.
+    //
+    // On a RESTORE the later flag is STRIPPED rather than refused, for the same reason the
+    // inapplicable field options are: the pre-fix snapshot's second `sortable` never
+    // ordered anything (the engine's two sort paths both take the first), so removing it
+    // cannot change a single read — while refusing the restore would brick the session.
+    let sortKey: { key: string; index: number } | undefined;
+
+    for (const [index, field] of fields.entries()) {
+        if (field.sortable !== true) continue;
+
+        if (sortKey === undefined) {
+            sortKey = { key: field.key, index };
+            continue;
+        }
+
+        if (sanitize) {
+            delete (fields[index] as Partial<RecordFieldDefinition>).sortable;
+            continue;
+        }
+
+        throw recordError(
+            RECORD_ERROR_CODES.definitionInvalid,
+            `${label}.fields[${index}].sortable is only valid on the collection's one sort key; ` +
+                `"${sortKey.key}" (fields[${sortKey.index}]) is already the sortable field.`
+        );
+    }
 
     if (existing !== undefined && existing.has(name)) {
         throw recordError(
@@ -1314,9 +1593,19 @@ const staleRecordError = (
                   .filter((key) => patched[key] !== undefined && fields.includes(key));
 
     const token = `retry with "expects" [{ id: "${entry.id}", rev: ${entry.rev} }]`;
+    // Finding 9 — `changed since revision <expected>` is only a true sentence when the
+    // record has moved PAST the token. A token AHEAD of the record (rev 99 against a
+    // record at rev 1: a hallucinated number, or a token copied off the wrong record) has
+    // never been reached, so NOTHING changed since it — and `mergeDisjoint` cannot help
+    // either, because its coverage walk runs expected+1 → current, which is empty in that
+    // direction (`mergeConcurrentFields` returns `undefined`). The code stays
+    // `stale-record` (it is still a CAS rejection with the current record attached); only
+    // the lie leaves.
+    const ahead = expected > entry.rev;
     const adviceText =
-        // A removal: the flag is not an option this caller has, so it is not mentioned.
-        advice.patch === undefined
+        // A removal, or a token that has not been reached: the flag is not an option this
+        // caller has, so it is not mentioned.
+        ahead || advice.patch === undefined
             ? `${token}.`
             : advice.mergeDisjoint
                 ? // The flag is already set, so re-recommending it is noise. When the
@@ -1330,12 +1619,21 @@ const staleRecordError = (
                               .join(' and ')} because this patch sets it too.`
                 : `${token} or pass "mergeDisjoint": true.`;
 
+    // The head of the sentence, in the one shape that is true for the direction the token
+    // is wrong in. Behind-the-record keeps the historical wording byte-for-byte (five pins
+    // and three docs quote it); an ahead-of-the-record token names the revision that DOES
+    // exist and says the caller's revision has not been reached.
+    const head = ahead
+        ? `${label} "${entry.id}" is at revision ${entry.rev} — revision ${expected} has not ` +
+          `been reached, so nothing has changed since you read it` +
+          `${entry.updatedAt === undefined ? '' : ` (last edited by "${entry.updatedBy ?? 'unknown'}" at ${entry.updatedAt})`}; `
+        : `${label} "${entry.id}" changed since revision ${expected} ` +
+          `(now ${entry.rev}, last edited by "${entry.updatedBy ?? 'unknown'}"` +
+          `${entry.updatedAt === undefined ? '' : ` at ${entry.updatedAt}`})${hint}; `;
+
     return recordError(
         RECORD_ERROR_CODES.staleRecord,
-        `${label} "${entry.id}" changed since revision ${expected} ` +
-            `(now ${entry.rev}, last edited by "${entry.updatedBy ?? 'unknown'}"` +
-            `${entry.updatedAt === undefined ? '' : ` at ${entry.updatedAt}`})${hint}; ` +
-            `${adviceText} ` +
+        `${head}${adviceText} ` +
             // R9's payload, rendered by the shared tail — see `stalePayloadTail`.
             stalePayloadTail(payload),
         {
@@ -1452,13 +1750,19 @@ type ResolvedEntry = {
     index: number;
     id?: string;
     patch: FieldPatch;
+    // Finding 3 — the `strings` entries this entry's normalization dropped, per field
+    // (duplicates and entries that collapse onto an earlier one once trimmed). Present
+    // only when something went; the apply loop decides whether it may be REPORTED,
+    // because a patch that stored nothing dropped nothing.
+    drops?: Record<string, number>;
 };
 
 type Plan = {
     // Entries naming an existing id, in caller order, values normalized and bounded.
     patches: ResolvedEntry[];
-    // New records to append, in caller order.
-    additions: FieldPatch[];
+    // New records to append, in caller order. Each carries its own normalization drops
+    // (finding 3) for the same reason.
+    additions: { patch: FieldPatch; drops?: Record<string, number> }[];
     // Ids to delete, in caller order.
     removals: string[];
     // Ids to read back one-by-one (`get`); conflicts with the three above.
@@ -1667,6 +1971,9 @@ const readEntryInput = (
 
     const byKey = new Map(definition.fields.map((field) => [field.key, field] as const));
     const patch: FieldPatch = {};
+    // Finding 3 — this entry's own drop bag. Per entry, so a batch whose second entry
+    // dropped three items cannot report them against the first.
+    const drops: Record<string, number> = {};
 
     for (const key of Object.keys(value)) {
         if (key === 'id') continue;
@@ -1684,7 +1991,7 @@ const readEntryInput = (
             );
         }
 
-        setOwn(patch, key, normalizeFieldValue(label, spec, value[key]));
+        setOwn(patch, key, normalizeFieldValue(label, spec, value[key], undefined, drops));
     }
 
     if (id === undefined) {
@@ -1708,7 +2015,14 @@ const readEntryInput = (
         );
     }
 
-    return { index, ...(id === undefined ? {} : { id }), patch };
+    // The drop bag rides along so the result can say what the writer lost; an entry
+    // that stored everything sends no key at all (finding 3).
+    return {
+        index,
+        ...(id === undefined ? {} : { id }),
+        patch,
+        ...(Object.keys(drops).length === 0 ? {} : { drops }),
+    };
 };
 
 // Validates the WHOLE call into a plan before anything is mutated. Every rejection
@@ -1786,11 +2100,16 @@ const readPlan = (
     const touched = new Map<string, string>();
     const lookups: string[] = [];
     const patches: ResolvedEntry[] = [];
-    const additions: FieldPatch[] = [];
+    // Each addition carries its own normalization drops, so the result can attribute
+    // them to the right id (finding 3).
+    const additions: { patch: FieldPatch; drops?: Record<string, number> }[] = [];
 
     for (const entry of entries) {
         if (entry.id === undefined) {
-            additions.push(entry.patch);
+            additions.push({
+                patch: entry.patch,
+                ...(entry.drops === undefined ? {} : { drops: entry.drops })
+            });
             continue;
         }
 
@@ -1813,9 +2132,22 @@ const readPlan = (
 
     // `ids` is the read half of a call. It may not overlap a write of the same id in
     // the same breath, because the page the caller then sees is ambiguous.
-    const reads = readIdList(label, rawIds, 'ids');
+    const requested = readIdList(label, rawIds, 'ids');
 
-    for (const id of reads) {
+    // R-0011 — a read list is a set of ids, so a repeated id is counted ONCE: it
+    // registers once, answers with one row, and takes one slot against
+    // `RECORD_MAX_READS`. The list is small (the cap bounds it) and the caller's order
+    // is kept, so first occurrence wins. Without this, `{ ids: ["1", "1"] }` used to
+    // return the same record twice, which read as two records to a caller adding the
+    // rows up.
+    const seen = new Set<string>();
+    const reads: string[] = [];
+
+    for (const id of requested) {
+        if (seen.has(id)) continue;
+
+        seen.add(id);
+
         if (touched.has(id)) {
             throw recordError(
                 RECORD_ERROR_CODES.batchConflict,
@@ -1823,7 +2155,19 @@ const readPlan = (
             );
         }
 
+        reads.push(id);
         lookups.push(id);
+    }
+
+    // R11 — `mergeDisjoint` guards ONE thing: a content patch whose record changed under
+    // it. Sent without any patch it can only have been copied from an example, and
+    // silently ignoring it would let a caller believe its write was covered. Refused,
+    // alongside the other ways the flag is refused (`readMergeDisjoint`).
+    if (mergeDisjoint && patches.length === 0) {
+        throw recordError(
+            RECORD_ERROR_CODES.invalidInput,
+            `${label} "mergeDisjoint" applies to a patch whose record changed under it; this call sends no patch, so there is nothing for it to merge.`
+        );
     }
 
     // STEP 3 — removed-since. Every token is compared against the live store BEFORE
@@ -1843,8 +2187,17 @@ const readPlan = (
         if (owner !== undefined) {
             // Live in another collection: the caller named the wrong door, and there is
             // nothing removed about it.
+            //
+            // Finding 6 — the CODE was the lie. `stale-record` means "the record exists
+            // here and moved past your token"; this record does not exist in THIS
+            // collection at all, which is exactly what a bare read of the same id already
+            // answers (`unknown-record`, `:1913`). One id therefore used to get two
+            // different codes depending on whether the caller happened to send a guard,
+            // and a client that retries on `stale-record` (the documented advice for that
+            // code) was told to retry a call that can never succeed. The owner hint that
+            // made this refusal useful stays in the message and in `details`.
             throw recordError(
-                RECORD_ERROR_CODES.staleRecord,
+                RECORD_ERROR_CODES.unknownRecord,
                 `${label} id "${id}" belongs to "${owner}" — re-read that collection.`,
                 {
                     id,
@@ -2340,7 +2693,10 @@ const readStoredCollection = (
 
     readSnapshotKeys(record, ['definition', 'items', 'storeRev', 'changes'], label);
 
-    const definition = readCollectionDefinition(`${label}.definition`, record.definition, existing);
+    // `true` = restore mode: a snapshot written before the option checks existed may carry
+    // options that were inert when they were stored, and those are stripped (see
+    // `refuseOrStripInapplicableOption`) instead of refusing the whole restore.
+    const definition = readCollectionDefinition(`${label}.definition`, record.definition, existing, true);
     const entries = readSnapshotArray(record.items, `${label}.items`);
 
     if (entries.length > definition.maxRecords) {
@@ -3189,20 +3545,59 @@ export const createRecordEngine = (): RecordEngine => {
             });
 
             if (plan.lookups.length === 1) {
+                // R-0012 — the one read that ALWAYS keeps its body. A `get` names a single
+                // record, so there is nothing to page and nothing to withhold: answering
+                // with `{ id, rev }` would answer the question with nothing.
                 const [only] = readIds(state, plan.lookups);
 
                 delete result.entries;
                 result.entry = only;
+                result.page = { offset: 0, limit, hasMore: false };
             } else if (plan.lookups.length > 1) {
-                result.entries = readIds(state, plan.lookups);
+                // R-0012 — an `ids` read used to be the one answer the budget never saw:
+                // `readIds` appended every body the caller named AFTER `project` had
+                // trimmed the page, so five ids naming 600-character records answered at
+                // 3,586 bytes under a 1,024-byte budget while the page beside them was cut
+                // to one row. The named list is the set this read answers from, so the byte
+                // budget now bounds it the way it bounds a page, in the caller's own order.
+                //
+                // `offset`/`limit` page THAT list — they were ignored here entirely. An
+                // explicit `limit` is respected; when the caller named no `limit`, the span
+                // is the whole list, because `ids` is an exhaustive read and clipping it at
+                // the page default would silently drop ids the caller asked for by name.
+                // `offset` indexes the DEDUPLICATED list (`readPlan` counts a repeated id
+                // once), which is also the list `nextOffset` continues from.
+                const span = raw.limit === undefined ? plan.lookups.length : limit;
+                const start = Math.min(offset, plan.lookups.length);
+                const total = plan.lookups.length;
+                const { kept, withheld } = fitRowsToBudget(
+                    readIds(state, plan.lookups.slice(start, start + span)),
+                    definition.responseBudgetBytes,
+                    // The baseline is 0 here, exactly as in `project`: the fixed keys of the
+                    // envelope (`counts`, `storeRev`, the floor) are absorbed by the
+                    // first-row allowance, and a row's own cost is the number that matters.
+                    0
+                );
+                const hasMore = start + kept.length < total;
+
+                delete result.entries;
+                result.entries = kept;
+                // The page `project` measured describes a DIFFERENT read (the collection,
+                // not the named ids), so this branch replaces it wholesale — as it always
+                // did. `nextOffset` is the continuation cursor for both kinds of cut: rows
+                // the caller's `limit` left out, and rows the budget withheld.
+                result.page = {
+                    offset: start,
+                    limit,
+                    hasMore,
+                    ...(hasMore ? { nextOffset: start + kept.length } : {}),
+                    ...(withheld > 0 ? { budgetTruncated: true } : {})
+                };
             }
 
-            // An `ids` read names its records EXHAUSTIVELY; the collection page `project`
-            // measured (with its budget cut and its nextOffset) describes a different
-            // read and would tell the caller to keep paging records it already holds.
-            if (plan.lookups.length > 0) {
-                result.page = { offset: 0, limit, hasMore: false };
-            }
+            // One flag for the whole envelope, so a caller that never looks at `page`
+            // still learns its response was cut (see `RecordsResult.budgetTruncated`).
+            if (result.page.budgetTruncated === true) result.budgetTruncated = true;
 
             return result;
         }
@@ -3251,6 +3646,26 @@ export const createRecordEngine = (): RecordEngine => {
         const changed: string[] = [];
         const nooped: string[] = [];
 
+        // R-0013 — THE DROP LEDGER, and it is charged only by writes that really stored.
+        // Normalization (`normalizeFieldValue`) drops `strings` entries the caller sent —
+        // a duplicate, or an entry that trims onto an earlier one — and until now the sole
+        // evidence was a shorter echo array, which is indistinguishable from the caller
+        // having sent fewer entries in the first place. Two gates decide who contributes:
+        //   - a patch that wrote NOTHING is a success with no event, so its input never
+        //     reached the record and its drops are not reported — the same gate `nooped`
+        //     uses below, because the receipt and the change feed have to tell one story;
+        //   - an ADDITION always stores, so its drops are always charged.
+        // A removal contributes nothing: it carries no field values to drop.
+        const droppedEntries: Record<string, number> = {};
+
+        const chargeDrops = (drops?: Record<string, number>): void => {
+            if (drops === undefined) return;
+
+            for (const [key, count] of Object.entries(drops)) {
+                droppedEntries[key] = (droppedEntries[key] ?? 0) + count;
+            }
+        };
+
         // 1. PATCHES. An existing entry keeps its position and its id, and only the
         //    fields the caller named change. A patch whose named fields already hold
         //    those values is a SUCCESS with no event — no rev bump, no attribution, no
@@ -3296,6 +3711,10 @@ export const createRecordEngine = (): RecordEngine => {
                 continue;
             }
 
+            // R-0013 — the patch stored, so whatever normalization took out of the caller's
+            // input is a fact about the record now, and it belongs in the response.
+            chargeDrops(patch.drops);
+
             entry.rev += 1;
 
             for (const [key, value] of written) {
@@ -3336,12 +3755,17 @@ export const createRecordEngine = (): RecordEngine => {
         //    a chapter never collide — F3). A new record starts at content rev 1,
         //    attributed when the caller has an identity.
         for (const addition of plan.additions) {
+            const patch = addition.patch;
+
+            // R-0013 — an addition always writes, so its drops are always the caller's.
+            chargeDrops(addition.drops);
+
             const id = String(nextId);
             const entry: RecordEntry = { id, rev: 1 } as RecordEntry;
 
             for (const spec of definition.fields) {
-                const value = Object.prototype.hasOwnProperty.call(addition, spec.key)
-                    ? addition[spec.key]
+                const value = Object.prototype.hasOwnProperty.call(patch, spec.key)
+                    ? patch[spec.key]
                     : spec.default;
 
                 if (value === undefined) continue;
@@ -3370,7 +3794,9 @@ export const createRecordEngine = (): RecordEngine => {
             ...(where === undefined ? {} : { where })
         });
 
-        if (removed.length > 0) result.removed = removed;
+        // R-0012 — `removed` is no longer assigned here. It is one of the two write echoes
+        // the response budget meters, and metering it means deciding after the page and the
+        // id lists are in place; see the echo meter at the end of this branch.
 
         // 0008 (issue 0008, proposal steps 1 and 2), re-shaped by 0012 (R1) — M3's remedy,
         // extended to the two writes it never reached. The defect 0008 fixed was real: the
@@ -3411,16 +3837,65 @@ export const createRecordEngine = (): RecordEngine => {
         if (nooped.length > 0) result.noopIds = nooped;
 
         // One affected record → `entry`, which is what lets an action wrapper answer
-        // `add`/`update` with its singular domain shape.
-        if (affected.length === 1) {
-            result.entry = copyEntry(
-                definition,
-                affected[0],
-                // A fresh chapter still costs no body in a mutation result: `get` is
-                // the one read that pays for it.
-                false
-            );
-        }
+        // `add`/`update` with its singular domain shape. The COPY is made here, before the
+        // measurement below, but the key is not ASSIGNED until after it — see D-A.
+        const echoEntry = affected.length === 1
+            ? copyEntry(
+                  definition,
+                  affected[0],
+                  // A fresh chapter still costs no body in a mutation result: `get` is
+                  // the one read that pays for it.
+                  false
+              )
+            : undefined;
+
+        // R-0012 — THE WRITE ECHOES ARE THE LAST THING THE RESPONSE BUDGET SEES. `project`
+        // has already spent what the page and the change feed cost, and the echoes used to
+        // be appended AFTER that with no accounting at all — which is how a 1,024-byte
+        // budget answered one patch with 60,409 bytes (the record at the head of the page
+        // appeared whole in the page AND whole again in `entry`), and how a removal echoed a
+        // 600-character body nothing in the response would ever show again. What is left of
+        // the budget now pays for them, in the order the envelope is read: the record the
+        // caller just wrote, then what it deleted.
+        //
+        // The id lists above are deliberately NOT metered. They are ~20 bytes each, and
+        // they are the one thing a cut response cannot afford to lose: a budget that
+        // withholds a BODY still hands back every ID.
+        //
+        // Measured from the envelope as it stands — page, counts, cursor, storeRev, feed
+        // and the id lists — rather than reconstructed, so the meter and `project` cannot
+        // drift into charging the same row twice. This is the same approach the `since`
+        // feed takes against the page inside `project`.
+        //
+        // D-A (independent review) — ORDER IS THE ACCOUNTING, and it is the whole fix. The
+        // baseline is taken while `entry` is NOT yet a key of the envelope: `fitOne` debits
+        // that body next, so an entry assigned before this line was charged twice, every
+        // judgement about the `removed` bodies came out one entry-row too poor, and batches
+        // whose responses fitted were flagged `budgetTruncated` with their last body withheld.
+        // (A page that echoes the patched record really does carry the body twice — those bytes
+        // are in the envelope and stay charged. Only the phantom copy is gone.)
+        const echoBase = Buffer.byteLength(JSON.stringify(result), 'utf8');
+
+        // The assignment happens HERE, so `entry` keeps the key slot it has always had (after the
+        // id lists, before `droppedEntries` and `removed`) and the envelope's byte total for any
+        // given response is unchanged by the move.
+        if (echoEntry !== undefined) result.entry = echoEntry;
+
+        // R-0013 — the drop ledger: charged only by the writes above that actually stored
+        // (see `chargeDrops`), and absent when nothing went. It is assigned BEFORE the meter
+        // is seeded, so its ~30 bytes are part of the baseline the echoes are judged against
+        // rather than uncharged overshoot on top of it.
+        if (Object.keys(droppedEntries).length > 0) result.droppedEntries = droppedEntries;
+
+        const echoes = echoMeter(definition.responseBudgetBytes, echoBase);
+
+        if (echoEntry !== undefined) result.entry = echoes.fitOne(result.entry as RecordEntry);
+        if (removed.length > 0) result.removed = echoes.fitList(removed);
+
+        // The envelope-level flag: this call's echoes were withheld, or the page already
+        // said so. An action wrapper answer has no `page` at all on a mutation, so without
+        // this key a caller there could not tell a withheld body from a cleared field.
+        if (echoes.truncated || result.page.budgetTruncated === true) result.budgetTruncated = true;
 
         return result;
     };
@@ -3880,7 +4355,15 @@ export const createRecordEngine = (): RecordEngine => {
                 // through by accident. Without this line `noopIds` would be a
                 // `records`-only key, and a `tasks` caller could not tell a patch that wrote
                 // from a patch that was refused silently.
-                ...(result.noopIds === undefined ? {} : { noopIds: result.noopIds })
+                ...(result.noopIds === undefined ? {} : { noopIds: result.noopIds }),
+                // R-0012/R-0013 — the same swallowing, for the two keys that answer "did I
+                // get everything?" and "what did my input lose?". `page` below carries
+                // `page.budgetTruncated`, but that key belongs to the PAGE: it says nothing
+                // about a write echo this envelope withholds, and it is not in the answer at
+                // all through an action wrapper. `droppedEntries` is a receipt for the write,
+                // so it rides wherever the write receipts ride.
+                ...(result.budgetTruncated === undefined ? {} : { budgetTruncated: result.budgetTruncated }),
+                ...(result.droppedEntries === undefined ? {} : { droppedEntries: result.droppedEntries })
             };
 
             if (result.changes !== undefined) shaped.changes = result.changes;
@@ -3911,6 +4394,17 @@ export const createRecordEngine = (): RecordEngine => {
 
         const action = (input.action ?? 'list') as RecordAction;
 
+        // R-0012/R-0013 — these three wrappers reshape the answer key by key, so the two
+        // budget receipts have to be spelled out here or they vanish: a `chapters` `add`
+        // that came back slimmed to `{ id, rev }` would otherwise be indistinguishable from
+        // a record whose body had been cleared, and this branch has no `page` beside it to
+        // say so. Spread into every action shape, including `list`, whose `page` carries its
+        // own `page.budgetTruncated` for the page half of the same fact.
+        const receipts = {
+            ...(result.budgetTruncated === undefined ? {} : { budgetTruncated: result.budgetTruncated }),
+            ...(result.droppedEntries === undefined ? {} : { droppedEntries: result.droppedEntries })
+        };
+
         // The action wrappers carry NO page on a mutation and NO storeRev: that is the
         // contract these three tools have always had, and Decision E's reshape is
         // allowed to keep it because the engine result underneath still has both.
@@ -3918,14 +4412,16 @@ export const createRecordEngine = (): RecordEngine => {
             return {
                 [wrapper.plural]: result.entries ?? [],
                 counts: result.counts,
-                page: result.page
+                page: result.page,
+                ...receipts
             };
         }
 
         if (action === 'remove') {
             return {
                 removed: (result.removed ?? [])[0],
-                counts: result.counts
+                counts: result.counts,
+                ...receipts
             };
         }
 
@@ -3943,11 +4439,15 @@ export const createRecordEngine = (): RecordEngine => {
         const bodyFields = definition.fields.filter((field) => field.getOnly === true);
 
         if (action !== 'get' || entry === undefined || bodyFields.length === 0) {
-            return { [wrapper.singular]: entry, counts: result.counts };
+            return { [wrapper.singular]: entry, counts: result.counts, ...receipts };
         }
 
         const summary: RecordEntry = { ...entry };
-        const shaped: Record<string, unknown> = { [wrapper.singular]: summary, counts: result.counts };
+        const shaped: Record<string, unknown> = {
+            [wrapper.singular]: summary,
+            counts: result.counts,
+            ...receipts
+        };
 
         for (const field of bodyFields) {
             // A declared `getOnly` field the entry does not carry stays ABSENT rather

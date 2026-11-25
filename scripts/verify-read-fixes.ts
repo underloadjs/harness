@@ -57,8 +57,11 @@ const show = (label: string, ok: unknown, detail?: string): void => {
 
     show(
         'D1  full-budget read survives the harness envelope',
-        bounded.truncated === false,
-        `wireBytes=${r.wireBytes} accurate=${r.wireBytes === Buffer.byteLength(serialized, 'utf8')} serialized=${Buffer.byteLength(serialized, 'utf8')} cap=${MODEL_TOOL_RESULT_BUDGET_BYTES}`
+        // F-CUTTER made `truncated: false` ambiguous on its own: an over-budget JSON
+        // document now comes back un-cut but REFUSED. "Survives" means all three: not
+        // cut, not refused, and the bytes are the ones the tool wrote.
+        bounded.truncated === false && bounded.rejected === undefined && bounded.content === serialized,
+        `wireBytes=${r.wireBytes} accurate=${r.wireBytes === Buffer.byteLength(serialized, 'utf8')} serialized=${Buffer.byteLength(serialized, 'utf8')} cap=${MODEL_TOOL_RESULT_BUDGET_BYTES}${bounded.rejected === undefined ? '' : ' REFUSED'}`
     );
 
     const e = r.files[0];

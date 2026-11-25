@@ -211,7 +211,7 @@ describe('stress: `ids` reads', () => {
         expect(JSON.stringify(result)).toContain(ids[1]);
     });
 
-    it('D5: a budget-truncated `ids` read reports the PAGE cursor, not the ids cursor', async () => {
+    it('D5: an `ids` read is bounded by responseBudgetBytes and hands back an IDS cursor', async () => {
         const engine = createRecordEngine();
 
         await define(engine, {
@@ -238,13 +238,50 @@ describe('stress: `ids` reads', () => {
             ids: ['1', '2', '3', '4', '5']
         });
 
-        // All five bodies came back, yet the page says the collection is not exhausted and
-        // hands back a nextOffset that points at records the caller already holds.
-        expect(read.entries.length).toBe(5);
-        expect((read.page as Record<string, unknown>).hasMore).toBe(false);
+        // F-STORE M1 CHANGED this pin. This read used to be the one answer with no byte
+        // budget at all: all five 400-character bodies came back under a 1,024-byte
+        // collection budget (1,586 bytes of rows) while the page claimed the collection was
+        // not exhausted. An `ids` read is now metered by the same budget as a page, so the
+        // first row is admitted whole (the first row of any KIND is always admitted) and the
+        // rest are withheld.
+        expect(read.entries.map((entry: any) => entry.id)).toEqual(['1']);
+        expect(read.entry).toBeUndefined();
+        expect(read.budgetTruncated).toBe(true);
+        // The cut is reported twice with two different meanings, and both are pinned: the
+        // page flag says "the page echo stopped short of `limit`", the top-level flag says
+        // "this answer withheld something". `nextOffset` counts positions in the DEDUPED
+        // list of ids the caller asked for, not positions in the collection.
+        expect(read.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            nextOffset: 1,
+            budgetTruncated: true
+        });
+
+        // The continuation is the part that was broken: replaying the SAME ids call at the
+        // cursor the engine returned now yields the next requested id (2), not a record the
+        // caller already holds. The plural shape survives the cut - five distinct ids were
+        // requested, so a one-row answer is still `entries`, never `entry`.
+        const next = await run(engine, 'records', {
+            collection: 'bodies',
+            ids: ['1', '2', '3', '4', '5'],
+            offset: 1
+        });
+        expect(next.entries.map((entry: any) => ({ id: entry.id, body: entry.body }))).toEqual([
+            { id: '2', body: `${body}a` }
+        ]);
+        expect(next.entry).toBeUndefined();
+        expect(next.page).toEqual({
+            offset: 1,
+            limit: 20,
+            hasMore: true,
+            nextOffset: 2,
+            budgetTruncated: true
+        });
     });
 
-    it('D5b: an `ids` read is NOT bounded by responseBudgetBytes (the F13 inner<outer rule)', async () => {
+    it('D5b: an `ids` read IS bounded by responseBudgetBytes (the F13 inner<outer rule)', async () => {
         const engine = createRecordEngine();
 
         await define(engine, {
@@ -266,9 +303,21 @@ describe('stress: `ids` reads', () => {
         const read = await run(engine, 'records', { collection: 'huge', ids: minted });
         const readBytes = JSON.stringify(read.entries).length;
 
-        // A page of the same records is budgeted; the ids read of the SAME records is not.
-        expect(pageBytes).toBeLessThan(20_000);
-        expect(readBytes).toBeGreaterThan(160_000);
+        // F-STORE M1 CHANGED this pin. A page of these records used to be budgeted while an
+        // `ids` read of the SAME 40 records was not (160,000+ characters of rows, past the
+        // 32,768-byte delivery cap). Both shapes are now metered by the same cutter, so they
+        // cost byte-for-byte the same amount: one 4,000-character row each.
+        expect(pageBytes).toBe(4118);
+        expect(readBytes).toBe(4118);
+        expect(read.entries.length).toBe(1);
+        expect(read.budgetTruncated).toBe(true);
+        expect(read.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            nextOffset: 1,
+            budgetTruncated: true
+        });
     });
 });
 

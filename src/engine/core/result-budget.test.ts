@@ -9,10 +9,17 @@
 //     what the envelope's note QUOTES. A result at or under the budget is returned
 //     BYTE-EXACT (no marker, no re-encoding), which is what keeps every existing tool
 //     result unchanged;
-//   - an over-budget result becomes a small, VALID JSON envelope that names the
-//     truncation, the original size, the applied budget, a HEAD preview (under the
-//     historical `content` key), a TAIL preview, and a note saying how much was cut
-//     and which call to re-run (T5.1);
+//   - an over-budget result that is NOT JSON (prose, a log) becomes a small, VALID JSON
+//     envelope that names the truncation, the original size, the applied budget, a HEAD
+//     preview (under the historical `content` key), a TAIL preview, and a note saying how
+//     much was cut and which call to re-run (T5.1);
+//   - an over-budget result that IS a JSON document is REFUSED, never cut (F-CUTTER):
+//     `truncated` stays false, `rejected` carries the reason and both sizes, and
+//     `content` is the refusal sentence naming the call, the narrowing that fits, and the
+//     fact that the document was discarded rather than shortened. A middle-cut document
+//     is not a document — the shipped cutter delivered `content` and `tail` that both
+//     failed `JSON.parse`, at `isError: false`, and dropped whichever keys landed in the
+//     hole (the probe in ./result-budget.ts records the exact figures);
 //   - the DELIVERED payload never exceeds the applied budget, except at the documented
 //     floor where the note alone is already the budget (see the sweep test);
 //   - a multi-byte character and a surrogate pair are never split at either cut;
@@ -167,27 +174,139 @@ describe('boundToolResult', () => {
         );
     });
 
-    it('keeps both ends of a JSON document, so the cut is the only loss', () => {
-        // The reason a head/tail split replaces the old mid-string cut. A large `read`
-        // answer keeps its opening structure AND its trailing continuation fields
-        // (`nextLine` here), which the prefix-only envelope used to destroy.
+    it('refuses an over-budget JSON document instead of handing over two broken halves', () => {
+        // F-CUTTER. This fixture is the one the head/tail envelope used to be praised
+        // for: a `read` page whose opening structure AND trailing `nextLine` were said to
+        // survive the cut. They did survive — as TEXT — but neither parses
+        // (`Unterminated string in JSON at position 19905` / `is not valid JSON`), so the
+        // "still parseable" claim in this file's old header was about the envelope, never
+        // about the document inside it, and the 1,054 bytes in the hole were gone with no
+        // cursor. A structure that does not fit is now REFUSED: `truncated` stays false
+        // (nothing was shortened — the value was dropped), and `rejected` carries the two
+        // sizes so a caller can report the decision without re-measuring.
         const source = JSON.stringify({ files: [{ path: 'a.ts', content: 'q'.repeat(2_000) }], nextLine: 42 });
-        const bounded = boundToolResult(source, 1_000, { source: { name: 'read', callId: 'r1' } });
-        const envelope = envelopeOf(bounded.content);
 
-        expect(bounded.originalBytes).toBe(utf8ByteLength(source));
-        expect(envelope.content.startsWith('{"files":[{"path":"a.ts","content":"qq')).toBe(true);
-        expect(envelope.tail.endsWith('],"nextLine":42}')).toBe(true);
-        // The note is honest about both previews and about the size of the hole. The
-        // previews are 50/16 bytes smaller than under the raw-byte measure because this
-        // source is itself JSON: every quote in the head and tail preview is escaped a
-        // SECOND time on the way into the request body, and that is the form billed.
-        expect(envelope.note).toBe(
-            "Cut 1464 of 2054 bytes from the middle by a 1000-byte cap; kept a 442-byte head and a 148-byte tail. The full text is not in this transcript: re-run tool 'read' (call r1) with narrower arguments to fetch it."
-        );
-        expect(modelPayloadBytes(bounded.content)).toBe(942);
-        expect(utf8ByteLength(bounded.content)).toBe(900);
-        expect(modelPayloadBytes(bounded.content)).toBeLessThanOrEqual(1_000);
+        expect(utf8ByteLength(source)).toBe(2_054);
+
+        const bounded = boundToolResult(source, 1_000, { source: { name: 'read', callId: 'r1' } });
+
+        expect(bounded.truncated).toBe(false);
+        expect(bounded.originalBytes).toBe(2_054);
+        expect(bounded.rejected).toEqual({
+            reason: 'oversized-json',
+            originalBytes: 2_054,
+            budgetBytes: 1_000,
+            message:
+                "Tool result too large to deliver: 2054 bytes against a 1000-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool 'read' (call r1) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying."
+        });
+        // The refusal IS the delivered text, byte for byte, and it is small: the model
+        // pays 367 serialized bytes for a page that would have cost it 2,066.
+        expect(bounded.content).toBe(bounded.rejected?.message);
+        expect(modelPayloadBytes(bounded.content)).toBe(367);
+        // And it states every fact a model needs to act: discarded (not shortened), both
+        // sizes, the narrowing that fits, and the write-safety warning.
+        expect(bounded.content).toContain('discarded, not truncated');
+        expect(bounded.content).toContain('2054 bytes');
+        expect(bounded.content).toContain('1000-byte budget');
+        expect(bounded.content).toContain("Re-run tool 'read' (call r1)");
+        expect(bounded.content).toContain('smaller limit, fewer ids, narrower fields');
+        expect(bounded.content).toContain('re-read before retrying');
+    });
+
+    it('refuses an oversized document at the default 8192-token budget too', () => {
+        // The engine-level case (./harness.budget.test.ts) reduced to the unit: the
+        // 32,768-byte payload budget refuses a 71,142-byte record page exactly as it
+        // refuses the 1,000-byte one above, and names the call it came from.
+        const source = JSON.stringify({
+            ok: true,
+            count: 400,
+            records: Array.from({ length: 400 }, (_, index) => ({
+                id: `rec-${String(index).padStart(4, '0')}`,
+                title: `Knowledge entry ${index}`,
+                body: 'k'.repeat(120)
+            })),
+            nextOffset: 400
+        });
+
+        expect(utf8ByteLength(source)).toBe(71_142);
+
+        const bounded = boundToolResult(source, MODEL_TOOL_RESULT_BUDGET_BYTES, {
+            source: { name: 'knowledge', callId: 'call_1' }
+        });
+
+        expect(bounded).toEqual({
+            content:
+                "Tool result too large to deliver: 71142 bytes against a 32768-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool 'knowledge' (call call_1) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying.",
+            truncated: false,
+            originalBytes: 71_142,
+            rejected: {
+                reason: 'oversized-json',
+                originalBytes: 71_142,
+                budgetBytes: 32_768,
+                message:
+                    "Tool result too large to deliver: 71142 bytes against a 32768-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool 'knowledge' (call call_1) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying."
+            }
+        });
+    });
+
+    it('delivers a JSON document exactly at the payload budget, whole', () => {
+        // The boundary stays inclusive for a document: 31 PAYLOAD bytes against a
+        // 31-byte budget is a result, not a refusal — the JSON quotes cost 4 bytes more
+        // than the text's own 27, which is the T3 currency and the reason the pre-T3
+        // "it fits" judgement destroyed continuation fields. One byte under, the same
+        // document is refused, so the rule has no gap between fitting and refusing.
+        const source = '{"ok":true,"items":[1,2,3]}';
+
+        expect(utf8ByteLength(source)).toBe(27);
+        expect(modelPayloadBytes(source)).toBe(31);
+        expect(boundToolResult(source, 31)).toEqual({ content: source, truncated: false, originalBytes: 27 });
+        expect(boundToolResult(source, 30, { source: { name: 'store', callId: 's1' } }).rejected).toEqual({
+            reason: 'oversized-json',
+            originalBytes: 27,
+            budgetBytes: 30,
+            message:
+                "Tool result too large to deliver: 27 bytes against a 30-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool 'store' (call s1) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying."
+        });
+    });
+
+    it('keeps the head/tail envelope for text that only looks like JSON', () => {
+        // THE rule does not apply to a document. A truncated write, a stack trace from a
+        // JSON service, or a log line that starts with a brace all LEAD like JSON and
+        // parse as nothing, and for them both previews are real content — which is why
+        // the pre-filter must be a filter, not the decision, and the decision must be a
+        // real `JSON.parse`.
+        const broken = JSON.stringify({ files: [{ path: 'a.ts', content: 'q'.repeat(2_000) }], nextLine: 42 }).slice(0, -1);
+
+        expect(utf8ByteLength(broken)).toBe(2_053);
+
+        const cut = boundToolResult(broken, 1_000, { source: { name: 'read', callId: 'r1' } });
+
+        expect(cut.truncated).toBe(true);
+        expect(cut.rejected).toBeUndefined();
+        expect(cut.originalBytes).toBe(2_053);
+        expect(envelopeOf(cut.content)).toEqual({
+            truncated: true,
+            originalBytes: 2_053,
+            budgetBytes: 1_000,
+            note: "Cut 1463 of 2053 bytes from the middle by a 1000-byte cap; kept a 442-byte head and a 148-byte tail. The full text is not in this transcript: re-run tool 'read' (call r1) with narrower arguments to fetch it.",
+            content: broken.slice(0, 442),
+            tail: broken.slice(broken.length - 148)
+        });
+
+        // A brace-led log page: the pre-filter cannot answer it, the parser can.
+        const log = `{lead}\n${'l'.repeat(1_000)}\n{tail}`;
+        const logCut = boundToolResult(log, 400, { source: { name: 'tail', callId: 't1' } });
+
+        expect(logCut.truncated).toBe(true);
+        expect(logCut.rejected).toBeUndefined();
+        expect(envelopeOf(logCut.content)).toEqual({
+            truncated: true,
+            originalBytes: 1_014,
+            budgetBytes: 400,
+            note: "Cut 934 of 1014 bytes from the middle by a 400-byte cap; kept a 60-byte head and a 20-byte tail. The full text is not in this transcript: re-run tool 'tail' (call t1) with narrower arguments to fetch it.",
+            content: log.slice(0, 60),
+            tail: log.slice(log.length - 20)
+        });
     });
 
     it('caps a huge result at the default 8192-token budget with an exact preview pair', () => {
@@ -473,5 +592,71 @@ describe('createToolResultTurnBudget', () => {
         expect(utf8ByteLength(capped.content)).toBe(658);
         expect(modelPayloadBytes(capped.content)).toBe(676);
         expect(turn.committedBytes()).toBe(676);
+    });
+
+    it('books a refusal for the refusal, never for the discarded document', () => {
+        // F-CUTTER, contract 3. A 1,433-byte JSON page over a 1,024-byte per-result cap
+        // is refused, and the turn pays the 368 bytes of the sentence — not the 1,441
+        // payload bytes of the body the model never received. One oversized result can
+        // therefore no longer spend a turn's window, and the results behind it still fit.
+        const turn = createToolResultTurnBudget(2_048, 1_024);
+        const doc = JSON.stringify({ ok: true, records: [{ id: 'x'.repeat(1_400) }] });
+
+        expect(utf8ByteLength(doc)).toBe(1_433);
+        expect(modelPayloadBytes(doc)).toBe(1_441);
+
+        const refusal =
+            "Tool result too large to deliver: 1433 bytes against a 1024-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool 'store' (call s1) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying.";
+
+        expect(turn.commit(doc, { source: { name: 'store', callId: 's1' } })).toEqual({
+            content: refusal,
+            truncated: false,
+            originalBytes: 1_433,
+            rejected: { reason: 'oversized-json', originalBytes: 1_433, budgetBytes: 1_024, message: refusal }
+        });
+        expect(turn.committedBytes()).toBe(368);
+
+        // 1,680 of the 2,048-byte window are still there, because the refusal charged the
+        // window almost nothing: the next result arrives whole.
+        expect(turn.commit('c'.repeat(100), { source: { name: 'gamma', callId: 'c3' } })).toEqual({
+            content: 'c'.repeat(100),
+            truncated: false,
+            originalBytes: 100
+        });
+        expect(turn.committedBytes()).toBe(468);
+    });
+
+    it('refuses a JSON document the per-turn spill used to cut', () => {
+        // The spill case, and the reason the JSON rule sits in `boundWithReason` and not
+        // in `boundToolResult`: this document FITS its 1,024-byte per-result cap (601
+        // bytes), so it reaches the aggregate, where the turn's 512-byte floor used to
+        // hand the model a 512-byte slice of a 593-byte JSON value. It is refused
+        // instead, and the sentence names the turn's cap rather than inventing a second
+        // per-result limit — the same honesty the spill note observes.
+        const turn = createToolResultTurnBudget(1_400, 1_024);
+
+        // The prose sibling first: it takes the ordinary per-result cut (986 bytes),
+        // leaving 414 bytes of headroom under this test's 1,400-byte aggregate.
+        expect(modelPayloadBytes(turn.commit('a'.repeat(1_500), { source: { name: 'alpha', callId: 'a1' } }).content)).toBe(986);
+
+        const doc = JSON.stringify({ ok: true, records: [{ id: 'x'.repeat(560) }] });
+
+        expect(utf8ByteLength(doc)).toBe(593);
+        expect(modelPayloadBytes(doc)).toBe(601);
+        // It fits the per-result cap on its own — the aggregate is the only thing wrong.
+        expect(boundToolResult(doc, 1_024)).toEqual({ content: doc, truncated: false, originalBytes: 593 });
+
+        const refusal =
+            "Tool result too large to deliver: 593 bytes against the 512 bytes this turn had left of its 1400-byte per-turn cap. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool 'store' (call s2) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying.";
+
+        expect(turn.commit(doc, { source: { name: 'store', callId: 's2' } })).toEqual({
+            content: refusal,
+            truncated: false,
+            originalBytes: 593,
+            rejected: { reason: 'oversized-json', originalBytes: 593, budgetBytes: 512, message: refusal }
+        });
+        // 986 + 411: still INSIDE the 1,400-byte window, and every call has exactly one
+        // answer — the pairing rule holds with nothing dropped.
+        expect(turn.committedBytes()).toBe(1_397);
     });
 });

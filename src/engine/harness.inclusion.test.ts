@@ -3232,10 +3232,22 @@ describe('context inclusion — the entry-time and live context estimates (conte
                     // is `ceil(serialized-payload bytes / 4)`. On top of the transcript sits
                     // the tool catalogue this round declares (`toolSchemaChars`,
                     // src/harness.ts `toolSchemaBytes`): `controlRun` declares `alpha` plus
-                    // the two runtime controls, 12,669 serialized payload bytes, a constant
-                    // 3,168-token floor. So entry is ceil((24 + 12,669) / 4) = 3,174. Nothing
+                    // the two runtime controls, 14,389 serialized payload bytes, a constant
+                    // 3,598-token floor. So entry is ceil((24 + 14,389) / 4) = 3,604. Nothing
                     // has been written yet, so the live accessor answers the same number.
                     // (Before the catalogue floor this read 6, the transcript alone.)
+                    //
+                    // WHY THE FLOOR IS 14,389 AND NOT the 12,669 this case carried until
+                    // 2026-11-25: the record tools' model-facing descriptions now disclose the
+                    // response budget and how to page past a withheld page (F-STORE M1/M8/M9/M12,
+                    // ../tools/runtime/records.tool.ts and its tasks/chapters/profiles/locations
+                    // mirrors), which is +1,720 serialized bytes on the runtime catalogue —
+                    // 12,657 -> 14,377 for the two controls alone, +2 for `alpha` here (the
+                    // review round then de-duplicated the `tasks` envelope text for a further
+                    // -40 B against the sentences it added). The estimator did not move, so
+                    // every figure in this case is the same arithmetic on the new constant:
+                    // 3,174/3,172 became 3,604/3,602 (+430 tokens each).
+                    // Re-derive with Math.ceil((<transcript bytes> + 14_389) / 4).
                     record.entryBefore = context.estimatedTokens;
                     record.liveBefore = context.currentEstimatedTokens();
                     record.listBefore = context.currentMessages().length;
@@ -3253,7 +3265,7 @@ describe('context inclusion — the entry-time and live context estimates (conte
 
                     // ...and the live accessor is the same estimator over the same list
                     // `currentMessages()` returns: 16 bytes now, so
-                    // ceil((16 + 12,669) / 4) = 3,172. The write saved exactly 2 tokens by
+                    // ceil((16 + 14,389) / 4) = 3,602. The write saved exactly 2 tokens by
                     // this measure — the catalogue is the same constant on both sides, so it
                     // cancels out of the saving — which is what a minimum-savings floor needs
                     // to see in the handler that made the write.
@@ -3264,13 +3276,13 @@ describe('context inclusion — the entry-time and live context estimates (conte
         });
 
         expect(record).toEqual({
-            entryBefore: 3174,
-            liveBefore: 3174,
+            entryBefore: 3604,
+            liveBefore: 3604,
             listBefore: 4,
             staticListBefore: 4,
-            entryAfter: 3174,
+            entryAfter: 3604,
             staticListAfter: 4,
-            liveAfter: 3172,
+            liveAfter: 3602,
             listAfter: 3
         });
 
@@ -3279,11 +3291,11 @@ describe('context inclusion — the entry-time and live context estimates (conte
         // still useful to a late reader (a parked context, a test inspecting one after the
         // run). The run has since committed its answer, so the canonical transcript is FIVE
         // entries and a naive re-projection now would measure four; this answers three
-        // entries and 3,172 tokens (16 transcript bytes + the 12,669-byte catalogue), exactly
+        // entries and 3,602 tokens (16 transcript bytes + the 14,389-byte catalogue), exactly
         // the request that went out.
         expect(late?.currentMessages()).toHaveLength(3);
-        expect(late?.currentEstimatedTokens()).toBe(3172);
-        expect(late?.estimatedTokens).toBe(3174);
+        expect(late?.currentEstimatedTokens()).toBe(3602);
+        expect(late?.estimatedTokens).toBe(3604);
         expect(writer.agent.messages).toHaveLength(5);
 
         // The provider received the live view, not the entry-time one: the disabled turn
@@ -3326,8 +3338,8 @@ describe('context inclusion — the entry-time and live context estimates (conte
 
                     // The projection at entry is 43 bytes of counted text — 6 + 8 + the
                     // 27-character thought + the run's own 2-character prompt — over the same
-                    // 12,669-byte catalogue `controlRun` declares, so
-                    // ceil((43 + 12,669) / 4) = 3,178 (11 tokens before the catalogue floor),
+                    // 14,389-byte catalogue `controlRun` declares, so
+                    // ceil((43 + 14,389) / 4) = 3,608 (11 tokens before the catalogue floor),
                     // and 27 of those bytes are the thinking. `core/agent.ts`
                     // `withoutWithheldReasoning` deletes the `reasoning` key from the request
                     // COPY of a flagged entry, so this is exactly the text the provider bills.
@@ -3335,19 +3347,19 @@ describe('context inclusion — the entry-time and live context estimates (conte
 
                     context.setReasoningIncluded(entryWith(context, 'answered'), false);
 
-                    // 16 bytes now, so ceil((16 + 12,669) / 4) = 3,172. The entry still
+                    // 16 bytes now, so ceil((16 + 14,389) / 4) = 3,602. The entry still
                     // travels, in the same slot, with its `content` — only its thinking
                     // stopped riding, and the number knows it. The saving reads 6 tokens here
                     // where the transcript-only fixture read 7 (11 - 4): the same 27 bytes
                     // cross one fewer `ceil` boundary once the constant catalogue sits under
-                    // both figures, which is the rounding of `ceil((n + 12,669) / 4)`, not a
+                    // both figures, which is the rounding of `ceil((n + 14,389) / 4)`, not a
                     // smaller withholding.
                     record.after = context.currentEstimatedTokens();
                 })
             ]
         });
 
-        expect(record).toEqual({ before: 3178, after: 3172 });
+        expect(record).toEqual({ before: 3608, after: 3602 });
 
         // The provider received the view the accessor measured: the answer is still there, its
         // thinking is not, and neither the flag nor the withheld text reaches the wire.

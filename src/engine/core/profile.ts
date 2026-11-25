@@ -26,10 +26,14 @@ export const PROFILE_MAX_TRAITS = 32;
 export const PROFILE_MAX_TRAIT = 200;
 
 // `traits` is the one field this collection has that `locations` does not: a
-// trimmed, de-duplicated string array. De-duplication and the raw-array cap are
-// engine rules for any `strings` field, so the old `readTraits` helper is gone —
-// and a flood of duplicates is still rejected, because the engine checks the RAW
-// length before normalizing.
+// trimmed, de-duplicated string array. De-duplication and the array cap are engine
+// rules for any `strings` field, so the old `readTraits` helper is gone — and the order
+// is the point: the engine NORMALIZES first (trim, drop blanks, collapse duplicates)
+// and caps the SURVIVOR count, so 32 traits written as 40 entries with 8 repeats still
+// stores. A flood of duplicates that survives normalization is rejected, and the
+// refusal quotes BOTH counts — sent and normalized — so the caller can see what the
+// cap actually saw. Blank entries are refused outright (`invalid-field`): a normalized
+// array cannot contain a value the cap was not written to bound.
 export const PROFILES_COLLECTION: RecordCollectionDefinition = {
     name: 'profiles',
     maxRecords: PROFILE_MAX_RECORDS,

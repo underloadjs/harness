@@ -1004,17 +1004,19 @@ describe('grep', () => {
     });
 
     it('keeps the honesty fields ahead of the result list in the serialized form', async () => {
-        // The harness caps a serialized tool result at 64 KiB of TEXT and keeps the
-        // BEGINNING when it must cut (core/result-budget.ts). grep's own budget is 64
-        // KiB of MATCH TEXT, not of JSON, so a full page of 1 KiB snippets serializes
-        // past that — every entry also carries its path, line number, flags and braces.
-        // If `matches` came first, the envelope would cut exactly the fields that
-        // explain the cut: `truncated`, `stopReason`, `skipped`, `excluded`, `note`.
+        // Whatever caps a serialized tool result must keep the BEGINNING usable
+        // (core/result-budget.ts). grep's own budget is 64 KiB of MATCH TEXT, not of
+        // JSON, so a full page of 1 KiB snippets serializes past that — every entry also
+        // carries its path, line number, flags and braces. If `matches` came first, a cut
+        // would destroy exactly the fields that explain the cut: `truncated`,
+        // `stopReason`, `skipped`, `excluded`, `note`.
         //
-        // The wire cap is now 256 KiB, comfortably above a 64 KiB-budget grep page, so
-        // the DEFAULT cap no longer bites here. The ordering property is still what
-        // protects a caller, so the test supplies a cap that DOES bite rather than
-        // quietly degrading into an assertion about a truncation that never happens.
+        // Since F-CUTTER the harness itself never delivers a cut JSON DOCUMENT (it
+        // refuses one), so this pin tests the ordering of the serialized form and the
+        // refusal the cap now produces; the ordering is still what protects a caller who
+        // truncates the page themselves. The cap that bites is supplied below rather than
+        // inherited, so the premise stays asserted instead of degrading into a truncation
+        // that never happens.
         const result = await grep({ pattern: 'Q', patterns: ['lines.txt'] });
 
         expect(result.truncated).toBe(true);
@@ -1028,15 +1030,51 @@ describe('grep', () => {
 
         const bounded = boundToolResult(serialized, appliedBudget);
 
-        expect(bounded.truncated).toBe(true);
+        // F-CUTTER (2026-11-25) changed what happens to a JSON page at this cap: the
+        // harness no longer CUTS a document (a middle-cut document is not that document —
+        // both previews fail `JSON.parse` and the keys in the hole are gone silently), it
+        // REFUSES the delivery. So `truncated` is false and the rejection carries the
+        // sizes; the model gets a sentence naming both, not half a page.
+        expect(bounded.truncated).toBe(false);
+        expect(bounded.rejected).toEqual({
+            reason: 'oversized-json',
+            originalBytes: Buffer.byteLength(serialized, 'utf8'),
+            budgetBytes: appliedBudget,
+            message: bounded.content
+        });
+        expect(bounded.content).toContain(`${Buffer.byteLength(serialized, 'utf8')} bytes`);
+        expect(bounded.content).toContain(`${appliedBudget}-byte budget`);
 
-        // The envelope is `{ truncated, originalBytes, budgetBytes, content }`, and
-        // `content` is the leading slice of the serialized result. What survives that cut
-        // must be the EXPLANATION, because that is the part a caller needs in order to
-        // read a short list correctly.
-        const envelope = JSON.parse(bounded.content) as { content: string };
-        const prefix = envelope.content;
+        // What this pin is really about is unchanged; D-F (independent review) is about WHERE
+        // it is asserted. `serialized.slice(0, appliedBudget)` is not a delivery: since
+        // F-CUTTER the harness REFUSES this page rather than shipping a byte slice of it, so a
+        // claim about a slice the caller never receives is a claim about a string. The ordering
+        // property is therefore asserted on the DELIVERED document's own byte offsets — grep
+        // emits every field that explains the answer BEFORE `matches`, so the load-bearing
+        // number is how many bytes precede the list. A caller that can carry only
+        // `appliedBudget` bytes of the real document holds the whole explanation and loses
+        // nothing but list entries.
+        const matchesAt = serialized.indexOf('"matches":[');
 
+        expect(matchesAt).toBeGreaterThan(-1);
+
+        // THE BLOCK THAT EXPLAINS THE ANSWER, pinned as an exact byte figure: grep's fixed
+        // prose plus the counts and flags, with `skipped`/`excluded`/`patterns` all fixed by
+        // this fixture. UTF-8 bytes, because that is the unit every cap in this file spends
+        // (`appliedBudget` above, and `budgetBytes` in the envelope the cutter emits).
+        const explanationBytes = Buffer.byteLength(serialized.slice(0, matchesAt), 'utf8');
+
+        expect(explanationBytes).toBe(579);
+
+        // The cap sits INSIDE the list, which is why the ordering is load-bearing rather than
+        // decorative: the explanation is ~1% of the budget, and the document runs a full cap
+        // past it, so the bytes a tight reader loses are entries and nothing else.
+        expect(explanationBytes).toBeLessThan(appliedBudget / 100);
+        expect(Buffer.byteLength(serialized, 'utf8')).toBeGreaterThan(appliedBudget + explanationBytes);
+
+        // Every honesty field is inside that block — asserted by its OWN byte offset, so a
+        // refactor that pushes one of them behind `matches` fails here on the delivered bytes
+        // instead of only in a model's context.
         for (const field of [
             '"output":"content"',
             '"truncated":true',
@@ -1049,13 +1087,15 @@ describe('grep', () => {
             '"patterns":["lines.txt"]',
             '"note":'
         ]) {
-            expect(prefix).toContain(field);
+            const at = serialized.indexOf(field);
+
+            expect(at).toBeGreaterThan(-1);
+            expect(Buffer.byteLength(serialized.slice(0, at), 'utf8')).toBeLessThan(explanationBytes);
         }
 
-        // The cut lands inside `matches` — the last key, and the only thing that can be
-        // lost without losing the meaning of the answer.
-        expect(prefix.indexOf('"matches":[')).toBeGreaterThan(prefix.indexOf('"note":'));
-        expect(prefix.endsWith(']')).toBe(false);
+        // And the list really is the last thing in the document, so a cut can only ever
+        // truncate entries — the key order below is the mechanism that makes that true.
+        expect(serialized.slice(matchesAt)).toMatch(/^"matches":\[.*\]\}$/s);
 
         // And the field order is the mechanism, pinned directly so a refactor that moves
         // `matches` back to the front fails here rather than in a model's context.

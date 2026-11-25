@@ -2370,6 +2370,28 @@ export type RecordsResult = {
     // on the same never-count-dependent rule as the two above, and disjoint from them:
     // an id is in `changedIds` or in `noopIds`, never both.
     noopIds?: string[];
+    // R-0012 — the RESPONSE-BUDGET flag for the whole envelope, not for one key.
+    // `page.budgetTruncated` says the PAGE was cut; it cannot say anything about the write
+    // echoes beside it, and through an action wrapper there is no page in the answer at
+    // all. So this key means one thing across every shape: `responseBudgetBytes` withheld
+    // something from this response — a record body the caller asked for (a write echo
+    // slimmed to `{ id, rev }`, an `ids` read's rows cut short) or the projected page. A
+    // body is ABSENT when it is withheld, never emptied, so this is the key that tells a
+    // caller its content is still stored rather than gone. It is absent unless true, and
+    // the change feed is NOT covered by it: a feed cut says so with `changesHasMore` and
+    // `droppedEvents`, and it carries no record body to lose.
+    budgetTruncated?: boolean;
+    // R-0013 — what the caller SENT and the record did not keep, per field: field key →
+    // number of `strings` ENTRIES dropped by normalization (duplicates, and entries that
+    // trim onto an earlier one). The engine used to answer an accepted write with the
+    // shorter array and nothing else, so a caller that sent five traits to a `maxItems: 3`
+    // field learned it lost two only by diffing the echo — and could not tell "the engine
+    // dropped them" from "my own code never sent them". This is the receipt for a write
+    // that SUCCEEDED; a field whose entry count is refused outright is a `field-too-many-
+    // items` error, and over-long entries and out-of-range numbers were never dropped at
+    // all. Present only when a write that really stored dropped something: a no-op patch
+    // contributes nothing, because it stored nothing.
+    droppedEntries?: Record<string, number>;
     // 0011 — the floor of THIS collection's retained change window: the oldest revision
     // `changes` can still show. It rides the feed, so it appears when `since` asked for
     // changes (and on a plain read of one collection, which reports its own window).

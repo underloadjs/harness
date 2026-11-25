@@ -934,13 +934,13 @@ a single counter, so the first profile of a session that already holds one task 
 | `tasks` entry **without** `id` | add one task (`text` required, trimmed, max 4000 chars) with the next stable id (`"1"`, `"2"`, …) |
 | `tasks` entry **with** a known `id` | patch that task: `text` and/or `completed`, whichever you send; omitted fields are unchanged |
 | `remove: ["7", "9"]` | remove those ids |
-| `ids: ["4"]` | read named records instead of a page — one id answers in `entry`, several in `entries` |
+| `ids: ["4"]` | read named records instead of a page — one id answers in `entry`, several in `entries`; a repeated id is read once, `offset` pages that list, and a read the byte budget cannot pay for in full continues at `offset: page.nextOffset` |
 | `where: { completed: true }` | equality filter for a list read (`{ field: value }`, AND across the keys), applied BEFORE ordering and paging, so the page and its cursors move over the matching records and `counts` describes the filtered set; it cannot combine with `since` or `ids` |
 | `expects: [{ id, rev }]` | the revisions you READ, one per id this call patches or removes; required for every such write whenever the runtime knows the caller — the lock and its ownership verbs are gone, so this is the only conflict control |
 | `since: <storeRev>` | also return the store events after that revision: `changes`, plus `changesHasMore` / `changesTruncated` / `oldestAvailableRev` / `droppedEvents` (see the change-feed bullet) |
 | `offset` / `limit` | index-page the returned list (limit 1-100, default 20) |
 | `afterId: "12"` | keyset-page it: the records with an id above `"12"`; cannot be combined with `offset` |
-| `mergeDisjoint: true` | opt-in: apply a stale content patch when the concurrent change touched only fields this patch leaves out |
+| `mergeDisjoint: true` | opt-in: apply a stale content patch when the concurrent change touched only fields this patch leaves out — and it belongs to a PATCH, so a call that sends none (a read, a removal, an addition) is refused rather than quietly ignoring it |
 
 ```text
 tasks({ "tasks": [{ "text": "Draft the plan" }] })
@@ -986,8 +986,16 @@ tasks({ "tasks": [{ "id": "1", "completed": true }],
   from the page. `page.nextOffset` (offset mode) or `page.nextAfterId` (`afterId`
   mode) is omitted when `hasMore` is false; loop on it to read the rest. The page is
   bounded by 100 items and a 64 KiB budget charged on the task records themselves — the JSON
-  around them is never counted, and the first record of a page always lands. Caps: 200 tasks, 4000
-  characters of text each, and going over is a refusal that sizes the job — `tasks would hold
+  around them is never counted, and the first record of a page always lands. That same budget then
+  covers the WHOLE answer, in one order: the page first, then the bodies this call echoes back
+  (its `entry`, the `removed` bodies, and the records an `ids` read named), so patching the record
+  at the head of a page no longer pays for one body twice. What no longer fits is WITHHELD rather
+  than cut: an echo collapses to `{ id, rev }` — an absent body, never an empty one — an `ids` read
+  stops at the last whole body and continues at `page.nextOffset`, and the answer says so with
+  `budgetTruncated: true` beside the envelope (`page.budgetTruncated` is the page half). Whatever
+  the collection allows, a tool result delivered to a model is capped again by the harness at
+  32,768 bytes. Caps: 200 tasks, 4000
+  characters of text each (counted as UTF-16 code units, so one astral emoji is 2 of them), and going over is a refusal that sizes the job — `tasks would hold
   201 tasks; the maximum is 200. Remove one before adding.`, or `Remove 2 more before adding.`
   when you are two over, because the number already nets off the `remove` list the same call
   sends.
@@ -1026,7 +1034,9 @@ tasks({ "tasks": [{ "id": "1", "completed": true }],
   five keys are written after that trim and never charged, and its first event always lands, a
   feed-bearing answer can come back a little over the declared budget by a small fixed amount that
   does not grow with `droppedEvents`. A feed is FIVE keys, and
-  nothing else adds any of them: `changes` (oldest first); `changesHasMore` — **this answer was
+  nothing else adds any of them: `changes` (oldest first — an EVENT ENVELOPE, not a diff: an
+  `update` names WHICH fields moved and never their VALUES, and an `add`/`remove` names nothing
+  beyond the id, so the feed says what to re-read and the read supplies the values); `changesHasMore` — **this answer was
   cut short**, more events exist above your `since` than the 50-entry cap or the byte budget let
   through, and nothing was lost, so read on from the last `rev` you got; `changesTruncated` —
   **the retention floor moved past `since`**, so part of the gap is gone for good and no further
@@ -1100,7 +1110,11 @@ a silent overwrite into an explicit, recoverable error:
   rejects, a removal never merges, and a log that cannot prove full coverage rejects
   rather than guessing — and when it rejects a second time the advice says why
   (`"mergeDisjoint" is already set, and the change window no longer covers every
-  revision since <expected>, so it cannot prove this patch disjoint.`).
+  revision since <expected>, so it cannot prove this patch disjoint.`). It is REFUSED
+  outright when the call carries no patch at all — an `ids` read, a `remove`, an
+  addition — because a flag that guards nothing is a flag that gets believed rather than
+  used: `notes "mergeDisjoint" applies to a patch whose record changed under it; this
+  call sends no patch, so there is nothing for it to merge.`
 
 ```ts
 // ONE harness session, two agents: `coder` and `reviewer`. Record "1" sits at
@@ -1161,7 +1175,13 @@ stable decimal-string ids from `"1"`, and cleared by `reset()` (ids restart at
 
 Pages default to 20 records (max 100) with a 64 KiB budget charged on the serialized records
 themselves and not on the `counts`/`page` JSON around them (the first record of a page always
-lands); caps are 200 records, 200-character names/titles, 4000-character text, and at most 32
+lands, and the same budget then pays for the body this call echoes back, so a written record that
+comes back as `{ id, rev }` is a record this answer had no budget left to echo — not one whose
+fields were cleared — while `get`, the one read that pays for the body, is never cut; either way
+the answer carries `budgetTruncated: true` when anything was withheld, and a tool result delivered
+to a model is capped again by the harness at 32,768 bytes); caps are 200 records,
+200-character names/titles, 4000-character text (counted as UTF-16 code units, so one astral emoji
+is 2 of them), and at most 32
 profile traits of 200 characters. Every result is a defensive snapshot (arrays and records
 are copies). A rejected
 call changes nothing: unknown action, missing/blank `id`, unknown id, wrong field

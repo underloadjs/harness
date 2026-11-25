@@ -42,11 +42,15 @@ export const TASK_MAX_TEXT = 4000;
 export const TASKS_COLLECTION: RecordCollectionDefinition = {
     name: 'tasks',
     maxRecords: TASK_MAX_RECORDS,
-    // F13's real invariant is inner page budget < OUTER model-facing budget, and it
-    // holds by construction: the page is budgeted at 64 KiB while ./result-budget.ts
-    // caps a rendered tool result at MODEL_TOOL_RESULT_BUDGET_BYTES (256 KiB). A
-    // page can therefore never report `hasMore: false` while the outer envelope
-    // silently truncates it. R8 says the 64 KiB number itself is tunable.
+    // F13's real invariant is about the RELATION of the two budgets, and the old sentence
+    // for it is stale: the page is budgeted at 64 KiB while ./result-budget.ts caps one
+    // rendered tool result at MODEL_TOOL_RESULT_BUDGET_BYTES = 32,768 payload bytes, so the
+    // inner budget is the LARGER of the two — the 256 KiB this comment used to quote no
+    // longer exists. What still holds is the honest half: a page over the cap is never
+    // silently truncated behind a `hasMore: false` claim. It is REFUSED at the delivery seam
+    // (F-CUTTER) with a "re-run with narrower arguments" error the caller can act on. R8
+    // says the 64 KiB number itself is tunable; an agent that needs a page to arrive whole
+    // sets `responseBudgetBytes` at or below 32,768.
     responseBudgetBytes: 64 * 1024,
     wrapper: { tool: 'tasks', plural: 'tasks', singular: 'task', style: 'batch' },
     fields: [

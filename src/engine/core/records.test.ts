@@ -507,12 +507,16 @@ describe('records engine — the stale refusal only recommends what the caller c
         );
     };
 
-    it('T4.1: a removal with a stale token never mentions mergeDisjoint, flagged or not', async () => {
+    it('T4.1: a removal cannot carry mergeDisjoint at all, flagged or not', async () => {
         const engine = createRecordEngine();
 
         await raced(engine);
 
-        // The observed case: the caller HAD sent the flag, and was told to send it.
+        // R11 — the case this test used to pin ("the caller HAD sent the flag, and was told
+        // to send it") is now refused at the top of the plan instead: a removal has no patch,
+        // so `mergeDisjoint` guards nothing and accepting it silently was the defect. The
+        // refusal runs BEFORE any store read, so it does not matter that the token is stale —
+        // the malformed argument is reported as the malformed argument it is.
         const flagged = await expectCode(
             run(
                 engine,
@@ -520,17 +524,16 @@ describe('records engine — the stale refusal only recommends what the caller c
                 { remove: ['2'], expects: [{ id: '2', rev: 1 }], mergeDisjoint: true },
                 'latecomer'
             ),
-            RECORD_ERROR_CODES.staleRecord
+            RECORD_ERROR_CODES.invalidInput
         );
 
-        expect(flagged.message).toContain(
-            'tasks "2" changed since revision 1 (now 2, last edited by "editor"'
+        expect(flagged.message).toBe(
+            'invalid-input: tasks "mergeDisjoint" applies to a patch whose record changed under ' +
+                'it; this call sends no patch, so there is nothing for it to merge.'
         );
-        expect(flagged.message).toContain('retry with "expects" [{ id: "2", rev: 2 }].');
-        expect(flagged.message.includes('mergeDisjoint')).toBe(false);
 
-        // Same answer without the flag: the flag was never an option for a removal. The
-        // refusal above changed nothing, so id "2" is still at rev 2 and still stale.
+        // Same call without the flag: the stale removal answers with its own refusal, and the
+        // flag is never recommended for it (the R4 rule this test was written for).
         const plain = await expectCode(
             run(engine, 'tasks', { remove: ['2'], expects: [{ id: '2', rev: 1 }] }, 'latecomer'),
             RECORD_ERROR_CODES.staleRecord
@@ -651,6 +654,10 @@ describe('records engine — a token for an absent id tells the truth (R5)', () 
         )) as { profile: RecordEntry };
         const foreignId = profile.profile.id;
 
+        // R-0012 — the CODE is `unknown-record`, not `stale-record`: a token cannot be stale
+        // about a record this collection never held, and `stale-record` sent the caller to
+        // re-read a `tasks` list that would never contain the id. The SENTENCE is unchanged,
+        // because naming the collection that DOES hold it is the actionable half.
         const failure = await expectCode(
             run(
                 engine,
@@ -658,11 +665,11 @@ describe('records engine — a token for an absent id tells the truth (R5)', () 
                 { tasks: [{ id: foreignId, text: 'mine now' }], expects: [{ id: foreignId, rev: 1 }] },
                 'author'
             ),
-            RECORD_ERROR_CODES.staleRecord
+            RECORD_ERROR_CODES.unknownRecord
         );
 
         expect(failure.message).toBe(
-            `stale-record: tasks id "${foreignId}" belongs to "profiles" — re-read that collection.`
+            `unknown-record: tasks id "${foreignId}" belongs to "profiles" — re-read that collection.`
         );
         expect(failure.message.includes('was removed')).toBe(false);
         expect(failure.message.includes('free again')).toBe(false);
@@ -691,7 +698,7 @@ describe('records engine — a token for an absent id tells the truth (R5)', () 
                 { collection: 'tasks', entries: [{ id: foreignId, text: 'mine now' }], expects: [{ id: foreignId, rev: 1 }] },
                 'author'
             ),
-            RECORD_ERROR_CODES.staleRecord
+            RECORD_ERROR_CODES.unknownRecord
         );
     });
 
@@ -851,8 +858,11 @@ describe('records engine — coded rejections (Decision O)', () => {
             RECORD_ERROR_CODES.fieldTooLong
         );
 
+        // 0012 (F-STORE 11) — the count named in the message is now labelled honestly: it
+        // is a UTF-16 code-unit count (`.length`), not a code-point/grapheme count. A string
+        // of astral emoji reports double its visible length, and the message says so.
         expect(tooLong.message).toBe(
-            'field-too-long: tasks "text" is 4001 characters; the limit is 4000. Shorten it and retry.'
+            'field-too-long: tasks "text" is 4001 characters, counted as UTF-16 code units; the limit is 4000. Shorten it and retry.'
         );
 
         const full = await expectCode(
@@ -3372,5 +3382,928 @@ describe('records engine — the change feed names its floor (0011)', () => {
             'collectionsRev',
             'storeRev'
         ]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F-STORE — one response budget, honest caps, and a feed that names values.
+//
+// This is the records-engine half of the F-STORE review (M1-M4 plus the minors 5-12) — the
+// same work the production comments call R-0012 (see the fitters' header at
+// src/engine/core/records.ts:483). Every expectation below is the exact observed answer,
+// captured against the shipped engine by Temp/fix-store/probe2.ts, probe4.ts, probe5.ts and
+// probe6.ts, so a regression shows up as a byte count or a quoted message, not as a vague
+// "it got shorter".
+// ---------------------------------------------------------------------------
+
+// The budget is a BYTE budget, so the tests measure the unit the engine charges
+// (`rowBytes`, src/engine/core/records.ts:504) — what the caller actually receives. The
+// calls that WRITE also send `threadId: 'thread-1'`, because an attributed row carries
+// `updatedThreadId` and every byte count pinned below was captured in that context.
+const wireBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value), 'utf8');
+
+// The complete offset walk of the `legacy` fixture the restore-softening pin uses, spelled
+// `id:a:b`. It is the pair that proves a stripped `sortable` costs nothing: the walk must be
+// identical on the engine that never saw the bad option and the one that restored it.
+const walkLegacy = async (engine: ReturnType<typeof createRecordEngine>): Promise<string[]> => {
+    const seen: string[] = [];
+    let offset = 0;
+
+    for (;;) {
+        const page = await run(engine, 'records', { collection: 'legacy', offset, limit: 3 }, 'reader');
+
+        seen.push(...(page.entries as RecordEntry[]).map((entry) => `${entry.id}:${entry.a}:${entry.b}`));
+
+        if ((page.page as Record<string, unknown>).hasMore !== true) break;
+
+        offset = (page.page as Record<string, number>).nextOffset as number;
+    }
+
+    return seen;
+};
+
+describe('records engine — the budget bounds every answer and every refusal names its cap (F-STORE)', () => {
+    // M1 — `responseBudgetBytes` was ONE budget with three uncharged spenders. `project`
+    // trimmed the page echo and nothing else was measured: the patched record arrived a
+    // SECOND time in `entry` (a 1,024-byte collection answered a patch with 60,409 bytes),
+    // an `ids` read added every body it named after the page was already cut, and removals
+    // echoed whole records. One meter now runs across the response in charge order
+    // page -> `entry` -> `removed` (`echoMeter`, src/engine/core/records.ts:547).
+    it('M1: one budget covers the page echo, the patched record, and the removal bodies', async () => {
+        const engine = createRecordEngine();
+
+        await run(
+            engine,
+            'records',
+            {
+                define: {
+                    name: 'notes',
+                    fields: [{ key: 'body', type: 'text' }],
+                    maxRecords: 10,
+                    responseBudgetBytes: 1024
+                }
+            },
+            'author'
+        );
+
+        const body = 'x'.repeat(600);
+        const seeded = await run(
+            engine,
+            'records',
+            { collection: 'notes', entries: [{ body }, { body }, { body }, { body }] },
+            'author',
+            'thread-1'
+        );
+
+        // One row is already over a 1,024-byte budget, and it is still admitted: the first
+        // row of every KIND always is, because an answer with no content and a `hasMore`
+        // promise is a loop that never terminates. The four ids are named in full even
+        // though three bodies were withheld — `addedIds` is never metered.
+        expect(seeded.addedIds).toEqual(['1', '2', '3', '4']);
+        expect((seeded.entries as RecordEntry[]).map((entry) => entry.id)).toEqual(['1']);
+        expect(seeded.entry).toBeUndefined();
+        expect(seeded.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            budgetTruncated: true,
+            nextOffset: 1
+        });
+        expect(seeded.budgetTruncated).toBe(true);
+        expect(wireBytes(seeded)).toBe(924);
+
+        const patched = await run(
+            engine,
+            'records',
+            { collection: 'notes', entries: [{ id: '1', body: `q${body}` }], expects: [{ id: '1', rev: 1 }] },
+            'author',
+            'thread-1'
+        );
+
+        // The headline number: this same call returned 60,409 bytes before the fix. The
+        // page echo is cut to what fits, and the patched record rides in `entry` WHOLE —
+        // `entry` is the only place a one-record write shows its content, so it gets the
+        // one allowance per KIND (src/engine/core/records.ts:570).
+        expect(patched.changedIds).toEqual(['1']);
+        expect(patched.entry).toEqual({
+            id: '1',
+            body: `q${body}`,
+            rev: 2,
+            updatedBy: 'author',
+            updatedThreadId: 'thread-1',
+            updatedAt: (patched.entry as RecordEntry).updatedAt
+        });
+        expect(patched.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            budgetTruncated: true,
+            nextOffset: 1
+        });
+        // The two flags mean two different things and both are on: the page flag says "the
+        // echo stopped short of `limit`", the top-level one says "this answer withheld
+        // something" (the removed bodies below are withheld with the page intact).
+        expect(patched.budgetTruncated).toBe(true);
+        expect(wireBytes(patched)).toBe(1642);
+
+        const pair = await run(
+            engine,
+            'records',
+            { collection: 'notes', remove: ['2', '3'], expects: [{ id: '2', rev: 1 }, { id: '3', rev: 1 }] },
+            'author',
+            'thread-1'
+        );
+
+        // A removal used to echo the WHOLE deleted record per id. Only the first body is
+        // admitted now (src/engine/core/records.ts:572); the next collapses to `{ id, rev }`
+        // — the two keys the caller needs for its next write — with the body ABSENT rather
+        // than blanked, so "no body" never reads as "the body was cleared".
+        expect(pair.removed).toEqual([
+            {
+                id: '2',
+                body,
+                rev: 1,
+                updatedBy: 'author',
+                updatedThreadId: 'thread-1',
+                updatedAt: (pair.removed as RecordEntry[])[0].updatedAt
+            },
+            { id: '3', rev: 1 }
+        ]);
+        expect('body' in (pair.removed as RecordEntry[])[1]).toBe(false);
+        expect(pair.budgetTruncated).toBe(true);
+        expect(wireBytes(pair)).toBe(1645);
+
+        const multi = await run(engine, 'records', { collection: 'notes', ids: ['1', '4'] }, 'author', 'thread-1');
+
+        // The other half of M1: an `ids` read was the one answer with no budget at all
+        // (3,586 bytes here, past the 32,768-byte delivery cap once records get bigger).
+        // It is metered by the same number now, and `nextOffset` counts positions in the
+        // DEDUPED requested-id list, not in the collection.
+        expect((multi.entries as RecordEntry[]).map((entry) => entry.id)).toEqual(['1']);
+        expect(multi.budgetTruncated).toBe(true);
+        expect(multi.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            nextOffset: 1,
+            budgetTruncated: true
+        });
+        expect(wireBytes(multi)).toBe(896);
+
+        // ...which is what makes the cursor usable: replaying the SAME ids call at
+        // `nextOffset` continues the caller's own list (id 4, body intact) instead of
+        // pointing at a record it already holds. Nothing was withheld here, so the marker
+        // is absent, not `false`.
+        const next = await run(engine, 'records', { collection: 'notes', ids: ['1', '4'], offset: 1 }, 'author');
+        expect((next.entries as RecordEntry[]).map((entry) => ({ id: entry.id, body: entry.body }))).toEqual([
+            { id: '4', body }
+        ]);
+        expect(next.page).toEqual({ offset: 1, limit: 20, hasMore: false });
+        expect('budgetTruncated' in next).toBe(false);
+
+        // And the one read that is never cut: a single-id get IS its record, so `entry`
+        // keeps the body whatever the budget says.
+        const single = await run(engine, 'records', { collection: 'notes', ids: ['1'] }, 'author');
+        expect((single.entry as RecordEntry).body).toBe(`q${body}`);
+        expect(single.page).toEqual({ offset: 0, limit: 20, hasMore: false });
+        expect('budgetTruncated' in single).toBe(false);
+    });
+
+    // D-A (independent review) — the echo meter charged the singular `entry` body TWICE. Its
+    // baseline was `Buffer.byteLength(JSON.stringify(result))` read AFTER `result.entry` had been
+    // assigned, and `fitOne` then debited that same body again through `admit(copy, first = true)`
+    // — so every judgement about the `removed` bodies was made one entry-row too poor, and a
+    // batch whose response fitted comfortably was reported truncated anyway. The rule the file
+    // states (and the tool description publishes) is that a record body is never paid for twice.
+    //
+    // THE FIXTURE MUST BE HONEST ABOUT WHERE THE ENTRY BODY LIVES. A mutation echoes the whole
+    // collection in `entries`, so a naive batch repeats the patched record IN THE PAGE as well —
+    // bytes the envelope really does carry and the baseline must count. Here the batch removes two
+    // of the four records, so the page echoes the patched record and the survivor, and the `entry`
+    // body is the response's own single copy: 2,000 bytes of budget against a 1,746-byte response
+    // leaves 254 bytes of genuine room that the phantom second charge (a full 300-byte row) ate.
+    //
+    // NOTE THE DIRECTION: the correct answer is BIGGER than the defective one (1,746 > 1,470
+    // bytes), so no "stays under budget" check can pin this — that passed on the broken code too.
+    it('D-A: a batch that mixes an `entry` with `removed` bodies pays for the entry once', async () => {
+        const seed = ['a', 'b', 'c', 'd'].map((lead) => ({ note: `${lead}${'x'.repeat(199)}` }));
+        const patched = { note: `e${'y'.repeat(199)}` };
+
+        // `mixedAt` runs the SAME mixed batch against a collection budgeted at `budget`: one
+        // patched record (so `entry` exists — the row that used to be charged twice) plus two
+        // removals (so `removed` exists — the rows that judgement withheld).
+        const mixedAt = async (budget: number) => {
+            const engine = createRecordEngine();
+
+            await run(engine, 'records', {
+                define: {
+                    name: 'echoes',
+                    fields: [{ key: 'note', type: 'text' }],
+                    maxRecords: 10,
+                    responseBudgetBytes: budget
+                }
+            });
+
+            await run(engine, 'records', { collection: 'echoes', entries: seed }, 'author', 'thread-1');
+
+            return await run(
+                engine,
+                'records',
+                {
+                    collection: 'echoes',
+                    entries: [{ id: '1', ...patched }],
+                    remove: ['2', '3'],
+                    expects: [
+                        { id: '1', rev: 1 },
+                        { id: '2', rev: 1 },
+                        { id: '3', rev: 1 }
+                    ]
+                },
+                'author',
+                'thread-1'
+            );
+        };
+
+        const mixed = await mixedAt(2000);
+
+        // THE FLAG IS ABSENT, not false: this answer withheld nothing. On the double-charging code
+        // the same call read `budgetTruncated: true` with `removed[1]` collapsed to `{ id, rev }`
+        // — 1,470 delivered bytes against a 2,000-byte budget.
+        expect('budgetTruncated' in mixed).toBe(false);
+        expect('budgetTruncated' in (mixed.page as Record<string, unknown>)).toBe(false);
+
+        // Every echo kept its body: the entry, and BOTH removals.
+        expect(mixed.changedIds).toEqual(['1']);
+        expect(mixed.entry).toEqual({
+            id: '1',
+            ...patched,
+            rev: 2,
+            updatedBy: 'author',
+            updatedThreadId: 'thread-1',
+            updatedAt: (mixed.entry as RecordEntry).updatedAt
+        });
+        expect(mixed.removed).toEqual([
+            {
+                id: '2',
+                note: seed[1].note,
+                rev: 1,
+                updatedBy: 'author',
+                updatedThreadId: 'thread-1',
+                updatedAt: (mixed.removed as RecordEntry[])[0].updatedAt
+            },
+            {
+                id: '3',
+                note: seed[2].note,
+                rev: 1,
+                updatedBy: 'author',
+                updatedThreadId: 'thread-1',
+                updatedAt: (mixed.removed as RecordEntry[])[1].updatedAt
+            }
+        ]);
+        expect((mixed.removed as RecordEntry[]).map((row) => 'note' in row)).toEqual([true, true]);
+        // The page is the survivor only — proof the `entry` row is not also riding in it, which is
+        // what makes the double charge spurious rather than a second real copy.
+        expect((mixed.entries as RecordEntry[]).map((row) => row.id)).toEqual(['1', '4']);
+        expect(mixed.counts).toEqual({ total: 2 });
+
+        // THE DEFECT'S FINGERPRINT: what the double-charged meter delivered instead, pinned as a
+        // number — the same envelope with `removed[1]`'s 300-byte body traded for an 18-byte stub
+        // and the flag it did not earn switched on (the flag key lands last, as the engine writes
+        // it, so this reconstruction is byte-for-byte the withheld answer).
+        expect(
+            wireBytes({
+                ...mixed,
+                removed: [(mixed.removed as RecordEntry[])[0], { id: '3', rev: 1 }],
+                budgetTruncated: true
+            })
+        ).toBe(1470);
+
+        // THE SAFE DIRECTION SURVIVES THE FIX: at 1,600 the same response (1,746 bytes whole)
+        // genuinely does not fit, and the meter still withholds — it never admits a response past
+        // the budget it was metered against. Same fixture, same bodies, one withheld, the wire
+        // inside the cap, and the page still whole (only echoes are ever traded away, never ids).
+        const tight = await mixedAt(1600);
+
+        expect(tight.budgetTruncated).toBe(true);
+        expect('budgetTruncated' in (tight.page as Record<string, unknown>)).toBe(false);
+        expect((tight.removed as RecordEntry[]).map((row) => 'note' in row)).toEqual([true, false]);
+        expect((tight.removed as RecordEntry[])[1]).toEqual({ id: '3', rev: 1 });
+        expect(wireBytes(tight)).toBe(1470);
+        expect(wireBytes(tight)).toBeLessThanOrEqual(1600);
+    });
+
+    // M1(e) — the fitters run inside `executeCollection`, so the wrappers inherit them; what
+    // was broken is that `toWrapperResult` rebuilt the answer key-by-key and dropped both
+    // flags, telling the model its truncated `tasks` answer was complete.
+    it('M1: the `tasks` wrapper forwards `budgetTruncated` on a read and on a write', async () => {
+        const engine = createRecordEngine();
+
+        const chunk = 'x'.repeat(600);
+        const seeded = await tasks(
+            engine,
+            { tasks: Array.from({ length: 20 }, () => ({ text: chunk.repeat(6) })) },
+            'author',
+            'thread-1'
+        );
+
+        // 20 tasks of 3,600 characters against the built-in 65,536-byte budget: 17 fit, the
+        // other 3 are named in `addedIds` only, and the wrapper says so.
+        expect(seeded.addedIds).toHaveLength(20);
+        expect((seeded.tasks as RecordEntry[]).length).toBe(17);
+        expect(seeded.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            budgetTruncated: true,
+            nextOffset: 17
+        });
+        expect(seeded.budgetTruncated).toBe(true);
+        expect(wireBytes(seeded)).toBe(63806);
+
+        const read = await tasks(engine, { ids: seeded.addedIds as string[] }, 'author');
+
+        // An `ids` read of all 20 through the wrapper: same 17 rows, and the marker reaches
+        // the model instead of dying in the envelope rebuild.
+        expect((read.tasks as RecordEntry[]).length).toBe(17);
+        expect(read.entry).toBeUndefined();
+        expect(read.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            nextOffset: 17,
+            budgetTruncated: true
+        });
+        expect(read.budgetTruncated).toBe(true);
+        expect(wireBytes(read)).toBe(63702);
+
+        const patched = await tasks(
+            engine,
+            { tasks: [{ id: '1', text: `${chunk}!`.repeat(6) }], expects: [{ id: '1', rev: 1 }] },
+            'author',
+            'thread-1'
+        );
+
+        // The write branch: 17 rows plus the patched record in `entry`, and the answer still
+        // declares what it withheld. The `entry` allowance is why this can pass 65,536.
+        expect((patched.tasks as RecordEntry[]).length).toBe(17);
+        expect((patched.entry as RecordEntry).text).toBe(`${chunk}!`.repeat(6));
+        expect(patched.changedIds).toEqual(['1']);
+        expect(patched.budgetTruncated).toBe(true);
+        expect(wireBytes(patched)).toBe(67477);
+    });
+
+    // M2 — the field options were read type-blind: `maxItems` on an `enum` or `values` on an
+    // `integer` was accepted, stored, and then never applied, so the cap the model saw in
+    // `describe` was a lie. `readFieldDefinition` refuses each option off-type
+    // (src/engine/core/records.ts, FIELD_OPTION_TYPES / refuseInapplicableOption), the same
+    // way it already refused `getOnly` and `sortable` off-type.
+    it('M2: a field option declared on a type that cannot honour it is refused by name', async () => {
+        const engine = createRecordEngine();
+
+        const refused = async (fields: unknown[], name: string) =>
+            expectCode(
+                run(engine, 'records', { define: { name, fields } }),
+                RECORD_ERROR_CODES.definitionInvalid
+            );
+
+        expect((await refused([{ key: 'flag', type: 'boolean', maxLength: 4 }], 'm2a')).message).toBe(
+            'definition-invalid: records "define".fields[0].maxLength is only valid on a text or strings field.'
+        );
+        expect((await refused([{ key: 'pick', type: 'enum', values: ['a'], maxItems: 2 }], 'm2b')).message).toBe(
+            'definition-invalid: records "define".fields[0].maxItems is only valid on a strings field.'
+        );
+        expect((await refused([{ key: 'list', type: 'strings', max: 5 }], 'm2c')).message).toBe(
+            'definition-invalid: records "define".fields[0].max is only valid on an integer field.'
+        );
+        expect((await refused([{ key: 'level', type: 'integer', values: [1, 2] }], 'm2d')).message).toBe(
+            'definition-invalid: records "define".fields[0].values is only valid on an enum field.'
+        );
+
+        // The two options that ARE applicable stay accepted — the refusal is per option,
+        // not a blanket ban on declaring caps.
+        const legal = await run(
+            engine,
+            'records',
+            {
+                define: {
+                    name: 'm2_legal',
+                    fields: [
+                        { key: 'pick', type: 'enum', values: ['a', 'b'] },
+                        { key: 'list', type: 'strings', maxLength: 4, maxItems: 2 }
+                    ]
+                }
+            }
+        );
+        expect((legal.definition as { name: string }).name).toBe('m2_legal');
+    });
+
+    // M4 — `sortable` marks THE sort key, and a second one used to be stored silently, which
+    // made `describe` report two sort keys for a collection that sorts by one.
+    it('M4: a second `sortable` field is refused and names the one that already has it', async () => {
+        const engine = createRecordEngine();
+
+        const failure = await expectCode(
+            run(engine, 'records', {
+                define: {
+                    name: 'm4_two',
+                    fields: [
+                        { key: 'a', type: 'integer', sortable: true },
+                        { key: 'b', type: 'integer', sortable: true }
+                    ]
+                }
+            }),
+            RECORD_ERROR_CODES.definitionInvalid
+        );
+
+        expect(failure.message).toBe(
+            `definition-invalid: records "define".fields[1].sortable is only valid on the collection's one sort key; "a" (fields[0]) is already the sortable field.`
+        );
+
+        const one = await run(engine, 'records', {
+            define: { name: 'm4_one', fields: [{ key: 'a', type: 'integer', sortable: true }] }
+        });
+        expect((one.definition as { name: string }).name).toBe('m4_one');
+    });
+
+    // M3 — a `strings` value over `maxItems` was silently truncated, so the model wrote five
+    // tags, saw a green result, and read back three. The value still trims and de-duplicates
+    // quietly (it always has), but the count that no longer fits is REFUSED, and the count
+    // that fits is reported in `droppedEntries` (src/engine/core/records.ts:3623) — charged
+    // only by a write that really stored something.
+    it('M3: array entries trimmed away are counted, and entries beyond the cap are refused', async () => {
+        const engine = createRecordEngine();
+
+        await run(engine, 'records', {
+            define: {
+                name: 'tag10',
+                fields: [{ key: 'tags', type: 'strings', maxItems: 3, maxLength: 8 }]
+            }
+        });
+
+        const added = await run(
+            engine,
+            'records',
+            { collection: 'tag10', entries: [{ tags: ['x', 'x', '  x  ', 'yy', 'zz'] }] },
+            'author'
+        );
+
+        // 5 sent, 3 stored: the duplicate and the whitespace-collapsed duplicate are the two
+        // the ledger names. The write is still a success — the ledger is the disclosure.
+        expect((added.entry as RecordEntry).tags).toEqual(['x', 'yy', 'zz']);
+        expect(added.addedIds).toEqual(['1']);
+        expect(added.droppedEntries).toEqual({ tags: 2 });
+
+        const patched = await run(
+            engine,
+            'records',
+            { collection: 'tag10', entries: [{ id: '1', tags: ['a', 'a', 'b'] }], expects: [{ id: '1', rev: 1 }] },
+            'author'
+        );
+        expect(patched.changedIds).toEqual(['1']);
+        expect(patched.droppedEntries).toEqual({ tags: 1 });
+
+        // A patch that stores nothing contributes nothing to the ledger — an untouched
+        // record cannot have dropped an entry.
+        const noop = await run(
+            engine,
+            'records',
+            { collection: 'tag10', entries: [{ id: '1', tags: ['a', 'a', 'b'] }], expects: [{ id: '1', rev: 2 }] },
+            'author'
+        );
+        expect(noop.noopIds).toEqual(['1']);
+        expect('droppedEntries' in noop).toBe(false);
+
+        // A removal carries no values at all, so it never grows the ledger either.
+        const removed = await run(
+            engine,
+            'records',
+            { collection: 'tag10', remove: ['1'], expects: [{ id: '1', rev: 2 }] },
+            'author'
+        );
+        expect('droppedEntries' in removed).toBe(false);
+
+        // Beyond the cap the answer is a refusal, and its wording separates the two counts so
+        // the caller can tell "you sent too many" from "you sent enough distinct ones".
+        const overPlain = await expectCode(
+            run(engine, 'records', { collection: 'tag10', entries: [{ tags: ['a', 'b', 'c', 'd', 'e'] }] }, 'author'),
+            RECORD_ERROR_CODES.fieldTooManyItems
+        );
+        expect(overPlain.message).toBe(
+            'field-too-many-items: tag10 "tags" has 5 entries; the limit is 3.'
+        );
+
+        const overTrimmed = await expectCode(
+            run(
+                engine,
+                'records',
+                { collection: 'tag10', entries: [{ tags: ['q', 'q', 'w', 'e', 'r'] }] },
+                'author'
+            ),
+            RECORD_ERROR_CODES.fieldTooManyItems
+        );
+        expect(overTrimmed.message).toBe(
+            'field-too-many-items: tag10 "tags" has 4 entries after trimming and de-duplication (5 sent); the limit is 3.'
+        );
+    });
+
+    // M5 — `max` on an `integer` field was declared, echoed by `describe`, and never
+    // enforced: 99 landed in a field capped at 10.
+    it('M5: an integer outside its declared magnitude is refused with the value it sent', async () => {
+        const engine = createRecordEngine();
+
+        await run(engine, 'records', {
+            define: { name: 'num10', fields: [{ key: 'n', type: 'integer', max: 10 }] }
+        });
+
+        const failure = await expectCode(
+            run(engine, 'records', { collection: 'num10', entries: [{ n: 99 }] }, 'author'),
+            RECORD_ERROR_CODES.fieldOutOfRange
+        );
+
+        expect(failure.message).toBe('field-out-of-range: num10 "n" is 99; its magnitude limit is 10.');
+
+        const inside = await run(engine, 'records', { collection: 'num10', entries: [{ n: 10 }] }, 'author');
+        expect((inside.entry as RecordEntry).n).toBe(10);
+    });
+
+    // M7 — one id repeated in `ids` used to be read N times, and an id that appeared in
+    // `ids` twice was also free to collide with `expects`. `ids` de-duplicates first, so
+    // `['1','1','1']` is a one-record read and answers through `entry`.
+    it('M7: repeated ids collapse into one lookup, and a read that resolves to one record answers with `entry`', async () => {
+        const engine = createRecordEngine();
+
+        const seeded = await run(
+            engine,
+            'records',
+            { collection: 'tasks', entries: [{ text: 'one' }, { text: 'two' }] },
+            'author'
+        );
+        const ids = seeded.addedIds as string[];
+
+        const dupes = await run(engine, 'records', { collection: 'tasks', ids: [ids[0], ids[0], ids[0]] }, 'author');
+
+        expect(dupes.entry).toBeDefined();
+        expect((dupes.entry as RecordEntry).id).toBe(ids[0]);
+        expect(dupes.entries).toBeUndefined();
+        // The page describes the ONE record the deduped list resolved to, so `hasMore` is
+        // honestly false — the walk is over, not truncated.
+        expect(dupes.page).toEqual({ offset: 0, limit: 20, hasMore: false });
+    });
+
+    // M8 — `mergeDisjoint` was accepted by any call shape, including the three that have no
+    // patch to merge. Accepting it there meant a caller could believe it had opted into a
+    // merge it never got.
+    it('M8: `mergeDisjoint` beside a call with no patch is refused, and changes nothing', async () => {
+        const engine = createRecordEngine();
+
+        await tasks(engine, { tasks: [{ text: 'a' }] }, 'author');
+
+        const refusal =
+            'invalid-input: tasks "mergeDisjoint" applies to a patch whose record changed under it; this call sends no patch, so there is nothing for it to merge.';
+
+        // The flag is refused on all three shapes at once: a read, an addition, and a
+        // removal. Each answer is the same bytes, because each is the same mistake.
+        for (const parameters of [
+            { ids: ['1'], mergeDisjoint: true },
+            { tasks: [{ text: 'b' }], mergeDisjoint: true },
+            { remove: ['1'], expects: [{ id: '1', rev: 1 }], mergeDisjoint: true }
+        ]) {
+            const failure = await expectCode(
+                tasks(engine, parameters, 'author'),
+                RECORD_ERROR_CODES.invalidInput
+            );
+            expect(failure.message).toBe(refusal);
+        }
+
+        // A refused call is a call that never happened.
+        expect((await tasks(engine, {})).counts).toEqual({ total: 1, completed: 0, pending: 1 });
+    });
+
+    // M9 — a token AHEAD of the store (rev 99 against a record at rev 1, the shape a stale
+    // client cache or a botched retry produces) took the ordinary stale branch and told the
+    // caller the record "changed since revision 99" — the opposite of the truth, plus advice
+    // to retry with a rev it had just been given.
+    it('M9: a token ahead of the store says nothing has moved, and the behind wording is untouched', async () => {
+        const engine = createRecordEngine();
+
+        await tasks(engine, { tasks: [{ text: 'a' }] }, 'author');
+        const read = await tasks(engine, { ids: ['1'] }, 'author');
+        const current = read.entry as RecordEntry;
+
+        const ahead = await expectCode(
+            tasks(engine, { tasks: [{ id: '1', text: 'b' }], expects: [{ id: '1', rev: 99 }] }, 'author'),
+            RECORD_ERROR_CODES.staleRecord
+        );
+
+        // Exact bytes: the record's revision, why the token cannot be stale, and the token
+        // the retry actually needs — never a promise that something changed.
+        expect(ahead.message).toBe(
+            `stale-record: tasks "1" is at revision 1 — revision 99 has not been reached, so nothing has changed since you read it (last edited by "author" at ${current.updatedAt}); retry with "expects" [{ id: "1", rev: 1 }]. current: ${JSON.stringify(current)}`
+        );
+        expect(ahead.message).not.toContain('changed fields');
+        expect(ahead.message).not.toContain('mergeDisjoint');
+
+        // The BEHIND branch — the one agents hit constantly — is byte-identical to the
+        // sentence `harness.task.test.ts` pins verbatim.
+        await tasks(engine, { tasks: [{ id: '1', text: 'b' }], expects: [{ id: '1', rev: 1 }] }, 'editor');
+        const moved = await tasks(engine, { ids: ['1'] }, 'author');
+
+        const behind = await expectCode(
+            tasks(engine, { tasks: [{ id: '1', text: 'c' }], expects: [{ id: '1', rev: 1 }] }, 'author'),
+            RECORD_ERROR_CODES.staleRecord
+        );
+        expect(behind.message).toBe(
+            `stale-record: tasks "1" changed since revision 1 (now 2, last edited by "editor" at ${(moved.entry as RecordEntry).updatedAt}); changed fields: text; retry with "expects" [{ id: "1", rev: 2 }] or pass "mergeDisjoint": true. current: ${JSON.stringify(moved.entry)}`
+        );
+    });
+
+    // M10 — the store-full advice: reviewed and found already correct (it counts the batch
+    // and nets it against the cap), so this is a pin, not a fix. What the review DID find in
+    // the same call shape is that a mixed batch at a tiny budget keeps every id list whole
+    // while its echo is cut — which is what makes a cheap write confirmable at all.
+    it('M10: the capacity refusal counts the batch, and a cut echo still names every id', async () => {
+        const engine = createRecordEngine();
+
+        await run(engine, 'records', {
+            define: {
+                name: 'tiny10',
+                fields: [{ key: 'note', type: 'text' }],
+                maxRecords: 5,
+                responseBudgetBytes: 1024
+            }
+        });
+
+        const batch = await run(
+            engine,
+            'records',
+            {
+                collection: 'tiny10',
+                entries: Array.from({ length: 4 }, () => ({ note: 'q'.repeat(1200) }))
+            },
+            'author',
+            'thread-1'
+        );
+
+        // 4 rows of 1,200 characters against 1,024 bytes: one body survives, all four ids
+        // are named, and nothing about the write is a mystery to the caller.
+        expect(batch.addedIds).toEqual(['1', '2', '3', '4']);
+        expect(batch.entry).toBeUndefined();
+        expect((batch.entries as RecordEntry[]).length).toBe(1);
+        expect(batch.budgetTruncated).toBe(true);
+        expect(batch.page).toEqual({
+            offset: 0,
+            limit: 20,
+            hasMore: true,
+            budgetTruncated: true,
+            nextOffset: 1
+        });
+        expect(wireBytes(batch)).toBe(1524);
+
+        const full = await expectCode(
+            run(engine, 'records', { collection: 'tiny10', entries: [{ note: 'z' }, { note: 'z' }] }, 'author'),
+            RECORD_ERROR_CODES.storeFull
+        );
+
+        // Already-correct wording, pinned: the count is the batch total (4 stored + 2 sent),
+        // so the advice matches the call the caller actually made.
+        expect(full.message).toBe('store-full: tiny10 would hold 6 tiny10; the maximum is 5. Remove one before adding.');
+        expect((await run(engine, 'records', { collection: 'tiny10' })).counts).toEqual({ total: 4 });
+    });
+
+    // M11 — the cap is enforced on `.length`, i.e. UTF-16 code units, while the message said
+    // "characters". The engine keeps counting code units (it is the number the cap is
+    // declared in); the message now says what it counted.
+    it('M11: a length refusal says the count is UTF-16 code units, on text and on `strings` entries', async () => {
+        const engine = createRecordEngine();
+
+        await run(engine, 'records', {
+            define: {
+                name: 'many12',
+                fields: [{ key: 'alpha', type: 'text' }, { key: 'tags', type: 'strings', maxLength: 4 }]
+            }
+        });
+
+        // '🎬🎬🎬' is 3 visible characters and 6 code units, and 6 is the number that tripped
+        // a cap of 4 — the message names the unit so the caller can count the same way.
+        const entry = await expectCode(
+            run(engine, 'records', { collection: 'many12', entries: [{ alpha: 'x', tags: ['ab', '🎬🎬🎬'] }] }, 'author'),
+            RECORD_ERROR_CODES.fieldTooLong
+        );
+        expect(entry.message).toBe(
+            'field-too-long: many12 "tags" entry 2 is 6 characters, counted as UTF-16 code units; the limit is 4.'
+        );
+    });
+
+    // M12 — the change feed is an EVENT envelope: it names which fields moved so a caller
+    // can PROVE a concurrent edit is disjoint, and it carries no values. Reviewed and found
+    // correct; pinned so a future "helpful" value in the event row is caught, plus the
+    // canonical field order an update reports.
+    it('M12: a feed row names the fields an update changed, in declaration order, and carries no values', async () => {
+        const engine = createRecordEngine();
+
+        // Declared out of alphabetical order on purpose: the update row must report the
+        // collection's CANONICAL order (zeta, alpha, tags, mid), not the caller's key order.
+        await run(engine, 'records', {
+            define: {
+                name: 'feed12',
+                fields: [
+                    { key: 'zeta', type: 'text' },
+                    { key: 'alpha', type: 'text' },
+                    { key: 'tags', type: 'strings', maxItems: 3, maxLength: 4 },
+                    { key: 'mid', type: 'text' }
+                ]
+            }
+        });
+
+        await run(
+            engine,
+            'records',
+            { collection: 'feed12', entries: [{ alpha: 'first', zeta: 'z1', tags: ['a', 'b'], mid: 'm' }] },
+            'author',
+            'thread-1'
+        );
+        await run(
+            engine,
+            'records',
+            { collection: 'feed12', entries: [{ id: '1', mid: 'm2', alpha: 'second' }], expects: [{ id: '1', rev: 1 }] },
+            'author',
+            'thread-1'
+        );
+        await run(
+            engine,
+            'records',
+            { collection: 'feed12', remove: ['1'], expects: [{ id: '1', rev: 2 }] },
+            'author',
+            'thread-1'
+        );
+
+        const feed = await run(engine, 'records', { collection: 'feed12', since: 0 }, 'reader');
+        const changes = feed.changes as RecordChange[];
+
+        expect(changes.map((change) => change.op)).toEqual(['add', 'update', 'remove']);
+        expect(changes[1].fields).toEqual(['alpha', 'mid']);
+        // `add` and `remove` name no fields: an addition changed everything and a removal
+        // changed the record's existence, so a field list would claim precision it lacks.
+        expect('fields' in changes[0]).toBe(false);
+        expect('fields' in changes[2]).toBe(false);
+        // The whole window is the event envelope — these are ALL the keys any row may carry,
+        // which is the assertion that keeps a value from ever riding along.
+        const keys = new Set(changes.flatMap((change) => Object.keys(change)));
+        expect([...keys].sort()).toEqual(['at', 'by', 'fields', 'id', 'itemRev', 'op', 'rev', 'threadId']);
+        expect(JSON.stringify(changes)).not.toContain('second');
+    });
+
+    // R-0012 follow-up — the restore softening. M2's and M4's refusals are right at DEFINE
+    // time, but a live session can hold a snapshot written before them (`rvxrev_*` fixtures,
+    // probe collections, every pre-fix `define`), and bricking that session's restore over
+    // an option that was never enforced costs more than the misreport the refusal fixes. So
+    // a RESTORE strips the never-enforced options instead of failing, and it provably costs
+    // nothing: `orderedFor`/`project` take the FIRST `sortable`, and no code path ever read
+    // an off-type `maxLength`/`maxItems`/`max`/`values`, so the stripped keys are the keys
+    // the engine already ignored. Pre-existing off-type refusals (`getOnly`, `sortable`,
+    // `count: true`) are NOT part of this channel and still refuse a restore byte-identically.
+    it('R-0012: a snapshot carrying inert field options restores with them stripped, and `define` stays strict', async () => {
+        const writer = createRecordEngine();
+
+        // A definition that satisfies the strict reader on purpose: the inert options are
+        // added to the PERSISTED copy afterwards, which is exactly what a pre-fix snapshot
+        // looks like on disk.
+        await run(
+            writer,
+            'records',
+            {
+                define: {
+                    name: 'legacy',
+                    fields: [
+                        { key: 'title', type: 'text', maxLength: 20 },
+                        { key: 'flag', type: 'boolean' },
+                        { key: 'pick', type: 'enum', values: ['x', 'y'] },
+                        { key: 'a', type: 'integer', sortable: true },
+                        { key: 'b', type: 'integer' }
+                    ],
+                    maxRecords: 10
+                }
+            },
+            'author'
+        );
+
+        for (const [a, b] of [[3, 1], [1, 2], [2, 3], [4, 4]] as [number, number][]) {
+            await run(
+                writer,
+                'records',
+                { collection: 'legacy', entries: [{ title: `t${a}`, flag: a % 2 === 0, pick: 'x', a, b }] },
+                'author',
+                'thread-1'
+            );
+        }
+
+        // The page order the second sort key never got to influence, captured pre-restore.
+        expect(await walkLegacy(writer)).toEqual(['2:1:2', '3:2:3', '1:3:1', '4:4:4']);
+
+        const state = writer.snapshot() as unknown as {
+            collections: { legacy: { definition: { fields: Record<string, unknown>[] } } };
+        };
+        const stored = state.collections.legacy.definition.fields;
+
+        stored[1].maxLength = 4; // boolean -> never enforced
+        stored[2].maxItems = 2; // enum -> never enforced
+        stored[3].max = 9; // integer -> APPLICABLE, must survive
+        stored[4].values = ['q']; // integer -> never enforced
+        stored[4].sortable = true; // the second sort key -> never enforced
+
+        // The restore is a void mutation, so the proof that it did not throw is that the
+        // line below is reached at all.
+        const reader = createRecordEngine();
+
+        reader.restore(state as unknown as never);
+
+        const described = await run(reader, 'records', { collection: 'legacy', describe: true }, 'reader');
+
+        // Stripped, in the engine's own key order, with the APPLICABLE cap kept: an
+        // applicable-but-unusual `max` on the sort key is data, not debris.
+        expect(described.definition).toEqual({
+            name: 'legacy',
+            fields: [
+                { key: 'title', type: 'text', maxLength: 20 },
+                { key: 'flag', type: 'boolean' },
+                { key: 'pick', type: 'enum', values: ['x', 'y'] },
+                { key: 'a', type: 'integer', max: 9, sortable: true },
+                { key: 'b', type: 'integer' }
+            ],
+            maxRecords: 10,
+            responseBudgetBytes: 65536
+        });
+        // `toEqual` reads an absent key and an `undefined` key alike, so the absence is
+        // asserted directly: the stripped options are gone from the live definition, not
+        // blanked in it.
+        expect('maxLength' in (described.definition as { fields: Record<string, unknown>[] }).fields[1]).toBe(false);
+        expect('sortable' in (described.definition as { fields: Record<string, unknown>[] }).fields[4]).toBe(false);
+        expect(described.counts).toEqual({ total: 4 });
+
+        // THE COST OF THE STRIP IS ZERO: the same walk the un-restored store produced, in the
+        // same order, records and revisions intact.
+        expect(await walkLegacy(reader)).toEqual(['2:1:2', '3:2:3', '1:3:1', '4:4:4']);
+
+        // Idempotent — the re-snapshot is already clean, so a second restore mutates nothing.
+        const again = reader.snapshot() as unknown as {
+            collections: { legacy: { definition: { fields: Record<string, unknown>[] } } };
+        };
+
+        expect(again.collections.legacy.definition).toEqual(described.definition);
+
+        const third = createRecordEngine();
+
+        third.restore(again as unknown as never);
+        expect((await run(third, 'records', { collection: 'legacy', describe: true }, 'reader')).definition).toEqual(
+            described.definition
+        );
+
+        // Define-time strictness is untouched: the same shapes are still refused, with the
+        // same bytes this section pinned.
+        const strictOption = await expectCode(
+            run(writer, 'records', { define: { name: 'fresh1', fields: [{ key: 'f', type: 'boolean', maxLength: 4 }] } }),
+            RECORD_ERROR_CODES.definitionInvalid
+        );
+
+        expect(strictOption.message).toBe(
+            'definition-invalid: records "define".fields[0].maxLength is only valid on a text or strings field.'
+        );
+
+        const strictSort = await expectCode(
+            run(writer, 'records', {
+                define: {
+                    name: 'fresh2',
+                    fields: [
+                        { key: 'p', type: 'integer', sortable: true },
+                        { key: 'q', type: 'integer', sortable: true }
+                    ]
+                }
+            }),
+            RECORD_ERROR_CODES.definitionInvalid
+        );
+
+        expect(strictSort.message).toBe(
+            `definition-invalid: records "define".fields[1].sortable is only valid on the collection's one sort key; "p" (fields[0]) is already the sortable field.`
+        );
+
+        // And the softening is bounded: `getOnly` on a boolean was refused by a restore
+        // BEFORE this change, and it still is, with the same sentence.
+        const legacySnapshot = writer.snapshot() as unknown as {
+            collections: { legacy: { definition: { fields: Record<string, unknown>[] } } };
+        };
+
+        legacySnapshot.collections.legacy.definition.fields[1].getOnly = true;
+
+        let refused = '';
+
+        try {
+            createRecordEngine().restore(legacySnapshot as unknown as never);
+        } catch (error) {
+            refused = (error as { message: string }).message;
+        }
+
+        expect(refused).toBe(
+            'definition-invalid: records state.collections.legacy.definition.fields[1].getOnly is only valid on a text or strings field.'
+        );
     });
 });

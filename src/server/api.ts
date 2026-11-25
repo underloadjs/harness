@@ -630,20 +630,33 @@ const settingsInputOf = (
     return input;
 };
 
-/** Bound ONE manual tool value for the HTTP result (the shared 64 KiB model-facing cap). */
-const boundToolValue = (value: unknown): unknown => {
+/**
+ * Bound ONE manual tool value for the HTTP result (the shared 32 KiB model-facing cap).
+ *
+ * `rejectedMessage` is the F-CUTTER signal: the value was a JSON DOCUMENT larger than
+ * the cap, so `boundToolResult` refused it instead of slicing it, and the route answers
+ * the way it answers every other tool failure (`ok: false`) rather than handing back a
+ * half-document the client cannot parse. A caller that ignores the flag still gets a
+ * sane `result`, because `result` keeps the tool's own value.
+ */
+const boundToolValue = (value: unknown): { result: unknown; rejectedMessage?: string } => {
     const text = typeof value === 'string' ? value : JSON.stringify(value);
 
-    if (text === undefined) return value;
+    if (text === undefined) return { result: value };
 
     const bounded = boundToolResult(text);
 
-    if (!bounded.truncated) return value;
+    if (bounded.rejected !== undefined) return { result: value, rejectedMessage: bounded.rejected.message };
 
+    if (!bounded.truncated) return { result: value };
+
+    // Non-JSON text (a log, a page of prose) keeps the head/tail envelope: both previews
+    // are the tool's own characters, and re-parsing an envelope that happens to be JSON
+    // keeps the HTTP body valid JSON at every size.
     try {
-        return JSON.parse(bounded.content);
+        return { result: JSON.parse(bounded.content) };
     } catch {
-        return bounded.content;
+        return { result: bounded.content };
     }
 };
 
@@ -659,10 +672,20 @@ const successfulToolResult = (value: unknown, started: number) => {
     const unwrapped = unwrapToolResult(value);
     const panels = unwrapped.panels;
     const media = unwrapped.media;
+    const bounded = boundToolValue(unwrapped.content);
+
+    // F-CUTTER: an oversized JSON document is a refusal, and a refusal is a tool
+    // failure reported as DATA — the same 200 `ok: false` shape every other failure on
+    // this route uses (./api-reads.ts `toolCallFailure`), so no new response shape
+    // enters the published contract. The message is the budget's own sentence: both
+    // sizes, "discarded, not truncated", and the narrowing that would fit. Panels and
+    // media are dropped with the value: the caller asked for the result and did not get
+    // it, and a partial success next to an error would claim half a delivery.
+    if (bounded.rejectedMessage !== undefined) return toolCallFailure(bounded.rejectedMessage, Date.now() - started);
 
     return {
         ok: true as const,
-        result: boundToolValue(unwrapped.content),
+        result: bounded.result,
         ...(panels === undefined || panels.length === 0 ? {} : { panels }),
         ...(media === undefined || media.length === 0 ? {} : { media: toolMediaDescriptors(media) }),
         duration_ms: Date.now() - started

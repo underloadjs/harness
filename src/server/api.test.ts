@@ -3440,9 +3440,11 @@ describe('manual tool execution', () => {
 
         // `boundToolValue` (./api.ts) cuts the serialized value with `boundToolResult`
         // and re-parses the envelope, so the HTTP body stays valid JSON while the
-        // beginning AND the end of the tool's own text survive inside it (T5.1). The
-        // manual route has no transcript call to name, so the note says only
-        // "the tool call" — and it still tells the client what was cut.
+        // beginning AND the end of the tool's own text survive inside it (T5.1). This is
+        // the NON-JSON path: `z`.repeat is not a document, so cutting it costs nothing a
+        // client needed (an oversized JSON document takes the refusal route pinned in the
+        // test below instead). The manual route has no transcript call to name, so the
+        // note says only "the tool call" — and it still tells the client what was cut.
         const bounded = executed.body.result as {
             truncated: boolean;
             originalBytes: number;
@@ -3474,6 +3476,55 @@ describe('manual tool execution', () => {
         expect(Buffer.byteLength(JSON.stringify(bounded), 'utf8')).toBeLessThanOrEqual(
             HARNESS_SERVICE_LIMITS.tool_result_bytes
         );
+    });
+
+    it('refuses an oversized JSON result on the manual route as an ok:false tool failure', async () => {
+        // F-CUTTER at the HTTP boundary (contract 4). The test above bounds a huge
+        // NON-JSON value and keeps the envelope; this one hands the same route a JSON
+        // DOCUMENT over the published cap. A cut document would have reached the client
+        // as `result: { truncated, content: "<half a document>", tail: "..." }` — valid
+        // HTTP JSON wrapping invalid tool JSON — so the route reports the refusal the way
+        // it reports every other tool failure: a 200 whose body is `ok: false` + error.
+        const runtime = createRuntime();
+        const session = await createDemo(runtime);
+
+        const registered = await call(runtime, 'POST', HARNESS_ROUTES.sessionsBySessionIdTools(session.id), {
+            name: 'ledger',
+            description: 'Return an unbounded JSON page.',
+            tags: ['text'],
+            source: 'return JSON.stringify({ ok: true, records: [{ id: "r1", body: "k".repeat(40000) }], nextOffset: 1 });'
+        });
+
+        expect(registered.status).toBe(201);
+
+        const executed = await call(
+            runtime,
+            'POST',
+            HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(session.id, 'ledger'),
+            { parameters: {} }
+        );
+
+        // The tool's own text, rebuilt here so the size in the message is arithmetic and
+        // not a captured figure: 40 000 body bytes plus the JSON around it.
+        const text = JSON.stringify({ ok: true, records: [{ id: 'r1', body: 'k'.repeat(40_000) }], nextOffset: 1 });
+
+        expect(Buffer.byteLength(text, 'utf8')).toBeGreaterThan(HARNESS_SERVICE_LIMITS.tool_result_bytes);
+
+        expect(executed.status).toBe(200);
+        expect(executed.body.ok).toBe(false);
+        expect(Object.keys(executed.body).sort()).toEqual(['duration_ms', 'error', 'ok']);
+        // A `HarnessErrorInfo` (`src/engine/types/index.ts:965`): message only, no new
+        // fields on the published contract. The budget it quotes IS the limit the boot
+        // document publishes, which is the pair `src/server/api.test.ts` exists to keep
+        // honest (./harness-api.test.ts pins the constant itself).
+        expect(Object.keys(executed.body.error)).toEqual(['message']);
+        expect(executed.body.error.message).toBe(
+            `Tool result too large to deliver: ${Buffer.byteLength(text, 'utf8')} bytes against a ${HARNESS_SERVICE_LIMITS.tool_result_bytes}-byte budget. ` +
+                'The result was discarded, not truncated: no part of it reached this transcript. ' +
+                'Re-run the tool call with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. ' +
+                'If this call could have written anything, that write may already be applied — re-read before retrying.'
+        );
+        expect(executed.body.duration_ms).toEqual(expect.any(Number));
     });
 
     it('returns a full-budget read result verbatim, without the envelope', async () => {

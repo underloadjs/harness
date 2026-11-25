@@ -181,8 +181,14 @@ import type { PatternSet, SearchCandidate } from './search';
 // on a code-point boundary and flagged with `textTruncated: true`.
 export const FILE_GREP_MATCH_TEXT_BYTES = 1024;
 
-// Maximum UTF-8 bytes of returned text across the whole call (the same 64 KiB budget
-// read uses). Reaching it ends the search with `truncated: true`.
+// Maximum UTF-8 bytes of returned text across the whole call. Reaching it ends the
+// search with `truncated: true`. The sibling claim used to be "the same 64 KiB budget
+// `read` uses" — `read` budgets 32 KiB of WIRE (FILE_READ_WIRE_BUDGET, 32,768, kept
+// equal to the harness cap by a pin in read.test.ts), so this one is the LARGER of the
+// two. Consequence worth knowing: a grep that fills its own 64 KiB produces a JSON
+// document over the harness's per-result delivery cap (MODEL_TOOL_RESULT_BUDGET_BYTES =
+// 32,768 payload bytes, ../../core/result-budget.ts) and is REFUSED at delivery with a
+// "re-run with narrower arguments" error rather than delivered cut.
 export const FILE_GREP_CONTENT_BUDGET = 64 * 1024;
 
 // Wall-clock bound on one whole search — walk, reads and matching together. This is

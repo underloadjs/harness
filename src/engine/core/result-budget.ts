@@ -12,11 +12,15 @@
 //
 //   - small results pass through EXACTLY unchanged (byte for byte): every
 //     existing tool result a model or a test has ever seen keeps its shape;
-//   - a result that exceeds the budget becomes a SMALL, VALID JSON envelope
-//     that names the truncation, the original size, the applied budget, a
-//     head preview, a tail preview, and a plain-language note saying what is
-//     missing and how to fetch it again. A truncated JSON-ish result is
-//     therefore still parseable JSON instead of a half-written document;
+//   - a NON-JSON result (prose, a log, a build output) that exceeds the budget becomes
+//     a SMALL, VALID JSON envelope that names the truncation, the original size, the
+//     applied budget, a head preview, a tail preview, and a plain-language note saying
+//     what is missing and how to fetch it again — a head/tail envelope is honest for
+//     text, because both previews are still the tool's own characters;
+//   - a result that IS a JSON document and exceeds the budget is REFUSED, not cut
+//     (F-CUTTER, see the section below): the delivery is the short refusal sentence and
+//     the outcome is a failed tool result, because a middle-cut JSON document is not
+//     JSON and no preview recovers the fields that fell in the hole;
 //   - the cap is applied to serialized TEXT, so it covers ordinary values, plain
 //     prose, and error messages with one rule;
 //   - the per-result cap is joined by an AGGREGATE per-turn cap
@@ -37,6 +41,39 @@
 // is to re-run the call, which is the "re-fetchable" condition the compaction
 // policy in ../docs/tasks/2026-11-09-progressive-compaction.md F5 depends on.
 //
+// WHY A JSON DOCUMENT IS REFUSED RATHER THAN CUT (F-CUTTER, 2026-11-25)
+// ---------------------------------------------------------------------
+// The head/tail envelope is honest for TEXT and dishonest for a STRUCTURE. A cut log
+// page still shows the log; a cut JSON document shows nothing a consumer can use,
+// because the preview pair is two halves of one value and the hole in the middle has
+// no cursor pointing at it. A probe (`Temp/fix-cutter/repro.ts`, run against the
+// shipped cutter before this change) delivered a 71,142-byte record page as
+// `content` = 19,905 bytes ending "Unterminated string in JSON at position 19905" and
+// `tail` = 6,636 bytes starting with a run of `k`s: `JSON.parse` fails on BOTH
+// previews, `isError` was false, and the 44,601 bytes in the hole — whichever records
+// and fields they were — were gone without a marker. That is the finding this rule
+// closes: the model is handed two slices of a document, believes it received a result,
+// and cannot tell which ids it never saw.
+//
+// So the decision is made ONCE, in `boundWithReason`, on the one question that can be
+// answered without guessing: does this text parse as a JSON document? If it does, the
+// result is REFUSED — the model gets the short refusal sentence (`refusalMessage`) and
+// the delivery is classified `failed`, which is the only outcome that already carries
+// an error to a model, a UI and a retry. If it does not parse, nothing about the
+// existing envelope changes.
+//
+// Two consequences, stated rather than discovered later:
+//   1. A tool whose own output cap is ABOVE this cap (grep budgets 64 KiB of match
+//      text, `FILE_GREP_CONTENT_BUDGET`) can now be refused where it used to be cut.
+//      That is the same information — the page did not fit — delivered honestly; the
+//      fix for the tool is to page (or to raise the harness cap), not to be handed a
+//      half-document.
+//   2. Refusal is only sound because the result is DELIVERED as an error rather than
+//      dropped: the provider still gets an answer for the call (the pairing rule in
+//      `ToolResultTurnBudget`), the refusal names the call and the narrowing that fits,
+//      and the ledger charges the refusal, not the discarded document, so one oversized
+//      result cannot spend a turn's whole aggregate.
+//
 // Two honest limitations, stated here because the cap is easy to oversell:
 //
 //   1. It is a POST-SERIALIZATION cap. The tool's value and its JSON string are
@@ -47,9 +84,11 @@
 //   2. It only bounds the MODEL-facing text. Declarative UI panels travel on a
 //      separate `ui` field and are bounded by core/tool-ui.ts instead; the two
 //      limits are deliberately independent.
-//   3. The aggregate guard SHRINKS results, it never drops one. A provider
-//      request must answer every `tool_calls[]` entry (core/../types pairing), so
-//      the last delivery of an over-budget turn still pays its envelope
+//   3. The aggregate guard SHRINKS results, it never drops one — with the JSON rule
+//      above, it never withholds an ANSWER either: a JSON document it cannot fit is
+//      answered by the refusal sentence, and that sentence is what gets booked. A
+//      provider request must answer every `tool_calls[]` entry (core/../types pairing),
+//      so the last delivery of an over-budget turn still pays its envelope
 //      overhead: the per-turn total is a soft bound, exceeded by at most one
 //      envelope (~a few hundred bytes) per result past the line.
 //   4. It bounds one RESULT and one TURN, not the conversation. Nothing in this
@@ -263,10 +302,28 @@ const TAIL_KEY = 'tail';
 // NOT in that unit: it counts serialized payload bytes, so the two numbers answering
 // "how big was it" and "how big is allowed" are deliberately different — see the note
 // on `spillNote` and the T3 section of this file's header.
+//
+// `rejected` (F-CUTTER) is the discriminator for the OTHER outcome: the content was a
+// JSON document too large to deliver, so `content` is the refusal sentence, `truncated`
+// is FALSE (nothing was cut — the document was dropped whole), and `rejected` carries
+// the sizes and the message. A caller that only reads `content` delivers the honest
+// sentence by accident; a caller that can change an outcome (`../harness.ts`,
+// `src/server/api.ts`) branches on this field.
 export type BoundedToolResult = {
     content: string;
     truncated: boolean;
     originalBytes: number;
+    rejected?: ToolResultRejection;
+};
+
+// Why a result was refused rather than bounded, and everything a caller needs to say
+// so: the two sizes (text bytes vs the payload budget that was applied) and the exact
+// sentence that is being delivered, so a host does not re-derive it and drift.
+export type ToolResultRejection = {
+    reason: 'oversized-json';
+    originalBytes: number;
+    budgetBytes: number;
+    message: string;
 };
 
 // Which call produced a result, so the envelope can name what to re-run. The
@@ -319,6 +376,82 @@ const sourcePhrase = (source?: ToolResultSource): string => {
     if (callId === undefined) return `tool '${name}'`;
 
     return `tool '${name}' (call ${callId})`;
+};
+
+// The JSON question, answered once per over-budget result (F-CUTTER).
+//
+// WHY THE CHEAP PRE-FILTER. Parsing is the only reliable test — `JSON.parse` is the
+// definition of "is a JSON document" — but an over-budget result is often megabytes of
+// build log, and a prose log never parses: its first non-whitespace character cannot
+// begin a JSON value. Testing that character first keeps the parse off every prose and
+// log delivery, and it is only a PRE-filter: whatever survives it still has to parse,
+// so a brace inside a prose sentence cannot buy a false refusal. JSON's own whitespace
+// set (space, tab, CR, LF) is skipped by code-point, not by `trimStart`, so a
+// megabyte-scale string is scanned without allocating a copy of itself.
+const isJsonWhitespace = (code: number): boolean =>
+    code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
+
+// The characters that can BEGIN a JSON value: `{` object, `[` array, `"` string, `-` or a
+// digit for a number, and the first letter of the three literals (`true`, `false`, `null`).
+const startsJsonValue = (first: string): boolean =>
+    first === '{' ||
+    first === '[' ||
+    first === '"' ||
+    first === '-' ||
+    first === 't' ||
+    first === 'f' ||
+    first === 'n' ||
+    (first >= '0' && first <= '9');
+
+const isJsonDocument = (content: string): boolean => {
+    let start = 0;
+
+    while (start < content.length && isJsonWhitespace(content.charCodeAt(start))) start += 1;
+    if (start >= content.length) return false;
+    if (!startsJsonValue(content.charAt(start))) return false;
+
+    try {
+        JSON.parse(content);
+        return true;
+    } catch {
+        // The overwhelmingly common case for real payloads: a document the parser gave
+        // up on. Not a signal of anything wrong, so no rethrow and no log.
+        return false;
+    }
+};
+
+// The refusal sentence (F-CUTTER). Same discipline as `spillNote`: exact numbers, no
+// locale-dependent prose, and the address the model can act on. It has to carry four
+// things, because it is the only thing the model will ever learn about this call:
+//   - that the result is GONE rather than shortened, so the model does not read a
+//     missing field as an empty one;
+//   - both sizes, so the model can pick an argument set that fits;
+//   - the narrowing that fits (limit / ids / fields), which is the actionable half;
+//   - the write-safety warning, because a discarded RESULT does not undo a completed
+//     WRITE — the tool may have committed the change and only its receipt is missing.
+//
+// Units follow `spillNote`: `originalBytes` is UTF-8 bytes of the tool's text,
+// `budgetBytes` is the payload budget that was applied (the aggregate case says so out
+// loud, the way the spill note does, so a turn-level squeeze is not read as a second
+// per-result cap the operator never set).
+const refusalMessage = (
+    originalBytes: number,
+    budgetBytes: number,
+    reason: SpillReason,
+    aggregateBytes: number | undefined,
+    source: ToolResultSource | undefined
+): string => {
+    const cap =
+        reason === 'aggregate' && aggregateBytes !== undefined
+            ? `against the ${budgetBytes} bytes this turn had left of its ${aggregateBytes}-byte per-turn cap`
+            : `against a ${budgetBytes}-byte budget`;
+
+    return (
+        `Tool result too large to deliver: ${originalBytes} bytes ${cap}. The result was discarded, not truncated: ` +
+        `no part of it reached this transcript. Re-run ${sourcePhrase(source)} with narrower arguments ` +
+        '(smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write ' +
+        'may already be applied — re-read before retrying.'
+    );
 };
 
 // The honest line: what was dropped, which cap did it, and where the rest is.
@@ -404,6 +537,10 @@ const envelope = (
 // QUOTES (a model reading "cut 64071 of 300000 bytes" is reading about the tool's
 // text, not about a JSON encoding it never sees), which is why both measures appear
 // here and only one of them gates anything.
+//
+// This is ALSO the single decision point for the JSON refusal (F-CUTTER): the per-result
+// cap and the aggregate spill both come through here, so there is no path that can hand
+// a middle-cut JSON document to the model.
 const boundWithReason = (
     content: string,
     budgetBytes: number,
@@ -418,6 +555,27 @@ const boundWithReason = (
     // bytes is now compared as 962 against the budget — the direction that was
     // previously 357 bytes of unbudgeted drift per such result.
     if (modelPayloadBytes(content) <= budgetBytes) return { content, truncated: false, originalBytes };
+
+    // THE JSON RULE (F-CUTTER) — the single decision point for the whole surface. A
+    // document that parses is a STRUCTURE, and a structure cut in the middle is not
+    // that structure: the head ends inside a value, the tail starts inside one, and
+    // whichever keys fell into the hole are simply absent from a message that still
+    // reads like an answer (the probe in this file's header records both previews
+    // failing `JSON.parse`, at isError false). So the document is refused rather than
+    // sliced, and the caller — `../harness.ts` (delivery becomes a failed tool result)
+    // or `src/server/api.ts` (the route answers `ok: false`) — reports it. Everything
+    // that does NOT parse keeps the head/tail envelope exactly as before, because for
+    // prose both previews are real content.
+    if (isJsonDocument(content)) {
+        const message = refusalMessage(originalBytes, budgetBytes, reason, aggregateBytes, source);
+
+        return {
+            content: message,
+            truncated: false,
+            originalBytes,
+            rejected: { reason: 'oversized-json', originalBytes, budgetBytes, message }
+        };
+    }
 
     // One code unit can never encode to less than one byte — after escaping either:
     // the widest escape JSON produces (`\u00XX`, `\udXXX`) is 6 bytes and the
@@ -461,6 +619,11 @@ const boundWithReason = (
 // `options.source` (T5.1) only changes the wording of the note, never the size
 // rule, so a caller that cannot name the producing call gets the same cut with
 // a less specific line.
+//
+// Over budget there are two outcomes, and `rejected` says which one happened
+// (F-CUTTER): a JSON document is refused (`truncated: false`, `rejected` set,
+// `content` the refusal sentence) and anything else is cut into the head/tail
+// envelope (`truncated: true`, `rejected` absent).
 export const boundToolResult = (
     content: string,
     budgetBytes: number = MODEL_TOOL_RESULT_BUDGET_BYTES,
@@ -507,6 +670,11 @@ export type ToolResultTurnBudget = {
      * Bound ONE result for this turn and record what it cost. Apply the
      * per-result cap first (T5.1) and only then the aggregate headroom, so a
      * result that fits both is byte-identical to `boundToolResult`'s output.
+     *
+     * A result `boundToolResult` REFUSES — an oversized JSON document, F-CUTTER —
+     * comes back as the refusal, and the ledger books the REFUSAL's bytes, never the
+     * discarded document's. A refusal never takes an aggregate spill: the document is
+     * already gone, and re-cutting the sentence that says so would bury it.
      */
     commit(
         content: string,
@@ -546,6 +714,18 @@ export const createToolResultTurnBudget = (
             // body without ever looking over budget.
             const size = modelPayloadBytes(capped.content);
 
+            // A REFUSAL is never spilled (F-CUTTER). The document is already gone and
+            // the sentence that replaced it IS the delivery; re-cutting that sentence to
+            // whatever headroom the turn had left would trade an actionable error for an
+            // envelope about an envelope. It is booked at its own size, so an oversized
+            // JSON result costs the turn a few hundred bytes instead of its whole
+            // (discarded) body — soft-bound past the line like every other delivery.
+            if (capped.rejected !== undefined) {
+                committed += size;
+
+                return capped;
+            }
+
             if (aggregate === 0 || committed + size <= aggregate) {
                 committed += size;
 
@@ -568,6 +748,10 @@ export const createToolResultTurnBudget = (
             }
 
             const spilled = boundWithReason(content, spillBudget, 'aggregate', aggregate, options.source);
+            // A JSON document that fits the PER-RESULT cap but not this turn's headroom
+            // is refused here rather than spilled (the rule lives in `boundWithReason`,
+            // which is why one decision covers both caps), and what gets booked is the
+            // short refusal — never the document that did not fit.
             // Same currency as `size` above (T3).
             committed += modelPayloadBytes(spilled.content);
 

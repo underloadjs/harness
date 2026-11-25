@@ -7,6 +7,10 @@
 //     x 4 bytes = 32 768 bytes for the built-in 200 000-token default), and one turn's
 //     results together through the per-turn envelope (24 576 tokens = 98 304 bytes);
 //   - every tool ERROR goes through the same cap;
+//   - an over-budget result that is a JSON DOCUMENT is REFUSED rather than cut
+//     (F-CUTTER): the delivery is the budget's refusal sentence, the outcome is
+//     `failed`, and the same bytes reach the transcript, the `tool_result` event and
+//     `tool.after`. Only text that does not parse keeps the head/tail envelope;
 //   - a small result is still fed back byte-exact;
 //   - `signal` reaches the transport, a tool's `ToolContext.signal`, a delegated
 //     child's request, and a ctx.run agent's tools;
@@ -73,7 +77,9 @@ describe('model-facing result budget', () => {
     it('caps a huge tool result in a valid truncation envelope, in the transcript and the event', async () => {
         // Must exceed the per-result envelope, so the fixture scales with it: the
         // built-in default window sizes the envelope at 8192 tokens x 4 bytes =
-        // 32 768 bytes, and 300 000 bytes is comfortably over it.
+        // 32 768 bytes, and 300 000 bytes is comfortably over it. It is also NOT JSON —
+        // a run of `z`s parses as nothing — which is why THIS delivery keeps the head/tail
+        // envelope while the test below, on a document of the same size, is refused.
         const huge = 'z'.repeat(300_000);
         const dump = tool({
             description: 'Dump.',
@@ -108,6 +114,85 @@ describe('model-facing result budget', () => {
 
         const result = events.find((event) => event.type === 'tool_result');
         expect(result).toMatchObject({ type: 'tool_result', name: 'dump', isError: false, content: fed });
+    });
+
+    it('refuses an oversized JSON result as a failed call, in the transcript, the event and tool.after', async () => {
+        // F-CUTTER at the delivery seam — the case the finding is actually about. The
+        // fixture is a record PAGE (the shape a store/knowledge read answers with), not
+        // the `z`-page the test above cuts. Over the 32 768-byte payload budget the
+        // cutter used to deliver `content` (a head that ends "Unterminated string in
+        // JSON") plus `tail` (a run of bytes that starts mid-value) with `isError:
+        // false`, so the model was told it had received a document, could not parse
+        // either half, and could not tell which records the 44 601-byte hole had taken.
+        // A document that does not fit is now a FAILED call carrying one sentence.
+        const page = JSON.stringify({
+            ok: true,
+            records: Array.from({ length: 400 }, (_, index) => ({
+                id: `rec-${String(index).padStart(4, '0')}`,
+                body: 'k'.repeat(120)
+            })),
+            nextOffset: 400
+        });
+
+        // The premise, asserted: this really is an over-budget JSON document.
+        expect(utf8ByteLength(page)).toBeGreaterThan(32_768);
+        expect(() => JSON.parse(page)).not.toThrow();
+
+        const store = tool({
+            description: 'Read a page of records.',
+            tags: ['store'],
+            visibility: 'core',
+            execute: () => page
+        });
+        const events: HarnessEvent[] = [];
+        const after: string[] = [];
+        const entry = brain(scripted([callTool('c1', 'store', '{}'), answer('done')]));
+        const writer = harness({
+            agents: { writer: entry },
+            tools: { store },
+            presets: false,
+            report: { progress: (event) => void events.push(event) },
+            plugins: [
+                {
+                    name: 'after-capture',
+                    setup: (api: { on: (event: string, handler: (payload: { content: string }) => void) => void }) => {
+                        api.on('tool.after', (payload) => void after.push(payload.content));
+                    }
+                } as never
+            ]
+        });
+
+        await writer('go');
+
+        // One sentence, byte-identical in all three places a consumer reads it from.
+        const refusal =
+            `Tool result too large to deliver: ${utf8ByteLength(page)} bytes against a 32768-byte budget. ` +
+            "The result was discarded, not truncated: no part of it reached this transcript. " +
+            "Re-run tool 'store' (call c1) with narrower arguments (smaller limit, fewer ids, narrower fields) " +
+            'to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying.';
+
+        expect((entry.messages[2] as { content: string }).content).toBe(refusal);
+        expect(after).toEqual([refusal]);
+
+        // The classification is what makes the sentence actionable: `failed` is derived
+        // into `isError` (core/tool-outcome.ts), so the model, the UI and a retry policy
+        // all see a call that did not answer rather than an answer with bytes missing.
+        expect((entry.messages[2] as { outcome?: string }).outcome).toBe('failed');
+
+        const result = events.find((event) => event.type === 'tool_result');
+
+        expect(result).toMatchObject({
+            type: 'tool_result',
+            name: 'store',
+            callId: 'c1',
+            isError: true,
+            outcome: 'failed',
+            content: refusal
+        });
+
+        // Nothing was silently dropped: the message states both sizes and the door back.
+        expect(refusal).toContain(`${utf8ByteLength(page)} bytes`);
+        expect(refusal).toContain('32768-byte budget');
     });
 
     it('caps a huge error message too', async () => {
@@ -437,13 +522,24 @@ describe('per-turn tool-result budget at the harness boundary', () => {
 
         // The fourth: spilled by the AGGREGATE, and the note says so — a model that
         // reads only this envelope can tell "my result was huge" from "this turn was".
-        expect(envelopes[3].originalBytes).toBe(300_000);
-        expect(envelopes[3].budgetBytes).toBe(8_850);
-        expect(envelopes[3].note).toContain("8850-byte budget set by this turn's 98304-byte per-turn cap");
-        expect(envelopes[3].note).toContain("re-run tool 'echo' (call c4)");
-        expect(utf8ByteLength(envelopes[3].content) + utf8ByteLength(envelopes[3].tail)).toBe(7_965);
-        expect(envelopes[3].content.startsWith('zzzz')).toBe(true);
-        expect(envelopes[3].tail.endsWith('zzzz')).toBe(true);
+        // D-F (independent review): pinned BYTE-FOR-BYTE like the three sibling envelopes
+        // above, instead of "the previews together are at or under the 8,850-byte headroom".
+        // The figures are the cutter's own arithmetic and therefore derivable: the byte loop
+        // grows one preview `keep` at a time until the serialized envelope fits the 8,850
+        // bytes this turn had left of its 98,304-byte per-turn cap (result-budget.ts
+        // `envelope()`), and splits that keep 3:1 by `HEAD_PREVIEW_RATIO`/`TAIL_PREVIEW_RATIO`
+        // — 7,965 text bytes to floor(7,965 x 3/4) = 5,973 of head and 1,992 of tail, all
+        // ASCII `z` so text bytes and payload bytes are the same number. The loose form proved
+        // too little: any smaller preview that happened to fit passed, a head/tail split that
+        // ignored the 3:1 rule passed, and a note that misnamed the head or tail size passed.
+        expect(envelopes[3]).toEqual({
+            truncated: true,
+            originalBytes: 300_000,
+            budgetBytes: 8_850,
+            note: "Cut 292035 of 300000 bytes from the middle by a 8850-byte budget set by this turn's 98304-byte per-turn cap; kept a 5973-byte head and a 1992-byte tail. The full text is not in this transcript: re-run tool 'echo' (call c4) with narrower arguments to fetch it.",
+            content: 'z'.repeat(5_973),
+            tail: 'z'.repeat(1_992)
+        });
 
         // The turn's committed total is over the cap by less than one envelope, and
         // NOTHING was dropped: four calls, four results, pairing intact.
@@ -536,13 +632,13 @@ describe('provider-anchored context estimate (T5.4)', () => {
     it('extrapolates the next turn from the reported prompt size', async () => {
         // Hand-derived, not read off the implementation. ONE constant first: the catalogue
         // this harness declares (the `echo` definition plus the runtime controls a session
-        // always offers) serializes to 12,657 payload bytes — `toolSchemaPayloadBytes` of
+        // always offers) serializes to 14,377 payload bytes — `toolSchemaPayloadBytes` of
         // the request's own `tools`, asserted exactly by the case below — so its floor is
-        // ceil(12,657 / 4) = 3,165 tokens.
+        // ceil(14,377 / 4) = 3,595 tokens.
         //   turn 1 sends one 2-byte user message and this agent has no instructions, so the
         //   anchored prefix is 2 bytes. Nothing has been reported yet, so turn 1 is the
         //   BLIND round, and the blind round now prices the catalogue that rides with it:
-        //   ceil((2 + 12,657) / 4) = 3,165. (It was 1 before the catalogue floor, which is
+        //   ceil((2 + 14,377) / 4) = 3,595. (It was 1 before the catalogue floor, which is
         //   the number the measured provider refusal proved wrong: a first request the
         //   harness believed was 464 tokens was billed 31,693.)
         //   The provider reports 900 prompt tokens for THAT request.
@@ -556,7 +652,7 @@ describe('provider-anchored context estimate (T5.4)', () => {
         const seen: HarnessStreamRequest[] = [];
 
         expect(await estimatesWith([calls('usage', ['c1', 'echo', '{}']), answerTurn], '', seen)).toEqual([
-            3165, 904
+            3595, 904
         ]);
     });
 
@@ -580,13 +676,13 @@ describe('provider-anchored context estimate (T5.4)', () => {
         );
 
         // The catalogue the shipped request carries, asserted exactly: 3 declarations —
-        // `echo` plus the runtime controls — and 12,657 serialized payload bytes.
+        // `echo` plus the runtime controls — and 14,377 serialized payload bytes.
         expect(seen[0].tools).toHaveLength(3);
-        expect(toolSchemaPayloadBytes(seen[0].tools)).toBe(12_657);
+        expect(toolSchemaPayloadBytes(seen[0].tools)).toBe(14_377);
         // The transcript alone would say 1 token; the round the provider receives is
-        // ceil((2 + 12,657) / 4), and that is the number the compaction limit is compared
+        // ceil((2 + 14,377) / 4), and that is the number the compaction limit is compared
         // against on the round that has no anchor to hide behind.
-        expect(firstTurn).toBe(Math.ceil((2 + 12_657) / 4));
+        expect(firstTurn).toBe(Math.ceil((2 + 14_377) / 4));
         expect(firstTurn).toBeGreaterThan(1);
     });
 
@@ -594,12 +690,12 @@ describe('provider-anchored context estimate (T5.4)', () => {
         // The identical conversation with the `usage` field absent: still the plain
         // heuristic, but the heuristic now counts what the body carries — the transcript
         // AND the catalogue, since no anchor exists to absorb either.
-        //   turn 1: ceil((2 + 12,657) / 4) = 3,165;
-        //   turn 2: ceil((14 + 12,657) / 4) = ceil(12,671 / 4) = 3,168.
-        // The transcript-only half is the old 1 and 4; the delta is the same 12,657 bytes
+        //   turn 1: ceil((2 + 14,377) / 4) = 3,595;
+        //   turn 2: ceil((14 + 14,377) / 4) = ceil(14,391 / 4) = 3,598.
+        // The transcript-only half is the old 1 and 4; the delta is the same 14,377 bytes
         // of declaration both rounds really send.
         expect(await estimatesWith([calls('plain', ['c1', 'echo', '{}']), answerTurn])).toEqual([
-            3165, 3168
+            3595, 3598
         ]);
     });
 
@@ -608,12 +704,12 @@ describe('provider-anchored context estimate (T5.4)', () => {
         // provider reports 900, which is inside the sanity band (900*4 >= 1001), so it
         // is a real measurement of a denser tokenizer and the number steps DOWN.
         // Turn 1 is still blind, so it reports the catalogue floor:
-        // ceil((4,002 + 12,657) / 4) = 4,165. Turn 2 then measures 4,014 bytes, 12 more
+        // ceil((4,002 + 14,377) / 4) = 4,595. Turn 2 then measures 4,014 bytes, 12 more
         // than the anchored prefix -> 900 + ceil(12 x 1.166 / 4) = 904, and the low-side
         // clamp (ceil(ceil(4,014/4) / 4) = 251) is far below it.
         expect(
             await estimatesWith([calls('usage', ['c1', 'echo', '{}']), answerTurn], 'p'.repeat(4000))
-        ).toEqual([4165, 904]);
+        ).toEqual([4595, 904]);
     });
 
     it('refuses a count the transcript cannot support and stays on the heuristic', async () => {
@@ -622,8 +718,8 @@ describe('provider-anchored context estimate (T5.4)', () => {
         // request's prompt size (a provider counting only the uncached delta, say). The
         // estimate keeps the heuristic it has always used — the heuristic that counts the
         // catalogue, because on this leg nothing else can: turn 1
-        // ceil((4,002 + 12,657) / 4) = 4,165, then turn 2
-        // ceil((4,014 + 12,657) / 4) = 4,168.
+        // ceil((4,002 + 14,377) / 4) = 4,595, then turn 2
+        // ceil((4,014 + 14,377) / 4) = 4,598.
         const refused: HarnessStreamEvent[] = [
             {
                 type: 'done',
@@ -633,6 +729,6 @@ describe('provider-anchored context estimate (T5.4)', () => {
             }
         ];
 
-        expect(await estimatesWith([refused, answerTurn], 'p'.repeat(4000))).toEqual([4165, 4168]);
+        expect(await estimatesWith([refused, answerTurn], 'p'.repeat(4000))).toEqual([4595, 4598]);
     });
 });

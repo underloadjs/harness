@@ -306,18 +306,21 @@ describe('turn.before interception', () => {
         expect(hooks[0].messages).toEqual([{ role: 'user', content: 'ABCDEFGH' }]);
         // 8 bytes of projected transcript, PLUS the tool catalogue this round declares: a
         // default harness (`presets` on, no explicit tool switches) offers 7 declarations,
-        // and `toolSchemaPayloadBytes` of the request's own `tools` is 33,538 serialized
-        // payload bytes — a constant 8,385-token floor the transcript can never show. The
+        // and `toolSchemaPayloadBytes` of the request's own `tools` is 35,258 serialized
+        // payload bytes — a constant 8,815-token floor the transcript can never show. The
         // round has no `usage` anchor yet, so it is priced blind at
-        // ceil((8 + 33,538) / 4) = 8,387; it read 2 while the estimate counted the
+        // ceil((8 + 35,258) / 4) = 8,817; it read 2 while the estimate counted the
         // transcript alone, which is the number the measured provider refusal proved wrong
         // (../core/context-estimate.ts "THE TOOL-CATALOGUE FLOOR", src/harness.ts
         // `toolSchemaBytes`). Re-derive with:
         //   Math.ceil((8 + toolSchemaPayloadBytes(seen[0].tools)) / 4).
-        // THE +144 BYTES against the 33,394/8,351 this pin carried are the `edit` entry's
-        // published `bytes` sentence (../tools/files/edit.tool.ts's F6 clause): a declared
-        // description is priced here byte for byte, so the floor moved +36 tokens.
-        expect(hooks[0].estimatedTokens).toBe(8387);
+        // THE +144 BYTES against the 33,394/8,351 this pin carried were the `edit` entry's
+        // published `bytes` sentence (../tools/files/edit.tool.ts's F6 clause), and the
+        // +1,720 net on top of THAT (35,258/8,817 today) is the record tools' response-budget
+        // disclosure, after the independent review de-duplicated the `tasks` envelope clause
+        // (-230 B against the +190 B of sentences it left in place): a declared description is
+        // priced here byte for byte, so the floor moved +36, then +440, then -10 tokens.
+        expect(hooks[0].estimatedTokens).toBe(8817);
         expect(hooks[0].iteration).toBe(1);
         expect(hooks[0].agent).toBe('writer');
         // The callable root runs in the entry agent's DEFAULT conversation.

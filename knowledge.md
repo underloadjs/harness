@@ -1883,7 +1883,10 @@ const engine = createRecordEngine();   // collections + the single id counter + 
 ```
 
 - The wire shape is one **merge command**, not an action enum: `tasks` holds patch
-  entries, `remove` holds ids, `ids` reads specific records, and
+  entries, `remove` holds ids, `ids` reads specific records (a repeated id is read ONCE —
+  the read list is a set, so one row comes back and one slot of the cap is spent — and the
+  bodies it names are charged to the response budget like a page, which is why `offset`
+  pages THAT list and a cut read continues at `page.nextOffset`), and
   `offset`/`limit`/`afterId`/`since` shape the answer. No
   arguments (or `{}`) is a read. An entry **without** `id` adds a task (`text`
   required); an entry **with** a known `id` patches it — `text` and/or `completed`,
@@ -1943,8 +1946,15 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   patch or a removal — and is a defensive copy, so mutating a
   result can never mutate the session list. `entry` is present when ONE record answers
   (an `ids` read or a single patch), `removed` when exactly one record was deleted and
-  `removedIds` when two or more were; `budgetTruncated` appears only when the byte
-  budget cut the page short of `limit`. **The three id receipts follow a DIFFERENT
+  `removedIds` when two or more were; `page.budgetTruncated` appears only when the byte budget
+  cut the PAGE short of `limit`, while the envelope-level `budgetTruncated: true` appears
+  whenever the budget withheld ANYTHING from this answer — a page row, the bodies of an `ids`
+  read, or a write's echo — which the page flag cannot say through an action wrapper, whose
+  mutation answer carries no page at all. A withheld echo collapses to `{ id, rev }`: the body
+  is ABSENT, never emptied, for the same reason a projection drops a `getOnly` field instead of
+  blanking it (`copyEntry`), and `rev` is still the receipt the next `expects` needs.
+  `droppedEntries: { <field>: N }` rides a write that really stored and whose `strings` input
+  lost entries to normalization (a duplicate, or one that trims onto an earlier entry). **The three id receipts follow a DIFFERENT
   presence rule from `removed`/`removedIds`, and that is the whole contract**: `addedIds`
   (every id the call minted, in mint order), `changedIds` (every id it REALLY patched, in
   caller order) and `noopIds` (every id whose patch wrote nothing) are each emitted
@@ -1973,7 +1983,11 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   plus `nextAfterId` while `hasMore` — never `nextOffset`.
 - **The change feed** is the cheap alternative to re-reading: `since: <storeRev>`
   adds FIVE keys, and nothing else adds any of them — `changes` (the events after that
-  revision, oldest first, at most `RECORD_MAX_CHANGES_IN_RESULT` = 50 entries — `src/core/records.ts:166` —
+  revision, oldest first — each one an EVENT ENVELOPE, not a diff: `{ rev, id, op, by?, threadId?,
+  at, fields?, itemRev? }`, where an `update` names WHICH fields moved and never their VALUES and
+  an `add`/`remove` names nothing beyond the id, so the feed says what to re-read and the read
+  supplies the values (`RecordChange`) — at most `RECORD_MAX_CHANGES_IN_RESULT` = 50 entries,
+  `src/core/records.ts:166`,
   and no further than `responseBudgetBytes` allows once the WHOLE serialized page has been
   charged against it, `:2880-2891`), `changesHasMore` (**the page was cut**: this answer carries
   fewer events than exist above `since`, measured against the whole post-`since` set, by the
@@ -1983,8 +1997,21 @@ const engine = createRecordEngine();   // collections + the single id counter + 
   `:2900-2906`), `oldestAvailableRev` (the floor itself: the oldest revision this
   collection's window can still show) and `droppedEvents` (its SIZE —
   `max(0, oldestAvailableRev - since - 1)`, the events strictly BELOW the floor that are gone
-  for good, `:2907-2922`). **What `responseBudgetBytes` bounds is the PAGE, not the answer, and
-  the feed is appended after it on purpose.** The page loop charges `JSON.stringify(entry)` plus one
+  for good, `:2907-2922`). **What `responseBudgetBytes` bounds is the ANSWER, and it is charged
+  in one order: the page first, then the bodies this call echoes back.** Before R-0012 the budget
+  stopped at the page and everything else was appended free, which made the size of a response a
+  function of the caller's arithmetic rather than of the cap: patching the record at the head of
+  the page put the same body in the answer TWICE (a collection budgeted at 1,024 bytes answered
+  one patch with 60,409), an `ids` read added every body it named after the page was already
+  trimmed, and a removal echoed a deleted body nothing else in the envelope would ever show
+  again. `fitRowsToBudget` and `echoMeter` (declared beside `cloneDefinition`) now share the page
+  loop's rule — whole rows only, the first row of each KIND always admitted, everything after it
+  charged against what the answer already costs — and what no longer fits is WITHHELD rather than
+  dropped: an `ids` read stops at the last whole body and hands back `page.nextOffset`, and an
+  `entry`/`removed` body collapses to `{ id, rev }`. Whatever this number allows, a TOOL result
+  delivered to a model is capped AGAIN by the harness at `tool_result_bytes` = 32,768
+  (`src/engine/shared/harness-api.ts`), so a collection budgeted above that is trimmed a second
+  time on the way out. The page loop charges `JSON.stringify(entry)` plus one
   separator per record against the budget, stops at the first record that would cross it, and
   always admits the first record of a non-empty page (`:2758-2769`). The feed is the LAST thing
   added, because the page the caller asked for is authoritative and "a feed that only reported
@@ -2124,10 +2151,19 @@ explicit instead of letting the last write win:
   moved, and CARRIES THE CURRENT RECORD (R9 — one round trip, not two):
   `tasks "1" changed since revision 1 (now 2, last edited by "writer" at <ISO>); changed fields: text; retry with "expects" [{ id: "1", rev: 2 }] or pass "mergeDisjoint": true. current: {"id":"1",…}`
   (`src/core/records.ts:1301-1317`, pinned byte-for-byte at
-  `src/harness.task.test.ts:589`). A token for an id this collection does NOT hold answers
+  `src/harness.task.test.ts:589`). A token AHEAD of the record is a different fact and gets its
+  own sentence — `tasks "1" is at revision 1 — revision 99 has not been reached, so nothing has
+  changed since you read it (last edited by "writer" at <ISO>); retry with "expects" [{ id: "1",
+  rev: 1 }].` — because "changed since revision 99" claimed a change that cannot exist and
+  recommended `mergeDisjoint` for a patch that was already current (`staleRecordError`'s `ahead`
+  branch; the behind-the-head wording, the `changed fields:` list and the carried `current`
+  record are byte-identical). A token for an id this collection does NOT hold answers
   ONE provable cause, never a choice between two (step 3, `:1802-1879`): an id that is
   **live in another collection** gets `tasks id "1" belongs to "chapters" — re-read that
-  collection.` (`:1814-1829`); an id this collection's own window still logs a `remove` for
+  collection.` (`:1814-1829`) under `unknown-record` and NOT `stale-record` — a token cannot be
+  stale about a record this collection never held, and answering `stale-record` there sent
+  callers to re-read a `tasks` list that would never contain the id (`readPlan`'s STEP 3 owner
+  check, pinned by T5.1 in `src/core/records.test.ts`); an id this collection's own window still logs a `remove` for
   gets the only sentence allowed to say "was removed" — `tasks "1" was removed since
   revision 1 — re-read the list and add or retry.` (`:1832-1841`); an id the global counter
   never minted, or one in a collection whose window still reaches revision 1 (where "no
@@ -2167,7 +2203,12 @@ explicit instead of letting the last write win:
   duplicate and touched none of the fields the patch sets. A logged `remove` of that
   id, an overlapping field, or an uncovered tail all refuse; a stale `remove` is never
   merged, because a removal carries no patch to prove disjoint
-  (`src/core/records.ts:1237`).
+  (`src/core/records.ts:1237`). `mergeDisjoint` is also REFUSED, with `invalid-input`, when the
+  call carries no patch at all — an `ids` read, a `remove`, an addition:
+  `notes "mergeDisjoint" applies to a patch whose record changed under it; this call sends no
+  patch, so there is nothing for it to merge.` It used to be accepted and ignored on those calls,
+  which is how a write guard ends up BELIEVED rather than used (pinned by T4.1 in
+  `src/core/records.test.ts`).
 - **Corrected in place (Decision P):** there is no claim, so a conversation ending strands
   nothing — no sweep, no wiring, and no lease for a crashed agent to hold. The guarantee is
   structural, and `src/harness.task.test.ts:1062-1082` pins it by SHAPE (no
@@ -2324,6 +2365,37 @@ drift from what the engine returns and adding a collection adds no validator.
   beside it.` (`src/core/records.ts:3946-3948`, pinned at `src/harness.records.test.ts:689-699`)
   — while `{ define }` on its own stays the documented call, because `undefined` is absence,
   not a sent collection.
+- **A field option belongs to exactly one type, and the cap that bites says what it measured.**
+  A `define` spec that declares `maxLength` on a boolean, `maxItems` on an enum, `max` on a
+  strings field or `values` on an integer is refused AT DEFINE —
+  `records "define".fields[0].maxLength is only valid on a text or strings field.` — by the same
+  exclusive map that already refused `getOnly` and `sortable` off-type (`FIELD_OPTION_TYPES` /
+  `refuseOrStripInapplicableOption`, enforced in `readFieldDefinition`): an option the type cannot
+  consume used to be STORED, echoed back by `describe`, and enforced by nothing, and a spec that
+  looked self-documenting was a lie about one of its caps. Two `sortable` fields are refused the
+  same way, naming the field that already holds the sort key — a collection has ONE page order,
+  and two sort keys would leave the order (and every `offset` cursor over it) undefined. Both
+  checks live in the definition readers, but the two DOORS are not the same, and that is
+  deliberate. `define` (and a code-declared spec) is STRICT, exactly as above. A snapshot RESTORE
+  runs the same readers in sanitize mode (`readStoredCollection` → `refuseOrStripInapplicableOption
+  (…, sanitize: true)`, `src/core/records.ts:338`): an option the engine NEVER enforced — an
+  off-type `maxLength`/`maxItems`/`max`/`values`, or a second-and-later `sortable` (both page
+  order paths take the FIRST one) — is STRIPPED from the stored definition instead of refusing the
+  restore, because a live session can hold a snapshot written before these refusals existed and
+  bricking its restore over a never-enforced key costs more than the misreport the refusal fixes.
+  Stripping provably costs nothing — nothing ever read those keys — and it is silent, since
+  `restore()` returns `void` and has no warning channel. Everything ELSE keeps its loud restore
+  failure byte-identically: an invalid `getOnly`/`sortable`-on-a-non-integer definition still fails
+  to restore LOUDLY, which is what it already did. At write time the three caps that reject are told
+  apart — `field-too-long` for text and for one over-long array entry, quoting the count as
+  **UTF-16 code units** because that is what `String.length` measures and what a reader must
+  reproduce (one astral emoji is 2 of them; the cap itself did not move, only the sentence),
+  `field-too-many-items` for an array whose entries are too many AFTER trimming and
+  de-duplication, naming both counts when they differ, and `field-out-of-range` for an integer
+  past its `max` (`num10 "n" is 99; its magnitude limit is 10.`) — and an array whose NORMALIZED
+  form fits is no longer rejected for the size of the raw one: the count moved behind the
+  pipeline, the pipeline itself is unchanged, and an accepted write that still dropped input
+  reports it as `droppedEntries` instead of leaving the caller to diff the echo.
 - **The store-full refusal sizes the job.** An over-cap call is refused BEFORE any id is
   consumed, with the advice computed for THIS call: `tasks would hold 201 tasks; the maximum
   is 200. Remove one before adding.`, and `Remove 2 more before adding.` at two over — the

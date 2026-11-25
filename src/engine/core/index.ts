@@ -36,8 +36,8 @@
 //   MAX_DISCOVERY_MATCHES - the legacy searchTools five-match cap. toolRequest
 //                  uses the uncapped selectTools and the harness's maxEnabledTools
 //                  bound instead.
-//   boundToolResult()/MODEL_TOOL_RESULT_BUDGET_BYTES — the model-facing 64 KiB
-//                  tool-result/error cap (R10). Reusable by a server that
+//   boundToolResult()/MODEL_TOOL_RESULT_BUDGET_BYTES — the model-facing 32,768-byte
+//                  (8,192-token) tool-result/error cap (R10). Reusable by a server that
 //                  serializes a manual result for a client.
 //   resolveToolParameters()/validateSchemaValue()/checkToolSchemaComplexity() —
 //                  the runtime JSON Schema gate and the single-property unwrap
