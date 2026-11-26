@@ -412,25 +412,69 @@ describe('toolList', () => {
         // F9 (2026-11-25): +1,688 (4 rows x 422) — the four record-wrapper descriptions grew
         // F11 (2026-11-26): +790 — the same four wrapper descriptions plus `records` and `agentManage`/
         // `agentResult` were reworded; measured on the registry this assertion enumerates.
+        // 0032 (2026-11-26): +484 payload bytes (+476 UTF-8), and the move is ONE row: `agentResult`,
+        // whose entry description now names the `toolActivity` tally — the counts, the up-to-8 name list
+        // and the counts-and-names-only boundary — so a caller learns the field exists before it asks.
+        // F1 (2026-11-26, independent audit of the 0032 pass): +69, and again ONE row — `toolCancel`, whose
+        // abandoned-call enumeration now names the fourth forensic field that really rides that envelope
+        // (`toolActivity`, cap stated) instead of promising three. This clause carries NO quote and no
+        // backslash, so it is +69 in both currencies at once: the payload figure here and the UTF-8 figure
+        // in the refusal below move by the identical amount, unlike 0032's sentence above.
+        // A per-tool diff of the generated manifest against HEAD names four changed strings in TWO tools,
+        // and only the `agentResult` pair can land in THIS document: `delegate`'s text grew too (+537 entry
+        // (+529 UTF-8) — the four escaped quotes in 0032's sentence are the difference — and +299
+        // `timeoutMs`, that one the same in both currencies because the advisory carries no quote), but
+        // `delegate` is registered only for an agent that has a lower-ranked
+        // peer (`./harness.delegation.test.ts` — "declares delegate only to the agent that has a
+        // lower-ranked peer"), so it is not one of these 26 rows; `KERNEL_ROWS` at :66 above carries no
+        // `delegate` for the same reason.
+        // C2 (2026-11-26, over-cap `threadFork` delivery): +434, and again exactly ONE row — `threadFork`'s
+        // description now states the delivery cap its summary has to fit (../tools/runtime/threadFork.tool.ts).
+        // The added text carries no `"` and no `\`, so both currencies move by the identical 434 and the
+        // 912-byte gap between them is untouched (66,001 payload / 65,089 UTF-8, both re-probed with
+        // `Temp/fix-f5/probe-tool-list-bytes.ts`, not derived).
         // by the same sentence (producer budget vs serve-time delivery cap). Still the same
         // fact this assertion exists for: the bare array is over the delivery cap.
-        expect(wireBytes(registry)).toBe(65014);
+        expect(wireBytes(registry)).toBe(66001);
 
         const bare = boundToolResult(JSON.stringify(registry));
 
         expect(bare.truncated).toBe(false);
         expect(bare.rejected).toEqual({
             reason: 'oversized-json',
-            originalBytes: 64110,
+            // 0032 (2026-11-26): +476 here against +484 above — the SAME document measured by two rules,
+            // and the arithmetic is the point. `originalBytes` is UTF-8 bytes of the serialized text
+            // (./core/result-budget.ts:300); `wireBytes` is model-facing payload bytes, which charge every
+            // `"` and `\` TWICE (./core/payload-bytes.ts:75-86). The new sentence adds four escaped
+            // quotes (manifest line: 24 `\"` pairs at HEAD, 28 now), so each costs 2 bytes here and 4
+            // there: 476 + 4x2 = 484 exactly. The refusal message below quotes the smaller figure, so
+            // the two numbers had to move together.
+            // F1 (2026-11-26, audit): +69 in BOTH figures at once — `toolCancel`'s added clause has no
+            // quote and no backslash, so nothing doubles and the 912-byte gap between the two currencies
+            // is untouched (65,567 payload / 64,655 UTF-8, both re-probed, not derived).
+            // C2 (2026-11-26): +434 in both figures again, from the one `threadFork` row recorded above, and
+            // the gap is STILL 912 (66,001 / 65,089) — the new sentence escapes to itself.
+            originalBytes: 65089,
             budgetBytes: MODEL_TOOL_RESULT_BUDGET_BYTES,
-            // The message text belongs to ./core/result-budget.ts:437-455, which is not
+            // The message text belongs to ./core/result-budget.ts (`refusalMessage`), which is not
             // this change's file, so only the figures it quotes are pinned here — and
             // they are worth pinning, because the advice it names ("smaller limit,
             // fewer ids, narrower fields") is the advice this schema used to REFUSE and
             // now implements.
-            message: expect.stringContaining('64110 bytes against a 32768-byte budget')
+            message: expect.stringContaining('65089 bytes against a 32768-byte budget')
         });
         expect(bare.rejected!.message).toContain('discarded, not truncated');
+
+        // C2 (2026-11-26): THE NON-HANDLE HALF, pinned where the document is the biggest one this
+        // package has. The registry is a JSON ARRAY, and the retained-handle clause in
+        // ./core/result-budget.ts (`retainedHandleOf`) only fires on an OBJECT carrying `branchId` or
+        // `invocationId` — so this refusal keeps the historical "narrow the arguments and re-run"
+        // sentence, which is right here because a `toolList` row set really is refetchable by
+        // `offset`/`limit`/`fields`. Pinned whole rather than as a fragment: a handle rule that
+        // leaked into non-handle documents fails on this line, not somewhere quieter.
+        expect(bare.rejected!.message).toContain(
+            'Re-run the tool call with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it.'
+        );
 
         // THE FIX, measured the same way. A default page is under the producer budget
         // AND under the cap, and the harness's own gate delivers it whole:
@@ -519,9 +563,20 @@ describe('toolManage list paging', () => {
         // F9 (2026-11-25): +1,688 (4 rows x 422) — the four record-wrapper descriptions grew
         // F11 (2026-11-26): +1,248 — every reworded description this document carries; the document is
         // further over the cap than before, which is the fact this pin protects.
+        // 0032 (2026-11-26): +794 — the same single `agentResult` row as the registry figure above, in
+        // DETAILS form, which is why the number is bigger: a details row also carries the SCHEMA, and this
+        // tool's `offset` parameter text grew with the past-the-end clamp sentence (+310 payload bytes on
+        // top of the entry description's +484). `delegate` is absent from this document for the peer-gate
+        // reason recorded in the registry case above, so its own +537/+299 (+529/+299 in UTF-8 — only
+        // 0032's four escaped quotes differ) does not appear in either figure.
+        // F1 (2026-11-26, audit): +69, the same `toolCancel` clause as above — this document carries that
+        // row too, and the clause has no escaped character, so one number covers both currencies.
+        // C2 (2026-11-26): +434, the same single `threadFork` row as the registry figure above — DETAILS
+        // form carries the same description, and its SCHEMA text did not move (the cap lives in the
+        // entry description, not in a parameter). 139,050 -> 139,484, re-probed.
         // by the same sentence (producer budget vs serve-time delivery cap). The refusal below
         // is what this pin protects, and a bigger document is still refused.
-        expect(wireBytes(unpaged)).toBe(138187);
+        expect(wireBytes(unpaged)).toBe(139484);
         expect(boundToolResult(JSON.stringify(unpaged)).rejected?.reason).toBe('oversized-json');
 
         // THE FIX: the default page is 5 rows, well inside both budgets, and the gate

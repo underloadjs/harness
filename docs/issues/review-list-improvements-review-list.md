@@ -1,6 +1,17 @@
 # 0007 — Improvements review list (not gaps)
 
-> **Status:** Open — reduced again on **2026-11-17** against the tree as it stands after the
+> **Status:** Open — re-audited and reduced on **2026-11-26** against the tree as it stands (the
+> delegate / agents-control defects in `docs/tasks/2026-11-26-delegate-defects-verified-fix-list.md`):
+> the Contract P1 `delegate` description row is cut to its surviving **pending-placeholder** half (the
+> "neither names … the `invocationId`/`threadId` it carries" clause is refuted and deleted outright,
+> because both description forms now name the two ids as HANDLES); three IT3 claims are recorded as
+> refuted in the `### Refuted as filed` table (the `threadSend` "a run is in flight" refusal, IT3's own
+> two retractions, and the `agentManage` `64 / 7 / 57` arithmetic); and one advisory sentence landed in
+> `delegate`'s `timeoutMs` description — **prose only**, no bound and no behaviour change, and it opens
+> no row. Every cite in this file is one directory move stale (`src/tools/…` and `src/core/…` are now
+> `src/engine/tools/…` and `src/engine/core/…`); the row above was re-anchored, the rest were not. The
+> evidence for this pass is the **Update (2026-11-26)** section at the end of this file. Earlier:
+> reduced again on **2026-11-17** against the tree as it stands after the
 > records-receipt, change-window and running-row-age work (0008-0012 and M1): three rows closed and
 > deleted (the mixed-batch receipt row, the change-feed floor-and-blind-spot row, and the
 > "`oldestAvailableRev` is undocumented in `knowledge.md`" row — the prose landed, with the
@@ -13,8 +24,10 @@
 > issue deleted in that sweep folded into the sections below as their own one-or-two-line rows, each
 > tagged **"(ex-00NN, closed 2026-11-16)"** so it does not read as a live cross-reference, and one
 > live gap added that no surviving issue owns (the search-side transport-cause collapse, the
-> `websearch/request.ts` half of ex-0015). The only live cross-references left are **0017, 0023,
-> 0026, 0032**. Earlier: extended on 2026-11-10 with the web-tools stress test (search / fetch /
+> `websearch/request.ts` half of ex-0015). The only live cross-references left were **0017, 0023,
+> 0026, 0032** — 0032 closed 2026-11-26 with the `toolActivity` tally, so the live set is now
+> **0017, 0023, 0026** and its surviving notes are the Operations journalled-child row and the
+> 2026-11-26 correction row. Earlier: extended on 2026-11-10 with the web-tools stress test (search / fetch /
 > download): five items became 0012-0016 (all closed 2026-11-16) and the rest are below; extended on
 > 2026-11-09 with the records-store stress-test findings that are doc fixes or wording, not gaps (the
 > four that are gaps became 0008-0011, also closed 2026-11-16); reduced earlier the same day (closed
@@ -45,7 +58,7 @@ Priority vocabulary: **P1** = cheap and prevents a consumer making a wrong assum
 | P2 | A `field-too-long` refusal says **characters** while the cap counts UTF-16 code units, so astral-plane text is refused at half the size a reader expects — a `maxLength: 4000` body holds 2000 emoji. | `src/core/records.ts:859` and `:821` (the same `${text.length} characters; the limit is ${cap}` sentence, re-anchored 2026-11-16 from `:850`/`:812`) | Reword to "UTF-16 code units", or count code points (`[...text].length`) and say which. |
 | P3 | A `define`d collection with no wrapper singular noun renders its own name twice in refusals: `unicode has no unicode with id "9999"`. Built-ins read correctly (`has no task with id`). | `src/core/records.ts:272-273` (`recordLabel` falls back to the collection name), used after `has no ` in the unknown-id refusals (re-anchored 2026-11-16: the former `:263-264`/`:1714`/`:1725` cites have drifted past those lines) | Fall back to "record" rather than the collection name in that slot. |
 | P1 | `toolCancel`'s release **races the child**: a child that answers a moment after the release reports `status: 'completed'` with **no** `error`, and `callCancelled: true` is the only marker that the caller let go — the release door's branch is unpinned (`callCancelled` is asserted exactly once in the suite), and AC2's third cause (a caller-aborted child) still has no discriminator on the result type. (ex-0021, closed 2026-11-16.) | `src/harness.ts:4688-4699` (`record.status === 'completed' ? undefined : …` plus `{ …envelope, callCancelled: true }`), `src/types/index.ts:1424-1431` (`callCancelled?: boolean`, "its absence never means 'not cancelled'"), the only assertion `src/harness.delegation.test.ts:1898` | Pin the answered-after-release shape (completed + no `error` + `callCancelled: true`) with a test, and either add a `caller-aborted` discriminator to `HarnessDelegationResult` or say in the description that `callCancelled` is the only signal. |
-| P1 | The catalogue / zero-subagent `delegate` description and the generated manifest teach a **smaller** contract than the allowlist description the model actually reads: neither names the pending placeholder or the `invocationId`/`threadId` it carries. (ex-0024, closed 2026-11-16.) | `src/tools/runtime/delegate.tool.ts:135-137` (the base `description` — no placeholder sentence) vs `src/core/metadata.ts:249` (`agentDelegateMetadata`'s "DELIVERY: … `{ status: "pending", callId, name, invocationId, threadId, elapsedMs, note }` paragraph); `src/core/tool-manifest.ts` carries the base text | Give both forms the placeholder paragraph (or point at it), regenerate with `yarn tools:manifest:check`, and pin the wording. |
+| P1 | The catalogue / zero-subagent `delegate` description teaches a **smaller** contract than the allowlist description the model actually reads: it carries **no pending-placeholder paragraph**, so a caller that only ever sees the catalogue row never learns that a delegation's first tool message may be a `{ status: "pending", … }` receipt instead of the envelope. (ex-0024, closed 2026-11-16.) **Reduced 2026-11-26** — the clause "neither names … the `invocationId`/`threadId` it carries" is deleted outright: both description forms now name the two ids as HANDLES, so that half is refuted (evidence below; refutation recorded in the Update section). | Cites re-anchored 2026-11-26 **by symbol** — the whole `src/tools/` + `src/core/` tree this row was filed against now lives under `src/engine/`. `src/engine/tools/runtime/delegate.tool.ts:142-143` (the base `description:` — it already says "The envelope names two HANDLES: `threadId` is the conversation the child ran in … and `invocationId` is what agentResult pages by", and a whole-file grep for `pending` matches ONLY `:186` — the `timeoutMs` **property** text, not the tool description — and `:283` — the entry's own allowlist template; so the base tool description genuinely carries no placeholder sentence) vs the "DELIVERY: … `{ status: "pending", callId, name, invocationId, threadId, elapsedMs, note }` paragraph at `src/engine/tools/runtime/delegate.tool.ts:283`, hand-duplicated at `src/engine/core/metadata.ts:250`; `src/engine/core/tool-manifest.ts` carries the base text verbatim (it is generated from that literal by `yarn tools:manifest`, and `src/engine/core/tool-discovery.test.ts` pins it byte-identically) | Give the base form the placeholder paragraph (or point at it), regenerate with `yarn tools:manifest` and verify with `yarn tools:manifest:check`, and pin the wording the way `src/engine/core/metadata.ownership.test.ts` pins the rest of the delegate prose. |
 | P2 | Delegation identity has three steps and only the first two are proof: the discovery fallback's step 3 — the set-difference "new since dispatch" — is still discovery and can adopt a **concurrent same-agent run**; it is unpinned. The 64-record live-eviction envelope test is also still owed. (ex-0029, closed 2026-11-16.) | `src/harness.ts:4935-4940` (owned-by-pair, then `records.find(record => !knownInvocations.has(record.invocationId))`), `src/harness.agent-results.test.ts:1184` (`retains at most 64 results and snapshot restores that bound`) | Replace the set-difference with an identity handed back by the dispatch, or pin the race with a concurrent-run test; add the live-eviction case beside the snapshot one. |
 | P2 | A **restored** record carries no `parentScope`/`parentCallId`, while `delegatedRecordOf` matches on exactly that pair — so pair-addressed doors (the `delegate` envelope, `agentResult`'s parent lookup) go quiet after a reload even though the record is back. (ex-0027 / ex-0033, closed 2026-11-16.) | `grep -c "parentScope" src/core/snapshot.ts` → **0**; `src/harness.ts:14290-14345` rebuilds only `partialContent` (`:14330-14336`), `cancelledAtMessage`, `stopReason` and `threadId` (`:14344`); `src/harness.ts:4716-4723` (`delegatedRecordOf` skips a record when `record.parentCallId !== parentCallId \\|\\| record.parentScope !== parentScope`); `src/harness.agent-results.test.ts:1184` pins the 64-record bound with **completed** rows only | Persist the pair on the snapshot record and restore it (the projection-idempotence argument that carries `threadId` applies verbatim), then extend the agent-results suite to reach a restored record by pair. |
 | P3 | `partialContent`'s `min: 1` snapshot reader bound is load-bearing for "absent means silent": AC2 (a stable present-and-empty key) was **declined by design**, and capture and the reader bound have to move together if anyone ever takes it up. (ex-0020, closed 2026-11-16.) | `src/core/snapshot.ts:301-306` (`readSnapshotString(record.partialContent, …, { min: 1 })`), capture at `src/harness.ts:12909-12916` ("The empty case stays empty (no synthetic empty string), which is what keeps the snapshot reader's `min: 1` guard meaningful") | Record the declined shape where a contributor will hit it (`knowledge.md`, in the cancellation-forensics prose) so it is not "fixed" into a regression. |
@@ -61,6 +74,8 @@ Priority vocabulary: **P1** = cheap and prevents a consumer making a wrong assum
 | P1 | REST still cannot tell a client whether a **stopped thread is resumable**: the read-model contract carries no stop reason at all. Retention is bounded rather than absolute, the journal is absent without a persistence root, `budget-exhausted` is typed and listed as resumable but never produced, and `api-error` is a fallback branch rather than a verified transport failure. (ex-0036, closed 2026-11-16.) | `grep -c stopReason src/shared/harness-api.ts` → **0**; `src/server/sessions.ts:3377` and `:4222` (`capThreadRecords`, defined `:4787`, prunes the oldest **inactive** rows), `:5440-5441` (`attachJournal` returns `undefined` with no persistence root); `src/harness.ts:710-717` (`RESUMMABLE_RUN_STOP_REASONS` lists `budget-exhausted`), `classifyRunStopReason` at `:12507` (never emits it; `api-error` is the catch-all arm) | Put the thread's stop reason (or a derived `resumable: boolean`) on the read route, and separate a verified transport failure from the fallback. |
 | P2 | An owed delegation account is paid at the **first act of the next model turn**; if the session never starts another turn the debt lives until `restore()`/`reset()` drops it, and only the **restore** half is pinned — no `reset()` case reads the register. (ex-0019, closed 2026-11-16.) | `src/harness.ts:9578` (`deliverOwedAccounts`), one call site at `:12662`; `accountsFor` appears only in `src/harness.delegation.test.ts` (grep over `src/` → that file plus the trimmer plugin), and no reset-path assertion reads it | Add the `reset()` counterpart to the owed-account test and state the lifetime where the delegation delivery rules are documented. |
 | P2 | The display-lane op-set route is still unimplemented. Seam list unchanged: the `harness.ts` handle beside `setThreadStatus`, the `Harness` member in `types/index.ts`, `lane-commit.ts`'s `CanonicalThread.contextLane` + op + `leaseScopeOf` + fold/digest, `lane-authority.ts`'s `threadsOf` / live replay / `liveRejectionCodeOf`, `lane-worker-loop.ts`'s `ReplicaReadView` + `deriveOperations`. Measured blocker, verbatim: "`thread:status` is declared and folded but **never SENT** … the boundary needs its own commit, the way `transcript:patch` does." (ex-0018, closed 2026-11-16; the crate-side lane drift is surviving issue 0017.) | `src/server/workers/lane-commit.ts:348` (the `{ kind: 'thread:status' }` op) + `:607` (fold) + `:734`, `src/server/workers/lane-authority.ts:1140` (fold arm) and `:1243`, `src/server/workers/lane-worker-loop.ts:981` (`ReplicaReadView`) + `:1020` (`deriveOperations`); `'thread:status'` is named nowhere outside the lane layer and the capability comments — no route or store file sends it | Land the op-set route with its own commit arm (the `transcript:patch` shape is the precedent), pin the reply boundary, and re-check the crate drift in 0017. |
+
+| P2 | Whether a delegated CHILD's own `tool` frames reach the **PARENT turn's** session journal is **unconfirmed** — carried here from ex-0032 (closed 2026-11-26), which listed the journal as out of scope and marked this observation the same way. What is established: a server deployment keeps one append-only journal per session (`<databaseRoot>/harness/sessions/<sessionId>/events.jsonl`, `src/server/journal.ts:12`, `HARNESS_JOURNAL_FILE` at `:105`), the append is a single site keyed by TURN id (`journal.append({ turnId, index, at, event })`, `src/server/sessions.ts:6642`), and the read route is turn-addressed (`GET …/turns/:turnId/events`) — so the journal is operator-facing, absent without a persistence root, and unreachable by the model. What was never traced is which `turnId` a delegated child's frames carry. Since the tally shipped, the model-facing question ("what did the stopped child DO?") no longer depends on this: `toolActivity` answers it from the ledger in both execution modes. What remains is an operator-side question about journal CONTENT, not a consumer gap. | `src/server/journal.ts:12`, `:105`; `src/server/sessions.ts:6642`; **unconfirmed** for the delegation path — no recorder on the child-run path was traced to a `turnId` | If an operator ever needs a child's frames under the parent's turn, trace the `turnId` a child's event is stamped with and state the answer in the journal's own doc; until then treat the journal as turn-scoped evidence only, and read the ledger for invocation-scoped facts |
 
 ## Security and trust posture
 
@@ -133,6 +148,10 @@ converter and `category` rows below.
 | `download` silently accepted a 3.6× truncation / lying proxy. | **Wrong mechanism.** The file is complete and byte-exact; the "mismatch" is gzip compressed-vs-decoded length (see the P2 row above). Genuine truncation already hard-errors (`download could not read the response body.`). One real silent case remains unproven either way: a server declaring *less* than it sends is truncated to the declared size and reported as success. |
 | `fetch` `query` mode should exclude References / External links / See also by default. | **Would break correct answers.** The contract is "the sections whose heading or text contain it" and it is met; `query="Bibcode"` returns exactly those sections as its entire correct answer, so blanket exclusion becomes a "no section matching" error. The payload-bloat half is real and stays open above (the `selectSections` per-section length cap, and the citation-link markdown verbosity; ex-0016, closed 2026-11-16); the unresumable-truncation half shipped with that issue and closed 2026-11-16. |
 | `fetch` reported `pageCharacters: 123456` — suspiciously round, likely a placeholder bug. | **Correct value.** That wikitext file is 185,358 **bytes** but exactly 123,456 **characters** (verified twice with curl + `python3 len()`). The field is genuinely character-based, as documented. |
+| `threadSend` into an agent's own **idle** default conversation refuses by claiming a run is in flight (IT3 defect 0038, which quoted `"agent:instruct" already has a run in flight`). | **False today — fixed since IT3 ran, or misquoted.** The verbatim refusal is `Tool "threadSend" failed: "agent:instruct" is agent "instruct"'s own conversation and is idle: a message into it would start a second turn of the agent that is asking. Use this turn, or address a thread you created (see threadList).` — it names the real state (`idle`) and the remedy. Source: the `ownThread \|\| ownDefault` branch in `src/engine/harness.ts` (re-anchored **by symbol** 2026-11-26 — that file is under concurrent edit, so every `harness.ts` number in this pass moves; grep for `own conversation and is idle`), and the quoted string `already has a run in flight` is nowhere in `src/` (grep → **0** hits). No action. |
+| IT3's follow-up that the `threadSend` default-conversation **note** names the wrong thread, and the reviewer objection that a `queued` receipt should read `started`. | **Both were withdrawn by their own authors — keep them withdrawn.** The note cannot name a dead thread: `liveSiblingNoteFor` (`src/engine/harness.ts:7688`; the candidate filter requires `entry.record.status === 'running'` at `:7709`, numbers as of this pass) returns `undefined` when nothing is running, and IT3 re-tested against a provably mid-run child and retracted the finding in full. The `queued` vs `started` objection misreads a deliberately three-valued field: `delivered: 'queued' \| 'started' \| 'resumed'` (`src/engine/types/index.ts:4176`) — `queued` steers a run already in flight, `started` begins one where none exists, `resumed` continues a cut-short run (`src/engine/harness.ts:7657-7666`), so a message into an in-flight run is `queued`, not `started`. |
+| `agentManage` under-reports: `totalResults: 64` while the per-agent `invocationCount` values sum to 7. | **Correct arithmetic — the observed numbers ARE the documented rule, not a shortfall.** Observed 2026-11-26: `totalResults: 64`, per-agent `invocationCount` summing to **7**, `hiddenResults: 57`, and `64 − 7 = 57` exactly. `agentManageView` (`src/engine/harness.ts`, re-anchored by symbol: `totalResults: records.length`, per-agent `invocationCount: recent.length`, `hiddenResults: records.length - listed`) defines `hiddenResults` as the retained ring minus the rows the page lists, and both relations are published in prose at `src/engine/tools/runtime/agentManage.tool.ts:60-71` ("`totalResults` EQUALS the sum of the `invocationCount`s while nothing is retired and is strictly greater once something is"; "`hiddenResults` is `totalResults` minus the rows this listing shows"). The 57 are rows retired with a released conversation: still readable by id through `agentResult`, listed by no agent, by design. Not a defect — IT3 reached the same conclusion independently. |
+| `threadFork`'s answer carries no `contentLength`/`truncated`/`nextOffset` (IT3 defect 0039) — and its transcript showed `contentLength: 16,015`, which proves the key exists. | **False on both halves.** `contentLength` is **not a fork key at any size**: `HarnessForkResult` is `{ branchId, threadId, content }` (`src/engine/types/index.ts:1967-1971`), and IT3's `16,015` is the **byte size of the serialized fork document** (15,957 characters + 58 bytes of envelope), not a field the fork emitted. And an **over-cap** fork emits **no keys at all** — `truncated` and `nextOffset` included — because the delivery seam refuses the **whole JSON document** instead of truncating it: `Tool result too large to deliver: 40058 bytes against a 32768-byte budget…`, `outcome: failed` (message prefix and cap `MODEL_TOOL_RESULT_BUDGET_BYTES`, both in `src/engine/core/result-budget.ts`). The branch keeps its full 40,000 characters and stays pageable by branch id through `agentResult` (`contentLength: 40000`, cursors accepted), so nothing was lost — only undeliverable in one frame. **Wrong mechanism, real gap underneath**: the refusal named no `branch-N` handle and prescribed `smaller limit, fewer ids, narrower fields`, arguments `threadFork` does not take, and the entry description never stated the delivery cap — that half was fixed by owner decision on 2026-11-26 (Update below, second wave). |
 
 ## Requests against other packages (out of this repo's hands)
 
@@ -249,7 +268,9 @@ cites; the row text says which were re-anchored.
   **+3**, Code health **+2**, Web tools **+4**, Requests against other packages **+2**. Nothing was
   added outside that set.
 - **Cross-reference hygiene.** Every mention of a deleted issue is written **"(ex-00NN, closed
-  2026-11-16)"**; the only live cross-references left are **0017, 0023, 0026, 0032**.
+  2026-11-16)"**; the live cross-references named at that pass were **0017, 0023, 0026, 0032**, and
+  0032 has since closed (2026-11-26, the `toolActivity` tally), so the live set is **0017, 0023,
+  0026** — see the 2026-11-26 hygiene bullet for where 0032's surviving notes went.
 - **Not re-verified this pass** (recorded rather than asserted): the `frontend/index.ts` "16,717
   lines across those 14 files" figure; the `src/server/persistence.ts` staging-write (`:38-45`,
   `:1747-1753`) and worker-IO (`:47-64`) cites; the records engine's scoped `counts` projection
@@ -328,4 +349,259 @@ below was read at source and is quoted with the pin that proves it.
   `0008:` / `0011:` / `0012:` test names survive, which is the log's own convention — a test name is
   not renamed to match a deleted file, so those keys are cited here as history, not as live
   cross-references. And every prose claim outside the five surfaces this pass was scoped to.
+- Status stays **Open**.
+
+## Update (2026-11-26)
+
+A verification pass over the delegate / agents-control defects filed by
+`docs/tasks/2026-11-26-delegate-defects-verified-fix-list.md`, scoped to the parts of that list that
+fold **here**: its Group C refutations and the one Contract row it points back at. Method: every claim
+re-checked **by symbol**, never by its cited line number — the entire `src/tools/` + `src/core/` tree
+has moved under `src/engine/` since the 2026-11-17 pass, so every number this file carries is stale,
+and rows left alone keep their stale cites and say so. `src/engine/harness.ts` was being edited
+concurrently during this pass, so its numbers were taken as of this date and re-locating them by
+symbol is stated wherever one is used.
+
+- **Row reduced (1), the closed part deleted outright.** Contract P1, the catalogue / zero-subagent
+  `delegate` description vs the allowlist description: the clause "neither names … the
+  `invocationId`/`threadId` it carries" is **gone**, because both forms now name the ids as HANDLES —
+  the base `description:` at `src/engine/tools/runtime/delegate.tool.ts:142-143` ("The envelope names
+  two HANDLES: `threadId` is the conversation the child ran in … and `invocationId` is what agentResult
+  pages by") and the entry's allowlist template at `:283`, hand-duplicated at
+  `src/engine/core/metadata.ts:250`. What survives — and is now the whole row — is the
+  **pending-placeholder** half: the base tool description carries no DELIVERY paragraph, shown by a
+  whole-file grep for `pending` in that entry, which matches only `:186` (the `timeoutMs` **property**
+  text) and `:283` (the template).
+- **Claims refuted and recorded (3), so they are not re-filed.** All three are IT3 findings the work
+  order re-tested (its Group C), now rows of the `### Refuted as filed` table: (1) `threadSend` into an
+  agent's own idle default "claims a run is in flight" — the refusal in force names the state and the
+  remedy verbatim (`… is agent "instruct"'s own conversation and is idle: a message into it would start
+  a second turn of the agent that is asking …`, the `ownThread \|\| ownDefault` branch of
+  `src/engine/harness.ts`), and the string IT3 quoted, `already has a run in flight`, is **0** hits in
+  `src/`; (2) IT3's own two retractions — the wrong-thread note and the `queued` vs `started` reviewer
+  objection — kept retracted against the code that makes each impossible (`liveSiblingNoteFor` and its
+  `status === 'running'` filter; `delivered: 'queued' \| 'started' \| 'resumed'` at
+  `src/engine/types/index.ts:4176`); (3) `agentManage`'s `totalResults: 64` against per-agent
+  `invocationCount` summing to 7 — `hiddenResults: 57` is `64 − 7` exactly, the rule published at
+  `src/engine/tools/runtime/agentManage.tool.ts:60-71` and computed in `agentManageView`
+  (`hiddenResults: records.length - listed`). That table is this log's **only** refutation table, so it
+  now carries non-web-tool rows; its heading is unchanged, and the scope note belongs here.
+- **Wording that landed today, recorded so it is not mistaken for a closed gap.** `delegate`'s
+  `timeoutMs` description gained one advisory sentence (work-order item B3, the prose-only half, owner
+  decision): a bound under roughly 1000 ms almost always cancels the child before it answers, that
+  cancellation still mints a child conversation and still costs a provider request, and the cancelled
+  child leaves the caller a thread to release with `threadDelete`. The owner chose the sentence over
+  auto-release, so the release duty that the descriptions already placed on the caller for a **finished**
+  child now covers a **timed-out** one too — by prose, not by code. `minimum: 1` is unchanged: the
+  suites pass sub-second bounds deliberately (`timeoutMs: 30` in `src/engine/harness.delegation.test.ts`
+  and `src/engine/harness.fork.test.ts`, 1-5 ms in plugin bounds), so the work order's "500 ms standing
+  case" — a **live probe**, not a test, corrected here against the tree — still does not license raising
+  the floor. The sentence is byte-identical across the three text copies the entry header names (the
+  entry literal, the generated `src/engine/core/tool-manifest.ts`, and the hand-mirrored Rust row
+  `packages/typecrate/harness/src/tools/catalogue.rs`), and is pinned in all three by
+  `src/engine/core/metadata.ownership.test.ts`; `yarn tools:manifest:check` passes, and no `cargo` run
+  was performed here (the crate rows stay text-verified, as the Requests section says).
+- **Shipped, and the entry it belonged to closed.** B4 landed the same day: `toolActivity`
+  (`HarnessToolActivity`, `src/engine/types/index.ts:1700`) is the bounded tally issue **0032**
+  proposed, and its acceptance criteria are pinned end to end — `src/engine/harness.delegation.test.ts`
+  (the cancelled, turn-cap, cap-at-eight and zero-call cases), `src/engine/harness.agent-results.test.ts`
+  (both doors, the persisted row, the reload, and the archive seam), `src/server/workers/lane-commit.test.ts`
+  (the lane fold, its receipt digest and its refusals), `src/server/workers/lane-worker-correctness.test.ts`
+  (worker mode, the zero-call case) and `src/engine/core/metadata.ownership.test.ts` (the four
+  description forms stated against `TOOL_ACTIVITY_NAME_CAP` rather than a second literal). **0032 is
+  therefore closed 2026-11-26**, its file deleted and its index row dropped; the surviving notes are
+  this list's Operations row on the journalled-child question and the correction below.
+- **Two further doors pinned, and the price of the prose, both measured.** The acceptance evidence
+  above is not the whole of it, and the final suite found what the first pass had left unpinned.
+  `src/server/threads.test.ts:3815`, `:3839` and `:3906` now carry the tally on all THREE doors of
+  the same child — the live `agentResult` call, the row the server wrote, and the row that same
+  file answers with after a restart — which is the `restore -> snapshot` idempotency pin 0032's
+  update demanded of the new key (a row that re-emitted a different tally, or dropped it and
+  re-added it, fails the byte-for-byte `rewritten` comparison that closes that case).
+  `src/engine/harness.background.test.ts:2570` pins the fourth route: the owed-account delivery an
+  ABANDONED scope finally pays at the next turn carries the same tally inside the placeholder it
+  upgrades in place. And the prose has a cost this list states rather than rediscovers: two byte
+  pins moved because the descriptions grew — `src/engine/harness.tool-list.test.ts:415` (+484
+  payload bytes, +476 UTF-8, the whole of it the `agentResult` row, since `delegate` is peer-gated
+  and absent from that registry) and `:524` (+794, the same row in DETAILS form, which also carries
+  its `offset` schema text) — and a delegating roster's request floor moved **16,362 → 16,567**
+  (probed by printing `measureRequestFloor` on the case), which is why `DELEGATE_FLOOR` moved
+  **15,896 → 16,101** at `src/engine/plugin/context-compaction.test.ts:4154` with its documented
+  466-token offset intact. A wording change that does NOT move that cap does not fail on a number:
+  the compaction pass declines to park at all, and the case dies as
+  `Thread "thread-1" never reached "paused" (last: running)` — the shape this regression actually
+  took, recorded so the next wording pass reads a token figure instead of a thread-state mystery.
+- **Correction to B4's own framing, recorded so the refutation is not re-filed backwards.** The work
+  order filed the turn-cap case as "a turn-capped child's envelope is EMPTY even though its tool work
+  survived", with the `maxTurns: 1` case as its evidence. The envelope is not the empty half: a capped
+  child that committed PROSE reports it as `content` AND `partialContent` (pinned in
+  `src/engine/harness.delegation.test.ts`, `cuts a child that would have answered one turn later` —
+  `content: 'pass 1'`, `partialContent: 'pass 1'`, `cancelledAtMessage: 3`), and a capped child whose
+  rounds were all tools reports an empty answer with NO `partialContent` and with
+  `stopReason: 'turn-cap'` naming the bound that fired (observed by this pass:
+  `{"status":"failed","content":"","cancelledAtMessage":3,"durationMs":10214,"stopReason":"turn-cap"}`;
+  the child behind it was a probe, not a fixture, so the count is this pass's own account). The claim
+  that survives — and is what B4 actually found — is the **ledger** half: before the tally a stopped,
+  prose-less, tool-heavy child left no addressable account of what it DID, and the `turn-cap` child is
+  the cleanest reproduction of that gap.
+- **B5 stays unconfirmed** — no live async reproduction of a placeholder omitting
+  `invocationId`/`threadId` exists, so the reduced P1 row above is not enlarged by it. Group A, B1 and
+  B2, the other issues, and the Operations, Security, Documentation, Packaging, Code-health and
+  Requests sections of this list were **not** re-audited this pass.
+  **Corrected later the same day (2026-11-26, second wave, below):** B5 **is confirmed** — and the P1 row
+  is still **not** enlarged by it, for a reason that replaced this one. Group A's pins were confirmed
+  passing and B1 and B2 **did** ship after that sentence was written, so what genuinely stayed
+  unaudited is the other issues and the Operations, Security, Documentation, Packaging, Code-health and
+  Requests sections.
+
+### Second wave of the same pass (2026-11-26)
+
+The parts the wave above left open, landed the same day against the same tree
+(`packages/underload/harness` `cabfeff`, every change uncommitted; `packages/typecrate/harness` `39090d0`
+and `packages/loadscript/harness` also touched). Recorded as a sub-section of this update rather than a
+second same-dated one: it is one pass, split only by when each half was written. The work-order file
+`docs/tasks/2026-11-26-delegate-defects-verified-fix-list.md` is now that pass's completed record.
+
+- **B1 shipped — `agentResult` now reports the clamp it used to swallow.** `offsetClamped: true` plus a
+  one-sentence `note` whenever the requested offset **strictly exceeds** the stored length, computed once
+  as `requested > total` and applied on BOTH the completed row and the failed / cancelled `partialContent`
+  branch, by `agentResultClampNote` above `agentResultFor` in `src/engine/harness.ts` (cited by symbol —
+  that file moved throughout). Pinned at `src/engine/harness.agent-results.test.ts:672`
+  (`reports an offset past the end as a clamp, and an in-range offset as nothing at all`), `:739`
+  (`reports the same clamp when paging a stopped child partialContent`) and `:1360`
+  (`does not report a surrogate-boundary repair as an offset clamp`) — the last one is why the flag
+  cannot lie: a lead-surrogate pull-back changes `page.offset` without ever satisfying `requested > total`.
+  Two deliberate deviations from the work order, both recorded there: **`offset === contentLength` carries
+  no flag** (that is the honest empty tail, and it is webfetch's own rule —
+  `startOffset !== invocation.offset`, `src/engine/tools/webfetch/index.ts:690`), and **no shared constant
+  was invented** — the note is a noun-swapped mirror of `src/engine/tools/webfetch/index.ts:871-876`, and
+  one constant would churn webfetch's pinned wording because the two tools name their unit differently.
+  The work order's "add the field to the agent-result type beside `contentLength`/`hasMore`" is
+  **impossible**: that door is untyped — `HarnessToolRuntime.agentResult: (parameters) => unknown`,
+  `src/engine/types/index.ts:1456` — so the documented-shape comment precedent beside `partialContent`
+  (`src/engine/types/index.ts:1778-1793`) was followed instead, and the `offset` parameter description now
+  advertises the clamp (`src/engine/tools/runtime/agentResult.tool.ts:174`).
+- **B2 shipped — two refusals, two remedies.** `…; it belongs to agent "X".` when the id is real and
+  owned elsewhere (and `…it belongs to agents "A", "B".` when a recycled id sits under two agents),
+  `…: no such invocation in this harness.` when it exists nowhere; both built by `agentResultRefusalFor`
+  in `src/engine/harness.ts`, pinned byte-for-byte at
+  `src/engine/harness.agent-results.test.ts:833`, `:872`, `:939` (the plural) and `:964`. The
+  unregistered-agent refusal is unchanged. **The cross-agent lookup the work order asked to be built
+  already existed** — `invocationRecordOfInvocationId` (`src/engine/harness.ts:4849`) has no agent filter
+  and its record carries `.agent`. The documented **ring behaviour is preserved and newly pinned**: an id
+  retired with its transcript stays readable by id and names its owner instead of reading as unknown
+  (`:968`), and the pre-existing "a flag is not a deletion" pins still hold (`:407-418`, `:517-523`).
+- **`toolCancel`'s enumeration corrected across all three copies** — the follow-on the B4 audit found,
+  against 0032's AC7: the tally rides the `toolCancel` door (the released child's envelope carries it)
+  but the description never enumerated `toolActivity`, and a field a caller cannot discover is a field it
+  will not ask for. Fixed in the entry `src/engine/tools/runtime/toolCancel.tool.ts`, the generated
+  `src/engine/core/tool-manifest.ts`, and the hand-mirrored Rust row
+  `packages/typecrate/harness/src/tools/catalogue.rs:293`. `toolCancel` is `pendingOnly: true`
+  (`src/engine/tools/runtime/toolCancel.tool.ts:77`), so its text rides **no** request catalogue and
+  `DELEGATE_FLOOR` is unmoved by it — stated in that constant's own comment.
+- **B5: CONFIRMED, by a different mechanism than either explanation, and the contract sentence that
+  explained it was false.** A live probe (2/2 round trips, `http://localhost:8800/providers/private/v1`
+  with `local/basalt`) showed the **single-child** placeholder carrying **both** ids — so the omission
+  needed more than one child. The real path is **two or more `delegate` calls to the same agent in one
+  assistant message**: the queued sibling has no child record yet, `delegatedRecordOf` finds nothing, and
+  both keys are dropped from its placeholder; after release both children had real ids. Two consequences
+  this log owns: the in-source comment's two named causes are wrong **as routes** (a pre-dispatch refusal
+  never reaches a pending projection, and `pruneInvocationRecords` skips `status === 'running'`, so
+  eviction can never hit an in-flight child), and the sentence *"a missing id means no run, not an unknown
+  one"* is **false for a queued sibling** — replaced in both allowlist copies
+  (`src/engine/tools/runtime/delegate.tool.ts`, `src/engine/core/metadata.ts`). **No manifest or Rust
+  mirror of that text exists** — `grep -c "DELIVERY:"` is **0** in `src/engine/core/tool-manifest.ts` and
+  **0** in `packages/typecrate/harness/src/tools/catalogue.rs` (re-measured) — and a new pin in
+  `src/engine/core/metadata.ownership.test.ts:810` asserts that absence so a future mirror fails loudly.
+  Pinned at runtime by an exact-key case, `src/engine/harness.delegation.test.ts:3326` (`gives the
+  started child both ids and the queued sibling neither, then gives that sibling a real id`); the runtime
+  was **deliberately not changed** — no invented identity.
+- **The Contract P1 row above is CORRECTED but stays OPEN — the honest status.** Its **runtime half is
+  done**: the omission is reproduced, pinned, and the false "a missing id means no run" clause is gone
+  from both allowlist copies. The row does **not** close, because the half it was filed for is untouched:
+  the **base / zero-subagent description still carries no placeholder paragraph at all**, and the
+  generated manifest and the Rust row carry **0 occurrences of `DELIVERY:`** — so the catalogue a
+  zero-subagent consumer reads still teaches the smaller contract than the allowlist description. The
+  row's suggested action (give the base form the paragraph, regenerate, pin it) is unchanged; a
+  description edit there moves the byte pins named in the measured-cost bullet above.
+- **C2: refuted as filed, and the gap underneath fixed by owner decision.** The refuted row is in the
+  table above (an over-cap fork emits no `truncated`/`nextOffset` because the **whole document** is
+  refused; `contentLength` is no fork key at any size, `src/engine/types/index.ts:1967-1971`). The
+  **owner authorised implementing in this pass**, overriding the work order's own "do not implement" for
+  Group C: the over-cap refusal now names the **retained handles** and points at `agentResult` on the
+  branch rather than a re-run, and `threadFork`'s description now states the 32,768-byte delivery cap
+  (`MODEL_TOOL_RESULT_BUDGET_BYTES`, `src/engine/core/result-budget.ts`), the whole-document refusal, and
+  that the branch stays pageable by id — read today at `src/engine/tools/runtime/threadFork.tool.ts:65`,
+  with the retained-handle clause sitting above `RetainedHandleKey` in `src/engine/core/result-budget.ts`
+  (a `branchId`/`invocationId` earns the "we kept it, page it" clause; a bare `threadId` deliberately does
+  not, because a thread addresses a conversation rather than the discarded document —
+  `src/engine/core/result-budget.ts:455-461`). **`corrected` — the "`unconfirmed` at line level until the
+  final verification pass lands" marking is spent** (the shipped wording was still moving when this was
+  written, and the over-cap shape has still never been observed live). The final pass re-anchored the
+  clause: `refusalMessage` has two arms (`src/engine/core/result-budget.ts:524`) over
+  `parseJsonDocument` (`:420`), `retainedHandleOf` (`:476`) and `REFUSAL_HANDLE_MAX_CHARS` (`:470`);
+  **five** refusal rows are pinned whole in `src/engine/core/result-budget.test.ts:177` (a fork
+  `branchId`, a delegation `invocationId`, a no-key object, an array, and an over-long handle that falls
+  back to the re-run sentence); the refusal is pinned end to end in
+  `src/engine/harness.fork.test.ts:307` — delivered whole as the only tool frame with
+  `outcome: 'failed'`, then paged back through `agentResult` under the branch id — and the description
+  cap is pinned **through `MODEL_TOOL_RESULT_BUDGET_BYTES`, never a bare literal**, across the entry,
+  `src/engine/core/metadata.ts`, `src/engine/core/tool-manifest.ts` and
+  `packages/typecrate/harness/src/tools/catalogue.rs` by
+  `src/engine/core/metadata.ownership.test.ts:867`. The clause is ported in Rust as `retained_handle`
+  and a two-arm `refusal_message` (`packages/typecrate/harness/src/tools/result.rs:288`, `:327`) with a
+  Rust test (`a_refused_document_that_names_a_retained_branch_is_pointed_at_that_branch`, `:1388`) that
+  caught a real defect the TS pins could not — the handle arm's missing sentence terminator — while the
+  non-handle arm stayed **byte-identical**. The work order's C2 section carries the shipped refusal
+  verbatim.
+- **Out-of-package fix — LANDED, and verified on the final tree.** `packages/loadscript/harness/src/types/index.ts`
+  mirrors the delegation envelope **without** `toolActivity` and asserted that a stopped child's tool
+  calls "are gone for good — 0020's leak boundary and 0032" (`:1735`, and again at `:4460`) — false once
+  0032 closed. Corrected here under the same owner decision. **`corrected` on the state of the tree:**
+  this entry first recorded the correction as **decided and in flight**, because that file reported a
+  clean working tree when the sentence was written — two source workers finished after it, and the change
+  is now in the tree: `HarnessToolActivity` (`src/types/index.ts:1695`) plus an optional `toolActivity`
+  on all three doors that carry it (`HarnessDelegationResult` `:1798`, `HarnessAgentResultSnapshot`
+  `:4547`, `HarnessInvocationArchiveInput` `:4657`), and the forensic sentence rewritten in BOTH places
+  it sat (`:1782-1786` and `:4517-4522`) so the client says what the engine says — the calls and their
+  result bodies / text stay unretained, the **bounded** tally is retained on a stopped run. The last pass
+  closed the two comments this wave had deliberately left out, which still asserted the opposite
+  ("a rolled-back run's tool activity is deliberately not retained") in `partialContent`'s note in each
+  package — `packages/underload/harness/src/engine/types/index.ts:4629-4634` and the same sentence in
+  `packages/loadscript/harness/src/types/index.ts:4517-4522`; both now distinguish the tool calls and
+  result bodies that 0020's leak boundary keeps out (so `partialContent` stays text-only) from the
+  bounded `toolActivity` tally — `calls`, `settled` and up to `TOOL_ACTIVITY_NAME_CAP` (8) names — that
+  0032 does retain. **Comments only, in identical wording on both sides** of the mirror; no type or
+  behaviour change. **Nothing makes that file a contractual mirror**: no generator, no test, no document
+  pins it to `src/engine/types/index.ts`, which is exactly why no check failed when 0032 shipped — and
+  that caveat survives the fix. The mirror-with-guard-test alternative was declined; recorded in the work
+  order's Out-of-scope section so the next pass reads it as a decision, not an oversight. **Verification
+  on the final tree:** `yarn typecheck` exit **0**, `yarn test` → **183 files / 2,626 tests passed** (in
+  `packages/loadscript/harness`).
+- **What this wave still did NOT observe** (so none of the above is read as more than it is):
+  worker-mode **positive** `toolActivity` is pinned only at the fold / archive-door level, never through a
+  live tool-using lane stub; no `cargo test` pins the mirrored Rust **catalogue-row** text (the guards
+  for that text are TS-side `sourceOf` greps in `metadata.ownership.test.ts`) — narrowed in the final
+  pass, because the crate's **refusal sentence** IS now pinned by Rust
+  (`a_refused_document_that_names_a_retained_branch_is_pointed_at_that_branch`,
+  `packages/typecrate/harness/src/tools/result.rs:1388`, both arms byte for byte); on-disk persistence and a lane restart were exercised
+  **in-process**, not through `src/server/persistence.ts` or a respawned worker; B5's queued-sibling shape
+  and the over-cap fork are both pinned **scripted, not live**; and no live multi-sibling `threadFork`
+  refusal-naming check was run. **Verification figures, replaced by the final pass.** The figures this
+  entry first recorded — full suite **272 files / 5,121 tests**, `yarn typecheck` exit **0**, both
+  manifest checks current, `cargo check --tests` exit **0** — were taken **before the last wording
+  edits**, exactly as the entry said; the final pass re-ran every check on the final tree: full suite
+  **272 files / 5,124 tests passed** (`yarn vitest run`, exit **0**), `yarn typecheck` exit **0**,
+  `yarn tools:manifest:check` (34 descriptors) and `yarn plugins:manifest:check` (3 plugins) both
+  current and exit **0**, `cargo test` in `packages/typecrate/harness` → **22 suites / 486 tests passed,
+  0 failed**, and `cargo check --tests` → exit **0**. The out-of-package mirror re-ran too:
+  `yarn typecheck` exit **0** and `yarn test` → **183 files / 2,626 tests** in
+  `packages/loadscript/harness`.
+- **For the next pass (recorded, not fixed).** Issue **0026** records the **absence** of a `maxChars`
+  description pin; it does not contain one. The Code-health "standing test-gap line" already lists that
+  trio as still owed, so it stays open and the work order's citation of 0026 as a precedent was wrong.
+- **Cross-reference hygiene:** the live cross-references are now **0017, 0023, 0026**; the 0032
+  mentions in this file were rewritten as **"(ex-0032, closed 2026-11-26)"** — its live gap shipped,
+  and what survived moved here (the Operations journalled-child row, and the B4 framing correction
+  above).
 - Status stays **Open**.

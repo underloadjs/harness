@@ -23,10 +23,25 @@ export const TOOL_CANCEL_NAME = 'toolCancel';
 // it; reaching the settled state again is success. Only an id this run never
 // started is an error, and the description says that too so the model knows the
 // difference.
+//
+// F1 (2026-11-26, independent audit of the 0032 pass) — the enumeration of what a cancelled
+// `delegate` call still delivers now names `toolActivity` too, with its cap. The shipped abandoned-
+// call envelope DOES carry the tally — ../../harness.delegation.test.ts
+// (`delivers the child forensics when toolCancel releases the delegation`) pins
+// `{calls: 1, settled: 0, byName: […], truncated: false}` on exactly that door — and `delegate`'s own
+// abandon sentence already lists all four forensic fields; this row named three, so a caller reading
+// ONLY this control's description was told a smaller contract than the one delivered — 0032 AC7's
+// rule is that a description names the field and its bound. The bound is stated BY REFERENCE to the
+// row that owns it: `TOOL_ACTIVITY_NAME_CAP` (../../core/agent-limits.ts) is what caps the name list,
+// and the `delegate`/`agentResult` descriptions spell "up-to-8" against that constant
+// (../../core/metadata.ownership.test.ts pins it), so this row repeats the number and points at the
+// row that defines the field. This entry is `visibility: 'core'`, so the extra words are
+// never scored by discovery (../../core/discovery.ts ranks only `searchable` rows); they do move
+// the two byte pins that carry this description — ../../harness.tool-list.test.ts re-measures them.
 export const TOOL_CANCEL_METADATA: CoreToolMetadata = {
     name: TOOL_CANCEL_NAME,
     description:
-        'Cancel one background tool call you started. Pass the callId shown in the pending list (tool_result.pending, a wakeup, or the tool_call event of a call still running). The harness releases the call immediately and ignores any later result, so you can continue without waiting for it - except a delegate call: its terminal envelope is still delivered, as that call\'s own tool message, carrying `status`, any `partialContent`/`cancelledAtMessage`, and `callCancelled: true` to mark that you released the call rather than the child finishing on its own. Cancelling a call that already completed, failed, or was already cancelled succeeds without changing anything - the receipt then reports `cancelled: true` together with `alreadySettled: true`, the flag that says the call had already reached a terminal state before you asked, so that pair is a success you can act on and not a second cancellation - so you never need to check first. A tool that watches its abort signal also stops its own work; JavaScript cannot be preempted, so a tool that ignores the signal may still finish in the background. An id this run never started is an error.',
+        'Cancel one background tool call you started. Pass the callId shown in the pending list (tool_result.pending, a wakeup, or the tool_call event of a call still running). The harness releases the call immediately and ignores any later result, so you can continue without waiting for it - except a delegate call: its terminal envelope is still delivered, as that call\'s own tool message, carrying `status`, any `partialContent`/`cancelledAtMessage`/`toolActivity` (the up-to-8 name tally the `delegate` row describes), and `callCancelled: true` to mark that you released the call rather than the child finishing on its own. Cancelling a call that already completed, failed, or was already cancelled succeeds without changing anything - the receipt then reports `cancelled: true` together with `alreadySettled: true`, the flag that says the call had already reached a terminal state before you asked, so that pair is a success you can act on and not a second cancellation - so you never need to check first. A tool that watches its abort signal also stops its own work; JavaScript cannot be preempted, so a tool that ignores the signal may still finish in the background. An id this run never started is an error.',
     tags: ['tool', 'tools', 'cancel', 'background', 'abort'],
     visibility: 'core',
     parameters: {

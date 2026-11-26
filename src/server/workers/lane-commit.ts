@@ -63,10 +63,11 @@ import { AGENT_RESULT_RETENTION, DEFAULT_CREATED_TOOLS_LIMIT, MAX_THREAD_RECORDS
 // `readArchiveForensicPair` below so the lane archive fold and the core's canonical write refuse the
 // same malformed FORENSIC PAIR (review finding #5 / issues 0020 + 0033). Direct module import, the
 // same convention src/harness.ts uses for these two helpers: the core barrel does not re-export them.
-import { readSnapshotInteger, readSnapshotString } from '../../engine/core/snapshot-validation';
+import { readSnapshotInteger, readSnapshotString, readSnapshotToolActivity } from '../../engine/core/snapshot-validation';
 // R4: the ONLY definition of "why did a run stop", shared with the snapshot reader that validates the
-// same field on both durable rows (../core/snapshot.ts `readAgentResults` for the invocation row,
-// `readThreads` for the thread row). Same convention as the validation helpers above — the core
+// same field on both durable rows (../../engine/core/snapshot.ts `readAgentResults` for the
+// invocation row, `readThreads` for the thread row). Same convention as the validation helpers
+// above — the core
 // barrel does not re-export these, and importing the union from core is what keeps a lane payload
 // from inventing a reason that the reader then refuses on reload.
 import { HARNESS_RUN_STOP_REASONS, isHarnessRunStopReason } from '../../engine/core/snapshot';
@@ -74,7 +75,8 @@ import type {
     AgentRank,
     HarnessAgentResultSnapshot,
     HarnessMessage,
-    HarnessRunStopReason
+    HarnessRunStopReason,
+    HarnessToolActivity
 } from '../../engine/types';
 import type { IdentityLedger } from './lane-identity';
 import { idOf } from './lane-identity';
@@ -179,6 +181,15 @@ export const archiveDigestOf = (record: {
     error?: string;
     partialContent?: string;
     cancelledAtMessage?: number;
+    // issue 0032 (2026-11-26): the fourth forensic member, INCLUDED for the same reason the pair
+    // above is — this projection is the skip test (`./lane-worker-loop.ts` `deriveOperations`
+    // emits an archive op only when `lane.archived` disagrees with it), so a canonical row moving
+    // from no-tally to tally has to be visible to it or the writer skips the very op that carries
+    // the tally. It is a writer-owned value (the lane replica's own `finishInvocation` produced
+    // it, the authority stores it verbatim, and both sides drop it on `completed`), which is the
+    // test this file uses to decide inclusion — the opposite case from `threadId`, `epoch` and
+    // `stopReason`, which stay excluded for the reasons documented above.
+    toolActivity?: HarnessToolActivity;
 }): string =>
     digestMemoryValue({
         invocationId: record.invocationId,
@@ -195,7 +206,15 @@ export const archiveDigestOf = (record: {
         // defaulting: a record whose partial was dropped (completed) must digest exactly like the
         // record the authority stored, key for key.
         ...(record.partialContent === undefined ? {} : { partialContent: record.partialContent }),
-        ...(record.cancelledAtMessage === undefined ? {} : { cancelledAtMessage: record.cancelledAtMessage })
+        ...(record.cancelledAtMessage === undefined ? {} : { cancelledAtMessage: record.cancelledAtMessage }),
+        // Same absent-vs-present discipline. What the digest normalizes is OBJECT KEYS: `digestMemoryValue`
+        // (./lane-memory.ts, whose `serializeMemoryValue` walks `Object.keys(record).sort()`), so the
+        // nested `byName` rows digest the same whichever order each side wrote `name`/`calls` in. It
+        // does NOT normalize ARRAY ORDER — the same rows in a different order are a different digest —
+        // so the cross-seam agreement of a tally is not this projection's work: it comes from the sort
+        // in `toolActivityOf` (src/engine/harness.ts), count descending with the NAME ascending as the
+        // tie-break, which is the only reason a lane replica and the authority emit the same ARRAY.
+        ...(record.toolActivity === undefined ? {} : { toolActivity: record.toolActivity })
     });
 
 // The FORENSIC PAIR of an archive payload: validated, and projected onto what a row may store
@@ -207,7 +226,8 @@ export const archiveDigestOf = (record: {
 // this fold rejects while the core accepts is a receipt that says `invalid-mutation` about state that
 // landed; a value the fold accepts while the core rejects rolls the whole group back after the fold
 // already moved the view. Both sides therefore call the same bounds, and the bounds are
-// `../../core/snapshot-validation.ts` — the module ../core/snapshot.ts itself uses to read these two
+// `../../engine/core/snapshot-validation.ts` — the module ../../engine/core/snapshot.ts itself uses
+// to read these two
 // fields back off disk — reused rather than re-derived, so a payload can never be legal to archive
 // and illegal to reload.
 //
@@ -220,8 +240,9 @@ export const archiveDigestOf = (record: {
 //   * a present-but-blank partial is refused for the same reason: "present" is the signal that the
 //     run said something, and whitespace says nothing;
 //   * a `completed` status DROPS both fields. That is not leniency, it is loadability —
-//     ../core/snapshot.ts:280-300 refuses to read a completed row that carries the pair, so a fold
-//     that kept it would write a canonical view (and a next snapshot) that cannot be reloaded.
+//     ../../engine/core/snapshot.ts `readAgentResults` refuses to READ a completed row that carries
+//     the pair (its completed-status refusal of `partialContent`/`cancelledAtMessage`, :522-529), so
+//     a fold that kept it would write a canonical view (and a next snapshot) that cannot be reloaded.
 //     A cancelled row that later COMPLETES is the ordinary case: the replacement payload has no pair
 //     of its own, and the drop is what stops the earlier cancellation's evidence outliving it.
 //
@@ -263,12 +284,14 @@ const readArchiveForensicPair = (mutation: {
 
 // R4: the third forensic field of a run that did not finish — WHY it stopped — with the identical
 // discipline `readArchiveForensicPair` applies to the pair above, because the same reader enforces
-// it on both (../core/snapshot.ts:342-364):
+// it on both (../../engine/core/snapshot.ts `readAgentResults`, whose :471-483 checks the value
+// against `isHarnessRunStopReason` / `HARNESS_RUN_STOP_REASONS`):
 //   * a value outside `HARNESS_RUN_STOP_REASONS` is REFUSED, never dropped. `'cancelled'` is the
 //     mistake that looks valid — it is a STATUS, not a reason — and quietly accepting it would send
 //     a consumer back to the prose-matching this field exists to end;
-//   * a `completed` status DROPS it. That is loadability, not leniency: ../core/snapshot.ts:360
-//     refuses to READ a completed invocation row that carries a stop reason, so a fold that kept one
+//   * a `completed` status DROPS it. That is loadability, not leniency: the same
+//     `readAgentResults` refuses to READ a completed invocation row that carries a stop reason
+//     (:505-510), so a fold that kept one
 //     through a replacement archive would write a canonical view (and a next snapshot) that cannot be
 //     reloaded. A cancelled row that later completes is the ordinary case here.
 //
@@ -293,6 +316,47 @@ const readArchiveStopReason = (mutation: {
     if (mutation.status === 'completed') return {};
 
     return { stopReason };
+};
+
+// issue 0032 (2026-11-26) — the fourth forensic member of a run that did not finish: WHAT it did,
+// as a bounded tally of its tool calls. Same discipline as `readArchiveForensicPair` and
+// `readArchiveStopReason` above, because the same reader enforces it on both seams
+// (../../engine/core/snapshot.ts `readAgentResults` refuses to READ a completed invocation row
+// carrying the key (:516-520), and refuses a
+// malformed value rather than coercing one):
+//   * ABSENT stays absent — a lane built against the previous payload archives the same row it
+//     always archived, and a `completed` row carries no tally;
+//   * a PRESENT value is validated by `readSnapshotToolActivity`
+//     (../../engine/core/snapshot-validation.ts), the ONE validator the core's own archive
+//     (`src/harness.ts`) and the snapshot reader share, so a payload can never be legal to
+//     archive and illegal to reload — an over-cap `byName` (more than TOOL_ACTIVITY_NAME_CAP
+//     entries), an empty name or one longer than 64 characters, a count under its `min` (a
+//     `byName` row starts at 1, the two tallies at 0), a `settled` above `calls`, or a missing
+//     `truncated` all refuse here instead of persisting into the canonical view. The name bound is
+//     a LENGTH check (`readSnapshotString`, `min: 1, max: 64`), so a whitespace-only name such as
+//     `" "` PASSES — this fold refuses exactly what the snapshot reader refuses and coerces
+//     nothing, which is the point of sharing one validator;
+//   * a `completed` status DROPS it. Loadability again: the tally describes a run that did not
+//     conclude, and a completed row that kept one would be re-written without it by the next
+//     projection, breaking `restore -> snapshot` idempotency.
+//
+// A throw is a PERMANENT refusal, mapped to `invalid-mutation` by the caller exactly as the pair's
+// and the reason's are.
+const readArchiveToolActivity = (mutation: {
+    invocationId: string;
+    status: string;
+    toolActivity?: HarnessToolActivity;
+}): { toolActivity?: HarnessToolActivity } => {
+    if (mutation.toolActivity === undefined) return {};
+
+    const toolActivity = readSnapshotToolActivity(
+        mutation.toolActivity,
+        `Invocation "${mutation.invocationId}".toolActivity`
+    );
+
+    if (mutation.status === 'completed') return {};
+
+    return { toolActivity };
 };
 
 export type CanonicalView = {
@@ -461,6 +525,22 @@ export type SharedMutation =
           // the identical rule on the live side.
           partialContent?: string;
           cancelledAtMessage?: number;
+          // issue 0032 (2026-11-26): WHAT the stopped run did — the bounded tool-activity tally
+          // (`HarnessToolActivity`: calls, settled, a capped per-name breakdown, and the `truncated`
+          // flag that says the cap closed the list). Optional, so an older send stays valid and an
+          // older lane archives the same rows it always did.
+          //
+          // Writer-owned, like the pair above, and IN `archiveDigestOf` for the same reason: the
+          // replica's own `finishInvocation` produced it at the rollback boundary, the authority
+          // stores it verbatim, and both sides drop it on a `completed` status. Leaving it out of
+          // the digest would keep the trap that file documents — the skip test is taken over that
+          // projection, so canonical state moving from no-tally to tally would be invisible to the
+          // test that decides whether to send the op at all.
+          //
+          // Validated before this fold touches the view (see `readArchiveToolActivity`), against
+          // the snapshot reader's own bounds, so a malformed tally can never persist into the
+          // canonical view or into the next snapshot.
+          toolActivity?: HarnessToolActivity;
           // R4 (2026-11-15): WHY a run that did not finish ended — `stopped` (a host halt) vs
           // `interrupted` (a lost worker) vs `refusal`/`error`. The forensic pair above says WHAT the
           // run said and WHERE it stopped; this says WHO ended it, which is the one thing a client
@@ -1104,10 +1184,16 @@ export const applySharedMutation = (
             // (a kernel-lane pin, ./lane-commit.test.ts:978); which field was malformed is already
             // honest in the appended detail, because each validator names the field it rejected.
             let reason: { stopReason?: HarnessRunStopReason };
+            // issue 0032: read in the SAME refusal site as the pair and the reason, for the same
+            // reason — the check must land before this fold touches `view`, and a malformed tally is
+            // a permanent `invalid-mutation` on identical terms. Each validator names the field it
+            // rejected, so the appended detail stays honest about which one was malformed.
+            let activity: { toolActivity?: HarnessToolActivity };
 
             try {
                 pair = readArchiveForensicPair(mutation);
                 reason = readArchiveStopReason(mutation);
+                activity = readArchiveToolActivity(mutation);
             } catch (error) {
                 return reject(
                     base,
@@ -1176,7 +1262,8 @@ export const applySharedMutation = (
                     ...pair,
                     // R4: WHY the archived run stopped, carried into the canonical row with the same
                     // completed-drop as the pair (see `readArchiveStopReason`). Kept OUT of
-                    // `archiveDigestOf`'s field list on purpose — ../core/snapshot.ts:360 shows the
+                    // `archiveDigestOf`'s field list on purpose — ../../engine/core/snapshot.ts
+                    // `readAgentResults` (the completed-status refusal at :505-510) shows the
                     // reader treats it as forensic evidence of a run that did not finish, and the two
                     // sides of this seam may disagree about whether the key exists at all while a
                     // lane and an authority from different builds share a session. Both halves now
@@ -1185,6 +1272,12 @@ export const applySharedMutation = (
                     // the digest here while an older peer still digests without it: every stop-reason
                     // row would re-archive on every boundary forever.
                     ...reason,
+                    // issue 0032: the tally, with the same completed-drop the pair and the reason
+                    // carry. UNLIKE the reason, it is inside `archiveDigestOf`'s field list, so both
+                    // sides of this seam must project the key or the digests diverge — this branch
+                    // is the writer's receipt source, and `harness.archiveInvocation`
+                    // (./lane-authority.ts) drops it under the identical rule.
+                    ...activity,
                     ...(mutation.threadId === undefined ? {} : { threadId: mutation.threadId })
                 };
 
@@ -1227,7 +1320,11 @@ export const applySharedMutation = (
                 ...pair,
                 // R4: and the reason, on identical terms — see `replacedRecord` above for why the
                 // digest stays independent of it.
-                ...reason
+                ...reason,
+                // issue 0032: and the tally, validated and completed-dropped above. A first archive
+                // is the case the field exists for: a cancelled lane child's canonical row gets what
+                // it DID, not only the fact that it stopped.
+                ...activity
             };
 
             view.results[record.invocationId] = record;

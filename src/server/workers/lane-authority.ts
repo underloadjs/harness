@@ -1185,7 +1185,16 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                         // key at all, so a lane conversation's `agentResult` lost its machine-readable
                         // cause as soon as the session re-snapshotted. Same completed-drop as the
                         // kernel's archive (`harness.archiveInvocation` validates and applies it).
-                        ...(mutation.stopReason === undefined ? {} : { stopReason: mutation.stopReason })
+                        ...(mutation.stopReason === undefined ? {} : { stopReason: mutation.stopReason }),
+                        // issue 0032 (2026-11-26): the tally, forwarded verbatim like the pair and
+                        // the reason above. Without this line the lane's tally died at the authority
+                        // a third time over: the op carried it, this fold put it in the canonical
+                        // VIEW, but the kernel's own ledger row — the one the NEXT snapshot projects
+                        // and the `agentResult` door reads — had no key at all. The core validates it
+                        // before it mints an order (`harness.archiveInvocation`), so a malformed
+                        // tally throws here instead of corrupting the canonical record, and the
+                        // `completed` drop is the core's own rule.
+                        ...(mutation.toolActivity === undefined ? {} : { toolActivity: mutation.toolActivity })
                     });
 
                     // The digest the lane compares against is `archiveDigestOf`, the projection
@@ -1197,7 +1206,9 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                     // The named code, the way `transcript:patch` above already does it (T10 finding
                     // S5's rule: a receipt whose code names the wrong conflict sends the lane to the
                     // wrong fix). Every throw from `archiveInvocation` here is a structurally bad
-                    // archive — an unregistered agent, a running status, a malformed forensic pair —
+                    // archive — an unregistered agent, a running status, a malformed forensic pair,
+                    // or a malformed tool-activity tally (issue 0032, forwarded on the line above and
+                    // validated by the core against the snapshot reader's own bounds) —
                     // which is permanent, whereas the kind's default live conflict (`stale-record`,
                     // see `liveRejectionCodeOf`) tells the lane its base moved and invites it to
                     // re-derive the same row forever.

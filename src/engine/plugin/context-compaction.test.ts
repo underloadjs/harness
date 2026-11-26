@@ -750,8 +750,10 @@ const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', strea
 // delegate case uses `DELEGATE_FLOOR` (:4140), not this constant, and says so: that constant is
 // the number the case caps its conversation with (`DELEGATE_FLOOR + 520`), and it has ALWAYS sat
 // under that roster's true floor — 15,208 against 15,674 before the growth, 15,702 against 16,168
-// before the +776-byte task/thread wave of 2026-11-26, and 15,896 against 16,362 today, the same
-// 466-token offset every time. That is why this constant moved by the MEASURED
+// before the +776-byte task/thread wave of 2026-11-26, 15,896 against 16,362 before the
+// `delegate`/`agentResult` description growth the same day (the 0032 tally sentence, the caller-cost
+// advisory and the `offset` clamp sentence — see the block at :4136 for the byte figures), and
+// 16,101 against 16,567 today: the same 466-token offset every time. That is why this constant moved by the MEASURED
 // DELTA (+494 tokens = +1,976 bytes / 4) rather than to the new floor: the ceiling the case sizes
 // its SEED + PROMPT against is `DELEGATE_FLOOR + 520`, and only the offset between the two floors
 // is what the case was written against. The case asserts no exact estimate.
@@ -4133,25 +4135,61 @@ describe('context-compaction summarize flow (T9)', () => {
     // caps its conversation with `DELEGATE_FLOOR + 520` so its
     // transcript budget and its crossing margin stay the numbers every sibling case uses.
     //
-    // THE CONSTANT BELOW IS THAT CAP, NOT THAT FLOOR: it reads 15,702, i.e. 466 tokens under
-    // today's floor of 16,168 — the SAME offset it carried before the growth, where 15,208 sat 466
-    // under 15,674. The case is a CAP test — it asserts a crossing, never an exact estimate — and
-    // `DELEGATE_FLOOR + 520` = 16,222 sits 54 tokens above the roster's floor either way, so the
-    // dead-run guard below stays satisfied (an irreducible request of 16,168 tokens fits a 16,222
-    // ceiling) and the case is green on the delta; moving the cap to the new floor would move the
-    // transcript budget every sibling compares against for no extra truth.
+    // THE CONSTANT BELOW IS THAT CAP, NOT THAT FLOOR: it reads 16,101 today, i.e. the same 466
+    // tokens under the roster's floor (16,567, probed 2026-11-26 by printing `measureRequestFloor`
+    // on this exact case).
+    //
+    // B5 + F1 (2026-11-26, the same work order): this constant did NOT move, and both reasons are
+    // MEASURED. B5 rewrote `delegate`'s placeholder sentence at the SAME size (342 characters
+    // replacing 344), so the allowlist description a delegating roster pays for shrank by 2 bytes:
+    // probe `Temp/fix-f5/probe-floors.ts` shape B (re-run today, output
+    // `Temp/opencode/x1-b5/after-floors.txt`) reads 66,268 B = 16,567 tokens EXACTLY — was 66,270 B /
+    // 16,567.5, which rounded UP to 16,568 — so the true floor fell by one token, the cap is still
+    // 466 under it, and `DELEGATE_FLOOR + 520` = 16,621 clears it by exactly 54, the figure the
+    // paragraph below already states. F1 added 69 bytes to `toolCancel`'s description, and that row
+    // is `pendingOnly: true` (declared only while a call is in flight), so it rides NO request
+    // catalogue: shape A still reads 57,544 B / 14,386, which is why `CATALOGUE` above is unmoved.
+    //
+    // C2 (2026-11-26) is the same NO-RIDE case one tool over, measured the same way: `threadFork`'s
+    // description grew +434 bytes stating the delivery cap its summary must fit
+    // (../tools/runtime/threadFork.tool.ts, +434 in BOTH currencies — see the two byte pins in
+    // ./harness.tool-list.test.ts), and that row is `activation: 'forks'` — declared only on a thread
+    // that forks — so it rides NO request catalogue either. Probe `Temp/fix-f5/probe-floors.ts` re-run
+    // today (`Temp/opencode/x2-c2/after-floors.txt`) still reads shape A 57,544 B / 14,386 and shape B
+    // 66,268 B = 16,567 EXACTLY, and `threadFork` appears in neither per-entry list. Both floors are
+    // therefore UNMOVED and the 466-token offset this block sizes itself against is intact.
+    //
+    // It moved +205 because four MODEL-FACING strings grew in this tree, and
+    // a delegating roster's catalogue carries every one of them: `delegate`'s entry description and
+    // its `timeoutMs` text (the 0032 tally sentence and the caller-cost advisory —
+    // ../tools/runtime/delegate.tool.ts), and `agentResult`'s entry description and its `offset`
+    // text (the same tally sentence, and the past-the-end clamp sentence). The byte cost of those
+    // four strings is measured, not estimated, two files over: ./harness.tool-list.test.ts pins the
+    // two documents they appear in at +484 and +794 payload bytes (the `keeps a default page of THIS
+    // repo's real registry inside the delivery cap` case and the `pages the details inventory and
+    // stays inside the delivery cap` case — cited by name, because those byte assertions move line to
+    // line while the cases do not). The case is a CAP
+    // test — it asserts a crossing, never an exact estimate — and `DELEGATE_FLOOR + 520` = 16,621
+    // sits 54 tokens above the roster's floor, exactly as it did at 15,896/16,362 and 15,702/16,168,
+    // so the dead-run guard stays satisfied (an irreducible request of 16,567 tokens fits a 16,621
+    // ceiling) and the case is green on the SAME delta every sibling uses; moving the cap to the
+    // floor itself would move the transcript budget every sibling compares against for no extra
+    // truth. If it is NOT moved, the guard is what bites: the pass declines to park at all, the
+    // thread stays `running`, and the failure reads "Thread never reached paused" rather than
+    // naming a token figure — which is how this regression presented on 2026-11-26.
     //
     // THE ONE TOKEN THIS COSTS: the writer-only catalogue is a multiple of 4 (56,968 B), so its
-    // siblings state an exact `CATALOGUE + n`; the delegating catalogue is not (64,670 B), so the
-    // crossing this block measures sits one token either side of the 6 its siblings state. The
-    // rounding is UP, which is the side that keeps the dead-run guard honest: an understated floor
-    // would cap the conversation BELOW the request's irreducible size and the pass would refuse.
+    // siblings state an exact `CATALOGUE + n`; the delegating catalogue is not (64,670 B before this
+    // growth), so the crossing this block measures sits one token either side of the 6 its siblings
+    // state. The rounding is UP, which is the side that keeps the dead-run guard honest: an
+    // understated floor would cap the conversation BELOW the request's irreducible size and the pass
+    // would refuse.
     //
     // WHY IT HAS TO MOVE AT ALL (X1, 2026-11-17): the pass now refuses to start when the request's
     // irreducible size is at or above the ceiling, and a `CATALOGUE + 520` ceiling in a
     // delegating harness sits 1,926 tokens UNDER its own floor — a request no amount of clipping
     // could ever fit, so the pass there was a dead run by construction.
-    const DELEGATE_FLOOR = 15_896;
+    const DELEGATE_FLOOR = 16_101;
 
     // Scripted transport with a window INTO the request: `on` runs while the model turn is
     // in flight, which is the only moment a case can observe the roster status mid-pass, the

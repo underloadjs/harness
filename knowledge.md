@@ -3046,7 +3046,7 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   they were runtime-only: `content` is empty for a non-completed run, so a save/restart/
   reload answered the very same `invocationId` with `content: ""` and no `partialContent`
   key at all, and the caller lost an answer it had already been shown. The server persists
-  `core` verbatim (`src/server/persistence.ts`), so this array IS what lands in
+  `core` verbatim (`src/server/persistence.ts`), so this array IS what lands in that
   that session's `sessions/<sessionId>/session.json` shard — the only part of `core` the
   writer splits out is `core.threads[].messages`, and an agent-result row never travels
   with a transcript (`splitHarnessSessionRecord`, `src/server/persistence.ts:2320-2358`),
@@ -3074,8 +3074,41 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   helper's interrupted placeholder (`SYNTHESIZED_INTERRUPTED_TOOL_RESULT_TEXT`,
   `src/core/transcript-repair.ts:79`). Only a forked BRANCH run still splices. The boundary
   this bullet guards is therefore narrower than it used to be — row-level, not
-  transcript-level — and it is still the criterion issue 0032 is written against, whose
-  transcript half R1 retired (see the issue record for 0036).
+  transcript-level — and it was the criterion issue 0032 was written against (closed
+  2026-11-26: the row now also carries `toolActivity`, counts and names only, so the
+  boundary held while the gap closed), whose transcript half R1 retired (see the issue
+  record for 0036).
+- **A stopped run also keeps WHAT it did (2026-11-26, issue 0032, closed).** The fourth forensic
+  member of a run that did not conclude is `toolActivity` (`HarnessToolActivity`,
+  `src/engine/types/index.ts:1700`): `calls` (invocations the run REGISTERED — a call refused before
+  it started is not counted), `settled` (of those, how many had their outcome handled, so
+  `calls - settled` is the rounds the stop caught mid-flight), an optional `byName` of the busiest
+  names, and `truncated` — the cap stating that IT closed the name list rather than the run ending
+  there. Four properties are the contract: it is SEPARATE (it never widens `partialContent`, whose
+  text-only rule and leak boundary are 0020's), BOUNDED (`byName` holds at most
+  `TOOL_ACTIVITY_NAME_CAP` = 8 names — `src/engine/core/agent-limits.ts:52` — ordered by count
+  descending with the NAME ascending as a code-point tie-break, because the array is persisted and a
+  locale-dependent order would make a restored ledger re-emit different bytes), body-free (counts and
+  tool names only — no arguments, no result bodies, read from the run's own `RunState.toolTally`,
+  never from a transcript: `src/engine/harness.ts:4990` dispatch, `:5000` settle, `:5015` projection,
+  captured at the rollback boundary before the splice at `:15345`), and never replayed (it lives on
+  the record, not in a message, so provider pairing, `threadRead` and every continuation path are
+  untouched). It is ABSENT rather than zero-shaped: a run that registered nothing reports no key at
+  all, which is 0029's no-invented-identity rule applied to a count, and it is absent on a
+  COMPLETED row too — `finishInvocation` (`:5082-5083`) and `archiveInvocation` (`:9793`) both drop it
+  there, and `src/engine/core/snapshot.ts:516-518` REFUSES a completed row that carries one, which is
+  what keeps `restore -> snapshot` idempotent for the key. Both doors read the ONE stored value
+  (`:5700` the `agentResult` payload, `:5891` the listing row, and `delegate`'s unfinished envelope
+  builder shares the same projection), the durable row carries it (`:16431`, restored at
+  `:16871-16874`), the archive seam validates-stores-and-returns it (`:9710-9715`, `:9793`, `:9836`),
+  and worker mode carries it end to end (`readArchiveToolActivity` in
+  `src/server/workers/lane-commit.ts:330-344`, the refusal site at `:1176-1189`, the digest
+  `archiveDigestOf:211`, the authority forward `lane-authority.ts:1197`, the lane emit
+  `lane-worker-loop.ts:1157`). The value is validated by ONE function, `readSnapshotToolActivity`
+  (`src/engine/core/snapshot-validation.ts:273`), so a tally that is legal to archive is always legal
+  to reload — an over-cap `byName`, a blank name, a `settled` above `calls` or a missing `truncated`
+  fails the whole restore, or lands on a lane as a permanent `invalid-mutation`, instead of being
+  tidied.
 - **Completed answers only.** The registry records the value `runAgentCore`
   returns, never a streamed delta, so an explicitly addressed running invocation
   has `status: 'running'` and no content and is OMITTED from a snapshot (never
@@ -4426,7 +4459,13 @@ const team = harness({
   the same to the model) — and `toolRequest` reports
   `toolCancel` under `alreadyAvailable` in exactly that window (it is a
   `pendingOnly` core control, declared only while work is in flight, so the report —
-  not the catalogue — is where it is discoverable). A conversation that SWITCHES
+  not the catalogue — is where it is discoverable). The two handles that placeholder normally
+  carries (`invocationId`, `threadId`) appear only once the child has STARTED: while a delegation is
+  still QUEUED behind a sibling `delegate` to the same agent in one assistant message there is no
+  child record for `delegatedRecordOf` to read them from, so both keys are ABSENT there — and absent
+  means "not started yet", never "no run", because that sibling gets real ids on its own envelope
+  (pinned in `src/engine/harness.delegation.test.ts` by the case `gives the started child both ids
+  and the queued sibling neither, then gives that sibling a real id`). A conversation that SWITCHES
   `toolCancel` off loses the declaration and that report together — the withheld set applies
   to a pending-only control like any other name — which is the hazard worth naming: the model
   is left with no way to withdraw an in-flight call while the server-side machinery it cannot
@@ -9324,21 +9363,23 @@ In the order they are expected:
    third scope this pass introduced (a session's own
    configuration) has no harness-level twin to fall back on, which is exactly why the panes
    hide instead of falling back.
-9. **no surviving record of what a killed child DID — now only for a BRANCH run.** The
-   premise this item was written on (a cancelled or failed run splices its own turns out of
+9. **what a stopped child DID is now on the ledger; what it SAID through tools is still not.**
+   The premise this item was written on (a cancelled or failed run splices its own turns out of
    the transcript, `runAgentCore`'s catch to `commitIndex`) was RETIRED for conversation runs
    by IT19 R1 (2026-11-15, issue 0036): a cut run keeps its committed turns, and a lone
    `tool_calls` block is closed by the repair helper's interrupted result
    (`src/core/transcript-repair.ts:79`) — the same pairing rule that made the splice look
-   necessary is now satisfied by the placeholder instead of by deletion. What is still open is
-   the two-thirds the item actually cared about: (a) a forked BRANCH run still splices to its
-   fork baseline, because it owns no thread state, so a cancelled branch's activity is still
-   unrecoverable except through `partialContent`/`agentResult`; and (b) the RESULT ROW for a
-   cut run is still TEXT only — `partialContent` never carries a tool call or a tool result
-   (issue 0020's leak boundary), so a post-mortem that reads only the agent-result ledger
-   still sees what a stopped child was SAYING and not what it DID. `threadRead` is the door
-   that answers with the retained work. The bounded, SEPARATE forensic field under discussion
-   in issue 0032 is therefore now a ledger-side concern, not a transcript-side one.
+   necessary is now satisfied by the placeholder instead of by deletion. The ledger half SHIPPED
+   on 2026-11-26 (issue 0032, closed): a run that did not conclude reports `toolActivity` — the
+   calls it registered, how many reached an outcome, and the up-to-8 busiest names — on
+   `delegate`'s unfinished envelope, the `agentResult` row, the durable snapshot and the lane
+   archive chain (see [Agent results](#agent-results-r3)), so a post-mortem that reads only the
+   ledger can now say what a stopped child DID. What is still NOT built is narrower and partly
+   deliberate: (a) a forked BRANCH run still splices to its fork baseline, so its calls and
+   result blocks are unrecoverable except as that tally; and (b) no stopped run's row ever
+   carries a tool RESULT BODY — 0020's leak boundary excludes it, and widening `partialContent`
+   was rejected for the same reason. `threadRead` stays the door that answers with the retained
+   work of a thread-bound run.
 10. **the knowledge base's surface beyond the tool** — the cross-session store is engine +
     files + one model-facing door today ([Cross-session knowledge](#cross-session-knowledge)),
     and five things are deliberately NOT built: (a) **no HTTP route, no panel, no swagger

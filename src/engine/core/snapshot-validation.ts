@@ -24,6 +24,11 @@
 //   - ../util                                      — HarnessError
 
 import { HarnessError } from '../util';
+// issue 0032 (2026-11-26): the tally validator below needs the SAME cap the writers enforce, and
+// this leaf is the only place both the core reader and the lane fold can reach it. `./agent-limits`
+// imports nothing, so this adds no cycle; the type import is erased at transpile.
+import { TOOL_ACTIVITY_NAME_CAP } from './agent-limits';
+import type { HarnessToolActivity } from '../types';
 
 // A JSON object. Arrays are rejected: a JSON array is valid data but never a
 // record, and accepting it would hide a schema mismatch behind an arbitrary key
@@ -235,4 +240,80 @@ export const readSnapshotJsonValue = (value: unknown, label: string, depth = 0):
     }
 
     return copy;
+};
+
+// issue 0032 (2026-11-26) — THE ONE VALIDATOR FOR THE TOOL-ACTIVITY TALLY.
+//
+// WHY IT LIVES HERE AND NOT IN ../core/snapshot.ts. The same value is validated at THREE
+// seams, and all three must accept EXACTLY the same payloads or a field is legal to write and
+// illegal to read back: the snapshot reader (`./snapshot.ts`, reading a row off disk), the
+// archive seam in core (`../harness.ts` `archiveInvocation`), and the lane fold
+// (`../../server/workers/lane-commit.ts`).
+// That is the same reason `readSnapshotString`/`readSnapshotInteger` are here: the bounds are
+// the reader's, and every other door reuses them rather than re-deriving a looser copy — 0020
+// lists coercion as a defect, so a wrong value is REFUSED at every door, never repaired.
+//
+// THE BOUNDS, and where each comes from:
+//   * `calls`/`settled` are safe integers >= 0, and `settled` may never exceed `calls` — the
+//     settled counter is only ever raised for a call this run scheduled, so an inversion is a
+//     hand edit or a broken writer, not a fact;
+//   * `truncated` is a boolean and is REQUIRED: the projection always states it, and a row that
+//     omitted it would let a capped list read as a complete one (0032's AC2);
+//   * `byName` is OPTIONAL (a run whose projection had no name data omits it, and 0032's AC6
+//     makes absence the "nothing to say" signal), and when present it is NON-EMPTY and at most
+//     `TOOL_ACTIVITY_NAME_CAP` entries — the cap the projection enforces is enforced on the way
+//     back IN as well, or a hand-edited document could smuggle an unbounded row past retention;
+//   * every name is 1..64 characters, the same ceiling the tool-name rule gives a live tool
+//     (`../harness.ts`, "at most 64 characters"), which is what makes the whole payload bounded
+//     on both axes (8 names x 64 characters plus two integers).
+//
+// KEY ORDER IS PART OF THE CONTRACT. The object is rebuilt as `calls, settled, byName?,
+// truncated`, the order the writers project it in, because a snapshot's durability test is
+// `restore -> snapshot` equality and a reordered key emits a different JSON string.
+export const readSnapshotToolActivity = (value: unknown, label: string): HarnessToolActivity => {
+    const record = readSnapshotRecord(value, label);
+    // `allowed` is the PERMITTED set and `optional` is the may-be-absent subset of it (see
+    // `readSnapshotKeys`: a key outside `allowed` is an unknown field, so `byName` has to appear
+    // in both lists to be legal-but-optional rather than unknown).
+    readSnapshotKeys(record, ['calls', 'settled', 'byName', 'truncated'], label, ['byName']);
+
+    const calls = readSnapshotInteger(record.calls, `${label}.calls`, { min: 0 });
+    const settled = readSnapshotInteger(record.settled, `${label}.settled`, { min: 0 });
+
+    if (settled > calls) {
+        throw new HarnessError(
+            `${label}.settled (${settled}) cannot exceed ${label}.calls (${calls}); a settled call is by definition one that was registered.`
+        );
+    }
+
+    const truncated = readSnapshotBoolean(record.truncated, `${label}.truncated`);
+
+    if (record.byName === undefined) return { calls, settled, truncated };
+
+    const entries = readSnapshotArray(record.byName, `${label}.byName`);
+
+    if (entries.length === 0) {
+        throw new HarnessError(
+            `${label}.byName is empty; a tally with no tool names omits the key rather than listing none.`
+        );
+    }
+
+    if (entries.length > TOOL_ACTIVITY_NAME_CAP) {
+        throw new HarnessError(
+            `${label}.byName contains ${entries.length} entries; at most ${TOOL_ACTIVITY_NAME_CAP} are recorded.`
+        );
+    }
+
+    const byName = entries.map((entry, index) => {
+        const entryLabel = `${label}.byName[${index}]`;
+        const row = readSnapshotRecord(entry, entryLabel);
+        readSnapshotKeys(row, ['name', 'calls'], entryLabel);
+
+        return {
+            name: readSnapshotString(row.name, `${entryLabel}.name`, { min: 1, max: 64 }),
+            calls: readSnapshotInteger(row.calls, `${entryLabel}.calls`, { min: 1 })
+        };
+    });
+
+    return { calls, settled, byName, truncated };
 };

@@ -497,7 +497,7 @@ import { isErrorOutcome, storedOutcomeEntry } from './core/tool-outcome';
 // convention as the helpers above. The point is a single discipline: `core/snapshot.ts:242-298`
 // is what reads `partialContent`/`cancelledAtMessage` back off disk, and an archive that accepted
 // a looser value would mint a live record the next snapshot cannot persist and reload.
-import { readSnapshotInteger, readSnapshotString } from './core/snapshot-validation';
+import { readSnapshotInteger, readSnapshotString, readSnapshotToolActivity } from './core/snapshot-validation';
 // The run-stop vocabulary (IT19 R3): the SAME table `core/snapshot.ts` enforces when it READS
 // `stopReason` off disk (:101-115) is reused at the live archive seam, so an accepted value can
 // never mint a row the next snapshot refuses. core/snapshot.ts:96-98 states this rule explicitly:
@@ -507,7 +507,7 @@ import { HARNESS_RUN_STOP_REASONS, isHarnessRunStopReason } from './core/snapsho
 // dependency-free leaf, the same convention as the core helpers above: the runtime may not
 // import the server tree, and `server/api-events.ts` aliases THIS constant, so the epoch a
 // REST cursor carries and the epoch a recorded frame carries name the same process.
-import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
+import { HARNESS_PROCESS_EPOCH, TOOL_ACTIVITY_NAME_CAP } from './core/agent-limits';
 // W19 (2026-11-17) — the invocation-RUN key, the same rule `./server/protocol.ts` publishes. Direct
 // module import of a dependency-free leaf, the same convention as `./shared/attachments` below and
 // the core helpers above: the result ledger (`invocationRecords`), the durable rows it projects, and
@@ -602,6 +602,7 @@ import type {
     HarnessThreadStatus,
     HarnessThreadSteerReceipt,
     HarnessInvocationStatus,
+    HarnessToolActivity,
     HarnessToolCall,
     HarnessToolCallOptions,
     HarnessToolOutcome,
@@ -4734,6 +4735,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // system instructions or tool bodies.
         partialContent?: string;
         cancelledAtMessage?: number;
+        // issue 0032 (2026-11-26) — the bounded tally of this run's TOOL CALLS, the fourth
+        // forensic member and the answer to the question the other three cannot: `partialContent`
+        // says what a stopped run SAID, `cancelledAtMessage` says how many messages it COMMITTED,
+        // and this says what it DID (`calls`, `settled`, and a capped per-name breakdown). Written
+        // in the same `else` branch of `finishInvocation` as the pair, from counters the run itself
+        // kept (`RunState.toolTally`), so nothing here is a transcript read and no tool RESULT
+        // body can leak (0020's AC3).
+        //
+        // ABSENT, never `{ calls: 0 }`: a run that registered no invocation has nothing to say,
+        // and a `completed` row never carries the key at all — `core/snapshot.ts` refuses one, so
+        // writing it there would make the next snapshot unrestorable and break the
+        // `restore -> snapshot` idempotency that `stopReason` below already depends on.
+        toolActivity?: HarnessToolActivity;
         // Measured span of the run, in milliseconds. Set on the terminal transition.
         durationMs?: number;
         // T28: the PARENT tool call that spawned this run (delegate/ctx.run pass their
@@ -4952,6 +4966,73 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // it produced and the last substantive text it committed) BEFORE the transcript
     // rollback erases it. That is the whole point: a cancelled run is exactly the one
     // you need to post-mortem, so the record must outlive the rollback.
+    // -----------------------------------------------------------------------
+    // issue 0032 (2026-11-26) — THE TOOL-ACTIVITY TALLY: three counters, one projection.
+    //
+    // WHY COUNTERS ON THE RUN RATHER THAN A READ OF THE BOARD AT CAPTURE TIME. The scheduler
+    // removes a task as soon as it settles (`./core/scheduler.ts`, "Completed tasks are removed
+    // from the board"), so the only thing still visible from `runAgentCore`'s catch is the work
+    // that never finished. The gap 0032 describes is precisely about the work that DID finish —
+    // a child that ran ten tool rounds and was cancelled in the eleventh — so the run has to keep
+    // the ledger itself as it goes. The three doors are `recordToolDispatch` at each
+    // `scheduler.schedule` site and `recordToolSettled` at the head of `deliverTask`.
+    //
+    // WHY NOTHING IS READ FROM THE TRANSCRIPT. 0020's AC3 makes the leak boundary a criterion:
+    // the forensic values come from the run's own state, never from a message read. A tool NAME
+    // is public vocabulary (the catalogue, `toolRequest`'s answers, the pending list all name it)
+    // while a tool RESULT body is exactly what that boundary keeps out, so this tally counts the
+    // calls and names them and carries neither body nor argument text.
+    // -----------------------------------------------------------------------
+
+    // One scheduled call. `name` is the resolved definition's wire name — the same string the
+    // pending list and the tool events already publish — so the tally cannot invent a name the
+    // caller could not otherwise have seen.
+    const recordToolDispatch = (run: RunState, name: string): void => {
+        run.toolTally.calls += 1;
+
+        const seen = run.toolTally.byName.get(name);
+        run.toolTally.byName.set(name, seen === undefined ? 1 : seen + 1);
+    };
+
+    // One call whose outcome was handled. Called from the head of `deliverTask`, which the
+    // scheduler reaches exactly once per task, so this cannot double-count; a call that the
+    // abandon sweep released without notifying never reaches it and stays unsettled.
+    const recordToolSettled = (run: RunState): void => {
+        run.toolTally.settled += 1;
+    };
+
+    // THE PROJECTION, taken at the rollback boundary and nowhere else.
+    //
+    // ABSENT WHEN NOTHING WAS REGISTERED (0032's AC6). A run that was refused before it started
+    // answers "no field", not `{ calls: 0 }`: "did nothing" and "reported nothing" stay
+    // distinguishable, which is 0029's no-invented-identity rule applied to a tally.
+    //
+    // BOUNDED, AND SAYS SO (0032's AC2). `byName` keeps at most `TOOL_ACTIVITY_NAME_CAP` entries,
+    // ordered by count descending with the NAME ascending as the tie-break, so the list is
+    // deterministic across runs, processes and lane replicas — an insertion-ordered top-N would
+    // make the same run report a different list to `delegate` than to `agentResult`. `truncated`
+    // is the cap stating that it, not the run, closed the list.
+    const toolActivityOf = (run: RunState): HarnessToolActivity | undefined => {
+        const { calls, settled, byName } = run.toolTally;
+
+        if (calls === 0) return undefined;
+
+        const ranked = [...byName.entries()]
+            .sort(
+                (left, right) =>
+                    right[1] - left[1] || (left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0)
+            );
+
+        const listed = ranked.slice(0, TOOL_ACTIVITY_NAME_CAP);
+
+        return {
+            calls,
+            settled,
+            byName: listed.map(([name, count]) => ({ name, calls: count })),
+            truncated: ranked.length > listed.length
+        };
+    };
+
     const finishInvocation = (
         run: RunState,
         outcome: { message?: HarnessAssistantMessage; error?: unknown }
@@ -4988,6 +5069,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 record.partialContent = partial;
             }
 
+            // issue 0032 (2026-11-26): the tally, written in this SAME branch for the same reason
+            // the pair above is — it is evidence about a run that did not conclude. Captured once
+            // at the rollback boundary (`runAgentCore`'s catch), so the transcript decision that
+            // follows it (retain-and-repair for a thread, splice for a branch) cannot change what
+            // the tally reports, which is what makes the inline and lane/worker readings of one run
+            // agree byte-for-byte.
+            //
+            // DELETED rather than set to `undefined` when absent, exactly like `stopReason` below:
+            // a record that goes cancelled -> completed must lose the key entirely, or the next
+            // snapshot writes a `completed` row the reader refuses (`core/snapshot.ts`).
+            if (run.toolActivity === undefined) delete record.toolActivity;
+            else record.toolActivity = run.toolActivity;
             // IT19 R3: the machine-readable WHY, classified once by `runAgentCore`'s catch (or
             // by an explicit stamp at the site that ended the run — the turn-cap guard). It
             // rides beside `error` and the forensic pair, and ONLY here: a `completed` row must
@@ -5338,6 +5431,62 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // agentManage is registered by the descriptor loop above; its body is this
     // view function, reached through `context.harness.runtime.agentManage()`.
 
+    // B1 (2026-11-26) — THE CLAMP NOTE, used by BOTH paging branches of `agentResultFor` below:
+    // the completed branch and the failed/cancelled `partialContent` branch.
+    //
+    // The sentence is a MIRROR of webfetch's clamp note (`./tools/webfetch/index.ts:874`) with the
+    // noun swapped (`page` -> `result`), because the two paging tools must explain one situation
+    // with one vocabulary (issue: `fetch` reported this clamp as `offsetClamped` while `agentResult`
+    // stayed silent). There is deliberately NO shared constant module: webfetch's wording is pinned
+    // byte-for-byte by its own suite and by its `offset` parameter description
+    // (`./tools/webfetch/index.ts:502`), so parameterising the noun to serve one call site would
+    // churn a stable contract for no gain. Both doors say the same thing in the same words, and this
+    // comment plus the one at each use site is the cross-reference.
+    const agentResultClampNote = (requested: number, total: number, clampedOffset: number): string =>
+        `Requested offset ${requested} is past the end of this ${total}-character result; showing what remains from ${clampedOffset}. The result is fully read once "content" is empty.`;
+
+    // B2 (2026-11-26) — the refusal `agentResult` gives when NO row of the addressed id belongs to
+    // the agent it was addressed by. ONE sentence used to cover two opposite failures — "you asked
+    // the wrong agent" (switch agent) and "that invocation never happened" (give up) — and the
+    // caller had to enumerate every agent to learn which one had occurred.
+    //
+    // The owners are the DISTINCT agents holding a row of that bare id, collected by scanning the
+    // ledger rather than by re-asking `invocationRecordOfInvocationId` (:4835): that resolver returns
+    // exactly ONE row, and a bare id legitimately has one row PER LEDGER GENERATION (a recycled id,
+    // pinned in ./harness.invocation-run-key.test.ts:101-141), so its single answer can name the
+    // owner of the wrong generation. The scan is bounded by `AGENT_RESULT_RETENTION` (64 rows,
+    // ./core/agent-limits.ts:25), so it is cheap and it is truthful.
+    //
+    // Deliberately NO `recordIsInactiveOwned` filter here (unlike `recordsForAgent`, :5117-5120,
+    // which retires a released conversation's rows from DISCOVERY only): such a row is still readable
+    // by id, so it is a row that EXISTS, and calling it "no such invocation" would contradict the
+    // documented ring behaviour (pinned at ./harness.agent-results.test.ts:407-418 and :517-523).
+    const agentResultRefusalFor = (requestedId: string, name: string): string => {
+        // Sorted so the message is deterministic rather than ledger-insertion ordered, and minus the
+        // asking agent: reaching this refusal means no row of that id is that agent's (the agent-scoped
+        // fallback above already tried every generation), so a message naming the caller as its own
+        // owner would be a bug rather than information.
+        const owners = [
+            ...new Set(
+                [...invocationRecords.values()]
+                    .filter((record) => record.invocationId === requestedId && record.agent !== name)
+                    .map((record) => record.agent)
+            )
+        ].sort();
+
+        if (owners.length === 0) {
+            return `No result "${requestedId}" is available for agent "${name}": no such invocation in this harness.`;
+        }
+
+        if (owners.length === 1) {
+            return `No result "${requestedId}" is available for agent "${name}"; it belongs to agent "${owners[0]}".`;
+        }
+
+        return `No result "${requestedId}" is available for agent "${name}"; it belongs to agents ${owners
+            .map((owner) => `"${owner}"`)
+            .join(', ')}.`;
+    };
+
     // Full retrieval by agent (and preferably invocation id). There is no
     // transcript access at all: every branch below reads the recorded answer
     // value only.
@@ -5377,11 +5526,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                 // An id belonging to another agent is reported as unavailable for
                 // THIS agent: the lookup is scoped, so a caller cannot probe
-                // sibling results through the wrong name.
+                // sibling results through the wrong name. B2 (2026-11-26) — the refusal now
+                // says WHICH of the two failures this is, because the remedies are opposite;
+                // see `agentResultRefusalFor` above. The success path above is untouched, so an
+                // id that does belong to this agent (including an older-generation row reached
+                // by the agent-scoped fallback) still answers normally.
                 if (candidate === undefined || candidate.agent !== name) {
-                    throw new HarnessError(
-                        `No result "${requestedId}" is available for agent "${name}".`
-                    );
+                    throw new HarnessError(agentResultRefusalFor(requestedId, name));
                 }
 
                 record = candidate;
@@ -5484,11 +5635,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // one page rather than the whole payload.
                 const partial = record.partialContent ?? '';
                 const partialTotal = partial.length;
-                const partialOffset =
-                    typeof parameters?.offset === 'number'
-                        ? Math.min(parameters.offset, partialTotal)
-                        : 0;
+                const requestedPartialOffset =
+                    typeof parameters?.offset === 'number' ? parameters.offset : 0;
+                const partialOffset = Math.min(requestedPartialOffset, partialTotal);
                 const partialPage = resultPageOf(partial, partialOffset, limit);
+
+                // B1 (2026-11-26) — the clamp is REPORTED here too, with the identical flag+note the
+                // completed branch below emits, so paging a stopped child's `partialContent` behaves
+                // exactly like paging a finished answer. Same rule as webfetch
+                // (./tools/webfetch/index.ts:690): STRICT overshoot against the stored length, never
+                // `partialPage.offset !== requestedPartialOffset`, because the lead surrogate repair
+                // in `resultPageOf` (:5234-5241) can pull an IN-RANGE offset back one unit and the
+                // flag would then lie. `requestedPartialOffset === partialTotal` is not an overshoot.
+                const partialOffsetClamped = requestedPartialOffset > partialTotal;
 
                 return {
                     ...base,
@@ -5500,6 +5659,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     ...(partialPage.nextOffset === undefined
                         ? {}
                         : { nextOffset: partialPage.nextOffset }),
+                    // Flag and note arrive together or not at all; the note names the offset the page
+                    // really starts at, which on an overshoot is the clamp target (`resultPageOf`'s
+                    // surrogate repair requires `start < total`, so it cannot move this one).
+                    ...(partialOffsetClamped
+                        ? {
+                              offsetClamped: true,
+                              note: agentResultClampNote(
+                                  requestedPartialOffset,
+                                  partialTotal,
+                                  partialPage.offset
+                              )
+                          }
+                        : {}),
                     error: record.error ?? 'The invocation did not complete.',
                     // B3 (2026-11-13): the WHOLE partial, next to the page. `content` is one
                     // page (4000 chars by default), so a caller that just wants to know what
@@ -5518,6 +5690,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     ...(record.cancelledAtMessage === undefined
                         ? {}
                         : { cancelledAtMessage: record.cancelledAtMessage }),
+                    // issue 0032 (2026-11-26) — AC4 AT THIS DOOR. The value is the record's, read
+                    // the same way `delegate`'s envelope reads it, so the two doors cannot report
+                    // different tallies for one invocation, and a caller that paged the answer after
+                    // the fact gets the same account the delegation printed. Absence-conditional
+                    // like its neighbours: a run stopped before it registered any invocation keeps
+                    // its exact pre-0032 byte shape (AC6), and a `completed` row never reaches this
+                    // branch at all.
+                    ...(record.toolActivity === undefined ? {} : { toolActivity: record.toolActivity }),
                     ...(record.durationMs === undefined
                         ? {}
                         : { durationMs: record.durationMs }),
@@ -5540,9 +5720,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
 
             const total = record.content.length;
-            const offset =
-                typeof parameters?.offset === 'number' ? Math.min(parameters.offset, total) : 0;
+            // B1 (2026-11-26) — the clamp is REPORTED, in the same vocabulary webfetch uses
+            // (./tools/webfetch/index.ts:689-690 for the flag, :871-876 for the pair). Two rules
+            // matter and neither is the obvious one:
+            //   * the flag is STRICT overshoot against the stored length, never
+            //     `page.offset !== requestedOffset`: the lead-surrogate repair inside `resultPageOf`
+            //     (:5234-5241) moves an IN-RANGE offset back one unit when it lands on the low half
+            //     of a surrogate pair, and comparing offsets would report that as a clamp;
+            //   * `requestedOffset === total` is NOT clamped — the window the caller asked for is the
+            //     one that exists, and an empty tail is a fact about the answer, not about the
+            //     request. That is webfetch's own rule (`startOffset !== invocation.offset`), and it
+            //     is why the key is absent there instead of `false`.
+            const requestedOffset = typeof parameters?.offset === 'number' ? parameters.offset : 0;
+            const offset = Math.min(requestedOffset, total);
             const page = resultPageOf(record.content, offset, limit);
+            const offsetClamped = requestedOffset > total;
 
             return {
                 ...base,
@@ -5551,7 +5743,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 offset: page.offset,
                 limit,
                 hasMore: page.hasMore,
-                ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset })
+                ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+                // Flag plus note, present together or not at all: `offsetClamped` carries the fact and
+                // the note names the clamp target for a caller that has not kept the length. On an
+                // overshoot `page.offset` IS the target, because the surrogate repair above can only
+                // fire while `start < total`.
+                ...(offsetClamped
+                    ? {
+                          offsetClamped: true,
+                          note: agentResultClampNote(requestedOffset, total, page.offset)
+                      }
+                    : {})
             };
     };
 
@@ -5678,7 +5880,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 : { partialContent: record.partialContent }),
             ...(record.cancelledAtMessage === undefined
                 ? {}
-                : { cancelledAtMessage: record.cancelledAtMessage })
+                : { cancelledAtMessage: record.cancelledAtMessage }),
+            // issue 0032 (2026-11-26): the tally of what the stopped child DID, on the SAME door
+            // and with the SAME absence rule as `partialContent` above — this is the surface 0032
+            // names first, because it is the one the PARENT agent reads, and "did fifty useful
+            // lookups" versus "retried one doomed call fifty times" is a decision only the caller
+            // can make. Read straight off the child's record, so the reprint doors
+            // (`owedAccountOf`) and the `toolCancel` delivery carry the identical value without a
+            // second capture point.
+            ...(record.toolActivity === undefined ? {} : { toolActivity: record.toolActivity })
         };
     };
 
@@ -6948,6 +7158,35 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // a frozen agent can be post-mortemed instead of vanishing.
         messagesProduced?: number;
         partialContent?: string;
+        // issue 0032 (2026-11-26) — THE RUN'S OWN TOOL-CALL LEDGER, accumulated as the run works
+        // and projected into the durable `toolActivity` tally only when the run ends without
+        // concluding. It lives HERE (not in the scheduler) for one reason: the board drops a task
+        // the moment it settles, so at the capture point `scheduler.pendingOfScope(run.scope)` can
+        // still see the calls in flight but has already forgotten every one that finished — and
+        // "which doomed call did it retry fifty times" is a question about the finished ones.
+        //
+        //   * `calls` — incremented at the three `scheduler.schedule` sites, i.e. only for a call
+        //     that really became scheduled work. A call refused before it started (unknown tool,
+        //     malformed arguments, outside the run's scope) answers inline and is not counted, so
+        //     "it never got to call anything" stays reportable and absent (0032's AC6).
+        //   * `settled` — incremented at the head of `deliverTask`, which runs exactly once per
+        //     scheduled call (one `onSettled` per task) whatever the outcome: delivered, failed,
+        //     released by `toolCancel`, or dropped because the run had already ended. A call the
+        //     abandon sweep released without notifying is therefore counted in `calls` and NOT in
+        //     `settled`, which is the whole point of the pair.
+        //   * `byName` — per-name call counts, the axis the fleet operator asks about. Names are
+        //     bounded by the tool-name rule (64 chars); the list is capped only at PROJECTION time
+        //     (TOOL_ACTIVITY_NAME_CAP) so `truncated` can honestly say the cap closed the list
+        //     rather than the run.
+        // Mutable and internal: it never reaches a wire shape, only the projection below does.
+        toolTally: { calls: number; settled: number; byName: Map<string, number> };
+        // The projected, bounded tally captured at the rollback boundary (see
+        // `runAgentCore`'s catch), and the value `finishInvocation` writes onto the record. It is
+        // captured THERE — before the transcript decision — for exactly the reason
+        // `messagesProduced` and `partialContent` are: the splice and the repair that follow it
+        // change what a later reader could reconstruct. Absent when the run registered no
+        // invocation, so the record omits the key rather than storing a zero-shaped one.
+        toolActivity?: HarnessToolActivity;
         // issue 0020 (AC1): the answer this run is STREAMING right now, for the model
         // request that is currently in flight. `partialContent` above could only ever
         // report text the run had already COMMITTED, so a child cut off between "the
@@ -9456,6 +9695,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                       min: 0,
                   });
 
+        // issue 0032 (2026-11-26): the fourth forensic member, validated HERE for the identical
+        // reason the pair is — `completedOrder` is minted a few lines down, so a payload rejected
+        // after that point would burn an order and leave the canonical row half-written while the
+        // lane seam (./server/workers/lane-authority.ts replays this call) reports
+        // `invalid-mutation` about state it already corrupted.
+        //
+        // The bounds are not re-derived here: `readSnapshotToolActivity`
+        // (./core/snapshot-validation.ts) is the SAME validator `core/snapshot.ts` runs when it
+        // reads this key off disk and `../server/workers/lane-commit.ts` runs when it folds the
+        // lane's op, so a tally can never be legal to archive and illegal to reload. A malformed
+        // value is REFUSED rather than coerced — 0020 lists coercion as a defect, and a repaired
+        // forensic field stops being evidence of what the run actually did.
+        const toolActivity =
+            input.toolActivity === undefined
+                ? undefined
+                : readSnapshotToolActivity(
+                      input.toolActivity,
+                      `Invocation "${invocationId}".toolActivity`
+                  );
+
         // IT19 R3: the third member of the forensic trio, and it is validated against the SNAPSHOT
         // READER'S OWN table (`core/snapshot.ts:113` `isHarnessRunStopReason`, the one place the
         // nine members are spelled) rather than a local list. A value outside the union is REFUSED,
@@ -9526,6 +9785,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // cancellation it described.
             ...(status === 'completed' || partialContent === undefined ? {} : { partialContent }),
             ...(status === 'completed' || cancelledAtMessage === undefined ? {} : { cancelledAtMessage }),
+            // issue 0032 (2026-11-26): the tally, on the SAME mutual-exclusion rule as the pair
+            // above — the reader (`core/snapshot.ts`) refuses a `completed` row carrying the key,
+            // so keeping one through a replacement archive would write a canonical view the next
+            // snapshot cannot load. A cancelled lane child that later COMPLETES is the ordinary
+            // case, and this literal replacing the row wholesale is what drops the stale tally.
+            ...(status === 'completed' || toolActivity === undefined ? {} : { toolActivity }),
             // IT19 R3: same mutual exclusion as the pair above, and the reader enforces it the same
             // way (`core/snapshot.ts:342-362` refuses a `completed` row carrying the key). A lane
             // child that was cancelled and later COMPLETES has its row replaced wholesale here, so
@@ -9561,6 +9826,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(archived.cancelledAtMessage === undefined
                     ? {}
                     : { cancelledAtMessage: archived.cancelledAtMessage }),
+                // issue 0032 (2026-11-26): carried exactly as stored, for the digest reason stated
+                // above. The tally IS in `archiveDigestOf`'s field list (unlike `threadId` and
+                // `epoch`, which the authority assigns or the writer cannot know), so a returned
+                // object that omitted it would put the coordinator's digest and the worker's
+                // permanently out of agreement — and the skip test in ./workers/lane-worker-loop.ts
+                // is taken over that digest, so the effect would be a lane re-archiving the row on
+                // every boundary forever.
+                ...(archived.toolActivity === undefined ? {} : { toolActivity: archived.toolActivity }),
                 // IT19 R3: carried exactly as stored, for the digest reason stated above — once the
                 // archive digest covers `stopReason`, a returned object that omitted it would put
                 // the coordinator and the lane permanently out of agreement.
@@ -10683,6 +10956,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // sentence byte-for-byte everywhere else.
         released?: DelegateCallTrace
     ): Promise<void> => {
+        // issue 0032: the call has now REACHED an outcome — this function runs exactly once per
+        // scheduled task (one `onSettled` per task), which is what makes the counter safe to raise
+        // here rather than only on the success path. All three shapes below settle a call: the two
+        // early returns drop a result the stopped run can no longer receive (the answer goes to the
+        // owed-account register instead), and the body below commits one. A call the abandon sweep
+        // released without notifying never comes here, so it stays counted in `calls` and not in
+        // `settled` — the pair's whole purpose is to separate "in flight when the stop landed" from
+        // "answered".
+        recordToolSettled(run);
+
         // A run-level abort discards results that lost the race with cancellation.
         // Keep a tool's own abort error, though: a tool that observed the signal
         // and threw explains the cancellation better than "operation was aborted".
@@ -11702,6 +11985,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // the live board plus this call, keyed on `run.actorKey`.
         await announcePending(run, call);
 
+        // issue 0032: this is the moment the call becomes an INVOCATION — every gate above
+        // (scope, discovery, argument parsing) answered inline and never scheduled, so a refused
+        // call must not appear in the stopped run's tally. Rules on the helper.
+        recordToolDispatch(run, call.name);
+
         scheduler.schedule({
             scope: run.scope,
             agent: run.actorKey,
@@ -12338,6 +12626,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // pair is keyed by scope + call id because a call id is unique only within one run.
         branchCallIds.set(`${run.scope}\u0000${call.id}`, metadata.branchId);
 
+        // issue 0032: a `threadFork` call is a tool invocation of this run like any other, so it
+        // joins the tally under its own wire name (`threadFork`). Counted at the schedule point,
+        // after every early return above that answers through `failBranchTool` without a task.
+        recordToolDispatch(run, call.name);
+
         scheduler.schedule({
             scope: run.scope,
             agent: run.actorKey,
@@ -12697,6 +12990,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // heartbeat arms for it exactly as it does for a fork or an async tool call.
         // Nothing is announced when the report itself failed: that run never schedules.
         await announcePending(run, call);
+
+        // issue 0032: same rule as the ordinary and fork sites — the tally counts calls that
+        // became background work, and every failure above answered inline without a task.
+        recordToolDispatch(run, call.name);
 
         scheduler.schedule({
             scope: run.scope,
@@ -15038,6 +15335,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     : lastSubstantiveText(brain.messages, commitIndex);
             run.streamedText = '';
 
+            // issue 0032 (2026-11-26) — the TALLY is captured HERE, in the same breath as the two
+            // values above, and for the same reason: this is the one exit every non-concluded run
+            // converges through, and the transcript decision below (keep-and-repair for a thread,
+            // splice for a branch) is the point after which a reader can no longer reconstruct what
+            // the run did. Counting from `RunState.toolTally` — the run's own ledger — rather than
+            // from the board means both sides of that boundary report the same numbers, and neither
+            // reads a message body.
+            run.toolActivity = toolActivityOf(run);
+
             // IT19 (R1/R3/R4) — the cause is classified HERE, at the one exit every non-concluded
             // run converges through, and BEFORE the transcript decision below: the rules that read
             // the record's `failed`/`paused`/`stopped` status must see the transcript as the model
@@ -15664,6 +15970,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // issue 0020: the in-flight stream buffer starts empty and is owned by
                 // whichever model request is currently open (see RunState.streamedText).
                 streamedText: '',
+                // issue 0032: the tool-call ledger starts empty rather than absent, because the
+                // three doors that raise it (`recordToolDispatch`, `recordToolSettled`) are hot
+                // paths inside the run loop and must not null-check on every tool call. Absence in
+                // the REPORTED sense comes from `toolActivityOf`, which reports nothing at all when
+                // `calls` is 0.
+                toolTally: { calls: 0, settled: 0, byName: new Map() },
                 attachments: validatedAttachments,
                 startedAt: Date.now(),
                 ...(callId === undefined ? {} : { parentCallId: callId }),
@@ -16109,6 +16421,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(record.cancelledAtMessage === undefined
                     ? {}
                     : { cancelledAtMessage: record.cancelledAtMessage }),
+                // issue 0032 (2026-11-26): the tool-activity tally, written exactly when the live
+                // record holds one — which is only ever a non-completed status, because
+                // `finishInvocation` deletes the key on a completed one (and `core/snapshot.ts`
+                // refuses a completed row that carries it, so writing it there would make the
+                // document unloadable rather than merely larger). Absent for every row written
+                // before the field existed, and the reader accepts that absence, so the schema
+                // version still does not move.
+                ...(record.toolActivity === undefined ? {} : { toolActivity: record.toolActivity }),
                 // IT19 (R3/R5): the machine-readable CAUSE, written exactly when the live record
                 // holds one — which is only ever a non-completed status, because
                 // `finishInvocation` drops it on a completed one. Absent for every row written
@@ -16546,6 +16866,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(result.cancelledAtMessage === undefined
                     ? {}
                     : { cancelledAtMessage: result.cancelledAtMessage }),
+                // issue 0032 (2026-11-26): the tally is rebuilt with the row, keyed only when the
+                // document carries one, so a restored record has exactly the shape a live one has
+                // (no `toolActivity: undefined` where absence used to mean "pre-feature row"), and
+                // the NEXT snapshot projects the same bytes — the idempotency the reader's
+                // completed-row refusal in `core/snapshot.ts` exists to protect.
+                ...(result.toolActivity === undefined ? {} : { toolActivity: result.toolActivity }),
                 // IT19 (R3/R5): the cause is rebuilt with the row, keyed only when the document
                 // has it — a restored record therefore has exactly the shape a live one has, with
                 // no `stopReason: undefined` sitting where absence used to mean "pre-feature row".

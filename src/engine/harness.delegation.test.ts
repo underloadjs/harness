@@ -1355,6 +1355,43 @@ describe('delegation result contract (T28)', () => {
         expect(answerOf(writerAgent.messages[2])).toEqual({ agent: 'researcher', content: 'summarised' });
     });
 
+    // A2 (2026-11-26, delegate-defects work order) — the pin the fix list recorded as MISSING:
+    // a brief whose done-ness is a plain-prose clause, carrying NONE of the label vocabulary.
+    //
+    // THE HONEST QUALIFICATION, and the reason this test asserts acceptance and nothing more:
+    // `missingBriefParts` (./harness.ts) is a LEXICAL gate — the `statesCondition` word list plus
+    // three shape regexes (`BRIEF_COUNTED_SHAPE`, `BRIEF_NAMED_FORMAT`, `BRIEF_BOUND`). The clause
+    // below clears it because `done when` is one of the words in that list, NOT because the harness
+    // read the meaning of the sentence. Change "Done when" to "Once" and this same prose is refused
+    // again, which is why no assertion here claims a semantic gate. What IS pinned is the useful
+    // half of the work order's observation: ordinary prose that says when the run is done — with no
+    // `acceptance`, `criterion`, `expect`, `should`, `must`, `verify` or `pass` anywhere in it —
+    // is not bounced back for a magic word, so the child actually runs.
+    it('accepts a plain-prose completion clause carried by the "done when" marker alone, with no acceptance vocabulary', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('printed')], seen));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    '{"agent":"researcher","input":"Read the file package.json and print its name verbatim. Done when the reply contains the exact name string.","requireClarification":true}'
+                ),
+                answer('final')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        // Accepted on BOTH halves of the lexical check: `package.json` is the target (the FILE
+        // alternative in `missingBriefParts`'s `hasTarget` regex needs a stem of >=2 characters —
+        // `\b[\w-]{2,}\.[A-Za-z]{1,5}\b` — which `package` has), and `Done when` is the acceptance
+        // signal in `statesCondition`. So the child ran and its answer came back.
+        expect(seen).toHaveLength(1);
+        expect(answerOf(writerAgent.messages[2])).toEqual({ agent: 'researcher', content: 'printed' });
+    });
+
     it('refuses an acceptance-worded brief that names no target, and names only the target', async () => {
         const seen: HarnessStreamRequest[] = [];
         const researcher = brain(scripted([answer('should not run')], seen));
@@ -2145,6 +2182,11 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
             error: 'Delegation to "researcher" was cancelled by the caller before the call returned.',
             partialContent: 'half an answer',
             cancelledAtMessage: 2,
+            // issue 0032 (2026-11-26, AC1/AC4) — the released-call door reprints the SAME envelope
+            // builder as the live door, so it carries the same tally for free. `settled: 0` beside
+            // `calls: 1` is the pair doing its job: the child's `hold` call was still in flight
+            // when the release landed, which is exactly what "did it get an answer or not" means.
+            toolActivity: { calls: 1, settled: 0, byName: [{ name: 'hold', calls: 1 }], truncated: false },
             callCancelled: true
         });
 
@@ -2180,6 +2222,106 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
         // 0021 also names. Replacing it is the record's business, not this door's, so it is
         // pinned here to make that boundary explicit.
         expect(stored.error).toBe('This operation was aborted');
+
+        await writer.dispose();
+    });
+
+    it('reports no tool tally when the released child never registered a call (0032 AC6)', async () => {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+
+        // A child that says one sentence and then parks INSIDE THE TRANSPORT: no tool call is ever
+        // emitted, so no tally is ever taken. This is the case the field's contract turns on — a
+        // `{ calls: 0, settled: 0, byName: [], truncated: false }` row would be a claim about a
+        // count that never existed, and it is indistinguishable from a run that called a tool and
+        // the recorder lost it. Absence keeps "did nothing" and "reported nothing" apart, which is
+        // 0029's no-invented-identity rule applied to a tally rather than to an id.
+        //
+        // The stop is a `toolCancel`, i.e. the same door the test above uses, so this is the
+        // cancelled shape with its ONE variable changed (zero dispatched calls) and nothing else.
+        const stalled = (async function* stream() {
+            yield { type: 'text', delta: 'half an answer' };
+            // Nothing downstream: the generation stays open until the cancellation lands.
+            await gate;
+        }) as unknown as HarnessStream;
+
+        const researcher = brain(stalled);
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
+                callTool('c2', 'toolCancel', '{"callId":"c1"}'),
+                answer('final')
+            ])
+        );
+
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            presets: false
+        });
+
+        const running = writer('go');
+        await settle();
+        await running;
+        release();
+        await settle();
+
+        // WHOLE, not `toMatchObject`: an added `toolActivity` key fails this assertion, which is the
+        // point. Everything else about the released child is unchanged from the test above — the
+        // child's answer, the harness-raised cancellation wording, the identity of the run, and
+        // `callCancelled` marking the door as a release rather than an answer.
+        expect(envelopeOf(toolMessageOf(writerAgent, 'c1'))).toEqual({
+            agent: 'researcher',
+            content: 'half an answer',
+            contentLength: 14,
+            offset: 0,
+            limit: 8000,
+            truncated: false,
+            invocationId: '2',
+            threadId: 'agent:researcher',
+            status: 'cancelled',
+            error: 'Delegation to "researcher" was cancelled by the caller before the call returned.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 1,
+            callCancelled: true
+        });
+
+        // THE LEDGER HALF, from the same run: the row the tally would have ridden on is the row the
+        // door just printed, so the key is missing on BOTH sides of the pairing and not only at the
+        // surface a caller happened to use. Asserted WHOLE — a written `toolActivity` key would
+        // fail this, exactly as an added key fails the door above.
+        const row = (
+            ((writer.snapshot() as { agentResults?: Record<string, unknown>[] }).agentResults ??
+                []).find((candidate) => candidate.invocationId === '2') ?? {}
+        ) as Record<string, unknown>;
+
+        expect(row).toEqual({
+            invocationId: '2',
+            // The first row this harness completed, whatever conversation it belongs to.
+            completedOrder: 1,
+            agent: 'researcher',
+            rank: 'B',
+            // A child started by `delegate` is recorded as a DELEGATION row — the `kind` vocabulary
+            // separates it from a `root` conversation run and from a `threadFork` branch, and it is
+            // the same value the door above resolves no id from.
+            kind: 'delegation',
+            status: 'cancelled',
+            // The caller released the CALL (0021's `toolCancel`), which is the caller's own
+            // decision rather than a host stop or a transport failure.
+            stopReason: 'caller-released',
+            // `content` is the COMPLETED answer, and this run never gave one; what it had said
+            // travels as the partial, which is present precisely to show that the absence above is
+            // about the tally alone and not about the forensic pair beside it.
+            content: '',
+            error: 'This operation was aborted',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 1,
+            // The child CONVERSATION's own turn position when the run ended — the counter the D5 pin
+            // in ./harness.agent-results.test.ts documents. It is not a row id and not a progress
+            // measure, which is exactly what the description of `cancelledAtMessage` promises.
+            sequence: 2,
+            threadId: 'agent:researcher',
+            epoch: HARNESS_PROCESS_EPOCH
+        });
 
         await writer.dispose();
     });
@@ -3180,6 +3322,171 @@ describe('pending delegation placeholder (delegate-stress T1.3/T1.4)', () => {
             'gamma finished'
         ]);
     });
+
+    it('gives the started child both ids and the queued sibling neither, then gives that sibling a real id (B5)', async () => {
+        // 2026-11-26 (delegate-defects work order, item B5 — the PIN half; the runtime was already
+        // honest and did not change).
+        //
+        // THE SHAPE the published contract could not describe: TWO `delegate` calls to ONE agent in
+        // one assistant message. Delegations are async, so the parent's next request is built while
+        // the first child is parked in a tool and the second has not run at all — a delegated child
+        // serializes behind that agent's own conversation, and the placeholder's two ids come from
+        // `delegatedRecordOf` (./harness.ts), which only ever sees a record the CHILD has registered.
+        // So c1's placeholder carries `invocationId`/`threadId` and c2's carries NEITHER —
+        // deterministically, not as a race.
+        //
+        // WHY THAT WAS A DEFECT: the allowlist description told the caller the ids are "ABSENT when
+        // the child never started, so a missing id means no run, not an unknown one". For this queued
+        // sibling the claim is simply false: c2 DOES become a run, and its terminal envelope carries a
+        // real id (the last block below). The fix is therefore the prose in
+        // ./tools/runtime/delegate.tool.ts and ./core/metadata.ts, pinned in
+        // ./core/metadata.ownership.test.ts; this test pins the RUNTIME shape the prose has to match.
+        //
+        // WHY EVERY ASSERTION IS A KEY SET RATHER THAN A FIELD CHECK: "absent" is the fact under test.
+        // A per-field check (`expect(x.invocationId).toBeUndefined()`) alone would also pass on a
+        // placeholder that invented an identity, which is the 0029 rule this projection honours — so
+        // the whole key list is asserted, and the two placeholders differ by exactly those two keys.
+        const gate = deferred<string>();
+        const seenParent: HarnessStreamRequest[] = [];
+
+        // ONE brain, TWO children. `scripted` hands out turns by request count, so the two child runs
+        // take the two PARK turns first and answer from the two `answer` turns once the gate releases
+        // — both children really park, which is what keeps c2 unstarted at projection time.
+        const hangTurn = (callId: string): HarnessStreamEvent[] => [
+            { type: 'text', delta: 'started the work' },
+            {
+                type: 'done',
+                stopReason: 'tool_calls',
+                toolCalls: [{ id: callId, name: 'hang', arguments: '{}' }]
+            }
+        ];
+
+        const researcher = brain(
+            scripted([hangTurn('r1'), hangTurn('r2'), answer('first finished'), answer('second finished')])
+        );
+
+        const writerAgent = brain(
+            scripted(
+                [
+                    [
+                        {
+                            type: 'done',
+                            stopReason: 'tool_calls',
+                            toolCalls: [
+                                { id: 'c1', name: 'delegate', arguments: '{"agent":"researcher","input":"find facts"}' },
+                                {
+                                    id: 'c2',
+                                    name: 'delegate',
+                                    arguments: '{"agent":"researcher","input":"find more facts"}'
+                                }
+                            ]
+                        }
+                    ],
+                    answer('waiting'),
+                    answer('final')
+                ],
+                seenParent
+            )
+        );
+
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            tools: { hang: parkedTool('hang', gate.promise) },
+            presets: false,
+            // The shipped heartbeat is replaced (the documented override path) so no timer can settle
+            // a child on its own and the pending shape below is the only thing being measured.
+            plugins: [{ name: 'async-ping', setup: () => undefined }]
+        });
+
+        const running = writer('go');
+        const state = probe(running);
+        await flush();
+
+        // The parent kept working: both delegations are still in flight, so this request carries a
+        // placeholder per call rather than an answer.
+        expect(state.status).toBe('pending');
+        expect(seenParent).toHaveLength(2);
+
+        // Both slots are placeholders — neither call has settled while the parent is re-asked.
+        const placeholderOf = (callId: string): Record<string, unknown> => {
+            const message = (seenParent[1]?.messages ?? []).find(
+                (entry) => entry.role === 'tool' && entry.toolCallId === callId
+            ) as Extract<HarnessMessage, { role: 'tool' }>;
+
+            return JSON.parse(message.content) as Record<string, unknown>;
+        };
+
+        const started = placeholderOf('c1');
+        const queued = placeholderOf('c2');
+
+        // EXACT KEY SETS — the seven the description publishes, against the five a queued call gets.
+        expect(Object.keys(started).sort()).toEqual([
+            'callId',
+            'elapsedMs',
+            'invocationId',
+            'name',
+            'note',
+            'status',
+            'threadId'
+        ]);
+        expect(Object.keys(queued).sort()).toEqual(['callId', 'elapsedMs', 'name', 'note', 'status']);
+
+        // And the payload each one DOES carry is the published shape, byte for byte. `elapsedMs` is 0
+        // because the fake clock never advanced.
+        expect({
+            status: started.status,
+            callId: started.callId,
+            name: started.name,
+            elapsedMs: started.elapsedMs
+        }).toEqual({ status: 'pending', callId: 'c1', name: 'delegate', elapsedMs: 0 });
+        expect({
+            status: queued.status,
+            callId: queued.callId,
+            name: queued.name,
+            elapsedMs: queued.elapsedMs
+        }).toEqual({ status: 'pending', callId: 'c2', name: 'delegate', elapsedMs: 0 });
+
+        // A host-run delegation re-enters the agent's default conversation (the same shape the AC3
+        // case above pins for three different agents), so the started child's THREAD handle is a known
+        // value. The `invocationId` is not: it is a minted runtime identity — which is exactly why the
+        // 0024 AC1 case above compares it against the terminal envelope instead of a literal.
+        expect(started.threadId).toBe('agent:researcher');
+
+        gate.resolve('released');
+        await flush();
+        await running;
+
+        const deliveredOf = (callId: string): Record<string, any> =>
+            delegationOf(
+                writerAgent.messages.find(
+                    (message) => message.role === 'tool' && message.toolCallId === callId
+                )
+            );
+
+        const startedResult = deliveredOf('c1');
+        const queuedResult = deliveredOf('c2');
+
+        // Both calls were ANSWERED, each by its own child run.
+        expect([
+            startedResult.status,
+            startedResult.content,
+            queuedResult.status,
+            queuedResult.content
+        ]).toEqual(['completed', 'first finished', 'completed', 'second finished']);
+
+        // THE SENTENCE THE OLD PROSE GOT WRONG, pinned from the other side: the call whose placeholder
+        // carried NO id has a run anyway, with its own identity — so "absent" never meant "no run".
+        // The ids are runtime values, so the exactness here is relational: the started child's
+        // placeholder id is the id that call is answered with (0024 AC1, restated for two siblings),
+        // and the queued sibling ends up with a DIFFERENT one, because it is a different run.
+        expect([
+            started.invocationId === startedResult.invocationId,
+            started.threadId === startedResult.threadId,
+            queuedResult.threadId,
+            typeof queuedResult.invocationId === 'string' && queuedResult.invocationId.length > 0,
+            queuedResult.invocationId !== startedResult.invocationId
+        ]).toEqual([true, true, 'agent:researcher', true, true]);
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -3314,7 +3621,17 @@ describe('per-delegation turn cap (I5)', () => {
     // because re-using one is a hard harness error, not a second round. Pass `answerAt`
     // to have the same child answer on that turn instead — that is how "the cap did not
     // interfere" is told apart from "the cap fired one turn too early".
-    const childTurns = (seen: HarnessStreamRequest[], answerAt?: number): HarnessStream => {
+    //
+    // 0032 (2026-11-26) adds `callsFor` for the SAME reason the cap needs no new fixture: a
+    // tool-activity tally can only be pinned by a child that calls tools BY NAME, and the
+    // cap-fires-on-turn-N ending is the one stop in this file with no timing in it (the run is
+    // over when the cap fires, so no cancel can race the dispatch). Default stays `peek`, so the
+    // five tests below keep their exact transcripts.
+    const childTurns = (
+        seen: HarnessStreamRequest[],
+        answerAt?: number,
+        callsFor?: (turn: number) => { id: string; name: string; arguments: string }[]
+    ): HarnessStream => {
         return async function* stream(request) {
             seen.push(request);
             const turn = seen.length;
@@ -3328,21 +3645,29 @@ describe('per-delegation turn cap (I5)', () => {
             yield {
                 type: 'done',
                 stopReason: 'tool_calls',
-                toolCalls: [{ id: `p${turn}`, name: 'peek', arguments: '{}' }]
+                toolCalls: callsFor
+                    ? callsFor(turn)
+                    : [{ id: `p${turn}`, name: 'peek', arguments: '{}' }]
             };
         };
     };
 
     // The host door, mirroring `hangingChild` above: the tool builds the delegate input
     // itself, so a value outside the model schema's 1-64 still reaches the runtime here.
-    // Only the two bounds under test are optional; the brief is fixed.
+    // Only the two bounds under test are optional; the brief is fixed. `tools` (0032) adds
+    // names to the registry WITHOUT removing `peek`, so a tally test can name whatever it
+    // needs while the sibling pins keep declaring exactly the tool they describe.
     const cappedChild = (options: {
         seenChild: HarnessStreamRequest[];
         maxTurns?: number;
         maxIterations?: number;
         answerAt?: number;
+        callsFor?: (turn: number) => { id: string; name: string; arguments: string }[];
+        tools?: Record<string, ReturnType<typeof tool>>;
     }) => {
-        const researcher = brain(childTurns(options.seenChild, options.answerAt));
+        const researcher = brain(
+            childTurns(options.seenChild, options.answerAt, options.callsFor)
+        );
         const writerAgent = brain(scripted([callTool('c1', 'hostDelegate', '{}'), answer('final')]));
 
         const hostDelegate = tool({
@@ -3369,7 +3694,8 @@ describe('per-delegation turn cap (I5)', () => {
             agents: { writer: writerAgent, researcher },
             tools: {
                 peek: tool({ description: 'Peek.', tags: ['test'], visibility: 'core', execute: () => 'a fact' }),
-                hostDelegate
+                hostDelegate,
+                ...(options.tools ?? {})
             },
             presets: false,
             ...(options.maxIterations === undefined ? {} : { maxIterations: options.maxIterations })
@@ -3438,13 +3764,171 @@ describe('per-delegation turn cap (I5)', () => {
             error:
                 'Agent "researcher" requested tools on all 2 model turns without answering, the maxTurns this run was given (2). maxTurns caps model REQUESTS, not tool rounds, and the child\'s answer has to be one of them, so N turns allow at most N-1 tool rounds: 2 turns = 1 tool round, and its answer had to land on turn 2.',
             partialContent: 'pass 2',
-            cancelledAtMessage: 5
+            cancelledAtMessage: 5,
+            // issue 0032 (2026-11-26, AC1) — the tally the turn cap now leaves behind. Both `peek`
+            // calls ANSWERED (`settled` equals `calls`), so this row says what the capped child
+            // actually did: two rounds of one tool. Pinned as a value, not `objectContaining`,
+            // because the whole point of the field is that the counts are exact.
+            toolActivity: { calls: 2, settled: 2, byName: [{ name: 'peek', calls: 2 }], truncated: false }
         });
 
         // The capped child is DATA for the parent, not a failed parent: the parent's own
         // run continues to its answer, and the released child thread is idle again.
         expect(content(writerAgent.messages[3])).toBe('final');
         expect(writer.thread('agent:researcher')?.status).toBe('idle');
+    });
+
+    // -----------------------------------------------------------------------
+    // issue 0032 (2026-11-26) — WHAT A STOPPED CHILD DID, counted and named
+    // -----------------------------------------------------------------------
+    //
+    // These two tests own the SHAPE claims of the new `toolActivity` field that the turn-cap door
+    // can make without any timing: `calls`/`settled` are exact because every call answered, and the
+    // STOP is the count bound rather than a cancellation. The cancellation cases — the unfinished
+    // pair `partialContent`/`cancelledAtMessage` beside the tally, and the zero-call case where the
+    // key is ABSENT — are pinned in the `delegation identity by value and cancel delivery` block
+    // above and in ./harness.agent-results.test.ts, where the fixtures are already about stopping
+    // a run rather than bounding one.
+    it('orders the tally by count and then by name, and hands the same value to both doors (0032 AC2, AC4)', async () => {
+        const seenChild: HarnessStreamRequest[] = [];
+
+        // Three names, dispatched in an order that INVERTS the documented tie-break. `zeta` is the
+        // only name called twice, and the two single-call names are dispatched BETA-THEN-ALPHA, so
+        // the two candidate orderings differ: an insertion-ordered list reads
+        // [zeta, beta, alpha], while the cap's documented order — count descending, NAME ascending
+        // as the tie-break — reads [zeta, alpha, beta]. `byName` is persisted into snapshots and
+        // into `result:archive` events, so an insertion order would make the same run report one
+        // list to `delegate` and another to a lane replica; this pin is what forbids that.
+        const { writer, writerAgent } = cappedChild({
+            maxTurns: 3,
+            seenChild,
+            tools: {
+                zeta: tool({ description: 'Zeta.', tags: ['test'], visibility: 'core', execute: () => 'z' }),
+                beta: tool({ description: 'Beta.', tags: ['test'], visibility: 'core', execute: () => 'b' }),
+                alpha: tool({ description: 'Alpha.', tags: ['test'], visibility: 'core', execute: () => 'a' })
+            },
+            callsFor: (turn) =>
+                turn === 1
+                    ? [
+                          { id: 'z1', name: 'zeta', arguments: '{}' },
+                          { id: 'z2', name: 'zeta', arguments: '{}' }
+                      ]
+                    : turn === 2
+                      ? [{ id: 'b1', name: 'beta', arguments: '{}' }]
+                      : [{ id: 'a1', name: 'alpha', arguments: '{}' }]
+        });
+
+        await writer('go');
+
+        // THE ENVELOPE. Four dispatched calls, four answered: the per-turn breakdown is
+        // deliberately not part of the field, so `calls` and `settled` are the totals and the name
+        // list carries the shape. Pinned as a VALUE, not `objectContaining`, because a count nobody
+        // checks exactly is a count that can move unnoticed.
+        const envelope = envelopeOf(writerAgent.messages[2]);
+
+        expect(envelope.toolActivity).toEqual({
+            calls: 4,
+            settled: 4,
+            byName: [
+                { name: 'zeta', calls: 2 },
+                { name: 'alpha', calls: 1 },
+                { name: 'beta', calls: 1 }
+            ],
+            truncated: false
+        });
+
+        // THE OTHER DOOR, same value. AC4's claim is that `delegate` and `agentResult` are two
+        // readings of ONE stored account, so the comparison is asserted directly rather than as
+        // two restatements of the literal above that could each drift and still pass.
+        const stored = (await writer.executeTool('agentResult', {
+            agent: 'researcher',
+            invocationId: '2'
+        })) as Record<string, any>;
+
+        expect(stored.toolActivity).toEqual(envelope.toolActivity);
+
+        // The tally is ADDITIVE. `status`, the partial and the message position keep the meanings
+        // the test above pins for the same shape — a tally that displaced `partialContent` would
+        // fail here rather than only in the issue's acceptance list.
+        expect([envelope.status, envelope.partialContent, envelope.error.includes('maxTurns')]).toEqual([
+            'failed',
+            'pass 3',
+            true
+        ]);
+    });
+
+    it('caps the name list at eight entries and reports `truncated` as the cap speaking (0032 AC2)', async () => {
+        const seenChild: HarnessStreamRequest[] = [];
+
+        // NINE distinct names is the smallest fixture that can reach `TOOL_ACTIVITY_NAME_CAP`, and
+        // they are dispatched in REVERSE alphabetical order (turn 1 names `n9`, turn 9 names `n1`).
+        // Every name has exactly one call, so the documented tie-break decides the list — and it is
+        // the only rule that could drop `n9`: an insertion-ordered top-8 would drop `n1` instead.
+        // The cap firing on turn 9 is also what makes the run non-completed with no timing in the
+        // fixture (the pinned `calls` count below is the proof that all nine dispatches landed).
+        const NAMES = ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9'];
+        const { writer, writerAgent } = cappedChild({
+            maxTurns: NAMES.length,
+            seenChild,
+            tools: Object.fromEntries(
+                NAMES.map((name) => [
+                    name,
+                    tool({ description: `Tool ${name}.`, tags: ['test'], visibility: 'core', execute: () => 'ok' })
+                ])
+            ),
+            callsFor: (turn) => [
+                { id: `t${turn}`, name: NAMES[NAMES.length - turn], arguments: '{}' }
+            ]
+        });
+
+        await writer('go');
+
+        expect(seenChild).toHaveLength(NAMES.length);
+
+        const envelope = envelopeOf(writerAgent.messages[2]);
+
+        // EIGHT entries, `n1`..`n8`, and `n9` gone — the dropped name is the ordering's last, not
+        // the dispatch order's last. `truncated: true` is the cap stating that IT closed the list,
+        // which is the difference between "the run used eight tools" and "the run used more than
+        // the list can hold"; `calls: 9` beside eight entries is the same fact from the other side.
+        expect(envelope.toolActivity).toEqual({
+            calls: 9,
+            settled: 9,
+            byName: [
+                { name: 'n1', calls: 1 },
+                { name: 'n2', calls: 1 },
+                { name: 'n3', calls: 1 },
+                { name: 'n4', calls: 1 },
+                { name: 'n5', calls: 1 },
+                { name: 'n6', calls: 1 },
+                { name: 'n7', calls: 1 },
+                { name: 'n8', calls: 1 }
+            ],
+            truncated: true
+        });
+
+        // THE LEDGER HALF OF THE BOUND (issue 0032's "travels with the row"): the capped child's
+        // row carries the same bounded value, so the cap is a property of the STORED tally and not
+        // of the door that printed it. Read back as one exact value, including `truncated`.
+        const stored = (await writer.executeTool('agentResult', {
+            agent: 'researcher',
+            invocationId: '2'
+        })) as Record<string, any>;
+
+        expect(stored.toolActivity).toEqual(envelope.toolActivity);
+
+        // The row on disk is the same eight-name list — the cap is applied before persistence, so a
+        // restart cannot be what finally trims it (and `readSnapshotToolActivity` would REFUSE an
+        // over-cap row rather than re-trim it, which is the other half of that sentence).
+        const row = (
+            ((writer.snapshot() as { agentResults?: Record<string, unknown>[] }).agentResults ?? []).find(
+                (candidate) => candidate.invocationId === '2'
+            ) ?? {}
+        ) as Record<string, any>;
+
+        expect(row.toolActivity).toEqual(envelope.toolActivity);
+
+        await writer.dispose();
     });
 
     it('falls back to the harness-wide maxIterations when maxTurns is omitted, without naming a run', async () => {
@@ -3469,7 +3953,10 @@ describe('per-delegation turn cap (I5)', () => {
             status: 'failed',
             error: 'Agent "researcher" requested tools on all 3 model turns without answering.',
             partialContent: 'pass 3',
-            cancelledAtMessage: 7
+            cancelledAtMessage: 7,
+            // issue 0032: three answered rounds of one tool — the session-cap door reports the
+            // tally exactly like the caller-cap door does, because the capture point is the same.
+            toolActivity: { calls: 3, settled: 3, byName: [{ name: 'peek', calls: 3 }], truncated: false }
         });
     });
 
@@ -3494,7 +3981,10 @@ describe('per-delegation turn cap (I5)', () => {
             status: 'failed',
             error: 'Agent "researcher" requested tools on all 2 model turns without answering.',
             partialContent: 'pass 2',
-            cancelledAtMessage: 5
+            cancelledAtMessage: 5,
+            // issue 0032: the tally is the same two answered rounds the transcript shows, and it
+            // travels on the session-cap door exactly as on the caller-cap door beside it.
+            toolActivity: { calls: 2, settled: 2, byName: [{ name: 'peek', calls: 2 }], truncated: false }
         });
     });
 
@@ -3509,6 +3999,13 @@ describe('per-delegation turn cap (I5)', () => {
         // The completed envelope, and the strict toEqual is what proves the ABSENCE of
         // error/partialContent/cancelledAtMessage: a cap that never fired leaves no
         // trace of being a cap at all.
+        //
+        // 0032 (2026-11-26) adds a fourth absence this same assertion now holds: this child DID call
+        // `peek` on turn 1, and a completed run still reports NO `toolActivity`. The tally describes
+        // a run that did not conclude, so `finishInvocation` drops it on `completed` and
+        // ../core/snapshot.ts REFUSES a completed row that carries one — a field that appeared here
+        // would make the row unrestorable, not merely noisy. The archive-door half of that rule is
+        // pinned in ./harness.agent-results.test.ts (`drops it when the run completed`).
         expect(envelopeOf(writerAgent.messages[2])).toEqual({
             agent: 'researcher',
             content: 'an answer',
@@ -3546,7 +4043,11 @@ describe('per-delegation turn cap (I5)', () => {
             error:
                 'Agent "researcher" requested tools on its single model turn without answering, the maxTurns this run was given (1). maxTurns caps model REQUESTS, not tool rounds, and the child\'s answer has to be one of them, so N turns allow at most N-1 tool rounds: 1 turn = 0 tool rounds — at maxTurns: 1 a child gets no tool round at all, and must answer without calling one.',
             partialContent: 'pass 1',
-            cancelledAtMessage: 3
+            cancelledAtMessage: 3,
+            // issue 0032: the degenerate cap still reports what the child DID — one tool round,
+            // answered, before the cap closed the run. `calls === settled` distinguishes this row
+            // from one stopped mid-call, which is the pair the field exists for.
+            toolActivity: { calls: 1, settled: 1, byName: [{ name: 'peek', calls: 1 }], truncated: false }
         });
     });
 

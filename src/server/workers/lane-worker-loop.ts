@@ -1146,6 +1146,15 @@ export const deriveOperations = (lane: LaneWorkerState, replica: ReplicaReadView
             // payload) desynchronizes the two and every stop row re-archives on every boundary
             // forever. Spread only when present, exactly like `error` and the pair.
             ...(record.stopReason === undefined ? {} : { stopReason: record.stopReason }),
+            // issue 0032 (2026-11-26): the tool-activity tally, on the same terms as the pair —
+            // spread only when present, and this replica PRODUCED it: its own `finishInvocation`
+            // captured it at the rollback boundary and the snapshot projection writes the key.
+            // Unlike `stopReason`, this key IS in `archiveDigestOf`'s field list (./lane-commit.ts
+            // states why: the skip test above is taken over that projection, and a writer-owned
+            // field that is missing from it lets a lane skip the very op that carries the evidence).
+            // Both sides project it, so the digests stay equal — and a `completed` replica record
+            // carries no key, so nothing extra travels on the ordinary path.
+            ...(record.toolActivity === undefined ? {} : { toolActivity: record.toolActivity }),
             // Stress report #6 (2026-11-14): the conversation this result belongs to. The
             // canonical record's `threadId` is what `purgeThread` matches when a conversation
             // is DELETED, and the lane states it from the one fact it knows: this replica runs

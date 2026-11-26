@@ -703,6 +703,23 @@ describe('worker mode: a stopped lane run archives its forensic pair (review #5,
         // so for a run stopped inside its first request it is an integer — the exact count is a
         // scheduling fact, its PRESENCE is the contract.
         expect(Number.isInteger(row.cancelledAtMessage)).toBe(true);
+
+        // issue 0032 (2026-11-26) — the fourth forensic member, on the SAME seam and in the same
+        // breath, and this run is the ZERO-CALL case: the stub answers in prose and never emits a
+        // tool call, so no tally is ever taken. The lane payload has to omit the key rather than
+        // send `{ calls: 0, settled: 0, byName: [], truncated: false }` — a zero-shaped tally would
+        // arrive in canonical state as a claim about a count that never existed, and the row would
+        // then disagree with the inline record of the very same shape (the door above in
+        // ./harness.agent-results.test.ts omits it too). Absence is asserted as a KEY check, because
+        // `toBeUndefined()` cannot tell an absent key from one written as `undefined`.
+        expect(Object.keys(row).includes('toolActivity')).toBe(false);
+        expect(row).not.toHaveProperty('toolActivity');
+
+        // And the completed row above stays tally-free for the stronger reason: a lane that archived
+        // a tally beside a finished answer produces a row `readAgentResults` REFUSES to load
+        // (../core/snapshot.ts, the completed-row rule), so the session would stop restoring.
+        expect(completed[0]).not.toHaveProperty('toolActivity');
+
         // And the row is still the delete-cascade carrier (stress report #6, above).
         expect(row.threadId).toBe(threadId);
     }, 300_000);

@@ -79,7 +79,8 @@ import {
     readSnapshotJsonValue,
     readSnapshotKeys,
     readSnapshotRecord,
-    readSnapshotString
+    readSnapshotString,
+    readSnapshotToolActivity
 } from './snapshot-validation';
 import { readRecordsStoreState } from './records';
 
@@ -212,6 +213,14 @@ const readAgentResults = (
                 // `error` text, which pushes every consumer back to string-matching a message
                 // the harness wrote for someone else.
                 'stopReason',
+                // issue 0032 (2026-11-26): the bounded tool-activity tally of a run that did not
+                // finish. It joins this whitelist for the same reason `stopReason` did — the
+                // check is EXACT-KEY (`./snapshot-validation.ts`), so a row the projection writes
+                // with this key and the reader does not know would make the WHOLE document
+                // unrestorable, not merely lose one field — and it joins the may-be-absent group
+                // below for the same reason too: every row written before the field existed is
+                // still valid and restores with its exact prior meaning.
+                'toolActivity',
                 // W19 (2026-11-17): the LEDGER GENERATION of the row — the process epoch that minted
                 // `invocationId` (../types `HarnessAgentResultSnapshot.epoch`). The key had to join
                 // this whitelist the moment `snapshot()` started writing it: `readSnapshotKeys` is
@@ -251,7 +260,13 @@ const readAgentResults = (
             // required field" message cannot tell a v2 author that the field RENAMED and its
             // vocabulary left, which is exactly what a rank-less row needs. Same mechanism as
             // `role` above: the whitelist knows the key, the dedicated check explains it.
-            ['error', 'partialContent', 'cancelledAtMessage', 'threadId', 'stopReason', 'epoch', 'role', 'rank']
+            //
+            // issue 0032 (2026-11-26): `toolActivity` joins as MAY-BE-ABSENT on the same two
+            // grounds as `stopReason` — a row from before the field is still a valid row, and a
+            // `completed` row never carries one because the tally describes a run that did NOT
+            // conclude. The value itself is bounded by `readSnapshotToolActivity`
+            // (`./snapshot-validation.ts`), the single validator all three doors share.
+            ['error', 'partialContent', 'cancelledAtMessage', 'threadId', 'stopReason', 'epoch', 'role', 'rank', 'toolActivity']
         );
 
         const invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
@@ -467,6 +482,22 @@ const readAgentResults = (
             result.stopReason = stopReason;
         }
 
+        // issue 0032 (2026-11-26) — WHAT THE STOPPED RUN DID, read (not dropped) under the same
+        // discipline as its three neighbours: optional on the row, refused rather than coerced,
+        // and meaningless once the run concluded. The value is validated by
+        // `readSnapshotToolActivity` (`./snapshot-validation.ts`), the ONE validator the archive
+        // seam and the lane fold call too, so a tally that is legal to archive is always legal to
+        // reload — the exact-key rule this file's header states, applied to a nested object rather
+        // than a scalar. An over-cap `byName`, a blank name, a negative count or a missing
+        // `truncated` fails the whole restore instead of restoring a row the projection would
+        // rewrite on the next save.
+        if (record.toolActivity !== undefined) {
+            result.toolActivity = readSnapshotToolActivity(
+                record.toolActivity,
+                `${entryLabel}.toolActivity`
+            );
+        }
+
         // Same mutual exclusion as `error` and the forensic pair: a COMPLETED run concluded,
         // so it has no stop reason, and a row that carried one would be re-written WITHOUT it
         // by the next projection — `restore -> snapshot` would stop being idempotent, which is
@@ -474,6 +505,17 @@ const readAgentResults = (
         if (status === 'completed' && result.stopReason !== undefined) {
             throw new HarnessError(
                 `${entryLabel}.stopReason must be absent on a completed result.`
+            );
+        }
+
+        // 0032's fourth member, refused on the same ground: the tally describes a run that did
+        // NOT conclude, `finishInvocation` and `archiveInvocation` both drop it on `completed`, and
+        // a row that kept one across a restore would be re-written without it by the next
+        // snapshot. This refusal is what makes the idempotency of `restore -> snapshot` a checked
+        // property rather than a hope for this key.
+        if (status === 'completed' && result.toolActivity !== undefined) {
+            throw new HarnessError(
+                `${entryLabel}.toolActivity must be absent on a completed result.`
             );
         }
 

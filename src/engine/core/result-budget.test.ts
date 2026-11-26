@@ -174,6 +174,89 @@ describe('boundToolResult', () => {
         );
     });
 
+    it('names the retained handle when the refused document carries one, and the re-run when it does not (C2)', () => {
+        // 2026-11-26 (delegate-defects work order, finding C2). "Re-run the call with narrower
+        // arguments" is the right advice for a result whose delivery WAS its only copy, and the
+        // wrong advice for a fork or a delegation: their answers stay readable by the id the
+        // discarded document itself carried, so following the old sentence cost a second full run
+        // (the accepted probe: a 40,000-char fork answer refused at 40,058 bytes, told to re-run
+        // with "smaller limit, fewer ids, narrower fields" — arguments `threadFork` does not take).
+        // The rule is HANDLES, never tool names: a `branchId` or an `invocationId` string earns the
+        // retained clause, everything else keeps the historical sentence BYTE FOR BYTE, which is
+        // what the pins this file already carries (and ./harness.budget.test.ts and
+        // src/server/api.test.ts) assert.
+        //
+        // Every row states the WHOLE `rejected` descriptor, so a change to either clause — or to the
+        // size guard on the quoted id — shows up as a diff on a named row.
+        const cases: Array<[string, string, { name?: string; callId?: string } | undefined, string]> = [
+            [
+                'a fork answer (branchId first)',
+                JSON.stringify({ branchId: 'branch-1', threadId: 'branch-1', content: 'x'.repeat(80) }),
+                { name: 'threadFork', callId: 'f1' },
+                "Tool result too large to deliver: 138 bytes against a 40-byte budget. The result was discarded, not truncated: no part of it reached this transcript. What was discarded is retained under branchId \"branch-1\": agentResult pages the full text by that id, so read it there instead of re-running tool 'threadFork' (call f1). If this call could have written anything, that write may already be applied — re-read before retrying."
+            ],
+            [
+                'a delegation envelope (invocationId)',
+                JSON.stringify({ agent: 'writer', invocationId: 'invocation-7', content: 'y'.repeat(80) }),
+                { name: 'delegate', callId: 'd1' },
+                "Tool result too large to deliver: 141 bytes against a 40-byte budget. The result was discarded, not truncated: no part of it reached this transcript. What was discarded is retained under invocationId \"invocation-7\": agentResult pages the full text by that id, so read it there instead of re-running tool 'delegate' (call d1). If this call could have written anything, that write may already be applied — re-read before retrying."
+            ],
+            [
+                'an object with neither key',
+                JSON.stringify({ id: 'thing-1', body: 'z'.repeat(80) }),
+                { name: 'read', callId: 'r1' },
+                "Tool result too large to deliver: 106 bytes against a 40-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool 'read' (call r1) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying."
+            ],
+            [
+                'an array, which has no keys at all',
+                JSON.stringify(Array.from({ length: 30 }, (_unused, index) => ({ id: `item-${index}` }))),
+                undefined,
+                "Tool result too large to deliver: 501 bytes against a 40-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run the tool call with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying."
+            ],
+            [
+                'a handle too long to quote (the refusal stays bounded)',
+                JSON.stringify({ branchId: 'b'.repeat(121), content: 'q'.repeat(80) }),
+                { name: 'threadFork', callId: 'f2' },
+                "Tool result too large to deliver: 229 bytes against a 40-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool 'threadFork' (call f2) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying."
+            ]
+        ];
+
+        for (const [label, source, origin, message] of cases) {
+            const bounded = boundToolResult(source, 40, origin === undefined ? {} : { source: origin });
+
+            expect([label, bounded.truncated, bounded.rejected]).toEqual([
+                label,
+                false,
+                {
+                    reason: 'oversized-json',
+                    originalBytes: utf8ByteLength(source),
+                    budgetBytes: 40,
+                    message
+                }
+            ]);
+            expect(bounded.content).toBe(message);
+        }
+
+        // THE CLAUSE THAT DID NOT FIRE, stated as its own assertion: a handle-naming bug that put
+        // BOTH sentences in one message would pass the equality above only if the pin text moved
+        // with it, and these two lines are the ones that would not.
+        const fork = boundToolResult(
+            JSON.stringify({ branchId: 'branch-1', content: 'x'.repeat(80) }),
+            40,
+            { source: { name: 'threadFork', callId: 'f1' } }
+        );
+
+        expect(fork.content).toContain('agentResult pages the full text');
+        expect(fork.content).not.toContain('narrower arguments');
+
+        const plain = boundToolResult(JSON.stringify({ id: 'thing-1', body: 'z'.repeat(80) }), 40, {
+            source: { name: 'read', callId: 'r1' }
+        });
+
+        expect(plain.content).toContain('with narrower arguments');
+        expect(plain.content).not.toContain('agentResult');
+    });
+
     it('refuses an over-budget JSON document instead of handing over two broken halves', () => {
         // F-CUTTER. This fixture is the one the head/tail envelope used to be praised
         // for: a `read` page whose opening structure AND trailing `nextLine` were said to

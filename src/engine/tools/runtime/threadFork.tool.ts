@@ -30,6 +30,25 @@ export const THREAD_FORK_NAME = 'threadFork';
 // finished — by using it as `invocationId`. Before this, the ids were reported and
 // nothing told the model they addressed anything.
 //
+// THE ANSWER'S OWN DELIVERY BUDGET (finding C2, 2026-11-26). A fork answer has NO length
+// bound of its own — no `maxChars`, no page, and `HarnessForkResult` (../types/index.ts
+// :1967-1971) carries no cap next to `content` — so the only limit it meets is the
+// harness-wide per-result delivery cap, `MODEL_TOOL_RESULT_BUDGET_BYTES` (../core/result-budget.ts:231,
+// 8192 tokens x 4 bytes = 32768 PAYLOAD bytes of the serialized result), which
+// `boundDelivery` in ../harness.ts applies to EVERY tool. Before this sentence the entry
+// called the id a handle and never said the answer could be refused whole: at 32,715+ chars
+// the document tips over the cap, the model gets a FAILED result quoting the size, and the
+// only lever it owns is the length it ASKS the branch for in `input` — there is no argument
+// to narrow, which is exactly what the old refusal used to advise. What the refusal now says
+// (../core/result-budget.ts `retainedHandleOf`) is that the branch record keeps the answer in
+// full and `agentResult` pages it by that id, so the entry prose and the error text agree.
+//
+// WHY THE NUMBER IS WRITTEN HERE AS A LITERAL: a tool entry may not VALUE-import ../core
+// (the cycle note above), so `32768` is restated, and the equality is pinned instead —
+// `../core/metadata.ownership.test.ts` has a case that reads THIS sentence against
+// `MODEL_TOOL_RESULT_BUDGET_BYTES`, the same shape as the `MODEL_TIMEOUT_MAX_MS` and
+// `TOOL_ACTIVITY_NAME_CAP` pins in that file. Change the constant and that case goes red.
+//
 // HOW AN EXPIRED BRANCH IS DELIVERED (W6 review, 2026-11-13). The clock ends the
 // branch TASK, so the requester's delivery goes through the FAILED path
 // (`src/harness.ts:7511-7548`), not a partial-success result: the tool message reads
@@ -43,7 +62,7 @@ export const THREAD_FORK_NAME = 'threadFork';
 export const THREAD_FORK_METADATA: CoreToolMetadata = {
     name: THREAD_FORK_NAME,
     description:
-        'Fork a private thread that reads the ENTIRE current conversation independently and returns one final summary. Use it when a self-contained investigation benefits from isolated reasoning without polluting this transcript. The new thread cannot see later messages and never receives this agent\'s tools automatically beyond the runtime grant. Pass the task as `input`; `label` is an optional short display name. The result reports `branchId` and `threadId`, which are the SAME generated `branch-N` id, plus the summary in `content`. Treat that id as a handle, not a receipt: threadRead accepts it to read the branch transcript, and agentResult accepts it as `invocationId` to page the answer - including the partialContent of a branch that was cancelled, failed or timed out before it answered. `timeoutMs` optionally bounds the branch clock (1-3600000 ms); omit it to take this harness\'s configured fork bound, which is no limit unless the host set one. On expiry the call reaches you as a FAILED tool result, not a summary: its message names the branch id, quotes a short preview (about 240 characters) of what the branch had produced, and points at threadRead and agentResult for the whole text - a branch that produced nothing reports only the reason. For a branch that was cancelled or timed out, `threadRead` on that id answers with the conversation it forked from plus whatever the branch had COMMITTED before its own rollback - the branch\'s unfinished turns are NOT in that transcript - so `agentResult` under that id is the door that holds the partial text it produced. A fork may fork again, but nesting stops at two levels below this conversation (your fork, and its fork) - a deeper fork is refused. The fork shares this process and any external side effects, so it is not a sandbox.',
+        'Fork a private thread that reads the ENTIRE current conversation independently and returns one final summary. Use it when a self-contained investigation benefits from isolated reasoning without polluting this transcript. The new thread cannot see later messages and never receives this agent\'s tools automatically beyond the runtime grant. Pass the task as `input`; `label` is an optional short display name. The result reports `branchId` and `threadId`, which are the SAME generated `branch-N` id, plus the summary in `content`. Treat that id as a handle, not a receipt: threadRead accepts it to read the branch transcript, and agentResult accepts it as `invocationId` to page the answer - including the partialContent of a branch that was cancelled, failed or timed out before it answered. The summary must fit the shared per-result delivery cap (32768 bytes of the serialized result). An over-cap answer is refused WHOLE - the call reaches you as a failed result naming the branch, with none of the summary delivered - while the branch record keeps it in full and stays pageable by that branch id through agentResult. `threadFork` takes no length argument, so your only lever is the length you ask the fork for in `input`. `timeoutMs` optionally bounds the branch clock (1-3600000 ms); omit it to take this harness\'s configured fork bound, which is no limit unless the host set one. On expiry the call reaches you as a FAILED tool result, not a summary: its message names the branch id, quotes a short preview (about 240 characters) of what the branch had produced, and points at threadRead and agentResult for the whole text - a branch that produced nothing reports only the reason. For a branch that was cancelled or timed out, `threadRead` on that id answers with the conversation it forked from plus whatever the branch had COMMITTED before its own rollback - the branch\'s unfinished turns are NOT in that transcript - so `agentResult` under that id is the door that holds the partial text it produced. A fork may fork again, but nesting stops at two levels below this conversation (your fork, and its fork) - a deeper fork is refused. The fork shares this process and any external side effects, so it is not a sandbox.',
     tags: ['fork', 'thread', 'branch', 'history', 'summarize', 'research'],
     // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
     // and enables it for this session instead of seeing it declared on every request.

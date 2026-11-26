@@ -62,7 +62,7 @@
 // an error to a model, a UI and a retry. If it does not parse, nothing about the
 // existing envelope changes.
 //
-// Two consequences, stated rather than discovered later:
+// Three consequences, stated rather than discovered later:
 //   1. A tool whose own output cap is ABOVE this cap (grep budgets 64 KiB of match
 //      text, `FILE_GREP_CONTENT_BUDGET`) can now be refused where it used to be cut.
 //      That is the same information — the page did not fit — delivered honestly; the
@@ -73,6 +73,14 @@
 //      `ToolResultTurnBudget`), the refusal names the call and the narrowing that fits,
 //      and the ledger charges the refusal, not the discarded document, so one oversized
 //      result cannot spend a turn's whole aggregate.
+//   3. "Narrow the arguments and re-run" is only the truth for a result whose delivery
+//      WAS its only copy. A document that carries its own retained address — `branchId`
+//      (a fork's answer, kept in full by the branch record) or `invocationId` (a
+//      delegation's or an `agentResult` page, kept by the ledger record) — is refused with
+//      a clause naming that id and the door that pages it, because re-running a fork or a
+//      child to get text that is one paged read away is the same information loss in
+//      slower clothing. The rule keys on the HANDLES, never on the tool name, so every
+//      other refusal keeps its historical sentence byte for byte. See `retainedHandleOf`.
 //
 // Two honest limitations, stated here because the cap is easy to oversell:
 //
@@ -403,21 +411,86 @@ const startsJsonValue = (first: string): boolean =>
     first === 'n' ||
     (first >= '0' && first <= '9');
 
-const isJsonDocument = (content: string): boolean => {
+// THE PARSE, returning the VALUE. It used to answer only the boolean question ("is this a
+// JSON document?"); it now hands the parsed value back too, because the refusal has to know
+// whether the discarded document CARRIED ITS OWN ADDRESS (see `retainedHandleOf`) and a
+// second `JSON.parse` of a megabyte document to ask that one question would double the
+// allocation the refusal path already pays. `undefined` is the "not a document" sentinel:
+// `JSON.parse` can legitimately return `null`, `0`, `""` or `false`, never `undefined`.
+const parseJsonDocument = (content: string): unknown => {
     let start = 0;
 
     while (start < content.length && isJsonWhitespace(content.charCodeAt(start))) start += 1;
-    if (start >= content.length) return false;
-    if (!startsJsonValue(content.charAt(start))) return false;
+    if (start >= content.length) return undefined;
+    if (!startsJsonValue(content.charAt(start))) return undefined;
 
     try {
-        JSON.parse(content);
-        return true;
+        return JSON.parse(content);
     } catch {
         // The overwhelmingly common case for real payloads: a document the parser gave
         // up on. Not a signal of anything wrong, so no rethrow and no log.
-        return false;
+        return undefined;
     }
+};
+
+// ---------------------------------------------------------------------------
+// THE RETAINED-HANDLE CLAUSE (finding C2, 2026-11-26)
+// ---------------------------------------------------------------------------
+// WHY THE GENERIC ADVICE IS WRONG FOR HALF THE DOCUMENTS IT TALKS ABOUT.
+// "Re-run the call with narrower arguments" assumes the ONLY copy of the answer was the
+// delivery. For most tools that is true and the sentence is exactly right. For the results
+// below it is FALSE, and following the advice costs the model a second full run:
+//   - `threadFork` answers `{ branchId, threadId, content }` (../types `HarnessForkResult`,
+//     built in ../harness.ts) and the BRANCH RECORD keeps the whole answer, pageable by that
+//     id (`agentResult`, which the probe in this file's header confirmed at 40,000 chars);
+//   - a `delegate` envelope and an `agentResult` page both carry the `invocationId` of the
+//     ledger record that holds the same text, also pageable.
+// So the rule is HANDLE-DRIVEN, not tool-name driven: a refused document that names a record
+// the harness retained gets a clause naming that record, because that clause is true of every
+// tool that carries one and of no other. Tools whose result is its own copy — `read`,
+// `grep`, `knowledge`, a record page — keep the byte-identical sentence they have always
+// shipped, which every pinned refusal in ./result-budget.test.ts, ../harness.budget.test.ts
+// and src/server/api.test.ts asserts.
+//
+// WHY `threadId` IS NOT ON THE LIST. The approved design offered it; it is left out because
+// it does not carry the same promise. A `branchId`/`invocationId` addresses an INVOCATION
+// RECORD that holds this answer and pages it; a bare `threadId` addresses a CONVERSATION,
+// whose transcript is related to the discarded document but is not it. Claiming retention of
+// "the discarded text" at a thread id would be the same false-advice defect this clause
+// exists to fix, one tool over. `threadFork`'s document carries `threadId` too, with the same
+// value as `branchId`, so nothing is lost by reading the stronger key first.
+type RetainedHandleKey = 'branchId' | 'invocationId';
+
+// The longest handle this clause will QUOTE. The refusal is itself a delivery, and the turn
+// ledger books its bytes (see `ToolResultTurnBudget.commit`); an unbounded quote would let a
+// tool that puts a megabyte in `invocationId` make the honest error larger than the document
+// it refuses. A real id is a `branch-N` / `invocation-N` string, far under this, and a value
+// over it is treated as "no handle" — the conservative direction, because the sentence that
+// follows then names nothing rather than half a name.
+const REFUSAL_HANDLE_MAX_CHARS = 120;
+
+// THE KEY ORDER IS THE CONFIDENCE ORDER. `branchId` first: it is the key a fork mints, and
+// the id every branch door accepts. `invocationId` next: it is the key the ledger doors
+// already speak. Only a JSON OBJECT can carry one — an array, a string or a literal has no
+// keys, so a document like `[...]` never grows this clause.
+const retainedHandleOf = (parsed: unknown): { key: RetainedHandleKey; value: string } | undefined => {
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+
+    const record = parsed as Record<string, unknown>;
+
+    for (const key of ['branchId', 'invocationId'] as const) {
+        const value = record[key];
+
+        if (
+            typeof value === 'string' &&
+            value.trim().length > 0 &&
+            value.length <= REFUSAL_HANDLE_MAX_CHARS
+        ) {
+            return { key, value };
+        }
+    }
+
+    return undefined;
 };
 
 // The refusal sentence (F-CUTTER). Same discipline as `spillNote`: exact numbers, no
@@ -426,9 +499,23 @@ const isJsonDocument = (content: string): boolean => {
 //   - that the result is GONE rather than shortened, so the model does not read a
 //     missing field as an empty one;
 //   - both sizes, so the model can pick an argument set that fits;
-//   - the narrowing that fits (limit / ids / fields), which is the actionable half;
+//   - the way back — which is where the handle clause (finding C2) lives;
 //   - the write-safety warning, because a discarded RESULT does not undo a completed
 //     WRITE — the tool may have committed the change and only its receipt is missing.
+//
+// THE TWO RECOVERY CLAUSES, and the rule that picks one (finding C2, 2026-11-26):
+//   - NO handle (the case every pre-existing pin asserts): "Re-run <call> with narrower
+//     arguments (smaller limit, fewer ids, narrower fields) to fetch it." The re-run IS the
+//     recovery, because the delivery was the only copy. This branch is BYTE-IDENTICAL to what
+//     this function shipped before the handle clause existed — the three strings below are
+//     concatenated in the same order with the same spaces — so `read`, `grep`, `knowledge`, a
+//     record page, and every fixture in ./result-budget.test.ts, ../harness.budget.test.ts and
+//     src/server/api.test.ts still read the sentence they were pinned against.
+//   - HANDLE (a refused document that carries the id of a record the harness kept): naming a
+//     re-run would send the model back through a whole fork or child run to recover text that
+//     is one paged `agentResult` call away. The clause therefore names the retained id and the
+//     door that pages it, and says NOT to re-run. It stays size-bounded: the quoted value is
+//     only accepted up to `REFUSAL_HANDLE_MAX_CHARS`.
 //
 // Units follow `spillNote`: `originalBytes` is UTF-8 bytes of the tool's text,
 // `budgetBytes` is the payload budget that was applied (the aggregate case says so out
@@ -439,17 +526,28 @@ const refusalMessage = (
     budgetBytes: number,
     reason: SpillReason,
     aggregateBytes: number | undefined,
-    source: ToolResultSource | undefined
+    source: ToolResultSource | undefined,
+    handle: { key: string; value: string } | undefined
 ): string => {
     const cap =
         reason === 'aggregate' && aggregateBytes !== undefined
             ? `against the ${budgetBytes} bytes this turn had left of its ${aggregateBytes}-byte per-turn cap`
             : `against a ${budgetBytes}-byte budget`;
 
+    // Both clauses end with a trailing space, so the write-safety sentence below joins with
+    // no separator and the non-handle path reproduces the historical byte stream exactly.
+    const recovery =
+        handle === undefined
+            ? `Re-run ${sourcePhrase(source)} with narrower arguments ` +
+              '(smaller limit, fewer ids, narrower fields) to fetch it. '
+            : `What was discarded is retained under ${handle.key} "${handle.value}": agentResult ` +
+              `pages the full text by that id, so read it there instead of re-running ${sourcePhrase(source)}. `;
+
     return (
         `Tool result too large to deliver: ${originalBytes} bytes ${cap}. The result was discarded, not truncated: ` +
-        `no part of it reached this transcript. Re-run ${sourcePhrase(source)} with narrower arguments ` +
-        '(smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write ' +
+        `no part of it reached this transcript. ` +
+        recovery +
+        'If this call could have written anything, that write ' +
         'may already be applied — re-read before retrying.'
     );
 };
@@ -566,8 +664,24 @@ const boundWithReason = (
     // or `src/server/api.ts` (the route answers `ok: false`) — reports it. Everything
     // that does NOT parse keeps the head/tail envelope exactly as before, because for
     // prose both previews are real content.
-    if (isJsonDocument(content)) {
-        const message = refusalMessage(originalBytes, budgetBytes, reason, aggregateBytes, source);
+    //
+    // The PARSED VALUE is kept, not thrown away, because the recovery clause is chosen
+    // from it (finding C2): a document that carries `branchId`/`invocationId` names a
+    // record the harness retained, and telling the model to re-run the call would send it
+    // through a second fork or child run for text that is already pageable. One parse,
+    // two questions. `undefined` is the only "not a document" answer — see
+    // `parseJsonDocument` for why `null` cannot be the sentinel.
+    const parsed = parseJsonDocument(content);
+
+    if (parsed !== undefined) {
+        const message = refusalMessage(
+            originalBytes,
+            budgetBytes,
+            reason,
+            aggregateBytes,
+            source,
+            retainedHandleOf(parsed)
+        );
 
         return {
             content: message,

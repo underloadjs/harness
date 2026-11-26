@@ -190,8 +190,13 @@ describe('agentManage / agentResult registration', () => {
                 offset: {
                     type: 'integer',
                     minimum: 0,
+                    // B1 (2026-11-26): the row now carries the clamp contract, so a caller learns
+                    // from the schema that an offset past the end answers with the END of the
+                    // result plus `offsetClamped`/`note`. Pinned whole, in this object's own
+                    // exact-equality style; the raw-source copies (entry literal, generated
+                    // manifest, Rust row) are pinned in core/metadata.ownership.test.ts.
                     description:
-                        '0-based character offset into the result. Defaults to 0; use nextOffset from the previous page.'
+                        '0-based character offset into the result. Defaults to 0; use nextOffset from the previous page. An offset past the end is clamped to it and reported as "offsetClamped" with a "note" naming where the page really starts, so overshooting reads as the end of the result rather than as an empty answer; an offset exactly at "contentLength" is the empty tail it looks like and carries no flag.'
                 },
                 limit: {
                     type: 'integer',
@@ -551,6 +556,17 @@ describe('agentManage', () => {
         expect(listed).not.toContain('PROMPT-SECRET');
         expect(result).not.toContain('PROMPT-SECRET');
         expect(result).toContain('safe answer');
+
+        // issue 0032 (2026-11-26, AC3) — the same scan over the STOPPED shape, because the tally is
+        // the first forensic field that names tools at all. This fixture's run completes, so it
+        // carries no tally; the stopped twin is the cancelled run in `carries a cancelled run partial
+        // and its message position through snapshot -> restore` above, whose tool answers `released`
+        // and whose door, row and reloaded row are pinned WHOLE — an added body or argument string
+        // would fail those exact `toEqual`s, not merely this scan. What this line owns is the field
+        // ON THE COMPLETED SHAPE: nothing about `toolActivity` crept into the listing or the page,
+        // which is the AC5 half of the same promise (the completed shape did not move).
+        expect(listed).not.toContain('toolActivity');
+        expect(result).not.toContain('toolActivity');
     });
 });
 
@@ -646,6 +662,145 @@ describe('agentResult', () => {
         ).rejects.toThrow('$.limit must be <= 8000.');
     });
 
+    // B1 (2026-11-26, work order
+    // docs/tasks/2026-11-26-delegate-defects-verified-fix-list.md) — an out-of-range `offset` used to
+    // be clamped SILENTLY here while `fetch` reported the identical clamp as `offsetClamped` + `note`
+    // (./tools/webfetch/index.ts:689-690 for the flag, :871-876 for the pair). A caller that overshoots
+    // by computing `contentLength - n` must be able to tell "you already have the end" from "the tail
+    // is genuinely empty" without arithmetic. Fixtures stay small so the note is pinned as an exact
+    // string, numbers included.
+    it('reports an offset past the end as a clamp, and an in-range offset as nothing at all', async () => {
+        const content = 'x'.repeat(300);
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer(content)])) },
+            presets: false
+        });
+        await writer('go');
+
+        // AC1 — overshoot: the clamped page exactly as before, PLUS the flag and a note naming the
+        // offset the page really starts at. The wording mirrors webfetch's note noun-for-noun.
+        expect(await writer.executeTool('agentResult', { agent: 'writer', offset: 900 })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: '',
+            contentLength: 300,
+            offset: 300,
+            limit: 4000,
+            hasMore: false,
+            offsetClamped: true,
+            note: 'Requested offset 900 is past the end of this 300-character result; showing what remains from 300. The result is fully read once "content" is empty.'
+        });
+
+        // AC2, and the ONE deliberate deviation from the work order's test item (b) ("offset exactly at
+        // contentLength -> same"): `offset === contentLength` is NOT an overshoot, so the key is
+        // ABSENT. Reasons, in the order the sources give them: webfetch's own rule is
+        // `startOffset !== invocation.offset` (./tools/webfetch/index.ts:690), and the work order's own
+        // Fix sentence says "when the requested offset EXCEEDS contentLength". An empty tail at the end
+        // of the window is a fact about the answer, not about the request. The exact `toEqual` below is
+        // the pin — one extra key and this assertion fails.
+        expect(await writer.executeTool('agentResult', { agent: 'writer', offset: 300 })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: '',
+            contentLength: 300,
+            offset: 300,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // AC2 — an in-range offset carries nothing either, so the flag never lies, and the paging
+        // keys stay byte-identical to the suite above.
+        expect(
+            await writer.executeTool('agentResult', { agent: 'writer', offset: 100, limit: 50 })
+        ).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'x'.repeat(50),
+            contentLength: 300,
+            offset: 100,
+            limit: 50,
+            hasMore: true,
+            nextOffset: 150
+        });
+    });
+
+    // B1 (2026-11-26) — the failed/cancelled branch pages `partialContent` with the SAME arithmetic,
+    // so it reports the clamp the same way. The row comes from `archiveInvocation` (the seam a lane
+    // commits through) rather than from a live cancellation, so the fixture is one call and the
+    // expected envelope is fully knowable: `stopReason` and `durationMs` are absent because the
+    // archive was given neither.
+    it('reports the same clamp when paging a stopped child partialContent', async () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+
+        // 14 characters of partial, and the forensic pair that makes this branch worth paging at all.
+        writer.archiveInvocation({
+            invocationId: '513',
+            sequence: 3,
+            agent: 'writer',
+            rank: 'B',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'Delegation exceeded its bound.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2
+        });
+
+        // AC3 — identical reporting on this branch: flag, note naming the clamp target, and the
+        // clamped page itself.
+        expect(
+            await writer.executeTool('agentResult', {
+                agent: 'writer',
+                invocationId: '513',
+                offset: 40
+            })
+        ).toEqual({
+            agent: 'writer',
+            invocationId: '513',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            contentLength: 14,
+            offset: 14,
+            limit: 4000,
+            hasMore: false,
+            offsetClamped: true,
+            note: 'Requested offset 40 is past the end of this 14-character result; showing what remains from 14. The result is fully read once "content" is empty.',
+            error: 'Delegation exceeded its bound.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2
+        });
+
+        // The in-range read of the same row keeps its pre-B1 key set exactly — the flag is additive,
+        // and every existing exact-key pin in this file depends on that.
+        expect(
+            await writer.executeTool('agentResult', { agent: 'writer', invocationId: '513' })
+        ).toEqual({
+            agent: 'writer',
+            invocationId: '513',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: 'half an answer',
+            contentLength: 14,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'Delegation exceeded its bound.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2
+        });
+    });
+
     it('reads a submitted invocation by id and reports an unknown id as an error', async () => {
         const writer = harness({
             agents: { writer: brain(scripted([answer('one')])) },
@@ -670,12 +825,190 @@ describe('agentResult', () => {
             hasMore: false
         });
 
+        // B2 (2026-11-26) — the wording changed because the old one conflated two opposite failures.
+        // This id exists nowhere in the ledger, so the refusal says so and the remedy is "give up".
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: 'missing' })
-        ).rejects.toThrow('No result "missing" is available for agent "writer".');
+        ).rejects.toThrow(
+            'No result "missing" is available for agent "writer": no such invocation in this harness.'
+        );
 
         await expect(writer.executeTool('agentResult', { agent: 'ghost' })).rejects.toThrow(
             'Agent "ghost" is not registered. Configured agents: writer.'
+        );
+    });
+
+    // B2 (2026-11-26, work order
+    // docs/tasks/2026-11-26-delegate-defects-verified-fix-list.md) — `agentResult` used to answer ONE
+    // sentence, `No result "<id>" is available for agent "<agent>".`, for both "this id is real but is
+    // somebody else's" (remedy: ask that agent) and "this id never happened" (remedy: stop). The 0034
+    // repro cost a blind probe per candidate agent, because `agentManage` caps each agent's list at 5
+    // rows with no cursor. Fixtures use `archiveInvocation` — the seam a lane commits through — so rows
+    // of several agents and several ledger generations exist without running several models.
+    it('names the owning agent when an invocation id belongs to another agent', async () => {
+        const writer = harness({
+            agents: {
+                writer: brain(scripted([answer('unused')])),
+                helper: brain(scripted([answer('unused')])),
+                lead: brain(scripted([answer('unused')]))
+            },
+            presets: false
+        });
+
+        writer.archiveInvocation({
+            invocationId: '513',
+            sequence: 5,
+            agent: 'helper',
+            rank: 'B',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'helper answer'
+        });
+
+        // THE WRONG-AGENT REFUSAL: the owner is named, so no enumeration is needed to find it.
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: '513' })
+        ).rejects.toThrow(
+            'No result "513" is available for agent "writer"; it belongs to agent "helper".'
+        );
+
+        // THE SUCCESS PATH IS UNCHANGED for the agent that really owns the id: same envelope, same keys,
+        // no `offsetClamped` (the flag is B1's, and an absent `offset` is 0, never an overshoot).
+        await expect(
+            writer.executeTool('agentResult', { agent: 'helper', invocationId: '513' })
+        ).resolves.toEqual({
+            agent: 'helper',
+            invocationId: '513',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'helper answer',
+            contentLength: 13,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // AC4 — the UNREGISTERED-AGENT refusal is a different failure, raised before any ledger lookup,
+        // and its sentence is preserved verbatim (the roster list is `Object.keys(agents)` order, the
+        // config order; same rule pinned at ./harness.delegation.test.ts:837).
+        await expect(
+            writer.executeTool('agentResult', { agent: 'ghost', invocationId: '513' })
+        ).rejects.toThrow(
+            'Agent "ghost" is not registered. Configured agents: writer, helper, lead.'
+        );
+    });
+
+    it('names every owner when a recycled id has rows under two agents, and both still answer', async () => {
+        const writer = harness({
+            agents: {
+                writer: brain(scripted([answer('unused')])),
+                helper: brain(scripted([answer('unused')])),
+                lead: brain(scripted([answer('unused')]))
+            },
+            presets: false
+        });
+
+        // THE RECYCLED ID: ONE bare id, TWO rows, TWO agents, TWO ledger generations (the shape pinned
+        // in ./harness.invocation-run-key.test.ts:101-141). The epoch-preferred resolver answers with
+        // exactly ONE of them — this process's — which is why the refusal scans the bounded ledger for
+        // every distinct owner instead of trusting that one answer.
+        writer.archiveInvocation({
+            invocationId: '520',
+            sequence: 6,
+            agent: 'helper',
+            rank: 'B',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'old generation',
+            epoch: 'epoch-pre-restart'
+        });
+        writer.archiveInvocation({
+            invocationId: '520',
+            sequence: 7,
+            agent: 'lead',
+            rank: 'A',
+            kind: 'root',
+            status: 'completed',
+            content: 'this generation'
+        });
+
+        // Both owners, sorted (deterministic, not ledger-insertion order), the asking agent excluded.
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: '520' })
+        ).rejects.toThrow(
+            'No result "520" is available for agent "writer"; it belongs to agents "helper", "lead".'
+        );
+
+        // SUCCESS PATH: each owning agent still reaches ITS OWN generation of that id — `helper` only via
+        // the agent-scoped fallback (`invocationRecordOfInvocationIdForAgent`), which B2 must not weaken.
+        await expect(
+            writer.executeTool('agentResult', { agent: 'helper', invocationId: '520' })
+        ).resolves.toMatchObject({
+            invocationId: '520',
+            kind: 'delegation',
+            content: 'old generation'
+        });
+
+        await expect(
+            writer.executeTool('agentResult', { agent: 'lead', invocationId: '520' })
+        ).resolves.toMatchObject({
+            invocationId: '520',
+            kind: 'root',
+            content: 'this generation'
+        });
+
+        // THE OTHER REFUSAL: an id the ledger has never heard of, in a harness that does hold rows.
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: 'nope' })
+        ).rejects.toThrow(
+            'No result "nope" is available for agent "writer": no such invocation in this harness.'
+        );
+    });
+
+    it('still reads an id retired with its conversation, and names its owner rather than calling it unknown', async () => {
+        const writer = harness({
+            agents: {
+                writer: brain(scripted([answer('listed')])),
+                quiet: brain(scripted([answer('unused')]))
+            },
+            presets: false
+        });
+
+        await writer('go');
+        await writer('go');
+
+        // A host thread's run is a row of the SAME agent, owned by that conversation (the same fixture
+        // the `hiddenResults` pin above builds, :421-523).
+        const thread = writer.createThread('writer');
+        await writer.sendThreadInput(thread.id, 'doomed');
+
+        // Released. The row leaves every AGENT-FACING LIST — `recordsForAgent` applies
+        // `recordIsInactiveOwned` — but it stays in the retention ring and stays readable by id, which
+        // is the documented ring behaviour (the pins at :407-418 and :517-523).
+        writer.deleteThread(thread.id);
+
+        // AC5 — asking its own agent still READS it. A refactor that moved the inactive filter onto the
+        // id-addressed path would turn this into the unknown-id refusal.
+        await expect(
+            writer.executeTool('agentResult', { agent: 'writer', invocationId: '3' })
+        ).resolves.toEqual({
+            agent: 'writer',
+            invocationId: '3',
+            kind: 'root',
+            status: 'completed',
+            content: 'listed',
+            contentLength: 6,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // And asking the WRONG agent names the owner: the owners scan may not apply the inactive filter
+        // either, or a released row would read as "no such invocation in this harness".
+        await expect(
+            writer.executeTool('agentResult', { agent: 'quiet', invocationId: '3' })
+        ).rejects.toThrow(
+            'No result "3" is available for agent "quiet"; it belongs to agent "writer".'
         );
     });
 
@@ -1014,6 +1347,59 @@ describe('result pagination and Unicode boundaries', () => {
             limit: 3,
             hasMore: true,
             nextOffset: 6
+        });
+    });
+
+    // B1 (2026-11-26) — THE FLAG MUST NOT LIE. The lead-surrogate repair inside `resultPageOf`
+    // (./harness.ts, `start--` in the pair-repair block) moves an offset that is perfectly IN RANGE back
+    // by one unit when it lands on the low half of a pair. A clamp computed as
+    // `page.offset !== requestedOffset` — the obvious implementation — would therefore report this
+    // legal page as an overshoot. The flag is computed as strict overshoot against the STORED LENGTH
+    // instead, so the exact `toEqual` below (no `offsetClamped`, no `note`) is the whole assertion, and
+    // the second one shows a genuine overshoot on the same fixture does carry the pair.
+    it('does not report a surrogate-boundary repair as an offset clamp', async () => {
+        // Length 8 UTF-16 units: A A A [high low] B B B.
+        const content = 'AAA😀BBB';
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer(content)])) },
+            presets: false
+        });
+        await writer('go');
+
+        // 4 is INSIDE the pair and 8 > 4, so this is in range on both counts: the start is repaired to
+        // 3 and nothing is reported, even though the echoed `offset` differs from the requested one.
+        expect(
+            await writer.executeTool('agentResult', { agent: 'writer', offset: 4, limit: 3 })
+        ).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: '😀B',
+            contentLength: 8,
+            offset: 3,
+            limit: 3,
+            hasMore: true,
+            nextOffset: 6
+        });
+
+        // AC1 on the same fixture: 9 units into an 8-unit answer IS an overshoot, so the pair appears
+        // and the note names the clamp target (8), not the requested offset (9).
+        expect(
+            await writer.executeTool('agentResult', { agent: 'writer', offset: 9, limit: 3 })
+        ).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: '',
+            contentLength: 8,
+            offset: 8,
+            limit: 3,
+            hasMore: false,
+            offsetClamped: true,
+            note: 'Requested offset 9 is past the end of this 8-character result; showing what remains from 8. The result is fully read once "content" is empty.'
         });
     });
 });
@@ -1420,9 +1806,14 @@ describe('snapshot durability (R3)', () => {
         expect(retained[0]).toMatchObject({ invocationId: '7', sequence: 7 });
         expect(retained.at(-1)).toMatchObject({ invocationId: '70', sequence: 70 });
 
+        // B2 (2026-11-26) — this id was EVICTED by the ring, so it exists nowhere and the refusal says
+        // the honest thing. (It is also why the wording pin belongs here: an evicted row is exactly the
+        // "no such invocation" case, not the wrong-agent case.)
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: '6' })
-        ).rejects.toThrow('No result "6" is available for agent "writer".');
+        ).rejects.toThrow(
+            'No result "6" is available for agent "writer": no such invocation in this harness.'
+        );
 
         const target = harness({
             agents: { writer: brain(scripted([answer('unused')])) },
@@ -1993,6 +2384,11 @@ describe('terminal commit is atomic for a finished run (B2)', () => {
             // one step earlier; this counter is a forensic position, not part of the selector
             // claim, and it is pinned exactly so a change here stays visible.
             cancelledAtMessage: 2,
+            // issue 0032 (2026-11-26) — the selector envelope now says what the stopped run DID.
+            // One `hold` call, and it never answered (`settled: 0`): the run was stopped inside
+            // the tool round, which is the case `partialContent` cannot describe at all — this row
+            // carries no partial, so before 0032 it said nothing about the call in flight.
+            toolActivity: { calls: 1, settled: 0, byName: [{ name: 'hold', calls: 1 }], truncated: false },
             durationMs: expect.any(Number)
         });
 
@@ -2202,6 +2598,9 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             error: 'operator stop',
             partialContent: 'half an answer',
             cancelledAtMessage: 2,
+            // issue 0032 (2026-11-26) — SURFACE 1, the live door: what the stopped run DID, beside
+            // what it said. One `hold` call, unanswered when the abort landed.
+            toolActivity: { calls: 1, settled: 0, byName: [{ name: 'hold', calls: 1 }], truncated: false },
             durationMs: expect.any(Number)
         });
 
@@ -2230,6 +2629,12 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             error: 'operator stop',
             partialContent: 'half an answer',
             cancelledAtMessage: 2,
+            // issue 0032 (2026-11-26) — SURFACE 2, the durable row. The tally is stored state, not
+            // a live projection: `finishInvocation` wrote it once at the rollback boundary and
+            // `snapshot()` writes it with the row, so the same account has to come back from disk.
+            // The key order matters here — the reader rebuilds it in this order so the re-projected
+            // row below is byte-identical, which is what `restore -> snapshot` idempotency means.
+            toolActivity: { calls: 1, settled: 0, byName: [{ name: 'hold', calls: 1 }], truncated: false },
             threadId,
             // W19: the ledger generation of this row (../types `HarnessAgentResultSnapshot.epoch`).
             epoch: HARNESS_PROCESS_EPOCH
@@ -2257,7 +2662,12 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             hasMore: false,
             error: 'operator stop',
             partialContent: 'half an answer',
-            cancelledAtMessage: 2
+            cancelledAtMessage: 2,
+            // issue 0032 (2026-11-26) — SURFACE 3, after the restart through real JSON: the tally
+            // crossed the reader (`core/snapshot.ts` validates it with the archive seam's own
+            // bounds) and answers the same value the live door printed above. AC4 and AC-B4-4 in
+            // one assertion: same value, both doors, on both sides of a reboot.
+            toolActivity: { calls: 1, settled: 0, byName: [{ name: 'hold', calls: 1 }], truncated: false }
         });
 
         // The restored record re-projects byte-for-byte, so a restart cannot start
@@ -2417,6 +2827,10 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             error: 'transport died mid-run',
             partialContent: 'a partial before the crash',
             cancelledAtMessage: 3,
+            // issue 0032 (2026-11-26, AC1) — the FAILED door, not only the cancelled one: the run
+            // answered one `boom` call and then lost the transport, so `calls` and `settled` agree.
+            // The crash happened after the round closed, and the tally says so.
+            toolActivity: { calls: 1, settled: 1, byName: [{ name: 'boom', calls: 1 }], truncated: false },
             durationMs: expect.any(Number)
         });
 
@@ -2438,6 +2852,10 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             error: 'transport died mid-run',
             partialContent: 'a partial before the crash',
             cancelledAtMessage: 3,
+            // issue 0032 (2026-11-26): the tally rides the durable row too, so a post-mortem that
+            // reads only the agent-result ledger — after a restart, with the transcript gone or
+            // released — can still say what this failed run did.
+            toolActivity: { calls: 1, settled: 1, byName: [{ name: 'boom', calls: 1 }], truncated: false },
             // The owner travels on a failed row exactly as it does on a cancelled one.
             threadId: thread.id,
             // W19: the ledger generation of this row.
@@ -2462,7 +2880,12 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             hasMore: false,
             error: 'transport died mid-run',
             partialContent: 'a partial before the crash',
-            cancelledAtMessage: 3
+            cancelledAtMessage: 3,
+            // issue 0032 (2026-11-26, AC4 + worker-mode-adjacent durability): the value survives
+            // the JSON round trip byte-identically — same counts, same single name, same flag —
+            // which is what the reader's shared validator in `core/snapshot-validation.ts` exists
+            // to guarantee rather than leave to chance.
+            toolActivity: { calls: 1, settled: 1, byName: [{ name: 'boom', calls: 1 }], truncated: false }
         });
     });
 
@@ -2838,6 +3261,195 @@ describe('the archive seam carries the forensic pair of a stopped run (review #5
 
         restored.restore(JSON.parse(JSON.stringify(staged.snapshot())) as never);
         expect(rowOf(restored.snapshot(), '513')).toEqual(rowOf(staged.snapshot(), '513'));
+    });
+
+    // -----------------------------------------------------------------------
+    // issue 0032 (2026-11-26) — THE TALLY CROSSES THE SAME SEAM AS THE PAIR
+    // -----------------------------------------------------------------------
+    //
+    // The archive payload is the ONLY way a stopped lane child's record reaches canonical state, so
+    // a field that is not on this door is invisible to every lane reader no matter what the engine
+    // stores. This test is the seam half of that claim: input, returned receipt, canonical row,
+    // completed-replacement drop, reload, and the refusals.
+    it('carries the tool tally through the archive seam, and drops it when the run completed (0032)', async () => {
+        const source = coreOf();
+
+        // A stopped lane child that called two tools, one of them twice. `cancelledArchive` above is
+        // the PRE-0032 payload and stays legal untouched (the last test in this block archives it
+        // with no tally at all) — this is the same door one field wider.
+        const toolActivity = {
+            calls: 3,
+            settled: 2,
+            byName: [
+                { name: 'read', calls: 2 },
+                { name: 'shell', calls: 1 }
+            ],
+            truncated: false
+        };
+        const archived = source.archiveInvocation({
+            ...cancelledArchive,
+            invocationId: '520',
+            sequence: 6,
+            toolActivity
+        });
+
+        // THE RECEIPT, key for key. `lane-authority.ts` digests this returned object as the receipt a
+        // lane compares against its own derivation, and `archiveDigestOf`
+        // (../server/workers/lane-commit.ts) covers `toolActivity` BECAUSE the fold stores it — a
+        // field the digest counts and the receipt omits is a lane that re-archives one row forever.
+        expect(archived.record).toEqual({
+            invocationId: '520',
+            sequence: 6,
+            completedOrder: 1,
+            agent: 'writer',
+            rank: 'B',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2,
+            toolActivity,
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+
+        // THE ROW — what `/results` serves and the next snapshot writes.
+        expect(rowOf(source.snapshot(), '520')).toEqual({
+            invocationId: '520',
+            sequence: 6,
+            completedOrder: 1,
+            agent: 'writer',
+            rank: 'B',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2,
+            threadId: 'thread-9',
+            toolActivity,
+            epoch: HARNESS_PROCESS_EPOCH
+        });
+
+        // READ BACK, not dropped: the door a caller uses answers with the archived tally, so the
+        // field survives archive → canonical state → surface, not just archive → disk.
+        expect(
+            await source.executeTool('agentResult', { agent: 'writer', invocationId: '520' })
+        ).toMatchObject({ status: 'cancelled', toolActivity });
+
+        // RELOAD, through the serialiser and the strict reader, and re-project: byte-identical.
+        // This is `restore -> snapshot` idempotency for this key, which is why the reader validates
+        // the value instead of trimming it (an over-cap row that RESTORED as an eight-name row would
+        // re-write itself smaller on the next snapshot, and the lane receipt would move).
+        const reloaded = coreOf();
+
+        reloaded.restore(JSON.parse(JSON.stringify(source.snapshot())) as never);
+
+        expect(rowOf(reloaded.snapshot(), '520')).toEqual(rowOf(source.snapshot(), '520'));
+        expect(
+            await reloaded.executeTool('agentResult', { agent: 'writer', invocationId: '520' })
+        ).toMatchObject({ toolActivity });
+
+        // COMPLETED MEANS IT IS GONE — on the row a completed archive writes, and on the row it
+        // REPLACES. The tally describes a run that did not conclude; ../core/snapshot.ts refuses a
+        // completed row that carries one, so keeping it here would make the next snapshot unloadable
+        // rather than merely stale. Same rule the partial pair above already enforces.
+        const done = source.archiveInvocation({
+            ...cancelledArchive,
+            invocationId: '520',
+            sequence: 6,
+            status: 'completed',
+            content: 'the finished answer',
+            error: undefined,
+            toolActivity
+        });
+
+        expect(done.replaced).toBe(true);
+        expect(done.record).not.toHaveProperty('toolActivity');
+        expect(rowOf(source.snapshot(), '520')).not.toHaveProperty('toolActivity');
+
+        // REFUSED, BEFORE ANYTHING MOVES, by the one validator all three doors share
+        // (../core/snapshot-validation.ts `readSnapshotToolActivity`). Each sentence is the reader's
+        // own, so nothing an archive accepts can be illegal to reload.
+        const refuse = (invocationId: string, value: unknown): (() => void) => () =>
+            source.archiveInvocation({
+                ...cancelledArchive,
+                invocationId,
+                sequence: 7,
+                toolActivity: value as never
+            });
+
+        // The cap, named as a number: nine entries is a tally the projection cannot produce.
+        expect(
+            refuse('521', {
+                calls: 9,
+                settled: 9,
+                byName: ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9'].map((name) => ({
+                    name,
+                    calls: 1
+                })),
+                truncated: true
+            })
+        ).toThrow('Invocation "521".toolActivity.byName contains 9 entries; at most 8 are recorded.');
+
+        // `settled` is a SUBSET of `calls`, and a row that says otherwise was not written by this engine.
+        expect(refuse('522', { calls: 1, settled: 2, truncated: false })).toThrow(
+            'Invocation "522".toolActivity.settled (2) cannot exceed Invocation "522".toolActivity.calls (1); a settled call is by definition one that was registered.'
+        );
+
+        // `truncated` is REQUIRED: a tally that does not say whether the cap closed the list leaves a
+        // reader to guess, which is the ambiguity the field exists to remove. The refusal is the
+        // whitelist's own "missing the field" sentence (`readSnapshotKeys`), not the boolean-coercion
+        // one — an absent key and a key holding `7` are two different defects and say so.
+        expect(refuse('523', { calls: 1, settled: 1 })).toThrow(
+            'Invocation "523".toolActivity is missing the field "truncated".'
+        );
+        expect(refuse('527', { calls: 1, settled: 1, truncated: 1 })).toThrow(
+            'Invocation "527".toolActivity.truncated must be a boolean.'
+        );
+
+        // An empty name list is the zero-shaped mistake in persisted form — the tally omits the key.
+        expect(refuse('524', { calls: 1, settled: 1, byName: [], truncated: false })).toThrow(
+            'Invocation "524".toolActivity.byName is empty; a tally with no tool names omits the key rather than listing none.'
+        );
+
+        // And an unknown key inside the tally is refused rather than tidied, exactly like an unknown
+        // key on the row itself.
+        expect(
+            refuse('525', {
+                calls: 1,
+                settled: 1,
+                truncated: false,
+                byName: [{ name: 'read', calls: 1, extra: true }]
+            })
+        ).toThrow('Invocation "525".toolActivity.byName[0] has an unknown field "extra".');
+
+        // None of the six left a row, and none burned a completion order — the same property the
+        // malformed-pair test below pins for the forensic pair, because the lane seam turns a throw
+        // into a permanent `invalid-mutation` and retries the same payload.
+        for (const invocationId of ['521', '522', '523', '524', '525', '527']) {
+            expect(rowOf(source.snapshot(), invocationId)).toBeNull();
+        }
+
+        // A LEGAL tally with no `byName` at all is accepted and reads back unchanged: the key is
+        // optional, and "a stopped run whose names the recorder could not list" is a different claim
+        // from "this run called nothing" (which reports no tally at all).
+        const names = source.archiveInvocation({
+            ...cancelledArchive,
+            invocationId: '526',
+            sequence: 8,
+            toolActivity: { calls: 2, settled: 1, truncated: false }
+        });
+
+        expect(names.record.toolActivity).toEqual({ calls: 2, settled: 1, truncated: false });
+        expect(rowOf(source.snapshot(), '526')?.toolActivity).toEqual({
+            calls: 2,
+            settled: 1,
+            truncated: false
+        });
+
+        await source.dispose();
+        await reloaded.dispose();
     });
 
     it('refuses a malformed pair before anything moves — no row, no burned completion order', () => {

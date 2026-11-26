@@ -1140,6 +1140,229 @@ describe('thread creation and result archiving: identity comes from the authorit
         expect(completed.effect?.digest).toBe(archiveDigestOf(view.results['513']));
     });
 
+    // -----------------------------------------------------------------------
+    // issue 0032 (2026-11-26) — THE TALLY RIDES THE SAME FOLD AS THE PAIR
+    // -----------------------------------------------------------------------
+    //
+    // A lane child's record reaches canonical state ONLY through this fold, so `toolActivity` has to
+    // be carried, digested, bounded and dropped here on the same terms as its three neighbours — and
+    // the skip test that decides whether a lane re-archives at all is `archiveDigestOf`, which is why
+    // the digest half is asserted as carefully as the row half.
+    it('carries the tool tally of a stopped run, digests it, and refuses an out-of-bounds one (0032)', () => {
+        const view = emptyCanonicalView();
+        const identity = createIdentityLedger({ invocation: 1 });
+        const leases = createWriterLeaseLedger();
+
+        // A cancelled lane child that called two tools, one of them twice, and was inside the second
+        // call when the stop landed (`settled` one short of `calls`). `truncated: false` beside two
+        // names says the list is complete — the flag is the cap speaking, and nothing else.
+        const toolActivity = {
+            calls: 3,
+            settled: 2,
+            byName: [
+                { name: 'read', calls: 2 },
+                { name: 'shell', calls: 1 }
+            ],
+            truncated: false
+        };
+        const stopped = {
+            kind: 'result:archive',
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'instruct',
+            rank: 'B',
+            runKind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2,
+            threadId: 'thread-9',
+            stopReason: 'caller-released',
+            toolActivity
+        } as SharedMutation;
+
+        const applied = applySharedMutation(view, stopped, {
+            laneEpoch: EPOCH_A,
+            leases,
+            identity,
+            opId: 0,
+            seq: 1
+        });
+
+        expect(applied.status).toBe('applied');
+
+        // THE ROW, key for key — the tally is STORED state, and the name list keeps the order the
+        // writer produced (count desc, name asc), which is the order the engine's own projection
+        // writes. A fold that re-sorted it would hand the same run two different lists depending on
+        // whether it ran inline or on a lane.
+        const stoppedRow = {
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'instruct',
+            rank: 'B',
+            kind: 'delegation',
+            status: 'cancelled',
+            content: '',
+            error: 'The run was cancelled.',
+            partialContent: 'half an answer',
+            cancelledAtMessage: 2,
+            threadId: 'thread-9',
+            stopReason: 'caller-released',
+            toolActivity
+        };
+
+        expect(view.results['513']).toEqual(stoppedRow);
+
+        // THE RECEIPT. This is the half that decides whether the field is durable at all: the writer
+        // compares the digest of the payload it sent against this slot's, so a digest that ignored
+        // `toolActivity` would report "already archived" for a row that never stored the tally and
+        // suppress the write. Asserted against the same function from both sides.
+        expect(applied.effect?.digest).toBe(archiveDigestOf(view.results['513']));
+
+        // THE SKIP TEST IS NOT BLIND TO IT: the same invocation archived with a DIFFERENT tally is a
+        // different receipt, so a lane whose second round did more work is never told its new account
+        // is already canonical.
+        const revisedActivity = {
+            calls: 4,
+            settled: 4,
+            byName: [
+                { name: 'read', calls: 2 },
+                { name: 'shell', calls: 2 }
+            ],
+            truncated: false
+        };
+        const revised = applySharedMutation(
+            view,
+            {
+                ...stopped,
+                toolActivity: revisedActivity
+            } as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 2 }
+        );
+
+        expect(revised.status).toBe('applied');
+        expect(revised.effect?.digest).not.toBe(applied.effect?.digest);
+        expect(view.results['513'].toolActivity).toEqual(revisedActivity);
+
+        // REPLAY is idempotent on both halves: same row, same digest, still one slot. Without this,
+        // a journal replay would move the receipt and every other lane would re-read.
+        const replay = applySharedMutation(
+            view,
+            { ...stopped, toolActivity: view.results['513'].toolActivity } as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 3 }
+        );
+
+        expect(replay.status).toBe('applied');
+        expect(replay.effect?.digest).toBe(archiveDigestOf(view.results['513']));
+        expect(Object.keys(view.results)).toHaveLength(1);
+
+        // BOUNDED BEFORE THE VIEW MOVES, with the snapshot reader's own sentence (the one validator
+        // all three doors share): nine names is more than `TOOL_ACTIVITY_NAME_CAP` and cannot come
+        // from the engine's projection, so it is refused rather than silently trimmed — a fold that
+        // trimmed would write a canonical row that re-projects smaller and moves the receipt.
+        const overCap = applySharedMutation(
+            view,
+            {
+                ...stopped,
+                toolActivity: {
+                    calls: 9,
+                    settled: 9,
+                    byName: ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9'].map((name) => ({
+                        name,
+                        calls: 1
+                    })),
+                    truncated: true
+                }
+            } as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 4 }
+        );
+
+        expect(overCap.status).toBe('rejected');
+        expect(overCap.rejection).toEqual({
+            code: 'invalid-mutation',
+            message:
+                'Archived invocation "513" carries a malformed forensic pair: Invocation "513".toolActivity.byName contains 9 entries; at most 8 are recorded.'
+        });
+
+        // `settled` above `calls` is the same contradiction in the other direction.
+        const inverted = applySharedMutation(
+            view,
+            { ...stopped, toolActivity: { calls: 1, settled: 2, truncated: false } } as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 5 }
+        );
+
+        expect(inverted.rejection).toEqual({
+            code: 'invalid-mutation',
+            message:
+                'Archived invocation "513" carries a malformed forensic pair: Invocation "513".toolActivity.settled (2) cannot exceed Invocation "513".toolActivity.calls (1); a settled call is by definition one that was registered.'
+        });
+
+        // Both refusals left the row exactly as the replay left it — a half-applied tally is worse
+        // than a refused one, and the ownership that lets this lane update its own conversation is
+        // untouched.
+        expect(view.results['513']).toEqual({ ...stoppedRow, toolActivity: revisedActivity });
+        expect(view.resultOwners['513']).toBe(EPOCH_A);
+
+        // A COMPLETED archive DROPS the tally, including off the row it replaces: the field describes
+        // a run that did not conclude, and ../core/snapshot.ts refuses to READ a completed row that
+        // carries one — so a fold that kept it would produce a canonical view, and a next snapshot,
+        // that cannot be reloaded. This is the ordinary case (a cancelled lane child that finishes),
+        // and the receipt has to agree: a completed row digests the same with or without the payload's
+        // tally, because the core dropped it from its own record too.
+        const beforeCompleted = archiveDigestOf(view.results['513']);
+
+        expect(beforeCompleted).not.toBe(applied.effect?.digest);
+
+        const completed = applySharedMutation(
+            view,
+            {
+                ...stopped,
+                status: 'completed',
+                content: 'the finished answer',
+                error: undefined,
+                partialContent: undefined,
+                cancelledAtMessage: undefined,
+                stopReason: undefined,
+                toolActivity
+            } as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 6 }
+        );
+
+        expect(completed.status).toBe('applied');
+        expect(view.results['513']).toEqual({
+            invocationId: '513',
+            sequence: 3,
+            completedOrder: 1,
+            agent: 'instruct',
+            rank: 'B',
+            kind: 'delegation',
+            status: 'completed',
+            content: 'the finished answer',
+            threadId: 'thread-9'
+        });
+        expect(completed.effect?.digest).toBe(archiveDigestOf(view.results['513']));
+
+        // And an absent tally stays absent — the pre-0032 payload archives the same row it always
+        // archived, which is what lets an older lane keep working while the field crosses the seam.
+        const bare = applySharedMutation(
+            view,
+            {
+                ...stopped,
+                invocationId: '514',
+                sequence: 4,
+                completedOrder: 2,
+                toolActivity: undefined
+            } as SharedMutation,
+            { laneEpoch: EPOCH_A, leases, identity, opId: 0, seq: 7 }
+        );
+
+        expect(bare.status).toBe('applied');
+        expect(view.results['514']).not.toHaveProperty('toolActivity');
+    });
+
     it('holds the core retention bound by evicting the oldest completed result', () => {
         const view = emptyCanonicalView();
         const identity = createIdentityLedger({ invocation: 1 });

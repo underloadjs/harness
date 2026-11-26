@@ -3831,7 +3831,14 @@ describe('delegated child threads', () => {
             // (`user-stopped` — the parent's `cancelThread` is an external halt). The row
             // always carried it; only this door was silent, which is what made a caller
             // string-match `error` prose.
-            stopReason: 'user-stopped'
+            stopReason: 'user-stopped',
+            // 0032 (2026-11-26, AC2) — the SAME door also answers what the stopped child DID:
+            // this child registered exactly ONE tool call (`hold`) and its outcome was never
+            // handled (the abort cut the round mid-flight), so `calls` 1 / `settled` 0 with the
+            // single name at count 1. `truncated: false` because ONE name is under the 8-name
+            // cap — the flag reports the cap, never the emptiness of the list. Counts and names
+            // only: no arguments and no result body appear on this envelope (0020's boundary).
+            toolActivity: { calls: 1, settled: 0, byName: [{ name: 'hold', calls: 1 }], truncated: false }
         });
 
         // SURFACE 2 — the bytes the server wrote. `content` stays EMPTY, because that field
@@ -3865,6 +3872,13 @@ describe('delegated child threads', () => {
             // `agentResult` door projects it too, so the live envelope above and the restart below
             // all state the SAME cause — one fact, three doors.
             stopReason: 'user-stopped',
+            // 0032 (2026-11-26, AC4/AC5) — the tally is on the BYTES, not only on the wire: the
+            // record that leaves this process carries the same counts and names the live door
+            // above answers with, which is what lets a restart re-emit them (see the reload
+            // below) instead of losing the fact. The reader validates the shape on the way back
+            // in (`core/snapshot-validation.ts`), so a row written by an older build simply lacks
+            // the key and is still legal.
+            toolActivity: { calls: 1, settled: 0, byName: [{ name: 'hold', calls: 1 }], truncated: false },
             // The OWNER is on the row too (0033/0024): the child's one-shot conversation is
             // `thread-2`. IT19 R2 note — this used to be the key `purgeThread`'s cascade matched to
             // DROP the row when the conversation was deleted; a delete is a mark now, so the key is
@@ -3918,7 +3932,13 @@ describe('delegated child threads', () => {
             // that asks "why did that child stop" after a restart gets the machine-readable
             // answer, not only the prose `error`. This key is what proves the durable half
             // of R4 instead of assuming it.
-            stopReason: 'user-stopped'
+            stopReason: 'user-stopped',
+            // 0032 (2026-11-26, AC5) — the tally round-trips the same way: the reader accepts
+            // the key, `restore()` re-projects it, and this door answers with the identical
+            // counts after the restart. Together with the byte-for-byte `rewritten` check below
+            // this is the `restore -> snapshot` idempotency pin for the new field: a row that
+            // re-emitted a different tally (or dropped it and re-added it) would fail here.
+            toolActivity: { calls: 1, settled: 0, byName: [{ name: 'hold', calls: 1 }], truncated: false }
         });
 
         // The reloaded store re-projects the row it was given, byte for byte — the round trip

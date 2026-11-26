@@ -12,6 +12,10 @@
 //     parentId links;
 //   - a blank/non-substantive branch answer and a depth/concurrency refusal are
 //     explicit tool errors;
+//   - a branch answer too large to deliver is REFUSED WHOLE by the shared per-result cap, and
+//     the refusal the requester reads names the retained `branch-N` and the `agentResult` door
+//     that pages it — the branch record keeps the full answer, so recovery is one paged read
+//     rather than a second fork run (C2, 2026-11-26);
 //   - branch records are detached, bounded audit state and are excluded from
 //     snapshot v1;
 //   - the manual executeTool path refuses threadFork.
@@ -23,7 +27,7 @@
 // child used to be given, with `vi.getTimerCount() === 0` proving nothing is armed.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness, tool } from './index';
+import { agent, harness, tool, utf8ByteLength } from './index';
 // The branch placeholder text is asserted verbatim, so the constant is read from
 // its own module (the same internal-import convention src/harness.snapshot.test.ts
 // uses for `./core/task`), never retyped.
@@ -32,7 +36,14 @@ import { BRANCH_PENDING_PLACEHOLDER } from './core/branch';
 // (./core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the branch mint in ./harness.ts
 // `branchThreadOf`). The constant, never a literal — the value is random by design — and exact
 // within one file, because vitest gives one module registry per test file.
-import { HARNESS_PROCESS_EPOCH } from './core/agent-limits';
+// `AGENT_RESULT_PAGE_CHARS` (4000) joins it for the C2 case below: that is the page width the
+// refusal sends the model to, so the recovered page is asserted against the bound rather than
+// against a retyped 4000.
+import { AGENT_RESULT_PAGE_CHARS, HARNESS_PROCESS_EPOCH } from './core/agent-limits';
+// C2 (2026-11-26): the cap the refused fork below is measured against is stated THROUGH the
+// constant (./core/result-budget.ts:231), never as a second literal — the house rule the
+// `TOOL_ACTIVITY_NAME_CAP` pin in ./core/metadata.ownership.test.ts spells out.
+import { MODEL_TOOL_RESULT_BUDGET_BYTES } from './core/result-budget';
 import type {
     Agent,
     Harness,
@@ -291,6 +302,125 @@ describe('threadFork runtime', () => {
             .map((event) => `${event.type}:${event.thread?.kind}:${event.thread?.branchId}`);
         expect(branchThreads).toContain(`start:fork:${records[0].branchId}`);
         expect(branchThreads).toContain(`done:fork:${records[1].branchId}`);
+    });
+
+    it('refuses a fork answer over the delivery cap whole, and names the branch that still holds it (C2)', async () => {
+        // 2026-11-26 (delegate-defects work order, finding C2). A fork answer has NO length bound of
+        // its own — `HarnessForkResult` is `{ branchId, threadId, content }`, no `maxChars` next to
+        // `content` (../types/index.ts, built in ./harness.ts) — so the only cap it meets is the
+        // shared per-result delivery gate, `boundDelivery` -> `core/result-budget.ts`, which every
+        // other tool result passes through too. What used to reach the model for a 40,000-char
+        // summary was a refusal that quoted no id and told it to re-run "with smaller limit, fewer
+        // ids, narrower fields" — arguments `threadFork` does not take — so recovery cost an
+        // `agentManage` probe PLUS a second fork run.
+        //
+        // THE CONTRACT NOW PINNED HERE, end to end: the delivery is the refusal, the outcome is
+        // `failed`, and the sentence NAMES `branch-1` and the door that pages it; and that door
+        // really answers, which is the half a unit test of the seam cannot show.
+        const SUMMARY = 'x'.repeat(40_000);
+
+        const entry = brain(
+            routed((request) => {
+                const results = toolContents(request);
+                // An async fork leaves a pending placeholder in the origin's view; only a REAL
+                // result means the branch has answered.
+                const realResults = results.filter((content) => !content.includes('"status":"pending"'));
+
+                if (realResults.some((content) => content.includes('too large to deliver'))) {
+                    return answer('root done');
+                }
+
+                // The branch's own turn: the fork input is its last user message, and the answer it
+                // gives is far too big to deliver.
+                if (latestUser(request) === 'summarize') return answer(SUMMARY);
+
+                // The origin's first turn: ask for the fork.
+                if (!request.messages.some((message) => message.role === 'assistant')) {
+                    return call('f1', 'threadFork', '{"input":"summarize"}');
+                }
+
+                return answer('waiting');
+            })
+        );
+
+        const writer = harness({ agents: { writer: entry }, presets: false });
+
+        await writer('go');
+        await flush();
+
+        // THE BRANCH ITSELF SUCCEEDED. The refusal is a DELIVERY decision, not a verdict on the
+        // run: the branch completed, and its record holds the whole answer — all 40,000 characters
+        // of it, which is the fact the refusal is now allowed to promise.
+        const records = writer.branches();
+
+        expect(records.map((record) => ({ status: record.status, kind: record.kind }))).toEqual([
+            { status: 'completed', kind: 'fork' }
+        ]);
+
+        // The id is read from the record, exactly as the sibling cases above do it: branch ids are
+        // minted from a process-wide counter, so a test in this file never hardcodes `branch-1`.
+        // What IS pinned is the SHAPE the refusal quotes, because that quoted id is the whole
+        // finding — a model that gets a `branch-N` in its error text has an address, not a mystery.
+        const branchId = records[0].branchId;
+
+        expect(branchId).toMatch(/^branch-\d+$/);
+        expect(writer.branch(branchId)?.result?.content).toBe(SUMMARY);
+
+        // THE DOCUMENT THAT WAS REFUSED, stated exactly: the fork's own three keys, and the byte
+        // figure the refusal quotes is the UTF-8 size of THIS text (the budget it is compared
+        // against is the payload measure, so the two currencies differ by the escape factor — see
+        // ./core/result-budget.ts's header).
+        const forkDocument = JSON.stringify({ branchId, threadId: branchId, content: SUMMARY });
+
+        expect(utf8ByteLength(forkDocument)).toBe(40_058);
+
+        // WHAT THE REQUESTER ACTUALLY RECEIVED. Pinned whole, because the whole point is that the
+        // branch id is inside the text a model reads: no probe of `agentManage` and no second fork
+        // run are needed to recover the answer. Only the two numbers the sentence quotes are
+        // derived — the sizes, exactly as ./harness.budget.test.ts derives them — and every word
+        // around them is literal, including the door the model is sent to.
+        const refusal =
+            `Tool result too large to deliver: ${utf8ByteLength(forkDocument)} bytes against a ${MODEL_TOOL_RESULT_BUDGET_BYTES}-byte budget. ` +
+            'The result was discarded, not truncated: no part of it reached this transcript. ' +
+            `What was discarded is retained under branchId "${branchId}": agentResult pages the full text by that id, ` +
+            `so read it there instead of re-running tool 'threadFork' (call f1). ` +
+            'If this call could have written anything, that write may already be applied — re-read before retrying.';
+
+        const deliveries = entry.messages
+            .filter((message): message is Extract<HarnessMessage, { role: 'tool' }> => message.role === 'tool')
+            .map((message) => message.content);
+
+        expect(deliveries).toEqual([refusal]);
+
+        // AND IT IS AN ERROR, not a shortened answer: `failed` derives into `isError`, so the model,
+        // the UI and a retry policy all read "this call did not answer" rather than "the summary was
+        // trimmed". Same classification rule ./harness.budget.test.ts pins for every other refusal.
+        expect(
+            entry.messages.filter(
+                (message): message is Extract<HarnessMessage, { role: 'tool' }> => message.role === 'tool'
+            )[0].outcome
+        ).toBe('failed');
+
+        // THE DOOR THE SENTENCE POINTS AT, taken at its word. `agentResult` under the id the refusal
+        // names answers with the first page of the discarded summary, the true length, and the
+        // cursor for the rest — the recovery is one paged read, not another run.
+        const page = (await writer.executeTool('agentResult', {
+            agent: 'writer',
+            invocationId: branchId
+        })) as Record<string, unknown>;
+
+        expect(page).toEqual({
+            agent: 'writer',
+            invocationId: branchId,
+            kind: 'fork',
+            status: 'completed',
+            content: SUMMARY.slice(0, AGENT_RESULT_PAGE_CHARS),
+            contentLength: 40_000,
+            offset: 0,
+            limit: AGENT_RESULT_PAGE_CHARS,
+            hasMore: true,
+            nextOffset: AGENT_RESULT_PAGE_CHARS
+        });
     });
 
     it('nests normal forks up to forkDepth and refuses a deeper fork as a tool error', async () => {

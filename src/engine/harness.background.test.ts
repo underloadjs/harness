@@ -2573,7 +2573,15 @@ describe('whole-run cancel', () => {
             'tool:d1:' +
                 '{"agent":"researcher","content":"child-waiting","contentLength":13,"offset":0,"limit":8000,"truncated":false,' +
                 '"invocationId":"2","threadId":"agent:researcher","status":"cancelled","durationMs":0,"error":"run aborted",' +
-                '"partialContent":"child-waiting","cancelledAtMessage":3}',
+                '"partialContent":"child-waiting","cancelledAtMessage":3,' +
+                // 0032 (2026-11-26, AC2) — the paid account carries the child's tool tally too.
+                // The child registered exactly ONE call (`dig`) and the whole-run cancel cut the
+                // round before its outcome was handled, so `calls` 1 / `settled` 0: the gap IS the
+                // mid-flight work the stop caught. One name under the 8-name cap means
+                // `truncated: false`. This is the owed-account delivery path (an abandoned scope
+                // paid at the next turn), pinned here so the tally travels that route and not only
+                // the immediate `delegate` return.
+                '"toolActivity":{"calls":1,"settled":0,"byName":[{"name":"dig","calls":1}],"truncated":false}}',
             'assistant::w1',
             expect.stringMatching(/^tool:w1:.*cancelled or interrupted/),
             'assistant:parent-waiting:',

@@ -28,6 +28,29 @@ export const AGENT_RESULT_PAGE_CHARS = 4000;
 
 export const AGENT_RESULT_PAGE_MAX_CHARS = 8000;
 
+// issue 0032 (2026-11-26) — THE BOUND ON `toolActivity.byName`.
+//
+// WHAT IT BOUNDS. A stopped run's ledger row now carries a tool-activity tally
+// (`../types` `HarnessToolActivity`): two counts plus a per-name breakdown. The counts are
+// fixed-width, so the only unbounded axis is the list of names — one entry per DISTINCT tool
+// the run called, and a tool-heavy child can touch many. This constant is that ceiling: the
+// projection keeps the `TOOL_ACTIVITY_NAME_CAP` busiest names (ordered by count, name as
+// tie-break) and sets `truncated: true` when the cap closed the list, so a caller is never
+// left to read a full-looking list that was silently cut.
+//
+// WHY EIGHT. The row is bounded by `AGENT_RESULT_RETENTION` (64 rows) and this is the one
+// variable-length payload on it, so the ceiling is deliberately the size of a screenful of
+// names — enough to answer "which tool was it hammering" (the question 0032's fleet operator
+// asks) and small enough that 64 rows times 8 names stays a rounding error next to one
+// `partialContent` string. Each name is itself capped at 64 characters by the tool-name rule
+// (`../harness.ts`, the name validation message), so the payload is bounded on BOTH axes by
+// construction — 8 x 64 characters plus two integers — and needs no separate byte cap.
+//
+// SAME DISCIPLINE AS THE NUMBERS ABOVE: the `delegate`/`agentResult` descriptions name this
+// bound as a LITERAL (a runtime entry may not value-import ../core — see the T13 note at the
+// top of this file), and `./metadata.ownership.test.ts` pins the literal against this constant.
+export const TOOL_ACTIVITY_NAME_CAP = 8;
+
 // T28 (ORIGINAL wording, kept auditable): "the wall-clock bound a delegation applies
 // to its CHILD when the caller does not pass `timeoutMs`. Before this, a child that
 // ran `sleep 600` sat `running` indefinitely and the only recovery was `toolCancel`
