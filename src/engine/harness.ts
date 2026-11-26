@@ -70,7 +70,11 @@
 // 32) bounds the persistent SEARCHABLE enabled set at the model-turn boundary.
 // `matched` is the whole union, `enabled`/`tools` are what the bound admitted, and
 // `omitted` is the difference. `limit` narrows only the current query. Undiscovered
-// tools are not callable, so the model cannot skip discovery by guessing a name.
+// SEARCHABLE tools are not callable, so the model cannot skip discovery by guessing
+// a name — the `core` declarations and the pending-only runtime controls are declared
+// up front and stay callable with no discovery at all (the core list is the
+// `visibility: 'core'` set the preset catalogue ships, and `visibleCoreTools` below is
+// the one rule for what a given caller actually sees).
 // The enabled set is per harness and survives across calls (turns), so a capability
 // discovered once stays declared across turns until it is displaced (the newest
 // request takes precedence when `maxEnabledTools` is full, reported as `evicted`) or
@@ -83,6 +87,15 @@
 // bound is untouched. The list is the caller's own view: an agent with no
 // rank-below peer never sees delegate there, and a harness whose roster spans a
 // single rank never has it to report.
+//
+// D7 (2026-11-26) qualified the last sentence for ONE query kind. A withheld name was
+// indistinguishable from an unregistered one, while `toolList` names the whole registry
+// unfiltered — so a Rank B child that asked for `delegate` by exact name concluded "not
+// registered". An explicit `names` query now also answers `unmatchedNames` (the names that
+// matched nothing selectable, absence-conditional), and adds a one-line `note` when such a
+// name is a registered core control this caller is withheld from BY THE RANK RULE. The
+// selector's own honesty rule is untouched: an absent `alreadyAvailable` entry still means
+// "this caller cannot call it", and the note only explains a name that is registered.
 //
 // Harness-owned names sit outside that scheme:
 //   - toolRequest  — discovery, described above.     (every agent, core)
@@ -4305,6 +4318,101 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return single.names.length === 0 && (single.alreadyAvailable?.length ?? 0) === 0;
         });
 
+        // D7 (2026-11-26) — THE NAMES HALF OF "nothing matched", plus the one case where the
+        // harness is able to say WHY.
+        //
+        // THE DEFECT. A `names` query that resolved to nothing selectable answered
+        // `{ enabled: [], tools: [], matched: 0, omitted: 0, availableTags: [...] }` with zero
+        // explanation, while `toolList` answers the same registry UNFILTERED one turn away. A
+        // Rank B child that asked for `delegate` therefore read a confident "not registered"
+        // about a tool `toolList` names by hand.
+        //
+        // `unmatchedNames` is the exact-name mirror of `unmatchedTags`: the names of a NAMES
+        // query that matched NOTHING selectable — absent from `tools`, from `alreadyAvailable`
+        // and from `forbidden`, which is exactly `selection`'s whole union (the denied entries
+        // are partitions of it, never extra names). A name that MATCHED and was then cut by
+        // `limit`/the enabled bound is NOT here — it is counted in `omitted`, a different fact,
+        // and it stays in `matched`. Names stay EXACT and case-sensitive, as `selectTools`
+        // matches them: the only filtering here is the selector's own (drop the empty string,
+        // deduplicate, keep caller order).
+        //
+        // Absence-conditional like `unmatchedTags`, so a fully-matched query keeps its exact
+        // pinned shape, and a tag/regex-only query gains nothing at all.
+        const selectableNames = new Set([
+            ...selection.names,
+            ...(selection.alreadyAvailable ?? []).map((match) => match.name)
+        ]);
+        const unmatchedNames = [
+            ...new Set(
+                query.names.filter((name) => name.length > 0 && !selectableNames.has(name))
+            )
+        ];
+
+        // THE NOTE — registered, but withheld from THIS caller by the rank rule. That is the
+        // one absence this door can explain truthfully: the definition IS in the registry, and
+        // `visibleCoreTools` (~:2774-2777) dropped it from THIS caller's declarations because
+        // `delegableNamesFor(its rank)` is empty — nobody ranks below it. The rank-projected
+        // set is what that arm gates (`delegate`, plus anything registered
+        // `activation: 'delegation'`), so this stays a one-vocabulary answer.
+        //
+        // EVERY OTHER UNMATCHED NAME KEEPS ITS HONEST ABSENCE — no note, `unmatchedNames` only:
+        //   - a name nobody registered: any reason here would be invented;
+        //   - a name THIS CONVERSATION switched off: invisible by design (the session-switch
+        //     block above), and pinned that way in ./harness.discovery.test.ts;
+        //   - a pending-only control (`toolCancel`): no catalogue identity, and it is reported
+        //     through `alreadyAvailable` exactly while it is genuinely actionable.
+        // The wording reuses the rank-refusal vocabulary `delegateFor` (~:5848-5863) already
+        // publishes — including its split between "nobody is junior" and "every junior opted
+        // out" — so the two doors can never tell two different stories about one rank.
+        // Resolved ONCE per call, exactly as `visibleCoreTools` resolves it for the same arm:
+        // the note's condition IS that function's condition, and re-filtering the roster per
+        // name would repeat the same work.
+        const callerRank = rankOf(caller ?? hostActor());
+        let delegateTargets: string[] | undefined;
+
+        const withheldCoreNames = unmatchedNames.filter((name) => {
+            const definition = tools[name];
+
+            if (
+                definition === undefined ||
+                definition.visibility !== 'core' ||
+                !rankProjectedDefinitions.has(definition) ||
+                // A switch or a pending-only window is the reason for THIS caller, not the
+                // ladder — and both keep their own honest absence above.
+                isToolWithheld(name) ||
+                pendingOnlyDefinitions.has(definition)
+            ) {
+                return false;
+            }
+
+            delegateTargets ??= delegableNamesFor(callerRank);
+
+            return delegateTargets.length === 0;
+        });
+
+        // One sentence per withheld name, joined — the multi-name case is rare (only the
+        // rank-projected rows qualify), and one string keeps the field a plain fact.
+        let note: string | undefined;
+
+        if (withheldCoreNames.length > 0) {
+            // Ranked strictly below the caller WHETHER OR NOT they opted out — the same
+            // distinction `delegateFor` draws, and the same one that decides which of the two
+            // sentences below is the true one.
+            const lowerRankedNames = Object.keys(agents).filter(
+                (name) => isLowerRank(rankByName.get(name) ?? defaultRank, callerRank)
+            );
+
+            note = withheldCoreNames
+                .map(
+                    (name) =>
+                        `\`${name}\` is registered but not declared for a Rank ${callerRank} agent, so ` +
+                        (lowerRankedNames.length === 0
+                            ? `it has no strictly lower-ranked peer: no agent in this harness is ranked below Rank ${callerRank}. Requesting it again will not change this answer.`
+                            : `it has no legal target: every agent ranked below Rank ${callerRank} (${lowerRankedNames.join(', ')}) is registered with \`addAgent(…, { delegate: false })\`, which is the host's choice rather than the ladder.`)
+                )
+                .join(' ');
+        }
+
         const result: Record<string, unknown> = {
             enabled: enabledResult.enabled,
             tools: returned,
@@ -4318,6 +4426,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         };
 
         if (unmatchedTags.length > 0) result.unmatchedTags = unmatchedTags;
+        // D7: the exact-name half of the same explanation, and the rank note beside it. Both
+        // are absence-conditional, so every fully-matched query is byte-for-byte what it was.
+        if (unmatchedNames.length > 0) result.unmatchedNames = unmatchedNames;
+        if (note !== undefined) result.note = note;
         if (availableTags !== undefined) result.availableTags = availableTags;
         // T11: only the IN-SCOPE core hits stay in `alreadyAvailable` ("you can call
         // this right now"); out-of-scope hits moved to `forbidden`. An unscoped run
@@ -4912,42 +5024,81 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ? undefined
             : { startedAt: record.startedAt, ageMs: Math.max(0, Date.now() - record.startedAt) };
 
-    // A preview is whitespace-trimmed answer text, capped at the declared size.
-    // The ellipsis marks truncation explicitly; `truncated` is the machine flag.
-    const invocationPreviewOf = (record: AgentInvocationRecord) => {
-        if (record.status !== 'completed') {
-            // DEFECT M1: only a RUNNING row gains `startedAt`/`ageMs`. A failed or cancelled
-            // preview already reports a terminal row whose span is `durationMs` on the full
-            // envelope, and adding the pair there would change a key set every listing pin
-            // asserts byte-for-byte. Absence-conditional, like `durationMs`/`stopReason` on the
-            // `agentResult` failed branch.
-            const age = record.status === 'running' ? invocationAgeOf(record) : undefined;
-
-            return {
-                invocationId: record.invocationId,
-                kind: record.kind,
-                status: record.status,
-                contentLength: 0,
-                preview: '',
-                truncated: false,
-                ...(age === undefined ? {} : age)
-            };
-        }
-
-        const trimmed = record.content.trim();
+    // THE ONE PREVIEW SHAPE (D1, 2026-11-26). A completed row's `content` and a terminal
+    // row's `partialContent` go through these same lines, so the two can never disagree about
+    // what "a preview" means.
+    //
+    // THE COUNTING ASYMMETRY IS AN EXISTING CONTRACT, kept exactly: `contentLength` counts the
+    // UNTRIMMED stored text — the answer as recorded — while `preview` shows the TRIMMED form,
+    // clipped pair-safely (T3, ./util/unicode.ts) at `AGENT_MANAGE_PREVIEW_CHARS` with a
+    // trailing ellipsis when it ran over. `truncated` is the machine flag for that clip.
+    // Passing `''` (the no-text case) yields the zero shape: `0 / '' / false`.
+    const previewFieldsOf = (
+        text: string
+    ): { contentLength: number; preview: string; truncated: boolean } => {
+        const trimmed = text.trim();
         const truncated = trimmed.length > AGENT_MANAGE_PREVIEW_CHARS;
 
         return {
-            invocationId: record.invocationId,
-            kind: record.kind,
-            status: record.status,
-            contentLength: record.content.length,
+            contentLength: text.length,
             // Pair-safe (T3): a glance preview that ends on half of an emoji would reach the
             // model as a lone surrogate inside a tool result.
             preview: truncated
                 ? `${clipPrefix(trimmed, AGENT_MANAGE_PREVIEW_CHARS)}…`
                 : trimmed,
             truncated
+        };
+    };
+
+    // A preview is whitespace-trimmed answer text, capped at the declared size.
+    // The ellipsis marks truncation explicitly; `truncated` is the machine flag.
+    const invocationPreviewOf = (record: AgentInvocationRecord) => {
+        if (record.status !== 'completed') {
+            // DEFECT M1 (2026-11-17) + D1/D2 (2026-11-26, stress-report pass) — what a
+            // NON-completed listing row reports, per row kind.
+            //
+            // D1 — THE TEXT. A failed or cancelled run that had said something keeps it in
+            // `partialContent` (`finishInvocation` ~:4874), and the store guard THERE keeps
+            // only a NON-BLANK partial, so `undefined` and a real string are the only states
+            // here. Such a row used to answer `contentLength: 0, preview: ''` while the
+            // `agentResult` door for the very same record returned that text in full — the
+            // listing hid an answer the caller already had. It now builds its preview through
+            // `previewFieldsOf`, exactly like the completed branch, so a 300-char partial is a
+            // 200-char clip with `truncated: true` at both doors. A row with NO partial —
+            // every `running` row, and a terminal run that committed nothing or only
+            // whitespace — keeps the `0 / '' / false` shape it has always had.
+            //
+            // D2 — THE CAUSE TRIO. `error`, `stopReason` and `durationMs` join TERMINAL rows,
+            // each absence-conditional, mirroring the `agentResult` failed branch
+            // (~:5341-5358). Absence is load-bearing, not decoration: all three are undefined
+            // on a `running` row, `durationMs` is absent on an archived or restored row
+            // (`archiveInvocation` ~:9326 writes no such key), and `stopReason` can be absent
+            // on a row restored from a pre-feature document. Those rows keep their exact
+            // pre-D2 key set.
+            //
+            // WHAT STAYS RUNNING-ONLY — the `startedAt`/`ageMs` pair, and ONLY that pair. A
+            // terminal row's span is `durationMs`; adding the live pair would report one
+            // elapsed span under two keys, and an archived/restored row has no start stamp at
+            // all (see the note on `AgentInvocationRecord.startedAt` ~:4589).
+            const age = record.status === 'running' ? invocationAgeOf(record) : undefined;
+
+            return {
+                invocationId: record.invocationId,
+                kind: record.kind,
+                status: record.status,
+                ...previewFieldsOf(record.partialContent ?? ''),
+                ...(age === undefined ? {} : age),
+                ...(record.error === undefined ? {} : { error: record.error }),
+                ...(record.stopReason === undefined ? {} : { stopReason: record.stopReason }),
+                ...(record.durationMs === undefined ? {} : { durationMs: record.durationMs })
+            };
+        }
+
+        return {
+            invocationId: record.invocationId,
+            kind: record.kind,
+            status: record.status,
+            ...previewFieldsOf(record.content)
         };
     };
 
@@ -5020,8 +5171,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // A target: a path-like token, a dotted/underscored identifier, a URL, or a
         // quoted name. `Fix the bug.` matches none of these.
+        //
+        // D4 (2026-11-26) — the FILE alternative now demands a STEM of at least TWO
+        // characters before the dot (`\b[\w-]{2,}\.[A-Za-z]{1,5}\b`). The old `{+}` stem let
+        // any single letter match, so an ordinary ABBREVIATION read as a file path and cleared
+        // the gate on its own: "Refactor it, e.g. the parser" named no target at all, yet the
+        // caller was told its brief was missing only a criterion. One- and two-letter
+        // abbreviations are the whole failure class — `e.g`, `i.e`, `a.m`, `P.S`, `U.S`, `D.C`,
+        // and every segment of `a.k.a` and `w.r.t` — and a real file name has a stem.
+        //
+        // THE ACCEPTED TRADEOFF, recorded on purpose: a genuinely single-letter file (`x.ts`)
+        // no longer counts as a target BY ITSELF. It still counts through every other
+        // alternative — a path with a slash (`src/x.ts`), backticks, quotes, an id — so the
+        // cost is a terse brief that writes a bare one-letter name with no other marker, and
+        // the gate's own rule is that it exists to stop `"Fix the bug."`, not to grade prose.
+        // NO lookbehind abbreviation list: the stem length is the entire fix, and a word list
+        // would need maintaining while `{2,}` cannot go stale.
         const hasTarget =
-            /(?:[\w.-]+\/[\w./-]+)|(?:\b[\w-]+\.[A-Za-z]{1,5}\b)|(?:https?:\/\/)|(?:`[^`]+`)|(?:"[^"]+")|(?:\b[a-z]+[A-Z]\w*\b)|(?:\b\w+_\w+\b)/.test(
+            /(?:[\w.-]+\/[\w./-]+)|(?:\b[\w-]{2,}\.[A-Za-z]{1,5}\b)|(?:https?:\/\/)|(?:`[^`]+`)|(?:"[^"]+")|(?:\b[a-z]+[A-Z]\w*\b)|(?:\b\w+_\w+\b)/.test(
                 brief
             );
 
@@ -5238,7 +5405,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     .filter((entry) => entry.status === 'completed')
                     .sort((left, right) => right.completedOrder - left.completedOrder);
 
-                record = completed[0] ?? recent.find((entry) => entry.status !== 'running');
+                // D5 (2026-11-26) — the TERMINAL half of this selector sort by COMPLETION order
+                // too, not by start order. `completedOrder` is stamped on every terminal
+                // transition (`finishInvocation` ~:4853), written by the archive seam
+                // (~:9318-9323) and required by snapshot restore, so the key is always present
+                // here. `recent` is START-ordered (`recordsForAgent` ~:4966), so the retired
+                // `recent.find(...)` handed the default to whichever overlapping child HAPPENED
+                // to start last: with no completed row, a child that started later but failed
+                // earlier beat the one that finished last, which is the fork-masking case the
+                // sentence above already promised was impossible.
+                record =
+                    completed[0] ??
+                    [...recent]
+                        .filter((entry) => entry.status !== 'running')
+                        .sort((left, right) => right.completedOrder - left.completedOrder)[0];
             }
 
             const limit =

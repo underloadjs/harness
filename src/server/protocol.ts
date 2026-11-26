@@ -181,11 +181,14 @@ export type SessionTurn = {
     // Result blocks this task was submitted with (R2). A block is referenced by
     // the turn that produced it plus its `threadId` (omitted for the turn's ROOT
     // invocation) and its compact conversation-scoped label. The server binds these
-    // at
-    // enqueue (rejecting unknown/already-failed targets), then expands each
-    // referenced block's terminal `done` content into the run prompt AFTER that
-    // block has completed. Omitted for a task that references nothing, so every
-    // pre-reference record keeps its exact shape.
+    // at enqueue; a 400 before any turn exists is reserved for a malformed entry, an
+    // unknown turn/label, and a target that is not EARLIER than this task. A TERMINAL
+    // target BINDS too, because its label is its address: the run prompt carries the
+    // block's recorded content or, when the run left none, the note naming the label
+    // as unavailable (./sessions.ts `composeReferences`). A target that has not
+    // settled yet binds as well and is read at EXECUTION, once it completes. Omitted
+    // for a task that references nothing, so every pre-reference record keeps its
+    // exact shape.
     references?: AgentResultReference[];
     // T14 gap (c): the `#LABEL`s this turn was submitted with that a DELETION took away.
     //
@@ -1270,12 +1273,16 @@ export type SubmitMessageRequest = {
 // `{ session, turn }` immediately and the server pump runs the task even if the
 // browser is gone. Task text is trimmed and bounded exactly like /messages.
 //
-// `references` (R2) names prior blocks whose completed results this task wants as
-// context. The UI sends `{turnId, threadId?, label}` entries; OMITTING the array
-// keeps the legacy body byte-identical. Typed `#LABEL` tokens in `input` are also
-// resolved server-side when the array is absent (or does not already cover that
-// label), so a client without metadata still works. Malformed entries, unknown
-// turns/labels, and already-failed/cancelled blocks are a 400 before a turn exists.
+// `references` (R2) names prior blocks whose results this task wants as context.
+// The UI sends `{turnId, threadId?, label}` entries; OMITTING the array keeps the
+// legacy body byte-identical. Typed `#LABEL` tokens in `input` are also resolved
+// server-side when the array is absent (or does not already cover that label), so a
+// client without metadata still works. The 400 before a turn exists is reserved for
+// a malformed entry, an unknown turn/label, a target that is not EARLIER than this
+// task, and more than 16 entries. A TERMINAL target BINDS, because its label is its
+// address: the run prompt carries its recorded content or, when the run left none,
+// the note naming the label as unavailable. A target that has not settled yet binds
+// too and is read at EXECUTION, once it completes.
 export type SubmitTaskRequest = SubmitMessageRequest & {
     references?: AgentResultReference[];
     // R1-R6: the persistent thread this input belongs to.

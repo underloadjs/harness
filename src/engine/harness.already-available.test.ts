@@ -311,6 +311,69 @@ describe('toolRequest already-available core tools', () => {
         });
     });
 
+    // D7 (2026-11-26) — THE RANK-WITHHELD CORE NAME, ASKED FOR BY EXACT NAME.
+    //
+    // The test above shows the TAG door; this one is the NAMES door, and it is where the stress
+    // report's harm actually landed. A `names: ["delegate"]` query from a Rank B child answered
+    // `{ enabled: [], tools: [], matched: 0, omitted: 0, availableTags: [...] }` with nothing to
+    // contradict "no such tool" — while `toolList`, which filters NOTHING, names `delegate` one
+    // turn away. The child concluded the capability was not registered, which is false: the
+    // definition is in the registry, and `visibleCoreTools` withheld it from THAT CALLER because
+    // nobody ranks below Rank B.
+    //
+    // So the envelope now names the miss (`unmatchedNames`) and states the one reason this door
+    // is allowed to state, in `delegateFor`'s own rank-refusal vocabulary. Two claims, both
+    // pinned here:
+    //   - the child: the name, plus the note;
+    //   - the Rank A host, same query, same harness: `alreadyAvailable` and NEITHER new field —
+    //     a fully-matched names query keeps its exact pinned shape, which is what makes the
+    //     fields absence-conditional rather than a widening of every answer.
+    it('explains a rank-withheld core name to the child that asked for it by exact name', async () => {
+        const researcher = brain(
+            scripted([callTool('r1', 'toolRequest', '{"names":["delegate"]}'), answer('found')])
+        );
+        const entry = brain(
+            scripted([
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
+                answer('done')
+            ])
+        );
+        const writer = harness({ agents: { writer: entry, researcher }, presets: false });
+
+        await writer('delegate?');
+
+        // The premise of the note: the tool IS registered in this harness (the roster spans two
+        // ranks), so the child's "not registered" was the wrong conclusion, not the answer.
+        expect(writer.tools.delegate).toBeDefined();
+
+        // Child (Rank B) history: [0] user, [1] assistant tool call, [2] tool result.
+        const childView = JSON.parse(content(researcher.messages[2]));
+
+        expect(childView).toEqual({
+            enabled: [],
+            tools: [],
+            matched: 0,
+            omitted: 0,
+            unmatchedNames: ['delegate'],
+            note: '`delegate` is registered but not declared for a Rank B agent, so it has no strictly lower-ranked peer: no agent in this harness is ranked below Rank B. Requesting it again will not change this answer.',
+            availableTags: SEARCHABLE_TAGS
+        });
+
+        // The SAME query from a caller that DOES hold the tool: the note and the unmatched name
+        // are both absent, and `alreadyAvailable` carries the projected card exactly as the
+        // pins above have always had it.
+        expect(
+            writer.runtime.requestTools(undefined, { names: ['delegate'] })
+        ).toEqual({
+            enabled: [],
+            tools: [],
+            matched: 0,
+            omitted: 0,
+            alreadyAvailable: [DELEGATE_MATCH],
+            availableTags: SEARCHABLE_TAGS
+        });
+    });
+
     it('reports core matches without spending the enabled bound or changing declarations', async () => {
         const seen: HarnessStreamRequest[] = [];
         const fixtures = Array.from({ length: 7 }, (_, index) => {

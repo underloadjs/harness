@@ -57,7 +57,14 @@
 //   - no declaration changes, because those tools were declared already;
 //   - the caller supplies the visible set, so a caller whose rank has no legal
 //     delegation target (delegate is not in its declared set) or a one-agent harness
-//     (which has no delegate at all) gets no such entry — absence stays honest;
+//     (which has no delegate at all) gets no such entry — absence stays honest AT THIS
+//     SELECTOR, which is a pure function of the catalogue and the declared set it is
+//     handed, and has no idea whether an unlisted name is unregistered or merely
+//     withheld. D7 (2026-11-26) added that explanation one layer UP, in the harness
+//     envelope that calls this: an explicit `names` query reports `unmatchedNames`, and
+//     names a registered core control the caller is withheld from by the rank rule.
+//     Nothing here changed — a caller that reads only `alreadyAvailable` still reads
+//     the caller's own visibility, not the registry's.
 //   - a core hit also counts as a MATCHED query tag, so `unmatchedTags` cannot
 //     claim a capability is absent when it is available.
 //

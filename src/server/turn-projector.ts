@@ -46,7 +46,7 @@
 //                                        completion of the child its call spawned
 //   - ../frontend/ui/time.ts:19 and ./cli/render.ts:83  `formatDuration`
 //   - ../frontend/ui/markdown.ts:474     `plainPreview`
-//   - ../frontend/ui/references.ts:44    `isReferenceableBlock`
+//   - ../frontend/ui/references.ts:77    `isReferenceableBlock`
 //   - ./sessions.ts:679                  a restored action request is EXPIRED
 //
 // What this file never does: it never edits the raw record (`turn.events` stays the
@@ -57,6 +57,10 @@
 
 import type { HarnessEvent, HarnessPendingTool, HarnessToolOutcome } from '../engine/harness';
 import type { AgentResultBlock } from '../engine/shared/agent-results';
+// R-TREF (2026-11-26): the ONE label parser (`agentLabelParts` → `AGENT_REFERENCE_LABEL_PATTERN`),
+// the same door `isReferenceableBlock` (../frontend/ui/references.ts) and every server label door
+// use, so the summary's `referenceable` flag can state the picker's rule without restating it.
+import { agentLabelParts } from '../engine/shared/agent-results';
 import {
     DISPLAY_ARGS_PREVIEW_CHARS,
     DISPLAY_ATTACHMENT_INLINE_CHARS,
@@ -1614,6 +1618,53 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         }
     };
 
+    // F11 (2026-11-26) — THE LABEL TWIN OF `syncThreadIds`, for the same reason one level up:
+    // a row folded BEFORE the store knew its conversation label shows an EMPTY name until this
+    // pass runs, and F11 forbids an unnamed row on the board ("all labels must be valid… all
+    // thread that started must be assigned a proper label"). The two cases it actually fixes:
+    //   - a child whose `start` frame carries NO `thread` metadata (the lane is minted by the
+    //     call), so `createChild`/`adoptPlaceholder` resolved `conversationLabelOf` to
+    //     `undefined` and the join landed on a later frame;
+    //   - a section created by a `tool_call`/`progress` frame that routed to a NEW row (a
+    //     recycled run id) while the store's `threadLabels` view already named that run.
+    //
+    // Rules, mirroring `syncThreadIds` exactly:
+    //   - the ROOT section is skipped: its label is `turn.threadLabel`, which the record states
+    //     directly (and `start` already back-fills with the join);
+    //   - a section that ALREADY has a label keeps it — first evidence wins, so a wire label is
+    //     never rewritten by a live join that arrives afterwards;
+    //   - a BRANCH section is skipped: a branch owns no conversation of its own, and the block
+    //     projection (../engine/shared/agent-results.ts `branchSharedLabelOf`) is what names it, with
+    //     the address of the conversation it forked from (`labelSource: 'shared'`). Stamping the
+    //     join's label here would claim the branch owns a sequence number of its own;
+    //   - an un-adopted placeholder has no `invocationId`, so it is skipped by the same rule that
+    //     skips it in `syncThreadIds`. Its display name is the CLIENT's provisional ordinal
+    //     (../frontend/ui/turns.ts `createThread`), which the settle pass keeps unique — the
+    //     projection never invents numbers, the display plane never renders a blank.
+    const syncSectionLabels = (ops: TurnDisplayOp[]): void => {
+        const join = context.threadLabels;
+
+        if (join === undefined) return;
+
+        for (const record of sections) {
+            if (record.key === ROOT_KEY) continue;
+            if (record.section.agentLabel.length > 0 || record.section.branchId !== undefined) continue;
+
+            const invocationId = record.section.invocationId;
+
+            if (invocationId === undefined) continue;
+
+            // R19: the row's OWN process epoch scopes the lookup (`record.epoch`), so a
+            // late-learned label for a RECYCLED id cannot rename a dead row. The store's view
+            // answers a bare key for a row that names no epoch.
+            const label = join.get(invocationRunKeyOf(invocationId, record.epoch));
+
+            if (label === undefined || label.length === 0) continue;
+
+            patchSection(record, { agentLabel: label }, ops);
+        }
+    };
+
     const route = (event: HarnessEvent, ops: TurnDisplayOp[]): SectionRecord => {
         const meta = event.thread;
 
@@ -2825,6 +2876,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // minted, or guidance addressed to a delegated conversation would be painted onto
         // the parent's bar.
         syncThreadIds(ops);
+        // F11: the same late-join back-fill for the row NAME (see `syncSectionLabels`).
+        syncSectionLabels(ops);
         syncSteerBlocks(stamp, ops);
 
         switch (event.type) {
@@ -3889,6 +3942,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // keep a delegated row without an address until the next reload, while the cold
         // replay (a full map from the first fold) would have had it from the start.
         syncThreadIds(ops);
+        // F11: the same late-join back-fill for the row NAME (see `syncSectionLabels`).
+        syncSectionLabels(ops);
 
         // Every steer this turn recorded is now final, including one that arrived after
         // the last stored event (the gate is off at settle, so both a live run and a
@@ -4134,9 +4189,16 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
             ...(block.content === undefined || block.content.length === 0
                 ? {}
                 : { preview: previewText(block.content, DISPLAY_BLOCK_PREVIEW_CHARS) }),
-            // `isReferenceableBlock` (../frontend/ui/references.ts:44): a failed or
-            // cancelled block has no usable result.
-            referenceable: block.status === 'done' || block.status === 'running' || block.status === 'queued'
+            // R-TREF (2026-11-26) — mirrors the picker's gate (`isReferenceableBlock`,
+            // ../frontend/ui/references.ts) after the terminal relaxation: every status the
+            // projection can produce now binds, because a `done` answer is not what makes a
+            // row referenceable — its ADDRESS is. A terminal row contributes the recorded
+            // content when it has any and the "no result available" note when it has none
+            // (./sessions.ts `composeReferences`), so refusing it here would hide a row the
+            // user can name. The label clause is the real filter, and post-F11 every label
+            // this projection emits is an address, so the door is closed only by a malformed
+            // label from an older record.
+            referenceable: agentLabelParts(block.label) !== undefined
         }));
 
     const summaryOf = (): TurnSummary => {
@@ -4249,6 +4311,8 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // by `section.threadId`, so the id must be adopted in the SAME frame the submit is
         // minted — this path is the only fold step that runs without a stored event.
         syncThreadIds(ops);
+        // F11: the same late-join back-fill for the row NAME (see `syncSectionLabels`).
+        syncSectionLabels(ops);
         syncSteerBlocks(finiteAtValue(at), ops);
 
         return ops;

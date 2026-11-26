@@ -289,8 +289,10 @@ export type DisplayBlockSummary = {
     status: AgentResultStatus;
     /** Bounded snippet of the block's latest committed prose. */
     preview?: string;
-    /** `isReferenceableBlock` (../frontend/ui/references.ts:44) decided server-side,
-     *  so the popup applies one boolean instead of a status rule. */
+    /** The picker's gate, `isReferenceableBlock` (../frontend/ui/references.ts:77),
+     *  decided server-side: the rule is "the label is an address"
+     *  (`agentLabelParts(label) !== undefined`), NOT a status rule, so every status
+     *  the server binds arrives as one boolean for the popup. */
     referenceable: boolean;
 };
 

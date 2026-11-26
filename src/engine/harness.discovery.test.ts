@@ -1107,7 +1107,7 @@ describe('the conversation tool switch (the withheld set)', () => {
         expect(cancelResults).toEqual(['done', SWITCHED_OFF('toolCancel')]);
     });
 
-    it('keeps a withheld name out of every toolRequest field — it is simply not listed', () => {
+    it('keeps a withheld name out of every toolRequest listing field — it is simply not listed', () => {
         const writer = harness({
             agents: { writer: brain(scripted([answer('done')])) },
             tools: fixtures(4),
@@ -1127,9 +1127,33 @@ describe('the conversation tool switch (the withheld set)', () => {
         });
 
         // An exact name the user switched off answers like a name that does not exist.
-        expect(
-            (writer.runtime.requestTools(undefined, { names: ['file-01'] }) as Record<string, unknown>).matched
-        ).toBe(0);
+        //
+        // D7 (2026-11-26) added `unmatchedNames` — the exact-name mirror of `unmatchedTags` —
+        // so this page now NAMES the name it could not resolve instead of answering a bare
+        // `matched: 0`. That is the whole change at this door: the name is reported, not
+        // explained. There is deliberately NO `note` here, and the key set below is what pins
+        // that: a name this conversation switched off has no reason a discovery answer may
+        // state, and the rank note fires only for a registered core control withheld by the
+        // RANK RULE (pinned in ./harness.already-available.test.ts). Absence stays honest.
+        const missed = writer.runtime.requestTools(undefined, { names: ['file-01'] }) as Record<
+            string,
+            unknown
+        >;
+
+        expect(Object.keys(missed).sort()).toEqual([
+            'availableTags',
+            'enabled',
+            'matched',
+            'omitted',
+            'tools',
+            'unmatchedNames'
+        ]);
+        expect([missed.enabled, missed.tools]).toEqual([[], []]);
+        expect([missed.matched, missed.omitted]).toEqual([0, 0]);
+        expect(missed.unmatchedNames).toEqual(['file-01']);
+        // The vocabulary half of the answer is unchanged by the switch: only `file-01`'s own
+        // tag vocabulary was ever 'widgets'-only, and the three siblings still carry it.
+        expect(missed.availableTags).toContain('widgets');
 
         // A regex whose only hit is the withheld name: same answer, and the name never
         // reaches the capped set.
@@ -1138,7 +1162,9 @@ describe('the conversation tool switch (the withheld set)', () => {
         expect(writer.withheldTools).toEqual(['file-01']);
 
         // A scoped run keeps its own denial channel, and a withheld name does NOT borrow it:
-        // `forbidden` stays the scope + deployment-deny field it always was.
+        // `forbidden` stays the scope + deployment-deny field it always was. D7's
+        // `unmatchedNames` is the THIRD channel and the one `file-01` lands in — it is not
+        // selectable, not already-available, and not forbidden, so it is simply unmatched.
         const scoped = writer.runtime.requestTools(
             undefined,
             { names: ['file-01', 'file-02'] },
@@ -1149,7 +1175,8 @@ describe('the conversation tool switch (the withheld set)', () => {
             enabled: ['file-02'],
             tools: [matchOf('file-02')],
             matched: 1,
-            omitted: 0
+            omitted: 0,
+            unmatchedNames: ['file-01']
         });
     });
 
@@ -1224,7 +1251,9 @@ describe('the conversation tool switch (the withheld set)', () => {
 
         // ONE call, all THREE selectors, and the withheld name is reachable by none of them:
         // the exact name misses, the regex contributes only `file-02`, and the tag union
-        // contributes `file-02` and `file-00`.
+        // contributes `file-02` and `file-00`. D7 (2026-11-26) names the miss in
+        // `unmatchedNames` — the NAMES criterion is the only one that can name a miss, so the
+        // regex and tag hits that DID land stay in `matched` untouched.
         expect(
             writer.runtime.requestTools(undefined, {
                 names: ['file-01'],
@@ -1235,7 +1264,8 @@ describe('the conversation tool switch (the withheld set)', () => {
             enabled: ['file-02', 'file-00'],
             tools: [matchOf('file-02'), matchOf('file-00')],
             matched: 2,
-            omitted: 0
+            omitted: 0,
+            unmatchedNames: ['file-01']
         });
 
         // Newest-first, exactly like any other selection — and `file-01` stayed switched off

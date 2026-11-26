@@ -10,7 +10,8 @@
 //   - a typed `#LABEL` without metadata resolves the LATEST prior block;
 //   - a still-streaming target binds at enqueue and expands after completion;
 //   - a nested/subagent block is addressable by thread id;
-//   - failed/cancelled/missing/malformed references are rejected clearly;
+//   - failed/cancelled/never-started targets BIND and compose the unavailable note (R-TREF);
+//   - missing/malformed/non-earlier references are still rejected clearly;
 //   - references survive a persistence restart and still expand afterwards;
 //   - the /tasks HTTP route forwards references and maps a bad binding to 400;
 //   - the existing 200k input bound still applies.
@@ -31,7 +32,10 @@ import {
     REFERENCED_RESULTS_BUDGET_MESSAGE,
     REFERENCED_RESULTS_FOOTER,
     REFERENCED_RESULTS_HEADER,
-    listAgentResultBlocks
+    REFERENCED_RESULTS_NO_RESULT_MARKER,
+    agentLabelParts,
+    listAgentResultBlocks,
+    referencedResultUnavailableNote
 } from '../engine/shared/agent-results';
 import type { TaskReceipt, TurnResponse } from '../engine/shared/harness-api';
 import type { SessionSnapshot, SessionTurn } from './protocol';
@@ -289,6 +293,70 @@ const createStore = (presets: HarnessPreset[], persistence?: HarnessPersistence)
         undefined,
         persistence === undefined ? {} : { persistence }
     );
+
+// R-TREF: ONE member, and the entry agent told to `delegate` to ITSELF. Rank A cannot
+// delegate to rank A (`isLowerRank`), so the runtime refuses the call: the spawning
+// `tool_call` frame is recorded, the tool answers an error `tool_result`, and the child
+// conversation NEVER STARTS. That is the never-started attempt row F11 keeps on the board
+// with a real label — the block ./sessions.ts must now bind instead of 400-ing.
+// NOTE: `agentCodeOf('lead')` is first+last letter, so the root is `LD1` and the attempt
+// `LD2` (see the label rules in ../engine/shared/agent-results.ts).
+const refusedTeamPreset = (requests?: RecordedRequest[]): HarnessPreset =>
+    presetOf(
+        'refuser',
+        (settings, progress) =>
+            harness({
+                agents: {
+                    lead: agent({
+                        model: settings.model,
+                        instruction: 'Try to delegate to yourself, then answer.',
+                        stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
+                            requests?.push({ agent: 'lead', messages: copyMessages(request.messages) });
+                            const last = request.messages[request.messages.length - 1];
+
+                            if (last !== undefined && last.role === 'tool' && last.name === 'delegate') {
+                                // The refusal came back as the tool result; the run answers.
+                                yield { type: 'text', delta: 'refused' };
+                                yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                                return;
+                            }
+
+                            yield {
+                                type: 'done',
+                                stopReason: 'tool_calls',
+                                toolCalls: [
+                                    {
+                                        id: 'call_self',
+                                        name: 'delegate',
+                                        arguments: '{"agent":"lead","input":"do it"}'
+                                    }
+                                ]
+                            };
+                        }
+                    })
+                },
+                entry: 'lead',
+                ranks: { lead: 'A' },
+                presets: false,
+                report: { progress }
+            }),
+        ['lead']
+    );
+
+// Exact injected prompt for a reference whose target produced NOTHING: the note section
+// replaces the locator with the `no result available` marker (the composer's own shape,
+// ../engine/shared/agent-results.ts `composeAgentResultPrompt`), and the note text is the
+// shared helper's, so the wire prompt is pinned verbatim rather than restated loosely.
+const notePrompt = (prompt: string, label: string, note: string): string =>
+    [
+        prompt,
+        '',
+        REFERENCED_RESULTS_HEADER,
+        `--- #${label} | ${REFERENCED_RESULTS_NO_RESULT_MARKER} ---`,
+        note,
+        `--- end #${label} ---`,
+        REFERENCED_RESULTS_FOOTER
+    ].join('\n');
 
 // Submit one queued task and wait for its completion.
 const submit = async (
@@ -556,29 +624,54 @@ describe('explicit result references', () => {
     });
 });
 
-describe('rejected references', () => {
-    it('rejects a failed target at enqueue and creates no turn', async () => {
+// R-TREF (2026-11-26) — TERMINAL TARGETS ARE REFERENCEABLE, end to end.
+//
+// WHY THIS FILE'S OLD ANSWER WAS WRONG (the user mandate, verbatim):
+//   "All labels must be valid. Cannot have T? or T- etc... all labels must be unique, as no
+//    thread share same labeling. This is because user using these label to reference as needed,
+//    and having a bunch of "T?" means they cannot reference specific one. All thread that
+//    started, regardless of failure etc... must be assigned a proper label."
+// F11 gave every row a valid, unique address — including the rows that died. An address the
+// user cannot type is not an address, so binding a terminal block had to stop being a 400: the
+// rows the operator most wants to name ARE the failed ones. What a terminal row lacks is a
+// RESULT, and this file's own note mechanism (`referencedResultUnavailableNote`, pinned by
+// ./thread-stop-reference.test.ts for a target that dies mid-wait) is the designed answer for
+// exactly that. Binding and composition moved in ONE fold, so no chip can be minted that the
+// server then rejects at submit.
+describe('terminal references bind', () => {
+    it('binds a failed target at enqueue and composes the unavailable-result note', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
         const created = await store.create('probe');
 
         const failed = await submit(store, created.id, 'BOOM now');
         expect(failed.status).toBe('error');
-        const before = store.get(created.id).turns.length;
 
-        // D4: `enqueue` is async, so a rejected submit is a REJECTION - `.rejects` takes the
-        // promise (awaiting inside `expect` would settle it before the assertion could see it).
-        await expect(
-            store.enqueue(created.id, 'reuse failure', undefined, [
-                { turnId: failed.id, label: 'PE1' }
-            ])
-        ).rejects.toThrow(
-            new SessionError(400, 'Block "#PE1" cannot be referenced because it ended as error.')
+        // The row keeps its address and its terminal status, with no result to reuse: the
+        // projection clears `content` for a non-`done` block, which is what makes the NOTE
+        // the honest composition below.
+        expect(listAgentResultBlocks(store.get(created.id).turns)).toEqual([
+            { turnId: failed.id, label: 'PE1', agent: 'probe', status: 'error' }
+        ]);
+
+        const second = await submit(store, created.id, 'reuse failure', [
+            { turnId: failed.id, label: 'PE1' }
+        ]);
+
+        // The binding is stored exactly as for a completed target: accepted at enqueue, no
+        // 400, and the task runs.
+        expect(second.status).toBe('done');
+        expect(second.prompt).toBe('reuse failure');
+        expect(second.references).toEqual([{ turnId: failed.id, label: 'PE1' }]);
+
+        // Composition injects the note, NOT an empty section: the model is told the input is
+        // missing and still answers the rest of the request.
+        expect(lastUser(fixture.requests[1].messages)).toBe(
+            notePrompt('reuse failure', 'PE1', referencedResultUnavailableNote('PE1', 'error'))
         );
-        expect(store.get(created.id).turns).toHaveLength(before);
     });
 
-    it('rejects a cancelled target at enqueue', async () => {
+    it('binds a cancelled target at enqueue and composes the unavailable-result note', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
         const created = await store.create('probe');
@@ -591,12 +684,85 @@ describe('rejected references', () => {
         await store.waitForIdle(created.id);
 
         expect(store.get(created.id).turns[0].status).toBe('cancelled');
-        await expect(store.enqueue(created.id, 'reuse cancelled', undefined, [
-                { turnId: task.turn.id, label: 'PE1' }
-            ])).rejects.toThrow(
-            new SessionError(400, 'Block "#PE1" cannot be referenced because it ended as cancelled.')
+
+        const second = await submit(store, created.id, 'reuse cancelled', [
+            { turnId: task.turn.id, label: 'PE1' }
+        ]);
+
+        expect(second.status).toBe('done');
+        expect(second.references).toEqual([{ turnId: task.turn.id, label: 'PE1' }]);
+        expect(lastUser(fixture.requests[1].messages)).toBe(
+            notePrompt('reuse cancelled', 'PE1', referencedResultUnavailableNote('PE1', 'cancelled'))
         );
     });
+
+    it('binds a typed #LABEL that names a terminal block, like the chip path does', async () => {
+        // The two spellings of one address must agree about what is referenceable, or the
+        // composer offers a token that only works when typed. `normalizeReferences` used to
+        // 400 here while the explicit list got through for a RUNNING target.
+        const fixture = probeFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        const failed = await submit(store, created.id, 'BOOM now');
+        expect(failed.status).toBe('error');
+
+        const second = await submit(store, created.id, 'reuse #PE1');
+
+        expect(second.references).toEqual([{ turnId: failed.id, label: 'PE1' }]);
+        expect(lastUser(fixture.requests[1].messages)).toBe(
+            notePrompt('reuse #PE1', 'PE1', referencedResultUnavailableNote('PE1', 'error'))
+        );
+    });
+
+    it('binds a never-started delegation attempt (a labelled row with no result)', async () => {
+        // THE SHAPE ITEM 2.3 ASKS ABOUT. A `delegate` call that the runtime refuses before
+        // starting a child still leaves a row on the board: the spawning call minted the
+        // placeholder, F11 let it KEEP its ordinal, and the parent's `tool_result` settles the
+        // attempt as `error`. The projected block is
+        //   { turnId, threadId: 'call:<callId>', label: '<CODE><n>', status: 'error' }
+        // with NO content — the exact row the old doors refused ("ended as error" / "has no
+        // completed result content"), which made the label the user was told to type useless.
+        // It now binds, and the parent's own tool call + error result is the content the user
+        // gets context for: the note says the attempt produced no answer.
+        const requests: RecordedRequest[] = [];
+        const store = createStore([refusedTeamPreset(requests)]);
+        const created = await store.create('refuser');
+
+        const first = await submit(store, created.id, 'delegate to yourself');
+
+        // The attempt row exists, is addressable, and has no result — asserted before the
+        // submit so the binding below cannot be accused of targeting the root instead.
+        const attempt = listAgentResultBlocks(store.get(created.id).turns).find(
+            (block) => block.threadId !== undefined
+        );
+        expect(attempt).toBeDefined();
+        expect(attempt).toEqual({
+            turnId: first.id,
+            threadId: 'call:call_self',
+            label: 'LD2',
+            agent: 'lead',
+            status: 'error'
+        });
+
+        const second = await submit(store, created.id, 'reuse the attempt', [
+            { turnId: first.id, threadId: 'call:call_self', label: 'LD2' }
+        ]);
+
+        expect(second.status).toBe('done');
+        expect(second.references).toEqual([
+            { turnId: first.id, threadId: 'call:call_self', label: 'LD2' }
+        ]);
+
+        // Composition answers with the note for THAT row (thread-addressed, label kept).
+        const waiter = requests.filter((request) => request.agent === 'lead');
+        expect(lastUser(waiter[waiter.length - 1].messages)).toBe(
+            notePrompt('reuse the attempt', 'LD2', referencedResultUnavailableNote('LD2', 'error'))
+        );
+    });
+});
+
+describe('rejected references', () => {
 
     it('rejects unknown turns, unknown labels, and a label/thread mismatch', async () => {
         const fixture = probeFixture();
@@ -822,5 +988,192 @@ describe('POST /tasks references', () => {
         expect(typed.body).toEqual({
             error: { message: `Unknown API route: POST /v1/harness/sessions/${id}/messages` }
         });
+    });
+});
+
+// ==================================================================================
+// T-C4 (2026-11-26) — THE NO-BROKEN-CHIPS MATRIX (the binding contract of the whole
+// reference redesign, stated once and then proven row by row).
+//
+//   EVERY ROW THE CLIENT'S PICKER OFFERS MUST BIND HERE AT SUBMIT.
+//
+// The client gate is loadscript `src/frontend/ui/references.ts` `isReferenceableBlock`:
+// after the terminal relaxation it accepts ALL five `AgentResultStatus` values and filters
+// ONLY on label validity (an unaddressable label is dropped because
+// `readAgentResultReferenceList` rejects the whole list). So each status is a matrix row, and
+// each row needs its proof on this side:
+//
+//   done      + content  -> binds, the recorded content is injected      (above: 'binds a root reference …')
+//   done      no content -> binds, the unavailable-result NOTE is injected  (BELOW: 'binds a done row …')
+//   error                -> binds, the note                               (above: 'binds a failed target …')
+//   cancelled            -> binds, the note                               (above: 'binds a cancelled target …')
+//   running              -> binds at enqueue, read after it settles       (above: 'binds a still-streaming target …')
+//   queued               -> binds at enqueue, read after it settles       (BELOW: 'binds a QUEUED target …')
+//
+// THE APPARENT TENSION, resolved against the code. The gate accepts `queued`/`running` while
+// `bindReference` still answers 400 for "a block … still queued/running". Those are two
+// different doors on two different facts:
+//   1. an UNSETTLED TARGET TURN (`target.status === 'running' || 'queued'`) returns EARLY, before
+//      any block is read — the binding is stored and composition waits for the terminal event
+//      (./sessions.ts, the branch above the `findAgentResultBlock` call). That is exactly the
+//      live row the picker mints a chip for, and it BINDS;
+//   2. the `queued`/`running` 400 is the SECOND check, reachable only after the target turn has
+//      settled. It cannot fire on a projected row, because the block fold closes EVERY unfinished
+//      child with the turn's own terminal status (../engine/shared/agent-results.ts, the
+//      `block.status = turn.status` pass) and the picker only ever offers projected rows. The
+//      third test below pins that closure instead of assuming it, which is what makes the
+//      invariant a fact rather than a hope.
+// ==================================================================================
+
+// A `done` turn that recorded NO ANSWER: the run stops without ever yielding a text delta, so
+// the projected root row carries the turn's terminal status with nothing to inject. This is the
+// shape `bindReference` used to refuse ("a `done` block with no content") while the picker kept
+// offering the row — the second never-started-attempt door the relaxation had to open.
+const silentPreset = (requests?: RecordedRequest[]): HarnessPreset =>
+    presetOf(
+        'silent',
+        (settings, progress) =>
+            harness({
+                agents: {
+                    probe: agent({
+                        model: settings.model,
+                        instruction: 'Answer with nothing.',
+                        stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
+                            requests?.push({ agent: 'probe', messages: copyMessages(request.messages) });
+                            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                        }
+                    })
+                },
+                entry: 'probe',
+                presets: false,
+                report: { progress }
+            }),
+        ['probe']
+    );
+
+describe('the no-broken-chips matrix', () => {
+    it('binds a QUEUED target at enqueue and expands it once the target settles', async () => {
+        // ROW: `queued`. The picker offers a queued row (the gate accepts every status); the
+        // server must not answer 400 for "it is still queued". The first submit parks inside the
+        // transport, so the second one is genuinely a QUEUED turn, not a running one.
+        const fixture = probeFixture();
+        const store = createStore([fixture.preset]);
+        const created = await store.create('probe');
+
+        const firstStarted = fixture.started('hold one');
+        const first = await store.enqueue(created.id, 'hold one');
+        await firstStarted.promise;
+
+        const second = await store.enqueue(created.id, 'produce two');
+        expect(second.session.turns[1].status).toBe('queued');
+
+        const third = await store.enqueue(created.id, 'reuse two', undefined, [
+            { turnId: second.turn.id, label: 'PE2' }
+        ]);
+
+        // The chip binds exactly as stored — no 400, and nothing is read at enqueue time.
+        expect(third.turn.references).toEqual([{ turnId: second.turn.id, label: 'PE2' }]);
+
+        // FIFO: the target runs first, so by the time the referencing task composes, the target
+        // has settled and its RECORDED answer is what lands in the prompt (not a note).
+        fixture.gate('hold one').resolve();
+        await first.settled;
+        await second.settled;
+        await third.settled;
+        await store.waitForIdle(created.id);
+
+        expect(store.get(created.id).turns[1].status).toBe('done');
+        expect(lastUser(fixture.requests[2].messages)).toBe(
+            injectedPrompt('reuse two', 'PE2', 'probe', second.turn.id, 'answer 2')
+        );
+    });
+
+    it('binds a done row that recorded no content and composes the unavailable-result note', async () => {
+        // ROW: `done` with NO content — the never-started-attempt shape inside a finished turn.
+        // The row exists, is labelled, is `done`, and has nothing to inject; the picker offers it
+        // and the server binds it, with the note as the honest composition. `bindReference` used
+        // to refuse exactly this shape ("a `done` block with no content") while the picker kept
+        // offering the row, which made the label the user was told to type useless.
+        const requests: RecordedRequest[] = [];
+        const store = createStore([silentPreset(requests)]);
+        const created = await store.create('silent');
+
+        const first = await submit(store, created.id, 'say nothing');
+        expect(first.status).toBe('done');
+
+        // Asserted BEFORE the submit, so the binding below cannot be accused of targeting a row
+        // that has an answer: the projected row is `done` with an EMPTY record, which is the
+        // `content.length === 0` case ./sessions.ts `composeReferences` sends to the note.
+        expect(listAgentResultBlocks(store.get(created.id).turns)).toEqual([
+            { turnId: first.id, label: 'PE1', agent: 'probe', status: 'done', content: '' }
+        ]);
+
+        const second = await submit(store, created.id, 'reuse the silence', [
+            { turnId: first.id, label: 'PE1' }
+        ]);
+
+        expect(second.status).toBe('done');
+        expect(second.references).toEqual([{ turnId: first.id, label: 'PE1' }]);
+
+        // The composition is the note, and the note names the row's own status: the model is told
+        // the labelled input produced nothing, and still answers the rest of the request.
+        expect(lastUser(requests[1].messages)).toBe(
+            notePrompt('reuse the silence', 'PE1', referencedResultUnavailableNote('PE1', 'done'))
+        );
+    });
+
+    it('closes every projected row of a SETTLED turn, so the block-level 400 can never contradict a chip', async () => {
+        // THE FOLD ROW OF THE MATRIX. While the delegated child is parked, the turn is `running`
+        // and BOTH rows project as `running` — the live rows the picker offers, which bind through
+        // the unsettled-target door. Once the turn settles, the projection closes the unfinished
+        // child with the turn's own terminal status, so no projected row of a settled turn is ever
+        // `queued`/`running`: the second 400 in `bindReference` cannot fire on a chip, only on a
+        // reference that names a row the projection no longer shows that way.
+        const requests: RecordedRequest[] = [];
+        const gate = deferred();
+        const store = createStore([teamPreset(requests, gate)]);
+        const created = await store.create('team');
+
+        const first = await store.enqueue(created.id, 'delegate please');
+        await waitUntil(() => requests.some((request) => request.agent === 'helper'));
+
+        // LIVE: both rows are `running` — the rows the picker offers while the run is in flight —
+        // and a chip minted from either one binds, because the target TURN has not settled and
+        // `bindReference` stores the binding without reading anything partial.
+        expect(listAgentResultBlocks(store.get(created.id).turns)).toEqual([
+            { turnId: first.turn.id, label: 'LD1', agent: 'lead', status: 'running' },
+            { turnId: first.turn.id, threadId: '2', label: 'HR1', agent: 'helper', status: 'running' }
+        ]);
+
+        const second = await store.enqueue(created.id, 'reuse the live child', undefined, [
+            { turnId: first.turn.id, threadId: '2', label: 'HR1' }
+        ]);
+        expect(second.turn.references).toEqual([{ turnId: first.turn.id, threadId: '2', label: 'HR1' }]);
+
+        // SETTLED: the target turns are terminal, and the projection closed EVERY unfinished row
+        // with its own turn's terminal status — so the block-level `still queued/running` door in
+        // ./sessions.ts `bindReference` can never fire on a row this session renders. Asserted as
+        // the exact invariant (not one hard-coded status), because WHICH terminal status this
+        // scripted run lands on is the runtime's business; the matrix only needs "never unsettled".
+        gate.resolve();
+        await first.settled;
+        await second.settled;
+        await store.waitForIdle(created.id);
+
+        const turns = store.get(created.id).turns;
+        const rows = listAgentResultBlocks(turns);
+
+        expect(turns.map((turn) => turn.status === 'queued' || turn.status === 'running')).toEqual([
+            false,
+            false
+        ]);
+        expect(rows.filter((row) => row.status === 'queued' || row.status === 'running')).toEqual([]);
+
+        // …and every row the settled record renders still owns an ADDRESS, which is the other half
+        // of the gate: `agentLabelParts` is the parser the picker and every server door share, so a
+        // row that passes the fold check is a row the picker may mint and the server will bind. The
+        // label list is pinned exactly so the check above cannot pass on an empty projection.
+        expect(rows.map((row) => row.label)).toEqual(['LD1', 'HR1', 'LD2', 'HR2']);
+        expect(rows.map((row) => agentLabelParts(row.label) !== undefined)).toEqual([true, true, true, true]);
     });
 });

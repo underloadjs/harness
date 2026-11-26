@@ -2494,8 +2494,11 @@ export interface SubmitTaskRequest {
     input: string;
     attachments?: HarnessAttachment[];
     /**
-     * Prior blocks whose completed results this task wants as context. A malformed entry, an unknown turn or
-     * label, and an already-failed or cancelled block are all 400 before a turn exists. Typed `#LABEL` tokens
+     * Prior blocks whose results this task wants as context. A malformed entry, an unknown turn or label, a
+     * label no block on that turn answers, and a target that is not EARLIER than this task are all 400 before a
+     * turn exists. A TERMINAL target BINDS, because its label is its address: the run prompt carries the
+     * block's recorded content or, when the run left none, the note naming the label as unavailable. A target
+     * that has not settled yet binds too and is read at EXECUTION, once it completes. Typed `#LABEL` tokens
      * inside `input` are resolved server-side when the array is absent or does not already cover that label, so
      * a client without metadata still works.
      */

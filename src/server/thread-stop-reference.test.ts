@@ -538,10 +538,14 @@ describe('stop/delete against a turn parked on a referenced block', () => {
         store.dispose();
     });
 
-    // Unchanged on purpose (design decision 4): a target that is ALREADY terminal when
-    // the task is accepted is still an enqueue-time 400. Only the mid-wait death gained
-    // the note, so the reader never silently queues a task against a dead block.
-    it('keeps rejecting a reference to an already-terminal target at enqueue', async () => {
+    // R-TREF (2026-11-26) — this test used to pin the OPPOSITE ("design decision 4": an
+    // already-terminal target is an enqueue-time 400, only a mid-wait death gained the note).
+    // The label mandate reversed that decision, and it is the reversal this file makes
+    // observable: the SAME block produces the note when it dies mid-wait (the test above) and
+    // when it was already dead at submit, so the answer the model gets no longer depends on
+    // how unlucky the operator's timing was. A row that has a label has an address; the note
+    // is the answer for the missing result.
+    it('binds a fresh reference to an already-terminal target and composes the same note', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
         const created = await store.create('probe');
@@ -563,14 +567,28 @@ describe('stop/delete against a turn parked on a referenced block', () => {
         await first.settled;
         await store.waitForIdle(created.id);
 
-        // A fresh reference to that cancelled block is now refused BEFORE a turn exists
-        // (references.test.ts:572 pins the same rule): the reader gets a 400 naming the
-        // dead block instead of a task that can only answer "no result".
-        await expect(
-            store.enqueue(created.id, 'ask again', undefined, [{ turnId: target.turn.id, label: 'PE1' }])
-        ).rejects.toThrow('Block "#PE1" cannot be referenced because it ended as cancelled.');
+        // A fresh reference to that cancelled block now BINDS: a turn is created, it runs, and
+        // its prompt carries the unavailable-result note — the identical composition the
+        // mid-wait waiter above received. (references.test.ts 'terminal references bind' pins
+        // the same contract for an `error` target and for a never-started attempt.)
+        const again = await store.enqueue(created.id, 'ask again', undefined, [
+            { turnId: target.turn.id, label: 'PE1' }
+        ]);
+        await again.settled;
+        await store.waitForIdle(created.id);
 
-        expect(turnRows(store, created.id)).toEqual(['0:hold rr4:cancelled', '1:ask it7:done']);
+        expect(again.turn.references).toEqual([{ turnId: target.turn.id, label: 'PE1' }]);
+
+        const waiterRequest = fixture.requests[fixture.requests.length - 1]!;
+        expect(lastUser(waiterRequest)).toBe(
+            notePrompt('ask again', 'PE1', referencedResultUnavailableNote('PE1', 'cancelled'))
+        );
+
+        expect(turnRows(store, created.id)).toEqual([
+            '0:hold rr4:cancelled',
+            '1:ask it7:done',
+            '2:ask again:done'
+        ]);
 
         store.dispose();
     });

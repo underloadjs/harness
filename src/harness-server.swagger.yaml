@@ -1515,9 +1515,12 @@ paths:
         or deleted `thread_id` is 404 before anything mutates.
 
 
-        `references` names prior blocks whose completed content this task wants as context; more than 16 of
-        them is 400, and malformed entries, unknown turn or label ids, and already-failed or cancelled blocks
-        are all 400 before a turn exists. Typed `#LABEL` tokens inside `input` are also resolved server-side, so a client
+        `references` names prior blocks whose content this task wants as context; more than 16 of them is
+        400, and malformed entries, unknown turn or label ids, and a target that is not earlier than this
+        task are all 400 before a turn exists. A TERMINAL target BINDS, because its label is its address:
+        the run prompt carries its recorded content or, when the run left none, a note naming the label as
+        unavailable, and a target that has not settled yet binds too and is read at execution once it
+        completes. Typed `#LABEL` tokens inside `input` are also resolved server-side, so a client
         without metadata still works. Validation is complete up front: an oversized body is 413 - this route
         alone gets the 16 MiB media cap, every other route 1 MB, and a task over 200,000 characters is 413
         whatever the JSON weighs - an unusable media type or a kind that disagrees with its MIME is 415, and
@@ -7203,10 +7206,13 @@ components:
           type: array
           maxItems: 16
           description: >-
-            Prior blocks whose completed results this task wants as context. A malformed entry, an unknown turn
-            or label, and an already-failed or cancelled block are all 400 before a turn exists. Typed `#LABEL`
-            tokens inside `input` are resolved server-side when the array is absent or does not already cover
-            that label, so a client without metadata still works.
+            Prior blocks whose results this task wants as context. A malformed entry, an unknown turn or
+            label, a label no block on that turn answers, and a target that is not EARLIER than this task
+            are all 400 before a turn exists. A TERMINAL target BINDS, because its label is its address: the
+            run prompt carries the block's recorded content or, when the run left none, the note naming the
+            label as unavailable. A target that has not settled yet binds too and is read at EXECUTION, once
+            it completes. Typed `#LABEL` tokens inside `input` are resolved server-side when the array is
+            absent or does not already cover that label, so a client without metadata still works.
           items:
             $ref: '#/components/schemas/AgentResultReference'
         thread_id:

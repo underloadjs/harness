@@ -1834,12 +1834,25 @@ reserved (`harness()` throws if the config or a preset already has `toolRequest`
 - `availableTags` (the sorted vocabulary of searchable tools) is returned when
   nothing matched or when the query was empty, so a failed query teaches the model
   the real tags.
+- An explicit **`names`** query that resolves to nothing selectable also answers
+  `unmatchedNames` (D7, 2026-11-26) — the names absent from `tools`, `alreadyAvailable`
+  and `forbidden` alike — and adds a one-sentence `note` when such a name is a REGISTERED
+  core control withheld from this caller by the rank rule (`delegate` for a caller with no
+  strictly-lower-ranked peer), reusing `delegateFor`'s refusal vocabulary. The motivating
+  harm: the bare `matched: 0` answer read as "not registered" to a child whose `toolList`
+  call names the tool, and the rank refusal was the only reason available to contradict it.
+  Absence stays the answer for every other kind of unmatched name — unregistered, switched
+  off for this conversation, or pending-only — and a tag/regex-only query keeps its exact
+  pre-D7 shape.
 - Active tools live in a `Set` per harness: discovery survives across calls and is
   cleared by `reset()`. `harness.discoveredTools` exposes the names (a copy); a
   server snapshot records them so a reload can show the discovery state.
-- An **undiscovered** tool is not callable: the harness answers the call with a
-  tool result naming tags that would enable it. The model cannot bypass discovery
-  by guessing a name.
+- An **undiscovered SEARCHABLE** tool is not callable: the harness answers the call with a
+  tool result naming tags that would enable it, so the model cannot bypass discovery by
+  guessing a name. `core` declarations and the pending-only runtime controls are the
+  exception and by design — they are declared up front and stay callable with no
+  discovery, which is why "undiscovered" only ever constrains the searchable set
+  (`visibleCoreTools`, `src/engine/harness.ts`, is the one rule for what a caller sees).
 - `declared()` builds the request list core-first, then the current capped enabled
   set, and is rebuilt for every request, so a toolRequest round shows up on the very
   next turn. Authorization reads that same set; a same-turn call evicted by an

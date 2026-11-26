@@ -8411,8 +8411,19 @@ export class SessionStore {
     //      rather than silently ignored.
     //
     // A target may still be running/queued: binding records it, execution waits for
-    // completion. A target that is already failed/cancelled, names a turn that is
-    // not EARLIER than this one, or has no matching block is a clear 400.
+    // completion.
+    //
+    // R-TREF (2026-11-26) — TERMINAL TARGETS BIND. A target that already ended
+    // `error`/`cancelled` used to be a 400 here, which made the rows the operator most
+    // wants to name (a failed child, a stopped run, a never-started attempt) impossible
+    // to reference: the label is valid and unique, only the RESULT is missing, and
+    // `composeReferences` already has the designed mechanism for that — the
+    // `referencedResultUnavailableNote` section. Binding is therefore allowed for every
+    // status the block projection can produce; what is STILL a clear 400 is a reference
+    // that names nothing: an unknown turn, a label/thread pair no block answers, a
+    // malformed token, a target that is not EARLIER than this task, or more entries
+    // than MAX_AGENT_REFERENCES. An UNSETTLED target is NOT a 400 (it is the case at
+    // the top of this note): only a row that cannot be ADDRESSED is refused.
     private normalizeReferences(
         session: Session,
         turnIndex: number,
@@ -8453,13 +8464,12 @@ export class SessionStore {
                 );
             }
 
-            if (block.status === 'error' || block.status === 'cancelled') {
-                throw new SessionError(
-                    400,
-                    `Block "#${label}" cannot be referenced because it ended as ${block.status}.`
-                );
-            }
-
+            // R-TREF: a typed token naming an `error`/`cancelled` row BINDS (see
+            // `normalizeReferences`), exactly like the explicit chip path in
+            // `bindReference`, so the composer's two spelling of the same address cannot
+            // disagree about what is referenceable. The missing RESULT is composition's
+            // problem, and `composeReferences` already answers it with the unavailable
+            // note; only a label that names NO block stays a 400.
             bound.push({
                 turnId: block.turnId,
                 ...(block.threadId === undefined ? {} : { threadId: block.threadId }),
@@ -9196,7 +9206,8 @@ export class SessionStore {
     }
 
     // Bind one explicit reference against the session record. Returns the exact
-    // normalised reference to store. See normalizeReferences for the status rules.
+    // normalised reference to store. See normalizeReferences, and the R-TREF block
+    // below, for the ADDRESSING rules — binding itself is status-blind.
     private bindReference(session: Session, turnIndex: number, reference: AgentResultReference): AgentResultReference {
         const target = session.turns.find((turn) => turn.id === reference.turnId);
 
@@ -9213,16 +9224,40 @@ export class SessionStore {
             );
         }
 
-        // A terminal target must resolve NOW, so a missing/failed block is a 400
-        // rather than a turn that fails later.
+        // A target whose TURN has not settled yet cannot be read now: its block may not
+        // exist, and a queued/running outcome is not an answer. Bind the client's binding
+        // and resolve it at EXECUTION, after adoption/completion — which is also the only
+        // way a `call:<callId>` alias (a pending delegation) or `inline:<agent>` (a legacy
+        // stream) can name a child that has not been given its conversation yet. Nothing
+        // partial is read here.
         if (target.status === 'running' || target.status === 'queued') {
-            // A running target may not have produced the block yet. Keep the
-            // client's binding (the UI's stable `call:<callId>` alias for a pending
-            // delegation, or `inline:<agent>` for a legacy stream) and resolve it at
-            // EXECUTION after adoption/completion. Nothing partial is read here.
             return { ...reference };
         }
 
+        // R-TREF (2026-11-26) — A TERMINAL TARGET BINDS, and the label mandate is why:
+        //   "All labels must be valid … all thread that started, regardless of failure
+        //    etc… must be assigned a proper label."
+        // A label exists so the operator can NAME a row; the rows they name most are the
+        // ones that died. What a terminal row lacks is a RESULT, and the composition step
+        // already owns that case (`composeReferences` injects
+        // `referencedResultUnavailableNote`, or the DELETED note when the conversation was
+        // removed). Rejecting here used to make the address useless exactly when the user
+        // needed it, while the same reference submitted one second earlier — while the run
+        // was still `running` — was accepted and produced the note anyway. Binding is now
+        // status-blind; the two doors agree.
+        //
+        // What stays a 400, because there is nothing to compose:
+        //   - a block that has not settled (`queued`/`running`): its outcome is unknown,
+        //     and an enqueue-time answer would be a guess (a target that is still running
+        //     when the submit is accepted returns above, to be resolved at execution);
+        //   - no block at all for this turn/thread/label — an unknown label or a
+        //     thread mismatch, i.e. a reference that names nothing.
+        //
+        // A `done` block with NO recorded content also binds: that is exactly the shape of
+        // a never-started `delegate` attempt in a turn that finished (F11 gives the row a
+        // label, the projection gives it the turn's status and no answer), and refusing it
+        // here while the picker still offers the row would mint a chip that dies at submit.
+        //
         // Conversation prefix (not just `[target]`): see `turnsThrough`. The
         // recorded seeds keep a surviving turn's labels stable after a deletion.
         const block = findAgentResultBlock(
@@ -9237,22 +9272,11 @@ export class SessionStore {
             );
         }
 
-        if (block.status === 'error' || block.status === 'cancelled') {
-            throw new SessionError(
-                400,
-                `Block "#${reference.label}" cannot be referenced because it ended as ${block.status}.`
-            );
-        }
-
-        if (block.status !== 'done') {
+        if (block.status === 'queued' || block.status === 'running') {
             throw new SessionError(
                 400,
                 `Block "#${reference.label}" cannot be referenced because it is still ${block.status}.`
             );
-        }
-
-        if (block.content === undefined) {
-            throw new SessionError(400, `Block "#${reference.label}" has no completed result content to reference.`);
         }
 
         return {
@@ -9265,7 +9289,7 @@ export class SessionStore {
     // Expand every reference into the prompt the harness actually receives. This
     // runs at EXECUTION, after the fresh-conversation reset, so:
     //   - a target that was still streaming has had time to finish;
-    //   - the content is the recorded terminal `done` text, never a delta stream;
+    //   - the content is the recorded terminal text, never a delta stream;
     //   - a target that failed/cancelled/was deleted after binding contributes an
     //     informational NOTE (see composeReferences) instead of chaining its death
     //     onto this turn: the user still gets an answer that says what is missing.
@@ -9365,16 +9389,25 @@ export class SessionStore {
                 continue;
             }
 
-            // A target that ended cancelled/error/stopped, or that ended `done` with
-            // no recorded content, contributes its NOTE instead of failing this turn:
-            // the waiter runs, and the model is told to report the missing input to
-            // the user. Only the TARGET died — chaining its death onto every turn
-            // that referenced it is what this branch replaces.
+            // R-TREF (2026-11-26) — CONTENT WHEN IT EXISTS, NOTE WHEN IT DOES NOT. A
+            // terminal reference now binds (see `bindReference`), so this is where its
+            // outcome is reported: whatever recorded content the block carries is injected
+            // and the locator line still names the row, and ONLY when there is nothing to
+            // reuse does the section become a NOTE. The status is deliberately not the test
+            // any more — a run that committed an answer and then died is worth reusing, and
+            // a `done` row with no text (the shape of a never-started `delegate` attempt)
+            // is not. NOTE: the block projection currently clears `content` for every
+            // non-`done` block (../engine/shared/agent-results.ts:1035), so today a terminal
+            // target always lands on the note; the content branch is what keeps this door
+            // honest the moment the projection keeps partial text.
             //
-            // IT19 R2: when the death was a DELETION the note stays the deleted one. "ended as
-            // cancelled" would describe the abort the deletion itself caused, while the user has
-            // to be told that the conversation they deleted is why the input is missing.
-            if (block.status !== 'done' || block.content === undefined) {
+            // IT19 R2: when the death was a DELETION the note stays the deleted one. "ended
+            // as cancelled" would describe the abort the deletion itself caused, while the
+            // user has to be told that the conversation they deleted is why the input is
+            // missing.
+            const content = block.content;
+
+            if (content === undefined || content.length === 0) {
                 entries.push({
                     label: block.label,
                     note: deletedConversation
@@ -9384,7 +9417,7 @@ export class SessionStore {
                 continue;
             }
 
-            entries.push({ block, content: block.content });
+            entries.push({ block, content });
         }
 
         return composeAgentResultPrompt(prompt, entries);
@@ -9392,8 +9425,13 @@ export class SessionStore {
 
     // Synchronous variant for a STEERED submit (F3): the runtime's steering API is
     // synchronous and the caller (enqueue) is synchronous too. It returns undefined
-    // when any referenced target is not terminal yet, which makes the caller queue a
-    // continuation turn instead of steering without its context.
+    // when a referenced target cannot contribute its RECORDED CONTENT right now — a
+    // target that has not settled, or a TERMINAL row that ended without an answer
+    // (`error`/`cancelled`, or a `done` block that recorded no content). Since R-TREF
+    // those rows are bound and named, but a steer has no execution step to compose
+    // them in, so the caller queues a CONTINUATION turn instead of steering without
+    // its context, and `expandReferences` writes the content or the unavailable-result
+    // note there.
     private composeSteerReferences(
         session: Session,
         prompt: string,
@@ -9524,10 +9562,11 @@ export class SessionStore {
         const input = validateInput(rawInput, validated.length);
         const wantedThread = this.normalizeThreadId(threadId);
 
-        // BIND now (R2): the referenced turn/block must exist and be a PRIOR
-        // completion target, so a bad reference is a 400 before a turn exists.
-        // Content is deliberately NOT read here: a still-running target is queued
-        // and expanded at EXECUTION (see expandReferences) after it completes.
+        // BIND now (R2): the referenced turn/block must EXIST and be EARLIER, so a
+        // reference that cannot be ADDRESSED is a 400 before a turn exists. A TERMINAL
+        // target binds too (its label is its address). Content is deliberately NOT read
+        // here: a target that has not settled yet is bound as-is and expanded at
+        // EXECUTION (see expandReferences) once it completes.
         // The prospective index is the monotonic high-water mark (not the array
         // length), so a deletion never lets a new turn sort before a survivor.
         const boundReferences = this.normalizeReferences(session, session.turnSequence, input, references);
@@ -10114,9 +10153,12 @@ export class SessionStore {
 
         // Reference context is part of the steered text: a focused follow-up gets
         // exactly what a normal turn prompt would (block content inside the shared
-        // delimiters). A target that is not terminal yet cannot be injected safely,
-        // so the submit becomes a queued CONTINUATION instead (it expands at
-        // execution like any other turn) rather than steering without its context.
+        // delimiters). A target that cannot contribute its RECORDED CONTENT right now
+        // cannot be injected safely — that is a row still `queued`/`running`, and after
+        // R-TREF also a TERMINAL row that left no answer (`error`/`cancelled`, or a
+        // `done` block that recorded no content). Such a submit becomes a queued CONTINUATION
+        // instead (it expands at execution, where the content or the unavailable-result
+        // note is composed) rather than steering without its context.
         const steeredText = this.composeSteerReferences(session, input, references);
         if (steeredText === undefined) return undefined;
 

@@ -1890,6 +1890,125 @@ describe('terminal commit is atomic for a finished run (B2)', () => {
         gate.resolve('released');
     });
 
+    // D5 (2026-11-26) — THE OTHER HALF OF THE B2 SELECTOR WAS STILL START-ORDERED.
+    //
+    // `agentResultFor`'s no-`invocationId` selector read `completed[0] ?? recent.find(e =>
+    // e.status !== 'running')`. The completed half sorts by `completedOrder`; `recent` is
+    // SORTED BY START (`recordsForAgent`), so the fallback half — exactly the state this block
+    // describes, an agent with nothing finished except failures — handed the default to
+    // whichever overlapping child happened to START LAST. Two children of one agent is the
+    // shape that makes that observable: the one that began second but died first beat the one
+    // that began first and finished last, which is the fork-masking case the comment at the
+    // selector promises is impossible ("completion order, not start order").
+    //
+    // The fixture keeps BOTH runs non-completed, so the fallback half is the only half that can
+    // answer, and pins the two orderings INVERTED, which is what makes the pin a proof rather
+    // than a restatement of the selector.
+    it('the no-id fallback picks the last FINISHED terminal record, not the last started one (D5)', async () => {
+        const gate = deferred<string>();
+
+        // `slow` parks inside `hold` (it is the run the test stops SECOND); `fast` dies on the
+        // transport immediately (it is the run that FINISHES FIRST while having STARTED last).
+        // `retry: false` keeps the failure ONE record rather than a retry sequence.
+        const writerAgent = brain(
+            routed((request) => {
+                const brief = latestUser(request);
+
+                if (brief.includes('fast')) {
+                    return [{ type: 'error', message: 'fast transport exploded' }];
+                }
+
+                return request.messages.some((message) => message.name === 'hold')
+                    ? answer('never answered')
+                    : callTool('h1', 'hold', '{}');
+            }),
+            { retry: false }
+        );
+
+        const hold = tool({
+            description: 'Hold until the test releases it.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: () => gate.promise
+        });
+
+        const writer = harness({ agents: { writer: writerAgent }, tools: { hold }, presets: false });
+
+        // START ORDER: slow first (record 1), fast second (record 2). Registration happens when
+        // the run begins, so the pump below is what guarantees `fast` registers AFTER `slow` —
+        // two threads of one agent run concurrently (pinned in
+        // ./harness.thread-runtime.test.ts:389), so both rows are alive at once.
+        const slow = writer.createThread('writer');
+        const slowRun = writer.sendThreadInput(slow.id, 'slow, then stop');
+
+        await pump(() => writer.thread(slow.id)?.status === 'running');
+
+        const fast = writer.createThread('writer');
+        await expect(writer.sendThreadInput(fast.id, 'fast')).rejects.toThrow('fast transport exploded');
+
+        // Nothing has completed and both rows are terminal-ish: `fast` is `failed`, `slow` is
+        // still `running`. The default therefore answers the failed run — the only finished one
+        // there is at this instant.
+        expect(await writer.executeTool('agentResult', { agent: 'writer' })).toMatchObject({
+            invocationId: '2',
+            status: 'failed'
+        });
+
+        // COMPLETION ORDER: now the older run finishes, SECOND. `completedOrder` is a global
+        // counter, so this is the step that inverts the two orderings — and the snapshot below
+        // is the proof, asserted as exact numbers rather than as a description.
+        expect(writer.stopThread(slow.id, 'the host stopped it')).toBe(true);
+        await expect(slowRun).rejects.toThrow();
+
+        expect(
+            ((writer.snapshot() as { agentResults?: Record<string, unknown>[] }).agentResults ?? [])
+                .map((row) => [row.invocationId, row.sequence, row.completedOrder, row.status])
+                // [id, sequence (START), completedOrder (FINISH), status] — deliberately crossed:
+                // the row that started first finished last, and vice versa.
+        ).toEqual([
+            ['1', 1, 2, 'cancelled'],
+            ['2', 2, 1, 'failed']
+        ]);
+
+        // THE SELECTOR. With no completed row, the retired `recent.find(...)` read START order
+        // and returned `2` (started last, finished FIRST); the fixed fallback sorts the terminal
+        // rows by `completedOrder` and returns `1` — the last thing that actually finished. The
+        // exact envelope is pinned so a change of selector cannot quietly swap the ERROR too.
+        expect(await writer.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'cancelled',
+            stopReason: 'user-stopped',
+            content: '',
+            contentLength: 0,
+            offset: 0,
+            limit: 4000,
+            hasMore: false,
+            error: 'the host stopped it',
+            // The POSITION the stopped run had reached, asserted as the number this fixture
+            // actually produces (assistant tool-call turn + the synthesized answer the harness
+            // writes for the unanswered call, 0036 R1's thread-bound retention — the transcript
+            // is `[user, assistant, tool(hold)]`). The M1 pin above shows `1` for a run stopped
+            // one step earlier; this counter is a forensic position, not part of the selector
+            // claim, and it is pinned exactly so a change here stays visible.
+            cancelledAtMessage: 2,
+            durationMs: expect.any(Number)
+        });
+
+        // Both rows stay individually addressable, so this is a SELECTOR fix and not a change to
+        // what the ledger holds: the started-last failure is still reachable by its own id.
+        expect(await writer.executeTool('agentResult', { agent: 'writer', invocationId: '2' })).toMatchObject(
+            {
+                invocationId: '2',
+                status: 'failed',
+                error: 'fast transport exploded'
+            }
+        );
+
+        gate.resolve('released');
+    });
+
     it('invents no invocation identity when the delegate result has no ledger record to point at', () => {
         // This one is pinned against the SOURCE, and the reason is honest: the omitted
         // identity has no reachable trigger inside one process today. A delegated child
@@ -2180,6 +2299,67 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
         expect(rowOf(target.snapshot(), invocationId)).toEqual(archived);
         expect(target.thread(threadId)).toBeUndefined();
         expect(source.thread(threadId)).toBeUndefined();
+    });
+
+    // D1 + D2 (2026-11-26) — THE ABSENCE HALF OF THE CAUSE TRIO, pinned where absence is real.
+    //
+    // The restored row is the case a blanket projection would have corrupted: `durationMs` is a
+    // wall-clock measurement of a run THIS process made, so the archive never writes it
+    // (`archiveInvocation`, `src/engine/harness.ts`) and the envelopes above assert its
+    // ABSENCE on purpose. A listing row that projected `durationMs: undefined` would add a key
+    // every pre-existing pin excludes. `error` and `stopReason`, in contrast, are forensic
+    // facts that DO travel — and the row now shows them, which is what a glance at
+    // `agentManage` was never able to say before.
+    it('previews a restored partial and its cause at the listing door, with `durationMs` still absent', async () => {
+        const { source, invocationId } = await cancelledRun();
+        const snapshot = source.snapshot();
+
+        const target = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+        target.restore(JSON.parse(JSON.stringify(snapshot)) as never);
+
+        const listed = (await target.executeTool('agentManage', {})) as {
+            agents: { name: string; results: unknown[] }[];
+            totalResults: number;
+            activeResults: number;
+        };
+
+        expect(listed.agents.map((entry) => entry.name)).toEqual(['writer']);
+        expect([listed.totalResults, listed.activeResults]).toEqual([1, 0]);
+
+        const [restoredRow] = listed.agents[0].results;
+
+        expect(restoredRow).toEqual({
+            invocationId,
+            kind: 'root',
+            status: 'cancelled',
+            // D1 — the partial survives persistence, so the glance shows it (14 chars, well
+            // under the 200 bound, so `truncated: false` and no ellipsis).
+            contentLength: 14,
+            preview: 'half an answer',
+            truncated: false,
+            // D2 — the two facts that travel through the archive are projected...
+            error: 'operator stop',
+            stopReason: 'caller-released'
+        });
+        // ...and the one that does not stays ABSENT, not `undefined`: this is the whole reason
+        // the trio is absence-conditional rather than a plain projection.
+        expect(restoredRow).not.toHaveProperty('durationMs');
+        expect(restoredRow).not.toHaveProperty('startedAt');
+        expect(restoredRow).not.toHaveProperty('ageMs');
+        // The live row and the reloaded one differ by EXACTLY ONE key — the wall-clock span of a
+        // run this process never made — and agree on every forensic field. That is the precise
+        // statement of what persistence does to a glance row: it carries the answer and the
+        // cause, and it drops the one number a restart cannot honestly re-derive.
+        const [liveRow] = (
+            (await source.executeTool('agentManage', {})) as {
+                agents: { name: string; results: unknown[] }[];
+            }
+        ).agents.find((entry) => entry.name === 'writer')!.results;
+
+        expect(liveRow).toEqual({ ...restoredRow, durationMs: expect.any(Number) });
     });
 
     it('carries a failed run partial through snapshot -> restore', async () => {
@@ -3020,13 +3200,32 @@ describe('a running invocation reports when it started and how old it is (M1)', 
         };
         const [cancelledRow] = listed.agents.find((entry) => entry.name === 'writer')?.results ?? [];
 
+        // The listing row for that same cancelled run (D1 + D2, 2026-11-26).
+        //
+        // D2 — the row now carries the CAUSE TRIO its own `agentResult` envelope has always
+        // carried, projected from the same record: `error`, `stopReason`, and `durationMs` with
+        // the SAME number the envelope reports (`AGED_MS`, because both are measured from the
+        // run's own start stamp). A listing that showed a run died and told the caller nothing
+        // about why is what sent the stress report's Rank B child back for another round trip.
+        //
+        // D1 — the text half stays `0 / '' / false` HERE, and that is the honest answer rather
+        // than the old blanket zero: this run was stopped by `stopThread` before it committed
+        // anything, so `finishInvocation`'s non-blank guard (~:4874) stored no `partialContent`
+        // at all — which is exactly why the envelope above has no `partialContent` key either.
+        // A cancelled run that HAD produced text is the other case, and it is pinned with an
+        // exact clipped preview two tests below.
+        //
+        // The age pair stays absent at this door too: a terminal row's span is `durationMs`.
         expect(cancelledRow).toEqual({
             invocationId: '1',
             kind: 'root',
             status: 'cancelled',
             contentLength: 0,
             preview: '',
-            truncated: false
+            truncated: false,
+            error: 'the host stopped it',
+            stopReason: 'user-stopped',
+            durationMs: AGED_MS
         });
         expectNoAgeKeys(cancelledRow);
 
@@ -3052,6 +3251,98 @@ describe('a running invocation reports when it started and how old it is (M1)', 
             hasMore: false
         });
         expectNoAgeKeys(empty);
+    });
+
+    // D1 + D2 (2026-11-26, stress-report pass) — THE OTHER HALF OF THE TERMINAL ROW. The pin
+    // above covers a terminal row with NO partial (`stopThread` before the first commit) and a
+    // clock delta, so the trio's values are `0 / '' / false` plus a real `durationMs`. This one
+    // is the case the defect named: a run that PRODUCED text and then failed, whose partial is
+    // longer than the 200-char preview bound. Before the fix this row answered
+    // `contentLength: 0, preview: '', truncated: false` while `agentResult` handed the same
+    // caller all 300 characters — the listing hid the one fact a glance is for.
+    it('previews and clips a long failed partial at the listing door, with the cause trio', async () => {
+        // 180 + 120 = 300 chars of two distinct runs, so the exact CLIP POSITION is asserted,
+        // not just "something shorter than the input": a preview one character off at the cut
+        // is a different string. The stored text is untrimmed and has no leading or trailing
+        // whitespace, so `contentLength` (the untrimmed answer, the completed branch's own
+        // convention) is 300 while `preview` shows the trimmed form clipped at 200.
+        const PARTIAL = `${'x'.repeat(180)}${'y'.repeat(120)}`;
+
+        // The 0033 failed-run shape: ONE committed assistant text turn, then a throwing tool,
+        // then the next request dies on the transport with `retry: false` so the whole run is
+        // one record. Routing on the tool message keeps the two turns apart with no counter.
+        const failing = harness({
+            agents: {
+                writer: brain(
+                    routed((request) =>
+                        request.messages.some((message) => message.role === 'tool')
+                            ? [{ type: 'error', message: 'transport died mid-run' }]
+                            : [{ type: 'text', delta: PARTIAL }, ...callTool('b1', 'boom', '{}')]
+                    ),
+                    { retry: false }
+                )
+            },
+            tools: {
+                boom: tool({
+                    description: 'Fail loudly.',
+                    tags: ['test'],
+                    visibility: 'core',
+                    execute: () => {
+                        throw new Error('tool exploded');
+                    }
+                })
+            },
+            presets: false
+        });
+
+        const thread = failing.createThread('writer');
+        await expect(failing.sendThreadInput(thread.id, 'go')).rejects.toThrow('transport died mid-run');
+
+        const listed = (await failing.executeTool('agentManage', {})) as {
+            agents: { name: string; results: unknown[] }[];
+        };
+        const [failedRow] = listed.agents.find((entry) => entry.name === 'writer')?.results ?? [];
+
+        expect(failedRow).toEqual({
+            invocationId: '1',
+            kind: 'root',
+            status: 'failed',
+            contentLength: 300,
+            // Exactly the first 200 code units of the trimmed partial (180 'x' + 20 'y'), plus
+            // the ellipsis that marks the clip — the SAME `previewFieldsOf` lines the completed
+            // branch runs, so the two doors cannot drift apart.
+            preview: `${'x'.repeat(180)}${'y'.repeat(20)}…`,
+            truncated: true,
+            error: 'transport died mid-run',
+            // The provider died mid-run, so the classifier stamped `api-error` — the same value
+            // the envelope and the durable row carry for this run (0033's pins above).
+            stopReason: 'api-error',
+            // Exact, not `expect.any(Number)`: the clock is frozen at `EPOCH_MS`, so a run that
+            // both began and ended under the frozen clock spans 0 ms — the same measurement the
+            // failed envelope reports at :2977.
+            durationMs: 0
+        });
+
+        // The pair the age clause reserves for RUNNING rows stays absent here even though the
+        // row now carries three more keys, and `cancelledAtMessage` (a forensic field of the
+        // envelope, never of the glance row) stays absent too.
+        expectNoAgeKeys(failedRow);
+        expect(failedRow).not.toHaveProperty('cancelledAtMessage');
+        expect(failedRow).not.toHaveProperty('partialContent');
+
+        // The two doors agree on ONE record, which is the claim D1 is worth: the listing's
+        // `contentLength` is the envelope's, and the listing's `preview` is that same content
+        // clipped — a caller that glances at `agentManage` and then reads `agentResult` is
+        // looking at one answer, not two.
+        expect(await failing.executeTool('agentResult', { agent: 'writer' })).toMatchObject({
+            invocationId: '1',
+            status: 'failed',
+            content: PARTIAL,
+            contentLength: 300,
+            error: 'transport died mid-run',
+            stopReason: 'api-error',
+            durationMs: 0
+        });
     });
 
     it('reports the pair on the parked run while the default door still answers the older completed run with none', async () => {

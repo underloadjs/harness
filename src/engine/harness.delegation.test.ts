@@ -1434,6 +1434,102 @@ describe('delegation result contract (T28)', () => {
         expect(seen).toHaveLength(0);
     });
 
+    // D4 (2026-11-26) — AN ABBREVIATION IS NOT A FILE NAME. The target regex's file
+    // alternative used `\b[\w-]+\.[A-Za-z]{1,5}\b`: a ONE-character stem satisfied it, so the
+    // dot inside an ordinary abbreviation read as a file extension and cleared the target check
+    // on its own. `Refactor it, e.g. the parser` names no file, no symbol, no URL and no id —
+    // yet the caller was told only its criterion was missing, which is a refusal that points the
+    // caller at the wrong half of its own brief. The fix is the stem length (`{2,}`), so every
+    // letter-final abbreviation is out: `e.g`, `i.e`, `a.m`, `P.S`, `U.S`, `D.C`, and each
+    // segment of `a.k.a` and `w.r.t`.
+    //
+    // The pair below is what makes the fix legible: the SAME abbreviation, with and without a
+    // criterion word beside it. Both briefs must now be refused, both refusals must name the
+    // TARGET, and only the first may name the criterion. Pre-fix neither refusal existed in its
+    // right shape: `e.g` supplied a phantom target, so the first brief was refused for the
+    // criterion alone, and the second brief was ACCEPTED outright (abbreviation plus `pass`
+    // looked complete) and reached a write-capable child with no target to work on.
+    it('refuses a brief whose only apparent target is an abbreviation, naming BOTH missing parts', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('should not run')], seen));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    '{"agent":"researcher","input":"Refactor it, e.g. the parser.","requireClarification":true}'
+                ),
+                answer('recovered')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        const refusal = content(writerAgent.messages[2]);
+
+        expect(refusal).toContain('is under-specified');
+        // `e.g` no longer counts, and nothing else in this brief does either.
+        expect(refusal).toContain('concrete target');
+        expect(refusal).toContain('acceptance criterion');
+        expect(seen).toHaveLength(0);
+    });
+
+    it('refuses an abbreviation-only brief naming only the target once a criterion is stated', async () => {
+        const seen: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('should not run')], seen));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    '{"agent":"researcher","input":"Refactor it, e.g. the parser, so tests pass.","requireClarification":true}'
+                ),
+                answer('recovered')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        const refusal = content(writerAgent.messages[2]);
+
+        // The target half is still missing — the abbreviation did not supply one...
+        expect(refusal).toContain('concrete target');
+        // ...and the criterion half is genuinely met (`pass` is an acceptance word), so the
+        // refusal must not claim otherwise. Pre-fix this brief was never refused at all: the
+        // abbreviation stood in for the target and `pass` for the criterion, so an unspecified
+        // brief reached a write-capable child, which is the harm the gate exists to stop.
+        expect(refusal).not.toContain('acceptance criterion');
+        expect(seen).toHaveLength(0);
+    });
+
+    it('accepts a real file whose stem is a single letter when a path names it', async () => {
+        // THE ACCEPTED TRADEOFF, pinned so it stays a decision. The `{2,}` stem means a bare
+        // one-letter name with no other marker (`x.ts`) no longer counts as a target by itself;
+        // a PATH does, because the slash alternative never depended on the stem length. This is
+        // the positive side of the same change: real targets still clear the gate, so the fix
+        // removed abbreviations and not files.
+        const seen: HarnessStreamRequest[] = [];
+        const researcher = brain(scripted([answer('done')], seen));
+        const writerAgent = brain(
+            scripted([
+                callTool(
+                    'c1',
+                    'delegate',
+                    '{"agent":"researcher","input":"Fix the alias in src/x.ts so the build passes.","requireClarification":true}'
+                ),
+                answer('final')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        expect(seen).toHaveLength(1);
+        expect(answerOf(writerAgent.messages[2])).toEqual({ agent: 'researcher', content: 'done' });
+    });
+
     it('reports a cancelled child as a structured result instead of an empty record', async () => {
         // A child that commits a substantive turn and then hangs inside a tool: the run
         // is cancelled mid-flight, which is exactly the case the transcript rollback
