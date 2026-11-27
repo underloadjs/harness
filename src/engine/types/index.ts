@@ -105,6 +105,17 @@ export type ToolMediaDescriptor = {
 // keys scheduled work and paired tool results by it. A turn that repeats an id, or
 // reuses one already committed, is rejected before any call executes (the run rolls
 // back) rather than letting one result silently alias another.
+//
+// THE RESERVED `async` KEY (see ../core/tool.ts). Every declaration the harness offers
+// carries one optional boolean property, `async`, so a call may name its OWN turn mode:
+// `true` resolves the call to 'async', `false` to 'sync', and its absence means "the
+// tool's own default". It is a harness-level switch, NOT a tool parameter: the harness
+// reads it to decide whether the completion joins its message's sync group, then strips
+// it in ./core/schema-validation.ts, so it never reaches schema validation,
+// `context.parameters`, or the implementation. The raw string above is the model's own
+// utterance and is never rewritten, so a transcript entry still shows the switch the
+// model wrote. A tool whose OWN schema declares `async` owns that property: the harness
+// neither injects it, nor strips it, nor lets it decide the mode.
 export type HarnessToolCall = {
     id: string;
     name: string;
@@ -1490,6 +1501,13 @@ export type HarnessToolRuntime = {
     ) => Promise<HarnessDelegationResult>;
     // Conditional cross-thread chat / roster. Sender identity comes from the
     // runtime context, never from model arguments.
+    //
+    // F1 (2026-11-27) — `caller` is the CALLING BRAIN, so a `threadFork` branch run arrives as
+    // the branch Agent, and the door resolves it through the branch metadata (`../core/branch.ts`
+    // `agentBranchOf`) rather than through an extra argument: a branch may not send into the
+    // family it was forked from unless its fork passed `allowFamilyWrites: true`, and when it may,
+    // the delivered message and the receipt name the BRANCH id as well as the owner conversation
+    // (the owner id alone attributes a branch to a conversation that is still answering itself).
     threadSend: (
         caller: Agent | undefined,
         threadId: string | undefined,
@@ -1509,9 +1527,18 @@ export type HarnessToolRuntime = {
     // conversation, and an unknown or already-deleted id). The cascade is `deleteThread`'s,
     // shared with the host path, so both doors release exactly the same set — and the
     // receipt reports it (see HarnessThreadDeleteResult).
+    //
+    // F1 (2026-11-27) — the THIRD argument is the caller's BRAIN, and it exists for one fact the
+    // thread id cannot carry: whether the caller is a `threadFork` BRANCH RUN. A branch run's
+    // persistent thread is its OWNER's (`RunState.threadId`), so `callerThreadId` alone cannot
+    // tell a branch speaking from the owner conversation itself — and a branch is refused here
+    // unless the fork that created it passed `allowFamilyWrites: true`. Omitted (a manual
+    // `executeTool`, a routed lane call, a plugin outside a conversation) means "not a branch",
+    // which is today's behaviour exactly.
     threadDelete: (
         callerThreadId: string | undefined,
-        threadId: string
+        threadId: string,
+        caller?: Agent
     ) => HarnessThreadDeleteResult;
     // Opt-in network tools. The per-harness provider closures (and therefore their
     // credentials) live in the harness; the independently compiled source entries
@@ -1995,6 +2022,15 @@ export type HarnessBranchSummary = {
     forkDepth: number;
     model: string;
     tools: string[];
+    // F1 (2026-11-27) — the fork's OPT-IN family-write flag, decided at creation from the
+    // model's `allowFamilyWrites` argument and read by the three WRITE doors.
+    //
+    // WHY IT IS OPTIONAL RATHER THAN ALWAYS-PRESENT: a `branch_start`/`branch_end` event carries
+    // this summary byte-for-byte, and existing pins compare those payloads. An absent key means
+    // `false` (the default: a branch may NOT write into its owner's family), so the historical
+    // payload of every fork that did not ask for the exception is unchanged, and only an
+    // opted-in fork adds the key.
+    allowFamilyWrites?: boolean;
 };
 
 // Lifecycle of one branch record. `running` is the only non-terminal state.
@@ -3412,6 +3448,17 @@ export type ToolContext<TParameters = any> = {
 // built-ins state their mode in their own `registration` literal so the policy
 // survives scanning, the generated manifest, and source loading without ever being
 // re-derived from a name.
+//
+// THE PER-CALL OVERRIDE. This declares the DEFAULT for a tool; a single call may
+// replace it with the reserved `async` property in its own arguments — `true` for
+// 'async', `false` for 'sync', absent for the chain above (see ../core/tool.ts, which
+// owns the key). The precedence at dispatch is: the switch on the call, then the
+// registration policy, then the mode the definition declares, then this default — plus
+// ONE built-in refinement: a `delegate` call that resolved to 'async' with no switch on
+// it, in a message holding exactly ONE async-resolving call, resolves to 'sync', because
+// one child is the shape where the spawner is waiting on that child's answer. A tool that
+// declares an `async` property in its OWN schema keeps it as a plain argument and is
+// never reached by the switch.
 export type ToolMode = 'sync' | 'async';
 
 // A tool definition. `name` is optional: inside a harness the registry key names
@@ -3896,6 +3943,20 @@ export type HarnessThread = {
 //
 // The id is runtime-generated and opaque; it is stable for the thread's whole
 // life (including across snapshot/restore) and never derived from model input.
+//
+// F1-C4 (2026-11-27) — why a branch row does NOT add a third member here. A `threadFork` branch
+// is not a conversation: it has no thread slot, is never persisted, and is never listed by
+// `harness.threads()` (the host roster, pinned by a sibling test to exclude branch runs). Two
+// runtime-only places DO present it as a row — the address a read seam resolves
+// (`../harness.ts` `threadRecordOfBranch`, which backs `harness.thread('branch-N')`) and the live
+// rows the MODEL roster adds (`branchRosterRows`, projected by `modelThreadRosterOf`) — and both
+// declare the kind with the `branchId` KEY on `HarnessThreadRecord` rather than with a third
+// `origin` value. That is a measured choice, not an oversight: `origin` is a WIRE union,
+// hand-mirrored in `../server/protocol.ts` (`SessionThread.origin` and the api roster row), so a
+// runtime-only member would advertise a value the wire can never emit and would need a widening at
+// every server mapping site (`../server/sessions.ts`, `../server/api-reads.ts`) to type-check.
+// `branchId` carries the same fact, is absent on every real conversation row, and never crosses a
+// plane (the 0012 rule: branch on key presence).
 export type HarnessThreadOrigin = 'agent' | 'host';
 
 // WHY A RUN reached a terminal state WITHOUT concluding — the machine-readable answer to
@@ -3995,8 +4056,18 @@ export type HarnessThreadRecord = {
     // The registry agent that owns this conversation. Threads never change owner.
     agent: string;
     // 'agent' = the agent's default conversation; 'host' = an extra thread opened
-    // with `createThread`.
+    // with `createThread`. A runtime-only row for a `threadFork` branch keeps `'host'` and
+    // declares itself with `branchId` below — see `HarnessThreadOrigin` for why the wire union
+    // does not carry a branch value.
     origin: HarnessThreadOrigin;
+    // F1-C4 (2026-11-27) — set ONLY on a runtime-only row that addresses a `threadFork` branch
+    // (`../harness.ts` `threadRecordOfBranch` / `branchRosterRows`), and then the branch's own id
+    // (`branch-N`), which is ALSO the row's `id` and its `invocationId`. It is not redundant:
+    // the id being a `branch-N` string is a convention, while this key is the declaration that
+    // the row addresses a branch record, so a caller branches on the KEY rather than matching a
+    // prefix. Absent on every real conversation row, which is the whole point of an optional
+    // key (the 0012 rule: branch on key presence).
+    branchId?: string;
     status: HarnessThreadStatus;
     // WHY this thread's LAST run ended short of its conclusion; see
     // `HarnessRunStopReason` above for the closed vocabulary and each member's cause.
@@ -4182,6 +4253,19 @@ export type HarnessThreadRoster = {
     // `threads` itself is SESSION-WIDE: a read reaches any conversation in the session, so a
     // row absent from `actOn` is still readable with `threadRead`.
     actOn?: string[];
+    // THE ROWS. For a host/plugin caller (`handle.threads()`, `api.threads.list`) these are the
+    // persisted conversations, exactly as always — a `threadFork` branch is an INVOCATION, not a
+    // conversation, and the sibling pin asserting `threads()` excludes it still holds.
+    //
+    // F1-C4 (2026-11-27) — the MODEL plane (`threadList`) additionally lists every branch that is
+    // RUNNING right now, as a row carrying a `branchId` key (../harness.ts
+    // `branchRosterRows`, added in `modelThreadRosterOf`, which is the model projection only; its
+    // `origin` stays `'host'` — see `HarnessThreadOrigin`).
+    // Before that, a caller was handed a `branch-N` id by `threadFork` and shown a roster with no
+    // such row, so the id looked stale the moment the fork started answering. Two rules travel
+    // with those rows, and both are stated on the row's own fields: `ownerThreadId` names the
+    // conversation the branch belongs to, and the row is READABLE (`threadRead` answers it) but
+    // never WRITABLE — `threadSend` refuses a branch address, and the row is never in `actOn`.
     threads: HarnessThreadRecord[];
 };
 
@@ -4571,6 +4655,43 @@ export type HarnessAgentSnapshot = {
     messages: HarnessMessage[];
 };
 
+// C0 (2026-11-27, the mid-run-report defect) — ONE SUBSTANTIVE TURN OF A RUN, kept addressable.
+//
+// WHAT QUALIFIES. Exactly the rule the delegated-answer rescue already applies to a run's
+// "answer so far" (../harness.ts, the answer-so-far recording and `resolveRunAnswer`): an assistant
+// turn that is TOOL-FREE, stopped with `stopReason === 'stop'`, is non-blank, and is NOT a
+// context-compaction reply. A tool-call turn is a preamble, a `length` stop is a truncation fact,
+// and a summarize pass is plumbing about the child's own context — none of them is something an
+// agent "reported".
+//
+// WHY THIS EXISTS AT ALL. The result ledger keeps ONE row per invocation and that row's `content`
+// is the run's final message, so an agent that posts its report and then does housekeeping loses
+// the report to every answer surface: `agentResult` returns the cleanup note byte-for-byte, and the
+// report survives only as a transcript line reachable through `threadRead` at an index. The harness
+// cannot INFER which mid-run message "was the real report" — that is a fact only the agent knows —
+// so instead of guessing it makes every substantive turn retrievable BY `invocationId`: this entry
+// is one of those turns, and `agentResult`'s `message` selector pages its content.
+//
+// BOUNDED, ON PAIN OF AN UNBOUNDED ROW. The list holds at most `AGENT_ANSWER_CANDIDATE_CAP` (4)
+// entries, keeping the MOST RECENT ones, and each entry's `content` is cut at
+// `AGENT_ANSWER_CANDIDATE_CHARS` (32000, the same ceiling `threadRead` gives one message).
+// `truncated` is that cap stating that it — not the run — closed the text, and it is the ONLY case
+// in which the stored content is not the whole message.
+export type HarnessAnswerCandidate = {
+    // WHERE the turn is. A 0-based index into the transcript that owns the run — the thread's
+    // canonical `agent.messages` for a thread-bound run, the branch's committed transcript for a
+    // fork — which is the SAME addressing `threadRead`'s `message` argument takes (index 0 is the
+    // system seed). So `threadRead({ thread, message: answerMessageIndex })` reads the answer, and
+    // `threadRead({ thread, message: candidate.messageIndex })` reads this turn, byte for byte.
+    // It is derived at the terminal commit, where the ledger row is written and the transcript is
+    // exactly what the model was shown; nothing here is re-derived after a compaction or a splice.
+    messageIndex: number;
+    // The committed text, verbatim, cut at the cap above when it ran over.
+    content: string;
+    // True when THE CAP cut this text, i.e. the stored content is a prefix of the committed message.
+    truncated: boolean;
+};
+
 // One TERMINAL agent result persisted by snapshot v1 (R3 durability). Active
 // (`running`) invocations are deliberately omitted: they have no answer yet, and
 // fabricating one would misrepresent an in-flight run. A result is immutable once
@@ -4717,6 +4838,51 @@ export type HarnessAgentResultSnapshot = {
     // RUN rather than the id — the same rule stated by the writer and by the reader, so a document
     // cannot claim one run twice.
     epoch?: string;
+    // C0 (2026-11-27, the mid-run-report defect) — WHICH MESSAGE the `content` above IS.
+    //
+    // THE DEFECT THIS ANSWERS. A run's ledger row keeps its FINAL message, and until now nothing
+    // said so: an investigator that posted its 8,117-char report mid-run and then wrote a
+    // 1,099-char cleanup note had the cleanup note returned by `agentResult` byte-for-byte, with no
+    // field anywhere telling a caller that the answer it was handed is message 175 rather than the
+    // report at 165. The rule itself is NOT changing (the final message stays the answer — see the
+    // note on `answerCandidates` for what did change); what was missing is the ADDRESS.
+    //
+    // WHAT THE NUMBER IS. A 0-based index into the transcript that owns the run — the thread's
+    // canonical `agent.messages` for a thread-bound run, the branch's committed transcript for a fork
+    // — i.e. the SAME addressing `threadRead`'s `message` argument takes (index 0 is the system
+    // seed). `threadRead({ thread, message: answerMessageIndex })` therefore reads the exact message
+    // this row's `content` came from. For a DELEGATED run whose answer was rescued from an earlier
+    // turn (`resolveRunAnswer`), it names that earlier turn, not the blank final one, which is
+    // precisely the fact a caller needs to check the rescue against the transcript.
+    //
+    // COMPLETED-ONLY, on pain of an unrestorable document: a `failed`/`cancelled` row has no answer
+    // message (`content` is empty there, and the run's text is `partialContent`), so the writer never
+    // puts the key on such a row and `../core/snapshot.ts` REFUSES a row that carries one — the
+    // `stopReason`/`toolActivity` precedent two fields above, kept because `restore -> snapshot` has
+    // to stay byte-idempotent.
+    //
+    // OPTIONAL AND ADDITIVE: every row written before this field has no key, restores with its exact
+    // prior meaning, and every door omits the derived key rather than inventing an index of 0. The
+    // schema version does not move.
+    answerMessageIndex?: number;
+    // C0 (2026-11-27) — THE RUN'S OTHER SUBSTANTIVE TURNS, kept retrievable by `invocationId`.
+    //
+    // WHY THIS IS THE HONEST FIX. The harness cannot know which mid-run message "was the real
+    // report" — only the agent knows that — so it does not try to pick one. It records every
+    // substantive tool-free `stop` turn of the run (the `HarnessAnswerCandidate` rule) EXCEPT the one
+    // the answer came from, and `agentResult` pages any of them by ordinal. A report that the ledger
+    // displaced is therefore still addressable by the id the caller already holds, instead of only by
+    // a transcript index nobody was given.
+    //
+    // BOUNDED, so the ledger stays a ledger: the last `AGENT_ANSWER_CANDIDATE_CAP` (4) turns, each
+    // cut at `AGENT_ANSWER_CANDIDATE_CHARS` (32000) characters with `truncated` saying the cap spoke.
+    // ABSENT (never `[]`) when the run had no substantive turn besides its answer — which is the
+    // ordinary single-answer run, and what keeps every pre-existing completed row byte-identical.
+    //
+    // COMPLETED-ONLY, on the same rule and for the same reason as `answerMessageIndex` above: the
+    // list describes the turns of a run that ANSWERED, and `../core/snapshot.ts` refuses the key on a
+    // `failed`/`cancelled` row so a stale list cannot outlive a re-run of the same invocation.
+    answerCandidates?: HarnessAnswerCandidate[];
 };
 
 // T5 lane-worker seam: ONE terminal invocation the coordinator archives on behalf of a
@@ -5734,6 +5900,16 @@ export type Harness = {
     thread: (id: string, callerThreadId?: string) => HarnessThreadRecord | undefined;
     // The thread's committed transcript, as a detached copy.
     threadMessages: (id: string, callerThreadId?: string) => HarnessMessage[];
+    // THE RECORD HALF OF THE READ DOOR (2026-11-27). `thread()` above is a DISCOVERY door and
+    // excludes a soft-deleted (`inactive`) row on purpose; this one answers the SAME set of
+    // addresses `threadMessages` serves — a live row, the retained row of a released
+    // conversation, and a finished fork's `branch-N` through the branch ledger — under the SAME
+    // admission test, so a read the transcript seam admits can never be refused by the record
+    // door. `threadRead`'s envelope is the consumer that needs it (the tool builds its identity
+    // block from the record), and the lane authority's routed `thread:read` answers the same
+    // pair. Contract matches `thread()`: a detached copy or `undefined`, never a sentence of its
+    // own for a missing row — a caller that wants the reason reads `threadMessages`.
+    threadReadRecord: (id: string, callerThreadId?: string) => HarnessThreadRecord | undefined;
     // C4: REPLACE one thread's committed transcript wholesale (the transcript
     // editor's write primitive). `messages` is validated with the same reader
     // `snapshot()`/`restore()` enforce, so a harness can never hold a transcript

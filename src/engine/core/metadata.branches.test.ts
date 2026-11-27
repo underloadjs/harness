@@ -119,7 +119,16 @@ describe('metadata: threadFork', () => {
         // B1 (2026-11-13): `timeoutMs` joined the surface — an OPTIONAL wall clock for
         // the branch, so it is not in `required` and carries no schema `default`
         // ("omit it" resolves to the harness option, never to a number invented here).
-        expect(Object.keys(schema.properties!)).toEqual(['input', 'label', 'timeoutMs']);
+        // F1 (2026-11-27): `allowFamilyWrites` is the third optional lever, and it follows the
+        // same rule — an omitted boolean is the `false` default the fork contract promises, so it
+        // is not in `required` and the schema carries no `default` either. The flag is read ONCE,
+        // at branch creation, and recorded on the branch record (../harness.ts `launchThreadFork`).
+        expect(Object.keys(schema.properties!)).toEqual([
+            'input',
+            'label',
+            'timeoutMs',
+            'allowFamilyWrites'
+        ]);
         expect(schema.properties!.input).toMatchObject({
             type: 'string',
             minLength: 1
@@ -135,6 +144,8 @@ describe('metadata: threadFork', () => {
             maximum: 3600000
         });
         expect(schema.properties!.timeoutMs).not.toHaveProperty('default');
+        expect(schema.properties!.allowFamilyWrites).toMatchObject({ type: 'boolean' });
+        expect(schema.properties!.allowFamilyWrites).not.toHaveProperty('default');
     });
 });
 

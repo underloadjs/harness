@@ -41,7 +41,7 @@ export const TOOL_CANCEL_NAME = 'toolCancel';
 export const TOOL_CANCEL_METADATA: CoreToolMetadata = {
     name: TOOL_CANCEL_NAME,
     description:
-        'Cancel one background tool call you started. Pass the callId shown in the pending list (tool_result.pending, a wakeup, or the tool_call event of a call still running). The harness releases the call immediately and ignores any later result, so you can continue without waiting for it - except a delegate call: its terminal envelope is still delivered, as that call\'s own tool message, carrying `status`, any `partialContent`/`cancelledAtMessage`/`toolActivity` (the up-to-8 name tally the `delegate` row describes), and `callCancelled: true` to mark that you released the call rather than the child finishing on its own. Cancelling a call that already completed, failed, or was already cancelled succeeds without changing anything - the receipt then reports `cancelled: true` together with `alreadySettled: true`, the flag that says the call had already reached a terminal state before you asked, so that pair is a success you can act on and not a second cancellation - so you never need to check first. A tool that watches its abort signal also stops its own work; JavaScript cannot be preempted, so a tool that ignores the signal may still finish in the background. An id this run never started is an error.',
+        'Cancel one background tool call you started. Pass the callId shown in the pending list (tool_result.pending, a wakeup, or the tool_call event of a call still running). The harness releases the call immediately and ignores any later result, so you can continue without waiting for it - except a delegate call: its terminal envelope is still delivered, as that call\'s own tool message, carrying `status`, any `partialContent`/`cancelledAtMessage`/`toolActivity` (the up-to-8 name tally the `delegate` row describes), and `callCancelled: true` to mark that you released the call rather than the child finishing on its own. Cancelling a call that already completed, failed, or was already cancelled succeeds without changing anything - the receipt then reports `cancelled: true` together with `alreadySettled: true`, the flag that says the call had already reached a terminal state before you asked, so that pair is a success you can act on and not a second cancellation - so you never need to check first. A tool that watches its abort signal also stops its own work; JavaScript cannot be preempted, so a tool that ignores the signal may still finish in the background. An id this run never started is an error. A background threadFork is the one call you may name TWO ways: the callId from its pending placeholder, or the branch-N id its result reported - they address the same call, and a receipt for released fork work echoes `branchId`, `invocationId` and `threadId` beside `callId`, which are the ids threadRead and agentResult take.',
     tags: ['tool', 'tools', 'cancel', 'background', 'abort'],
     visibility: 'core',
     parameters: {
@@ -50,7 +50,14 @@ export const TOOL_CANCEL_METADATA: CoreToolMetadata = {
             callId: {
                 type: 'string',
                 minLength: 1,
-                description: 'The callId of the tool call to cancel (pending or already settled).'
+                description:
+                    // F1-C3 (2026-11-27) — the one argument now names a call two ways. A
+                    // `threadFork` answer hands the caller `{ branchId, threadId, content }`, where
+                    // both ids are the generated `branch-N` string (and that string is also the
+                    // `invocationId` `agentResult` pages with), while the pending placeholder hands
+                    // it a callId. Until now only the second one worked here, so the id the fork
+                    // told the model to keep was the id this control could not resolve.
+                    'The callId of the tool call to cancel (pending or already settled). A background threadFork may also be named by the branch-N id its result reported - that id and its callId address the same call, and the receipt echoes the branch id back.'
             }
         },
         required: ['callId'],

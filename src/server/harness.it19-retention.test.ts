@@ -308,6 +308,11 @@ const probe = <T>(promise: Promise<T>) => {
 // committed round from inside the transport. That is safe here and only here — the `delegate` call
 // has already parked, so the child's run keeps progressing in its own chain while the parent's next
 // request is open (./harness.delegation.test.ts:1842-1908 relies on the same non-blocking park).
+// SINCE 2026-11-27 that park is EXPLICIT on `releasedChild()`: the lone-delegate refinement
+// (../engine/harness.ts, step 3 of the mode precedence) resolves an UNSWITCHED single `delegate`
+// call to 'sync', so the fixture hands the reserved `async: true` switch to keep the background
+// shape these three contracts measure; `stoppedChild()` needs no switch because it never awaits the
+// parent before the host stops the child.
 
 const CHILD_NOTES = ['first note', 'second note', 'third note'] as const;
 
@@ -448,7 +453,19 @@ const releasedChild = async () => {
         arrivals += 1;
 
         if (arrivals === 1) {
-            yield* callTool('c1', 'delegate', { agent: 'researcher', input: 'find facts' });
+            // `"async": true` pins the BACKGROUND shape this fixture is built on, and since
+            // 2026-11-27 it has to say so: an UNSWITCHED `delegate` that is the only
+            // async-resolving call of its message now resolves to 'sync' (step 3 of the mode
+            // precedence in ../engine/harness.ts — the lone-delegate refinement), so the parent
+            // would sit in its batch gate until the child came back. And the child only comes
+            // back when THIS test settles `hang`, which happens after `writer('go')` returns —
+            // the fixture dead-locks, and the three `releasedChild()` cases time out at 15 s
+            // without ever reaching a cancelled record. The switch is the tool's documented door
+            // to the parked shape (../engine/tools/runtime/delegate.tool.ts:253-261) and is
+            // stripped from the arguments before validation (../engine/core/schema-validation.ts),
+            // so the transcript, the ledger row and the cause this file asserts stay exactly the
+            // shape AC1/AC2/AC3 pin.
+            yield* callTool('c1', 'delegate', { agent: 'researcher', input: 'find facts', async: true });
 
             return;
         }
@@ -1239,7 +1256,13 @@ describe('AC6 — a deleted thread is INACTIVE, never destroyed, and still on di
         const [refusal] = resultsForCall(writer.threadMessages(caller.id), 't1');
 
         expect(String(refusal?.content)).toContain('is inactive (deleted)');
-        expect(String(refusal?.content)).toContain('A host can still read it by id');
+        // F1 (2026-11-27) — the caveat moved from a flat "a host can still read it" to the two
+        // readers that really can: the LINEAGE that released the conversation (the door is now
+        // lineage-gated, not identity-gated, so the releaser reads its own released transcript) and
+        // the host, always. This caller is neither, which is why it is still refused.
+        // The lineage half is pinned by name in ../engine/harness.branch-writes.test.ts.
+        expect(String(refusal?.content)).toContain('The conversation that released it');
+        expect(String(refusal?.content)).toContain('a host can always read it by id');
 
         // The readability half of a soft delete is the HOST seam the refusal promises: the
         // conversation is off the roster, yet its bytes still resolve by id.

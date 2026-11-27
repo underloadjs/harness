@@ -503,7 +503,9 @@ describe('sync batching (R3)', () => {
         expect(toolMessages(world.brain.messages)).toEqual([
             's1:Tool "willFail" failed: boom',
             's2:Tool call "willCancel" (s2) was cancelled before it completed; no result is available.',
-            'c9:{"cancelled":true,"callId":"s2","name":"willCancel"}'
+            // F1-M6 (2026-11-27) — the cancel receipt names the conversation it released the work
+            // in, as the trailing `threadId` key.
+            'c9:{"cancelled":true,"callId":"s2","name":"willCancel","threadId":"agent:writer"}'
         ]);
 
         // A late result for the released call is data on a dead task: it must not wake

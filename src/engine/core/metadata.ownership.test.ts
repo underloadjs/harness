@@ -920,9 +920,18 @@ describe('runtime entry metadata ownership', () => {
         // AND THE SCHEMA STILL OFFERS NO LENGTH: the sentence above is only honest while these are
         // the three properties, so the claim "takes no length argument" is pinned against the
         // schema rather than against memory.
+        // F1 (2026-11-27) — a FOURTH property joined (`allowFamilyWrites`), and it is a BOOLEAN, so
+        // the honesty survives: none of the four is a length or a size. The list stays ordered so a
+        // fifth lever has to be a decision too.
         const properties = (threadForkEntry.THREAD_FORK_METADATA.parameters as any).properties;
 
-        expect(Object.keys(properties)).toEqual(['input', 'label', 'timeoutMs']);
+        expect(Object.keys(properties)).toEqual([
+            'input',
+            'label',
+            'timeoutMs',
+            'allowFamilyWrites'
+        ]);
+        expect(properties.allowFamilyWrites.type).toBe('boolean');
         expect((threadForkEntry.THREAD_FORK_METADATA.parameters as any).additionalProperties).toBe(false);
     });
 

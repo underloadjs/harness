@@ -187,6 +187,16 @@ describe('agentManage / agentResult registration', () => {
                     description:
                         "Invocation id from agentManage. Omit to read that agent's latest completed result."
                 },
+                // C0 (2026-11-27) — the new selector, pinned in the same exact-equality style as
+                // the members around it (and in core/metadata.ownership.test.ts for the raw source
+                // copy). It is an ORDINAL into the result's own `answerCandidates` list, never a
+                // transcript index, and the description says so because the row carries both numbers.
+                message: {
+                    type: 'integer',
+                    minimum: 0,
+                    description:
+                        '0-based POSITION in the "answerCandidates" list this result reports - the run\'s substantive turns besides its answer - NOT a transcript index: each listed entry names its own "messageIndex". Omit it to read the answer, exactly as before. With it, "content" is one page of THAT turn\'s text and "contentLength" is that text\'s length, and offset/limit/nextOffset page it the same way; the result echoes "message" and "messageIndex" beside the page. A row with no "answerCandidates" has nothing to select, and an ordinal outside the list is an error naming the legal range.'
+                },
                 offset: {
                     type: 'integer',
                     minimum: 0,
@@ -238,6 +248,7 @@ describe('agentManage', () => {
                     invocationCount: 1,
                     results: [
                         {
+                            answerMessageIndex: 4,
                             invocationId: '1',
                             kind: 'root',
                             status: 'completed',
@@ -254,6 +265,7 @@ describe('agentManage', () => {
                     invocationCount: 1,
                     results: [
                         {
+                            answerMessageIndex: 2,
                             invocationId: '2',
                             kind: 'delegation',
                             status: 'completed',
@@ -299,6 +311,7 @@ describe('agentManage', () => {
                     invocationCount: 1,
                     results: [
                         {
+                            answerMessageIndex: 2,
                             invocationId: '1',
                             kind: 'root',
                             status: 'completed',
@@ -319,6 +332,7 @@ describe('agentManage', () => {
         expect(JSON.stringify(listed)).not.toContain('PROMPT-SECRET');
 
         expect(await writer.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            answerMessageIndex: 2,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -359,6 +373,7 @@ describe('agentManage', () => {
                     invocationCount: 6,
                     results: [
                         {
+                            answerMessageIndex: 11,
                             invocationId: '6',
                             kind: 'root',
                             status: 'completed',
@@ -367,6 +382,7 @@ describe('agentManage', () => {
                             truncated: false
                         },
                         {
+                            answerMessageIndex: 9,
                             invocationId: '5',
                             kind: 'root',
                             status: 'completed',
@@ -375,6 +391,7 @@ describe('agentManage', () => {
                             truncated: false
                         },
                         {
+                            answerMessageIndex: 7,
                             invocationId: '4',
                             kind: 'root',
                             status: 'completed',
@@ -383,6 +400,7 @@ describe('agentManage', () => {
                             truncated: false
                         },
                         {
+                            answerMessageIndex: 5,
                             invocationId: '3',
                             kind: 'root',
                             status: 'completed',
@@ -391,6 +409,7 @@ describe('agentManage', () => {
                             truncated: false
                         },
                         {
+                            answerMessageIndex: 3,
                             invocationId: '2',
                             kind: 'root',
                             status: 'completed',
@@ -411,6 +430,7 @@ describe('agentManage', () => {
 
         // The oldest row is still readable by id — a flag is not a deletion.
         await expect(writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })).resolves.toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -447,6 +467,7 @@ describe('agentManage', () => {
                     invocationCount: 3,
                     results: [
                         {
+                            answerMessageIndex: 1,
                             invocationId: '3',
                             kind: 'root',
                             status: 'completed',
@@ -455,6 +476,7 @@ describe('agentManage', () => {
                             truncated: false
                         },
                         {
+                            answerMessageIndex: 3,
                             invocationId: '2',
                             kind: 'root',
                             status: 'completed',
@@ -463,6 +485,7 @@ describe('agentManage', () => {
                             truncated: false
                         },
                         {
+                            answerMessageIndex: 1,
                             invocationId: '1',
                             kind: 'root',
                             status: 'completed',
@@ -495,6 +518,7 @@ describe('agentManage', () => {
                     invocationCount: 2,
                     results: [
                         {
+                            answerMessageIndex: 3,
                             invocationId: '2',
                             kind: 'root',
                             status: 'completed',
@@ -503,6 +527,7 @@ describe('agentManage', () => {
                             truncated: false
                         },
                         {
+                            answerMessageIndex: 1,
                             invocationId: '1',
                             kind: 'root',
                             status: 'completed',
@@ -583,6 +608,7 @@ describe('agentResult', () => {
         const first = await writer.executeTool('agentResult', { agent: 'writer' });
 
         expect(first).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -601,6 +627,7 @@ describe('agentResult', () => {
         });
 
         expect(second).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -619,6 +646,7 @@ describe('agentResult', () => {
         });
 
         expect(third).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -644,6 +672,7 @@ describe('agentResult', () => {
                 limit: 3
             })
         ).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -681,6 +710,7 @@ describe('agentResult', () => {
         // AC1 — overshoot: the clamped page exactly as before, PLUS the flag and a note naming the
         // offset the page really starts at. The wording mirrors webfetch's note noun-for-noun.
         expect(await writer.executeTool('agentResult', { agent: 'writer', offset: 900 })).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -702,6 +732,7 @@ describe('agentResult', () => {
         // of the window is a fact about the answer, not about the request. The exact `toEqual` below is
         // the pin — one extra key and this assertion fails.
         expect(await writer.executeTool('agentResult', { agent: 'writer', offset: 300 })).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -718,6 +749,7 @@ describe('agentResult', () => {
         expect(
             await writer.executeTool('agentResult', { agent: 'writer', offset: 100, limit: 50 })
         ).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -814,6 +846,7 @@ describe('agentResult', () => {
                 invocationId: '1'
             })
         ).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -992,6 +1025,7 @@ describe('agentResult', () => {
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: '3' })
         ).resolves.toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '3',
             kind: 'root',
@@ -1035,6 +1069,7 @@ describe('agentResult', () => {
         await blank('go');
 
         expect(await blank.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -1162,6 +1197,7 @@ describe('delegated and fork results', () => {
         await writer('go');
 
         expect(await writer.executeTool('agentResult', { agent: 'helper' })).toEqual({
+            answerMessageIndex: 1,
             agent: 'helper',
             invocationId: '2',
             kind: 'delegation',
@@ -1205,6 +1241,7 @@ describe('delegated and fork results', () => {
         expect(
             await writer.executeTool('agentResult', { agent: 'lead', invocationId: branchId })
         ).toEqual({
+            answerMessageIndex: 4,
             agent: 'lead',
             invocationId: branchId,
             kind: 'fork',
@@ -1218,7 +1255,15 @@ describe('delegated and fork results', () => {
 
         // Without an id, the agent's latest FINISHED answer is the root's final
         // turn, not the fork that finished earlier.
+        //
+        // THE INDEX IS 4, NOT 3 (C3/R1, 2026-11-27). `answerMessageIndex` is the position of the
+        // answer row in its own transcript, and the transcript gained one row before that answer:
+        // the `threadFork` creation-time pointer, appended when the branch was created and left
+        // there when the result was spliced back at the call's position. The index is a POSITION,
+        // so it moves with the ledger — which is the point of publishing it: `threadRead({ thread,
+        // message: 4 })` must land on this row, and it does.
         expect(await writer.executeTool('agentResult', { agent: 'lead' })).toEqual({
+            answerMessageIndex: 4,
             agent: 'lead',
             invocationId: '1',
             kind: 'root',
@@ -1237,6 +1282,7 @@ describe('delegated and fork results', () => {
 
         expect(leadResults).toEqual([
             {
+                answerMessageIndex: 4,
                 invocationId: branchId,
                 kind: 'fork',
                 status: 'completed',
@@ -1244,7 +1290,10 @@ describe('delegated and fork results', () => {
                 preview: 'fork result',
                 truncated: false
             },
+            // The listing row and the envelope above agree, pointer shift and all — one index,
+            // computed once, published by both doors.
             {
+                answerMessageIndex: 4,
                 invocationId: '1',
                 kind: 'root',
                 status: 'completed',
@@ -1275,6 +1324,7 @@ describe('result pagination and Unicode boundaries', () => {
         // The limit would cut the emoji: return only the three A's and advance to
         // the pair boundary instead of emitting half a glyph.
         expect(first).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -1294,6 +1344,7 @@ describe('result pagination and Unicode boundaries', () => {
         });
 
         expect(second).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -1313,6 +1364,7 @@ describe('result pagination and Unicode boundaries', () => {
         });
 
         expect(third).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -1337,6 +1389,7 @@ describe('result pagination and Unicode boundaries', () => {
                 limit: 3
             })
         ).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -1372,6 +1425,7 @@ describe('result pagination and Unicode boundaries', () => {
         expect(
             await writer.executeTool('agentResult', { agent: 'writer', offset: 4, limit: 3 })
         ).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -1389,6 +1443,7 @@ describe('result pagination and Unicode boundaries', () => {
         expect(
             await writer.executeTool('agentResult', { agent: 'writer', offset: 9, limit: 3 })
         ).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -1466,6 +1521,11 @@ describe('snapshot durability (R3)', () => {
         // survive the round trip or a conversation deleted after a reload keeps its results).
         expect(snapshot.agentResults).toEqual([
             {
+                // 5, not 4: the root transcript carries the `threadFork` creation-time pointer
+                // before its final answer (C3/R1, 2026-11-27), and this index is a POSITION in
+                // that transcript. The durability claim is unchanged — the number simply follows
+                // the ledger it points into, and the restored harness below reports the same one.
+                answerMessageIndex: 5,
                 invocationId: '1',
                 sequence: 1,
                 completedOrder: 3,
@@ -1481,6 +1541,7 @@ describe('snapshot durability (R3)', () => {
                 epoch: HARNESS_PROCESS_EPOCH
             },
             {
+                answerMessageIndex: 1,
                 invocationId: '2',
                 sequence: 2,
                 completedOrder: 1,
@@ -1493,6 +1554,7 @@ describe('snapshot durability (R3)', () => {
                 epoch: HARNESS_PROCESS_EPOCH
             },
             {
+                answerMessageIndex: 5,
                 invocationId: branchId,
                 sequence: 3,
                 completedOrder: 2,
@@ -1518,6 +1580,10 @@ describe('snapshot durability (R3)', () => {
         target.restore(JSON.parse(JSON.stringify(snapshot)) as never);
 
         expect(await target.executeTool('agentResult', { agent: 'lead' })).toEqual({
+            // Restored, and identical to the snapshot row above (5): the pointer travelled with
+            // the transcript, so the answer it sits above keeps the same position on both sides
+            // of the round trip.
+            answerMessageIndex: 5,
             agent: 'lead',
             invocationId: '1',
             kind: 'root',
@@ -1529,6 +1595,7 @@ describe('snapshot durability (R3)', () => {
             hasMore: false
         });
         expect(await target.executeTool('agentResult', { agent: 'helper' })).toEqual({
+            answerMessageIndex: 1,
             agent: 'helper',
             invocationId: '2',
             kind: 'delegation',
@@ -1542,6 +1609,7 @@ describe('snapshot durability (R3)', () => {
         expect(
             await target.executeTool('agentResult', { agent: 'lead', invocationId: branchId })
         ).toEqual({
+            answerMessageIndex: 5,
             agent: 'lead',
             invocationId: branchId,
             kind: 'fork',
@@ -1557,8 +1625,11 @@ describe('snapshot durability (R3)', () => {
         expect(target.snapshot().agentResults).toEqual(snapshot.agentResults);
 
         // A new run takes sequence 4, so it cannot reuse/overwrite invocation '1'.
+        // (Its answer sits at 7, one row later than the pre-pointer ledger put it: the pointer
+        // shifted every row after it, and this index is a position.)
         await target('after');
         expect(await target.executeTool('agentResult', { agent: 'lead' })).toEqual({
+            answerMessageIndex: 7,
             agent: 'lead',
             invocationId: '4',
             kind: 'root',
@@ -1676,6 +1747,7 @@ describe('snapshot durability (R3)', () => {
 
         expect(writer.snapshot().agentResults).toEqual([
             {
+                answerMessageIndex: 3,
                 invocationId: '1',
                 sequence: 1,
                 completedOrder: 1,
@@ -1736,6 +1808,7 @@ describe('snapshot durability (R3)', () => {
             'snapshot.agentResults[0].status must be one of: completed, failed, cancelled (running is not persisted).'
         );
         expect(await target.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -3049,6 +3122,7 @@ describe('the forensic partial survives persistence (issue 0033)', () => {
             'snapshot.agentResults[0].partialContent and .cancelledAtMessage must be absent on a completed result.'
         );
         expect(await target.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -3700,6 +3774,7 @@ describe('a running invocation reports when it started and how old it is (M1)', 
         const completed = await writer.executeTool('agentResult', { agent: 'quiet' });
 
         expect(completed).toEqual({
+            answerMessageIndex: 3,
             agent: 'quiet',
             invocationId: '1',
             kind: 'root',
@@ -3720,6 +3795,7 @@ describe('a running invocation reports when it started and how old it is (M1)', 
 
         expect(settled.agents.find((entry) => entry.name === 'quiet')?.results).toEqual([
             {
+                answerMessageIndex: 3,
                 invocationId: '1',
                 kind: 'root',
                 status: 'completed',
@@ -3987,6 +4063,7 @@ describe('a running invocation reports when it started and how old it is (M1)', 
         const settled = await writer.executeTool('agentResult', { agent: 'writer' });
 
         expect(settled).toEqual({
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -4048,6 +4125,7 @@ describe('a running invocation reports when it started and how old it is (M1)', 
                 ageMs: AGED_MS
             },
             {
+                answerMessageIndex: 1,
                 invocationId: '1',
                 kind: 'root',
                 status: 'completed',
@@ -4060,5 +4138,505 @@ describe('a running invocation reports when it started and how old it is (M1)', 
 
         gate.resolve('released');
         expect((await running).content).toBe('second answer');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// C0 (2026-11-27) — THE ANSWER'S ADDRESS, AND THE REPORTS THE LEDGER DISPLACED
+// ---------------------------------------------------------------------------
+//
+// The observed session: an investigator posted its 8,117-character report as a mid-run
+// assistant message (thread ledger index 165), then kept working — tool calls plus a
+// 1,099-character cleanup note at index 175 — and the run ended normally. Every answer
+// surface then reported the cleanup note byte-for-byte, and the report was reachable only
+// as a transcript line. Three things are pinned here:
+//   1. the ANSWER RULE IS UNCHANGED — the run's final message is still the answer;
+//   2. the completed row now says WHICH message that is (`answerMessageIndex`, addressable
+//      by `threadRead`'s `message` argument, on both doors and on the durable row);
+//   3. the run's other substantive turns are retrievable BY `invocationId`
+//      (`answerCandidates` + the `message` selector), capped at
+//      `AGENT_ANSWER_CANDIDATE_CAP` entries of `AGENT_ANSWER_CANDIDATE_CHARS` characters.
+describe('the answer address and the run\'s displaced reports (C0)', () => {
+    // A call whose promise the TEST settles, so the run stays open after a tool-free turn
+    // (R2 of ./harness.background.test.ts: a no-tool-call answer with work pending PAUSES the
+    // run instead of ending it — which is exactly how a real report ends up mid-run).
+    type Gate = { promise: Promise<string>; resolve: (value: string) => void };
+
+    const gate = (): Gate => {
+        let resolve!: (value: string) => void;
+        const promise = new Promise<string>((settle) => {
+            resolve = settle;
+        });
+
+        return { promise, resolve };
+    };
+
+    // Drain the microtask chain without touching the clock (no fake timers in this file).
+    const settle = async (): Promise<void> => {
+        for (let pass = 0; pass < 12; pass += 1) await Promise.resolve();
+    };
+
+    // Wait until the run has REACHED its pause, then (and only then) release the gate. The order
+    // is the fixture: R2 (./harness.background.test.ts) parks the run on a tool-free answer while
+    // an async call is pending, and that parked turn is the mid-run report. Releasing the gate
+    // too early settles the call before the report turn is even requested, the run then has
+    // nothing pending, and the report becomes the final message — i.e. the defect never happens.
+    const waitFor = async (predicate: () => boolean, stage: string): Promise<void> => {
+        for (let pass = 0; pass < 400 && !predicate(); pass += 1) await Promise.resolve();
+
+        if (!predicate()) {
+            throw new Error(`C0 fixture never reached ${stage}`);
+        }
+
+        // One extra drain so the `done`/delivery chain ahead of the park has run too.
+        await settle();
+    };
+
+    // The committed transcript of an agent's default conversation — the SAME array
+    // `threadMessages('agent:<name>')` (and therefore `threadRead`) serves.
+    const transcriptOf = (agent: Agent) => agent.messages;
+
+    // One async tool handing out one gate per call, in call order. It takes no arguments
+    // because the transcript never needs any: the gate, not the parameters, is what paces the run.
+    const queuedTool = (gates: Gate[]) =>
+        tool({
+            description: 'Gated async tool for the C0 fixtures.',
+            tags: ['test'],
+            visibility: 'core' as const,
+            // ASYNC, exactly like the `hang` fixture in ./harness.already-available.test.ts:541 —
+            // a sync call would hold the batch gate and the run could not take the report turn
+            // while the call is still pending.
+            mode: 'async' as const,
+            execute: (() => {
+                // A COUNTER, not `shift()`: the fixtures keep the gate array to release each call
+                // in turn, and consuming it here would empty the caller's list under the loop.
+                let issued = 0;
+
+                return () => gates[issued++]?.promise ?? Promise.resolve('released');
+            })()
+        });
+
+    const REPORT = 'MID-RUN REPORT: the migration touches 3 files; the ledger rewrite is the risk.';
+    const CLEANUP = 'Cleanup note: 2 tasks closed and 1 thread deleted.';
+
+    // The reported shape, one agent one run: async call, substantive report while the call is
+    // pending, one housekeeping call once it lands, then the cleanup note that becomes the answer.
+    const displacedRun = async () => {
+        const first = gate();
+        const writer = brain(
+            scripted([
+                callTool('s1', 'hold', '{}'),
+                answer(REPORT),
+                callTool('c2', 'tasks', '{}'),
+                answer(CLEANUP)
+            ])
+        );
+        const session = harness({
+            agents: { writer },
+            tools: { hold: queuedTool([first]) },
+            presets: false
+        });
+
+        const run = session('go');
+        // Park on the report first, then release the call so the housekeeping and the cleanup
+        // note are the turns that FOLLOW it.
+        await waitFor(
+            () => transcriptOf(writer).some((entry) => entry.role === 'assistant' && entry.content === REPORT),
+            'the parked report turn'
+        );
+        first.resolve('held');
+        await run;
+
+        return { session, writer };
+    };
+
+    it('keeps the final message as the answer and names its transcript index', async () => {
+        const { session } = await displacedRun();
+        const result = (await session.executeTool('agentResult', { agent: 'writer' })) as Record<string, any>;
+
+        // THE RULE, UNCHANGED: the answer is still the run's last message, byte for byte.
+        expect(result.content).toBe(CLEANUP);
+        // Measured against the transcript the default conversation actually holds — the array
+        // `threadMessages('agent:writer')` (and therefore `threadRead` `"message"`) serves, which is
+        // `agent.messages` verbatim (harness.ts `threadMessages` returns `cloneMessages(state.agent
+        // .messages)`). This agent has no system seed IN its transcript, so the numbering starts at
+        // the user turn: 0 user 'go', 1 assistant tool_call(s1), 2 tool 'held', 3 assistant REPORT,
+        // 4 assistant tool_call(c2), 5 tool '{"tasks":[]…', 6 assistant CLEANUP.
+        expect(result.answerMessageIndex).toBe(6);
+        // And the report the ledger displaced is now ON the row, as a pointer.
+        expect(result.answerCandidates).toEqual([
+            { messageIndex: 3, contentLength: REPORT.length, preview: REPORT, truncated: false }
+        ]);
+    });
+
+    it('answers the transcript at answerMessageIndex, and at each candidate index', async () => {
+        const { session } = await displacedRun();
+        const result = (await session.executeTool('agentResult', { agent: 'writer' })) as Record<string, any>;
+
+        // The transparency half of the fix, asserted where a caller actually lands: the index the
+        // row publishes is an index the transcript serves, and it returns the bytes the row holds.
+        // `threadMessages` is the canonical read `threadRead.tool.ts` calls, so this is the same
+        // array the model would be handed — and the default conversation is `agent:writer`.
+        const transcript = session.threadMessages('agent:writer');
+
+        expect(transcript[result.answerMessageIndex]).toMatchObject({
+            role: 'assistant',
+            content: CLEANUP
+        });
+        expect(transcript[result.answerCandidates[0].messageIndex]).toMatchObject({
+            role: 'assistant',
+            content: REPORT
+        });
+        // The numbering is the DOOR's, not this test's: `threadRead`'s `"message"` argument indexes
+        // the raw transcript `threadMessages` returns, so index 0 of THIS fixture is its first entry —
+        // the user turn; this agent has no system seed in its transcript, and a transcript that starts
+        // with one (a seeded thread) would number from the seed, exactly as `threadRead` documents.
+        expect(transcript[0]).toMatchObject({ role: 'user', content: 'go' });
+    });
+
+    it('pages a selected candidate through the same offset/limit machinery as the answer', async () => {
+        const { session } = await displacedRun();
+
+        // Ordinal 0 = the first listed candidate. `content` is THAT turn's text, `contentLength`
+        // is that text's length, and both addresses ride beside the page.
+        expect(await session.executeTool('agentResult', { agent: 'writer', message: 0 })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            answerMessageIndex: 6,
+            answerCandidates: [
+                { messageIndex: 3, contentLength: REPORT.length, preview: REPORT, truncated: false }
+            ],
+            message: 0,
+            messageIndex: 3,
+            content: REPORT,
+            contentLength: REPORT.length,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // A window into the same candidate: the cursor is an index into THAT text.
+        expect(await session.executeTool('agentResult', {
+            agent: 'writer',
+            message: 0,
+            offset: 20,
+            limit: 20
+        })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            answerMessageIndex: 6,
+            answerCandidates: [
+                { messageIndex: 3, contentLength: REPORT.length, preview: REPORT, truncated: false }
+            ],
+            message: 0,
+            messageIndex: 3,
+            content: REPORT.slice(20, 40),
+            contentLength: REPORT.length,
+            offset: 20,
+            limit: 20,
+            hasMore: true,
+            nextOffset: 40
+        });
+
+        // An ordinal the list does not hold is an error naming the legal range — never an empty
+        // page that reads like "the report was blank".
+        await expect(session.executeTool('agentResult', { agent: 'writer', message: 1 })).rejects.toThrow(
+            'has no answer candidate 1: "message" is a 0-based position in the 1 listed under "answerCandidates" (0-0).'
+        );
+    });
+
+    it('lists every substantive turn oldest-first and evicts the oldest past the cap', async () => {
+        // Five substantive tool-free turns, four of them bought by a pending async call. The cap
+        // (`AGENT_ANSWER_CANDIDATE_CAP`, 4) keeps the TAIL, and the answer turn is excluded from
+        // the listing, so the first report is the one that falls off the row.
+        const gates = [gate(), gate(), gate(), gate()];
+        const turns = [
+            callTool('s1', 'hold', '{}'),
+            answer('report one'),
+            callTool('s2', 'hold', '{}'),
+            answer('report two'),
+            callTool('s3', 'hold', '{}'),
+            answer('report three'),
+            callTool('s4', 'hold', '{}'),
+            answer('report four'),
+            answer('final note')
+        ];
+        const writer = brain(scripted(turns));
+        const session = harness({
+            agents: { writer },
+            tools: { hold: queuedTool(gates) },
+            presets: false
+        });
+
+        const run = session('go');
+        // Each gate releases only once its report turn is parked, so the five substantive turns
+        // land in the order the defect produced them. `pending` is a COPY: the tool indexes the
+        // original array by call counter, so draining it here would move the pairing.
+        const pending = [...gates];
+
+        for (const report of ['report one', 'report two', 'report three', 'report four']) {
+            await waitFor(
+                () => transcriptOf(writer).some((entry) => entry.role === 'assistant' && entry.content === report),
+                `the parked ${report} turn`
+            );
+            pending.shift()?.resolve('held');
+        }
+        await run;
+
+        const result = (await session.executeTool('agentResult', { agent: 'writer' })) as Record<string, any>;
+
+        expect(result.content).toBe('final note');
+        expect(result.answerCandidates.map((entry: any) => entry.preview)).toEqual([
+            'report two',
+            'report three',
+            'report four'
+        ]);
+        // The ordinals select them in listing order.
+        expect((await session.executeTool('agentResult', { agent: 'writer', message: 1 })).content).toBe(
+            'report three'
+        );
+    });
+
+    it('carries the address pair on the agentManage row and the snapshot row', async () => {
+        const { session } = await displacedRun();
+        const listed = session.runtime.agentManage() as {
+            agents: Array<{ results: Record<string, any>[] }>;
+        };
+
+        expect(listed.agents[0].results).toEqual([
+            {
+                invocationId: '1',
+                kind: 'root',
+                status: 'completed',
+                contentLength: CLEANUP.length,
+                preview: CLEANUP,
+                truncated: false,
+                answerMessageIndex: 6
+            }
+        ]);
+
+        // The durable projection carries the LIST itself (content, not a preview), because the
+        // report has to survive the restart that would otherwise take it back.
+        expect(session.snapshot().agentResults).toEqual([
+            {
+                invocationId: '1',
+                sequence: 1,
+                completedOrder: 1,
+                agent: 'writer',
+                rank: 'A',
+                kind: 'root',
+                status: 'completed',
+                content: CLEANUP,
+                threadId: 'agent:writer',
+                epoch: HARNESS_PROCESS_EPOCH,
+                answerMessageIndex: 6,
+                answerCandidates: [{ messageIndex: 3, content: REPORT, truncated: false }]
+            }
+        ]);
+    });
+
+    it('round-trips the address pair through snapshot -> restore, and re-snapshots identically', async () => {
+        const { session } = await displacedRun();
+        const document = JSON.parse(JSON.stringify(session.snapshot()));
+        const restored = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+
+        restored.restore(document as never);
+
+        expect(await restored.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            answerMessageIndex: 6,
+            answerCandidates: [
+                { messageIndex: 3, contentLength: REPORT.length, preview: REPORT, truncated: false }
+            ],
+            content: CLEANUP,
+            contentLength: CLEANUP.length,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+
+        // The whole point of the durable half: the displaced report is still pageable after the
+        // restart, by the same invocation id.
+        expect(await restored.executeTool('agentResult', { agent: 'writer', message: 0 })).toMatchObject({
+            message: 0,
+            messageIndex: 3,
+            content: REPORT
+        });
+
+        // And restoring the document does not quietly rewrite it: `restore -> snapshot` is the
+        // same document.
+        expect(JSON.parse(JSON.stringify(restored.snapshot()))).toEqual(document);
+    });
+
+    it('restores a row that never carried the new keys and answers without inventing them', async () => {
+        // Compatibility asserted against DATA, not against this build's own writer: this is the
+        // row shape every file written before C0 holds. Both halves matter — the old row still
+        // validates, and no door INVENTS an index of 0 for it.
+        const base = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+        const document = base.snapshot() as Record<string, unknown>;
+
+        document.agentResults = [
+            {
+                invocationId: '1',
+                sequence: 1,
+                completedOrder: 1,
+                agent: 'writer',
+                rank: 'A',
+                kind: 'root',
+                status: 'completed',
+                content: 'a finished answer'
+            }
+        ];
+
+        const target = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+        target.restore(JSON.parse(JSON.stringify(document)) as never);
+
+        expect(await target.executeTool('agentResult', { agent: 'writer' })).toEqual({
+            agent: 'writer',
+            invocationId: '1',
+            kind: 'root',
+            status: 'completed',
+            content: 'a finished answer',
+            contentLength: 17,
+            offset: 0,
+            limit: 4000,
+            hasMore: false
+        });
+        await expect(target.executeTool('agentResult', { agent: 'writer', message: 0 })).rejects.toThrow(
+            'has no answer candidate 0: its only substantive turn is the answer itself, so omit "message" to read that.'
+        );
+        expect(target.snapshot().agentResults).toEqual(document.agentResults);
+    });
+
+    it('refuses an answer-address value the runtime can never write', async () => {
+        const base = harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false });
+        const rowOfStatus = (status: string): Record<string, unknown> => ({
+            invocationId: '1',
+            sequence: 1,
+            completedOrder: 1,
+            agent: 'writer',
+            rank: 'A',
+            kind: 'root',
+            status,
+            content: status === 'completed' ? 'done' : '',
+            ...(status === 'completed' ? {} : { error: 'operator stop' })
+        });
+
+        const restoreWith = (patch: Record<string, unknown>): (() => void) => () => {
+            const document = JSON.parse(JSON.stringify(base.snapshot())) as {
+                agentResults: Record<string, unknown>[];
+            };
+            document.agentResults = [patch];
+
+            harness({ agents: { writer: brain(scripted([answer('unused')])) }, presets: false }).restore(
+                document as never
+            );
+        };
+
+        // A stopped run has no answer message, so an index on its row is a contradiction; the
+        // refusal is what keeps `restore -> snapshot` byte-idempotent.
+        expect(restoreWith({ ...rowOfStatus('cancelled'), answerMessageIndex: 4 })).toThrow(
+            'snapshot.agentResults[0].answerMessageIndex and .answerCandidates must be absent on a cancelled result.'
+        );
+
+        // An index is a transcript position: never negative, never fractional, never a string.
+        expect(restoreWith({ ...rowOfStatus('completed'), answerMessageIndex: -1 })).toThrow(
+            'snapshot.agentResults[0].answerMessageIndex must be between 0 and Infinity.'
+        );
+        expect(restoreWith({ ...rowOfStatus('completed'), answerMessageIndex: 1.5 })).toThrow(
+            'snapshot.agentResults[0].answerMessageIndex must be a safe integer.'
+        );
+
+        // `[]` is not a fact this build writes — a run with nothing to list OMITS the key — and a
+        // fifth entry is a writer that stopped bounding its row.
+        expect(restoreWith({ ...rowOfStatus('completed'), answerCandidates: [] })).toThrow(
+            'snapshot.agentResults[0].answerCandidates is empty; a run with no substantive turn besides its answer omits the key rather than listing none.'
+        );
+        expect(
+            restoreWith({
+                ...rowOfStatus('completed'),
+                answerCandidates: Array.from({ length: 5 }, () => ({
+                    messageIndex: 1,
+                    content: 'x',
+                    truncated: false
+                }))
+            })
+        ).toThrow(
+            'snapshot.agentResults[0].answerCandidates contains 5 entries; at most 4 are recorded.'
+        );
+
+        // The per-entry bounds: a blank text (the recording site only admits non-blank turns), an
+        // over-cap text, a negative index, and a missing cap flag.
+        expect(
+            restoreWith({
+                ...rowOfStatus('completed'),
+                answerCandidates: [{ messageIndex: 1, content: '', truncated: false }]
+            })
+        ).toThrow('snapshot.agentResults[0].answerCandidates[0].content must be at least 1 character.');
+        expect(
+            restoreWith({
+                ...rowOfStatus('completed'),
+                answerCandidates: [
+                    { messageIndex: 1, content: 'y'.repeat(32001), truncated: true }
+                ]
+            })
+        ).toThrow('must be at most 32000 characters');
+        expect(
+            restoreWith({
+                ...rowOfStatus('completed'),
+                answerCandidates: [{ messageIndex: -1, content: 'x', truncated: false }]
+            })
+        ).toThrow('snapshot.agentResults[0].answerCandidates[0].messageIndex must be between 0 and Infinity.');
+        expect(
+            restoreWith({
+                ...rowOfStatus('completed'),
+                answerCandidates: [{ messageIndex: 1, content: 'x' }]
+            })
+        ).toThrow('snapshot.agentResults[0].answerCandidates[0] is missing the field "truncated".');
+
+        // A key the row does not know stays a refusal, not a silent drop.
+        expect(
+            restoreWith({
+                ...rowOfStatus('completed'),
+                answerCandidates: [{ messageIndex: 1, content: 'x', truncated: false, extra: 1 }]
+            })
+        ).toThrow('has an unknown field "extra"');
+
+        // And a VALID list restores, keeps its order, and re-projects byte-identically.
+        const valid = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+        const document = JSON.parse(JSON.stringify(base.snapshot())) as {
+            agentResults: Record<string, unknown>[];
+        };
+        document.agentResults = [
+            {
+                ...rowOfStatus('completed'),
+                answerMessageIndex: 3,
+                answerCandidates: [
+                    { messageIndex: 1, content: 'first report', truncated: false },
+                    { messageIndex: 2, content: 'second report', truncated: false }
+                ]
+            }
+        ];
+        valid.restore(document as never);
+
+        expect((valid.snapshot().agentResults as Record<string, unknown>[])[0]).toEqual(
+            document.agentResults[0]
+        );
     });
 });

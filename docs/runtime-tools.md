@@ -70,10 +70,14 @@ answerExtraction?, sessionBound?, listed?, alwaysDeclared? }` — exactly
 `ToolRegistration` plus the resolved row, `src/core/tool-metadata.ts:95-151`. NO field carries
 authority: the rank model REMOVED `primaryOnly` from both types, so a descriptor can no longer
 name the agent allowed to use it (see the policy-flag paragraph below). `mode` is the
-resolved turn policy — WHEN a completion may re-enter the model — bound to
+resolved DEFAULT turn policy — WHEN a completion may re-enter the model — bound to
 the published DEFINITION rather than the wire name, and ABSENT when the
 entry declared none so a consumer can tell "defaulted" (the runtime applies
-`DEFAULT_TOOL_MODE`, `'sync'`) from "stated"; `alwaysDeclared` is a
+`DEFAULT_TOOL_MODE`, `'sync'`) from "stated". Since 2026-11-27 that is the WHOLE truth
+about the row and not the whole truth about a call: the row states the policy a call
+DEFAULTS to, and every call may override it with the reserved `async` argument
+(`src/engine/core/tool.ts:129`), which lives on the model-facing declaration copy, not on
+this row — `mode` is a per-call DEFAULT, never a per-call verdict; `alwaysDeclared` is a
 DECLARATION classification (membership in the always-declared core
 projection from `coreToolMetadata()`), not a registration condition. One
 loop in `src/harness.ts` registers every row whose `activation` the current
@@ -139,9 +143,22 @@ the LAUNCH for one named agent — is deleted from `ToolRegistration` and `Disco
 (`src/core/tool-metadata.ts:95-151`) and from the dispatch path. Rank behaviour is two
 RUNTIME projections over the same registered row, not a descriptor field: `delegate` is
 withheld from a caller with no strictly-lower-ranked target (`rankProjectedDefinitions`,
-`src/harness.ts:1804`, and its `activation: 'delegation'` row above), and `toolCreate` is
-withheld below the `toolCreation` letter (`creationGatedDefinitions`, `:1810`). Every other
+`src/engine/harness.ts:2052`, and its `activation: 'delegation'` row above), and `toolCreate` is
+withheld below the `toolCreation` letter (`creationGatedDefinitions`, `:2058`). Every other
 registered tool is declared and callable by EVERY agent, whatever its rank.
+
+The turn policy is the one flag with a SECOND, per-call half that this page's registry view
+cannot show. The definition-bound chain (`modeDefinitions` `src/engine/harness.ts:2073` →
+`definition.mode` → `DEFAULT_TOOL_MODE`, `effectiveToolMode` `:2082-2083`) decides only what a
+call DEFAULTS to; the reserved `async` argument rides on the CALL, is injected into the offered
+declaration copy (`:7008`, `:7037`), and is stripped centrally before validation (`:1213` →
+`src/engine/core/schema-validation.ts:353`). So no row, descriptor or registry object carries
+it, and a consumer reading `registration.mode` — or the plugin-visible `api.tools[name].mode` —
+can be right about the default and wrong about the call. One consequence lives on this page
+because it is a registry fact rather than a schema one: the lone-`delegate` refinement counts
+the async-resolving calls of ONE assistant message, so two `delegate` calls the model writes in
+**separate** messages both refine and the children run sequentially — the block under "The one
+key the published literal does NOT carry" below states the rule and its boundaries.
 
 `presets: false` filters the `preset` **group** and nothing else; the runtime
 (harness-owned) rows stay registered. Configured `toolSources`, `toolFolders`,
@@ -212,9 +229,9 @@ fails a test instead of ageing as prose.
 
 The published `parameters` literal is not decoration: it is what `GET /v1/harness/tools` shows a
 model AND the door those arguments pass (`validateSchemaValue`,
-`src/core/schema-validation.ts:122`, reached through `resolveToolParameters` `:334`, runs BEFORE
+`src/engine/core/schema-validation.ts:124`, reached through `resolveToolParameters` `:336`, runs BEFORE
 `execute`), and the validator implements only `type`/`enum`/bounds/`items`/`required`/
-`additionalProperties:false` — no `if`, `then` or `allOf` (`:122`, `:200`, `:221`). So a
+`additionalProperties:false` — no `if`, `then` or `allOf` (`:124`, `:200`, `:221`). So a
 per-verb difference a flat union schema cannot state has to be resolved on the single shared
 bound, and `knowledge` resolves it in the direction the model can trust: never wider than the
 engine (a bound that admits a call the engine then refuses is a late, confusing refusal), and
@@ -227,6 +244,49 @@ one call guards one article and a second token is either a duplicate the engine 
 different article it refuses (`:2020-2036`). The rule itself is stated where the schema is
 written (`src/tools/runtime/knowledge.tool.ts:153-174`) and pinned digit-by-digit, door included,
 in `src/tools/runtime/knowledge.test.ts:342-491`.
+
+**The one key the published literal does NOT carry is the one every model call may send.** The
+harness offers each tool an extra optional `async` argument
+(`src/engine/core/tool.ts:129`), and it is injected into the model-facing DECLARATION copy only —
+`withToolAsyncSwitch` at `src/engine/harness.ts:7008` (ordinary rows) and `:7037` (the pending-only
+`toolCancel` row) — never into `definition.parameters`, which is the validation schema and the
+catalogue row. So an asymmetry is the contract, and both halves of it are deliberate:
+`GET /v1/harness/tools` shows the published literal WITHOUT the key, while the tools array in the
+request shows it WITH the key. A consumer comparing the two must not read the difference as a
+missing field, and a tool author must not add the key by hand — one that does (`toolOwnsAsyncParameter`,
+`src/engine/core/tool.ts:144`) owns it: the harness neither injects, strips, nor honours it as a
+mode. The reason the copy exists at all is the single-property rule: `parameters` is ALSO the
+schema `resolveToolParameters` unwraps through `toolParameterKey` (`src/engine/core/tool.ts:66`),
+so a second property there would hand `execute` a wrapper instead of the value for every one-property
+tool. Injection is therefore paired with the strip that is the FIRST statement of
+`resolveToolParameters` (`src/engine/core/schema-validation.ts:353`, `stripToolAsyncSwitch`,
+`src/engine/core/tool.ts:206`), which every door passes through — the model wire
+(`src/engine/harness.ts:1213`), `callTool` (`:17549`), `executeTool` (`:17650`) and the server's
+manual tool route (`src/server/api.ts:2937`). Consequences worth
+stating: a closed `additionalProperties:false` schema still accepts the call; the key never reaches
+`context.parameters` or an implementation; a non-boolean value is refused as `$.async must be a
+boolean (true for async, false for sync); received <type>.`; and `call.arguments` in the transcript
+KEEPS the key — only the resolved value is stripped, so provider replay stays byte-exact
+(`src/engine/types/index.ts:100-123`).
+
+**What the lone-`delegate` refinement does to a registry, in one paragraph a model author can
+act on.** The gate counts async-resolving calls **per assistant message**
+(`countAsyncResolvedCalls`, `src/engine/harness.ts:2104`, computed once per message at the
+launch loop `:15444`), so a model that asks for a child in one message and another child in the
+NEXT message gets **no fan-out**: both calls resolve `sync` and the children run strictly one
+after the other (measured in this tree 2026-11-27, `Temp/docfinal/probe-sequential.ts`:
+`child#0 START @358ms → ANSWER @609ms → child#1 START @612ms → ANSWER @863ms`; a probe figure,
+reproduced by no test). Parallel children therefore need BOTH calls in a single
+message, or an explicit `"async": true`. Two boundaries of the count, both conservative: a name
+the request never advertised contributes 0 — the counter reads the same offered map the launches
+resolve through and skips a miss (`:2113`, pinned at
+`src/engine/harness.tool-async-switch.test.ts:963`) — and a call that is advertised but later
+refused (bad arguments, a withheld name) was already counted, since the count precedes every
+launch gate (`:15444`; `launchToolCall` `:11782`, its withheld-name gate `:11898`), so a doomed
+sibling suppresses the refinement rather than stranding the `delegate` beside it. And the
+refinement is keyed to the BASELINE definition, not the wire name
+(`rankProjectedDefinitions.has(definition)`, `:11964`): a host that re-registers `delegate`
+with an ordinary tool has opted that session out of the refinement entirely.
 
 ## External tool folders and `toolManage`
 

@@ -954,9 +954,22 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
             // has) stays unscoped, which is the historical host view.
             case 'thread:read': {
                 const callerThreadId = request.identity.threadId;
-                const record = harness.thread(request.threadId, callerThreadId);
 
-                if (record === undefined) {
+                // R1 (2026-11-27) — MESSAGES FIRST, THEN THE RECORD, in that order. The two doors
+                // of one read must agree on WHO is refused, and `threadMessages` is the seam that
+                // owns that decision (a soft-deleted conversation is readable to its host and to
+                // the lineage that released it, refused to a stranger — src/harness.ts
+                // `refuseUnreadableThread`). Answering the record first used to make this routed
+                // arm throw the not-found sentence for a released conversation that the inline
+                // path serves in full, because the record door it consulted, `harness.thread()`,
+                // is a DISCOVERY seam that voids every `inactive` row. The record the tool needs
+                // now comes from the READ seam (`threadReadRecord`), and only after the transcript
+                // has been admitted, so a lane refuses exactly what the same inline call refuses,
+                // with the same words.
+                const messages = harness.threadMessages(request.threadId, callerThreadId);
+                const readRecord = harness.threadReadRecord(request.threadId, callerThreadId);
+
+                if (readRecord === undefined) {
                     // THE SAME FACT, THE SAME SENTENCE (issue 0034, 2026-11-14). A
                     // missing thread record is one fact with three doors — the core's
                     // `threadStateOf` (src/harness.ts:5404), this routed read, and
@@ -975,9 +988,22 @@ export const createLaneAuthority = (options: LaneAuthorityOptions): LaneAuthorit
                     throw new Error(`Thread "${request.threadId}" is not available in this harness; it was never created, or it was deleted.`);
                 }
 
-                const messages = harness.threadMessages(request.threadId, callerThreadId);
-
-                return { value: { threadId: request.threadId, record, messages, length: messages.length } };
+                // TWO RECORDS, BECAUSE THE REPLICA HAS TWO SEAMS TO FEED. `record` keeps the
+                // DISCOVERY answer the handle's `thread()` member gives inline — `undefined` for a
+                // released conversation — so replacing that member with a routed read cannot make
+                // a lane see a roster row the coordinator itself hides (the invariant this file
+                // exists for: the two execution modes never disagree about the same address).
+                // `readRecord` is the READ answer, the row the admitted transcript belongs to,
+                // and it is what `threadRead`'s envelope builds its identity block from.
+                return {
+                    value: {
+                        threadId: request.threadId,
+                        record: harness.thread(request.threadId, callerThreadId),
+                        readRecord,
+                        messages,
+                        length: messages.length
+                    }
+                };
             }
 
             // T10 finding M4: the transcript delta a replica is missing. `haveLength` is the

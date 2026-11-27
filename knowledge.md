@@ -2,7 +2,26 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-11-19 (composition) for TOOL-CALL COMPOSITION VISIBILITY and the four
+> **Last verified:** 2026-11-27 (delegate/branch/result-ledger) for the F1/C0/M-series fixes that
+> shipped 2026-11-26 and 2026-11-27 under `docs/tasks/2026-11-26-delegate-defects-verified-fix-list.md`,
+> documented from the code and its suites rather than from the brief — the record is that file, the
+> claims here are the enforcing lines: the three WRITE doors (`threadSend`/`delegate`/`threadDelete`)
+> that refuse a branch run unless its `threadFork` passed `allowFamilyWrites: true`, the one sentence
+> they share, and the guard that resolves the caller's BRAIN (`src/engine/harness.ts:8777-8822`,
+> `:6545`, `:8139`, `:9487`; `src/engine/harness.branch-writes.test.ts`); the delivered branch
+> attribution `from agent "…" (thread …, branch branch-N):` (`:8238`); the roster's RUNNING branch
+> rows and `threadRead`'s lineage read of a released conversation (`:9799-9860`, `:8289`); the answer
+> ADDRESS a completed row now carries — `answerMessageIndex` plus up to 4 `answerCandidates` and the
+> `message` ordinal that pages them (`:15601`, `:15700`, `:5681`, `:5697`;
+> `src/engine/harness.agent-results.test.ts:4141-4624`), which is how an 8,117-character report
+> displaced by a 1,099-character cleanup note stays readable by the `invocationId` the caller already
+> held; `toolCancel` taking a `branch-N` handle and a receipt that names the thread or branch it
+> cancelled (`:13117-13131`); and the fork seeding its own creating call into the branch transcript
+> (`src/engine/core/branch.ts:86-102`, `src/engine/harness.branch-seed.test.ts`). The lane seam keeps
+> its own note where the lane behaviour lives (see [Lane workers](#lane-workers-threadexecution-worker)).
+> The 2026-11-27 per-call `async` turn-mode switch (`docs/tasks/2026-11-27-tool-call-mode-switch.md`)
+> is documented on its own lane, in `docs/runtime-tools.md` and the "Turn modes" section below.
+> Before that, 2026-11-19 (composition) for TOOL-CALL COMPOSITION VISIBILITY and the four
 > transport liveness fixes that came with it, documented from the code and from two live captures,
 > not from a brief: the `progress` event kind (projection-only, counters-only, NEVER argument text —
 > `HarnessProgressPhase` / `HarnessToolCallProgress`, `src/types/index.ts:468, 477`), the one
@@ -498,9 +517,11 @@ src/
                               model-facing descriptions) as registered
   harness.websearch.test.ts   opt-in search registration/core declaration/secrets
   harness.webfetch.test.ts    opt-in fetch registration (native default, hosted keys)
-  harness.*.test.ts     the other 28 root-level loop suites: action-request,
+  harness.*.test.ts     the other 30 root-level loop suites: action-request,
                         agent-results, already-available, attachments, background,
-                        browser-fallback, budget, creation-policy, discovery, fork,
+                        branch-seed (what a branch seed says about its requester's
+                        unsettled calls), branch-writes (the write doors for a branch
+                        run), budget, creation-policy, discovery, fork,
                         inclusion, media, missing-source, nested-runs, plugin, races,
                         retry, self-modifying, snapshot, sync-async, thread-park-queue,
                         thread-read, thread-runtime, threads, tool-failures,
@@ -1450,23 +1471,71 @@ What is deliberately **not** renamed:
 ## Turn modes: sync vs async (T2)
 
 Every tool has an EFFECTIVE turn mode — `ToolMode = 'sync' | 'async'`
-(`src/types/index.ts`) — and the documented default is **`'sync'`** (`DEFAULT_TOOL_MODE`,
-`src/core/tool.ts`). The mode answers exactly one question: *when this call finishes, may
-the agent be re-prompted right now?*
+(`src/engine/types/index.ts`) — and the documented default is **`'sync'`** (`DEFAULT_TOOL_MODE`,
+`src/engine/core/tool.ts:85`). The mode answers exactly one question: *when this call finishes,
+may the agent be re-prompted right now?* It is resolved **per call**: a declaration states the
+default, and the model's own call may override it.
 
 | Declared where | Applies to |
 |---|---|
-| `registration: { mode }` in a `*.tool.ts` entry | the shipped built-ins: read by the AST scanner (`src/core/tool-scan.ts`), projected into the discovered row (`DiscoveredTool.mode`), copied by every descriptor clone (`src/tools/descriptors.ts`, `src/core/tool-discovery.ts`), and emitted into the generated `src/core/tool-manifest.ts` |
+| **the call itself** — the reserved `async` argument (`ToolCall` arguments, not a tool parameter) | ONE call. `true` → `'async'`, `false` → `'sync'`, absent → the chain below. Advertised on EVERY offered declaration, injected into the model-facing COPY (`withToolAsyncSwitch`, `src/engine/core/tool.ts:156`; `src/engine/harness.ts:7008`, `:7037`) and stripped centrally before validation (`src/engine/core/schema-validation.ts:353`) |
+| `registration: { mode }` in a `*.tool.ts` entry | the shipped built-ins: read by the AST scanner (`src/engine/core/tool-scan.ts`), projected into the discovered row (`DiscoveredTool.mode`), copied by every descriptor clone (`src/engine/tools/descriptors.ts`, `src/engine/core/tool-discovery.ts`), and emitted into the generated `src/engine/core/tool-manifest.ts` |
 | `tool({ mode })` (`ToolConfiguration.mode`) | every custom tool: a host `tools: {…}` entry, a `toolSources`/`toolFolders` module, a `toolCreate`/`toolRegistry` revision |
 | declared nowhere | effective `'sync'` |
 
-Precedence at launch is: the registration policy bound to the PUBLISHED definition
-(`modeDefinitions`, set inside `registerDescriptor`) → `definition.mode` → `'sync'`. It is
-keyed to the definition OBJECT and never to the wire name, exactly like the rank-projection
-marker, the `toolCreation` ceiling marker and the control markers, so replacing `shell` with an
-ordinary tool publishes a plain sync tool — no policy leaks onto a replacement.
+Precedence for one call (`launchToolCall`, `src/engine/harness.ts:11911-11958`): the explicit
+`async` switch on that call → the registration policy bound to the PUBLISHED definition
+(`modeDefinitions`, `src/engine/harness.ts:2073`, set inside `registerDescriptor` at `:4146`) →
+`definition.mode` → `DEFAULT_TOOL_MODE` (`'sync'`), the chain `effectiveToolMode` implements
+(`:2082-2083`). The declaration half is keyed to the definition OBJECT and never to the wire
+name, exactly like the rank-projection marker, the `toolCreation` ceiling marker and the control
+markers, so replacing `shell` with an ordinary tool publishes a plain sync tool — no policy
+leaks onto a replacement. The switch half is keyed to the call: it beats the chain in BOTH
+directions (a sync tool forced async, a declared-async tool forced sync), and it is inert on a
+tool whose own schema declares `async` (`toolOwnsAsyncParameter`,
+`src/engine/core/tool.ts:144`).
 
-Behaviour (`runAgentCore`, `deliverTask`, `launchToolCall` in `src/harness.ts`):
+**The lone-`delegate` refinement (2026-11-27).** One built-in exception runs AFTER the chain
+(step 3, after step 2 has produced a mode), and it exists for exactly one shape: a `delegate`
+call that the chain resolved
+to `'async'`, carries **no** switch, and belongs to an assistant message holding **exactly one**
+async-resolving call — then it resolves to `'sync'`
+(`loneDelegation`, `src/engine/harness.ts:11960-11966`). The rationale is the spawner's intent:
+one child is the shape where the caller is waiting on that child's answer, so the placeholder
+turn the async policy buys is pure cost — the next request carries the child's REAL result. The
+gate counts **async-resolving calls**, not delegates (`countAsyncResolvedCalls`, `:2104`, computed
+once per message at the launch loop, `:15444`): two delegates, or one delegate plus one other
+async-resolving call (`threadFork`, `shell`), is a real fan-out and keeps background behaviour,
+while a `delegate` plus a `read` still counts as one thing to wait for because the `read` joins
+the same sync group. A `delegate` REPLACEMENT published under the baseline wire name is an
+ordinary tool here — the marker checked is `rankProjectedDefinitions`, never the name — and the
+refinement deliberately never reaches a `threadFork` (a branch's whole point is that the
+requester keeps running, `src/engine/harness.ts:12088-12091`).
+
+**The consequence the count's MESSAGE scope has (2026-11-27): two `delegate` calls in
+SEPARATE assistant messages are not a fan-out.** Each of those messages holds exactly one
+async-resolving call, so **both** refine to `sync`, and the children run **strictly
+sequentially** — measured in this tree 2026-11-27 (`Temp/docfinal/probe-sequential.ts`, log
+`Temp/docfinal/probe-sequential.txt`): `child#0 START @358ms → ANSWER @609ms → child#1 START
+@612ms → ANSWER @863ms`, 3 parent requests, no placeholder turn; pinned by no test. A model
+author who wants two children
+in flight at once must therefore put BOTH calls in ONE message, or send an explicit
+`"async": true` on each. Two further boundaries of the same count, both conservative and
+neither one stranding a call: a name this request never ADVERTISED contributes 0, because the
+counter reads the same offered map the launches resolve through and skips a miss
+(`src/engine/harness.ts:2113`, `offered?.get(call.name)` then `continue`; pinned at
+`src/engine/harness.tool-async-switch.test.ts:963`); and a call that IS advertised but is
+later refused — a bad-argument failure, a scope gate — was already counted, because the count
+is taken before any launch runs its gates (`:15444`, and every launch then passes
+`launchToolCall`, `:11782`, whose withheld-name gate is at `:11898`), so a doomed sibling
+suppresses the refinement and leaves the surviving `delegate` in its historical background
+shape. A host that wants a session OUT of the refinement altogether re-registers the name: a
+replacement published under `delegate` is an ordinary tool, since the marker tested is the
+definition, not the wire name (`rankProjectedDefinitions.has(definition)`,
+`src/engine/harness.ts:11964`).
+
+Behaviour (`runAgentCore` `src/engine/harness.ts:15106`, `deliverTask` `:11056`,
+`launchToolCall` `:11782`):
 
 - **sync** — the call joins the SYNC GROUP of the assistant message that requested it
   (`RunState.syncGroups`). A member is removed only once its outcome was DELIVERED, and
@@ -1475,42 +1544,123 @@ Behaviour (`runAgentCore`, `deliverTask`, `launchToolCall` in `src/harness.ts`):
   turn, and a lone sync call starts its next turn only after it finished.
 - **async** — the completion marks the run dirty immediately and triggers its own turn,
   even while another call from the same message is still running.
-- The batch gate (`waitForSyncBatch`) is a PARK, never a block: any other wake (an async
-  completion, the recurring heartbeat, a steer, a parked delivery failure) or the run's
-  abort signal releases it, and no delivery is ever delayed by a pending sibling. The
-  heartbeat is not on hand for a `sync`-only park, though: it arms only while at least one
-  pending call resolves to `mode: 'async'` (`src/plugins/async-ping.plugin.ts`), so such a
-  park releases on its own group settling, on a steer, or on the abort signal. The
-  implementation stays background work — scheduled on the board, cancelable per call,
-  delivered through the agent mailbox in canonical order.
+- The batch gate (`waitForSyncBatch`, `src/engine/harness.ts:10323`) is a PARK, never a
+  block: any other wake (an async completion, the recurring heartbeat, a steer, a parked
+  delivery failure) or the run's abort signal releases it, and no delivery is ever delayed
+  by a pending sibling. The heartbeat is not on hand for a `sync`-only park, though: it arms
+  only while at least one pending call resolves to `mode: 'async'`
+  (`src/engine/plugins/async-ping.plugin.ts:11-47`), so such a park releases on its own group
+  settling, on a steer, or on the abort signal. The implementation stays background work —
+  scheduled on the board, cancelable per call, delivered through the agent mailbox in
+  canonical order.
 - Groups are per run, so a delegated, `ctx.run`, or branch run never holds its parent's
   batch.
 
-Shipped values: `read`, `edit`, `search`, `fetch`, and `actionRequest` are `'sync'`;
-`shell`, `delegate`, and `threadFork` declare `'async'`. `threadFork` is the deliberate
-control-tool exception: a fork's answer arrives independently of the requester's batch
-(that dispatch never joins a group), and making it sync would hold a batch hostage to a
-detached clone. `actionRequest` is `'sync'` because the requester's wait IS the hold, not
-a placeholder turn: while a run owns an unsettled request the turn loop issues no model
-request (`waitForActionRequests`, `src/harness.ts`), and an owner answer, a `toolCancel`,
-or expiry is what releases it — the scheduler owns no clock. The owner that answers a
-CHILD request is a distinct agent (actor key `branch:<id>`, its own scope), so a child
-never waits on itself and no lane head-of-lines. A batch of questions in one message
-therefore costs ONE turn, after the last answer.
-`toolCancel` is answered inline and declares nothing, so its default is inert.
+Shipped DEFAULTS (a call may override each one with its `async` argument; the declared
+literals are unchanged and `src/engine/core/tool-manifest.ts` is byte-identical): `read`,
+`edit`, `search`, `fetch`, and `actionRequest` default to `'sync'`; `shell`
+(`src/engine/tools/command/shell.tool.ts:378`, and `:425` on the standalone `tool()`),
+`delegate` (`src/engine/tools/runtime/delegate.tool.ts:261`), and `threadFork`
+(`src/engine/tools/runtime/threadFork.tool.ts:121`) default to `'async'`. So a document that
+says these tools "**are** `async`" is wrong in one direction only: they **default to**
+`async`, and one call may say `"async": false` and wait. `threadFork` is the deliberate
+control-tool exception in BOTH directions: a fork's answer arrives independently of the
+requester's batch, and its dispatch joins the message's sync group on exactly ONE route — an
+explicit `"async": false` on that call (the dispatch at `src/engine/harness.ts:12107`, the group
+handed down at `:12111`); absent, `true`, or a fork that owns the key keeps the no-group launch.
+`actionRequest` defaults to `'sync'` because the requester's wait IS the hold, not a
+placeholder turn: while a run owns an unsettled request the turn loop issues no model request
+(`waitForActionRequests`, `src/engine/harness.ts:14785`), and an owner answer, a `toolCancel`,
+or expiry is what releases it — the scheduler owns no clock. The switch still reaches it:
+`"async": true` clears its group, because the join helper ignores an absent group
+(`launchActionRequest`, called at `src/engine/harness.ts:12117`, defined at `:12938`, joining
+the group it was handed at `:13185`). The owner that answers a CHILD request
+is a distinct agent (actor key `branch:<id>`, its own scope), so a child never waits on itself
+and no lane head-of-lines. A batch of questions in one message therefore costs ONE turn, after
+the last answer. `toolCancel` is answered inline, declares no mode
+(`src/engine/tools/runtime/toolCancel.tool.ts:70`), and its dispatch never schedules, so its
+default is inert — it ACCEPTS the reserved `async` argument and ignores it (the switch is
+advertised on its pending-only declaration, `src/engine/harness.ts:7037`, precisely so the key
+is never taught as per-tool).
 
-`src/harness.sync-async.test.ts` pins the whole contract — the completion orders of a
+What the switch and the refinement cost, measured (not inferred) on the
+`src/engine/harness.inclusion.test.ts` estimate fixture: advertising the key on every
+declaration raises `estimatedTokens` from **3,744 to 3,866 — +122 estimated tokens per
+request** (the catalogue floor moves 14,951 → 15,438 serialized payload bytes, +487 B across the
+three declarations that fixture's roster offers; the injected sentence was stated as "~151 B per
+declaration" on 2026-11-27 — `corrected`, the measured figure is **147 B mean per advertised
+declaration**, 146 B on the cheapest row and 193 B on a row with NO `properties` at all —
+so the figure is the sum of its declarations, not a per-tool rate; only the TOTAL was measured
+per request, by the estimator's own `toolSchemaPayloadBytes`/`/4` rule,
+`src/engine/core/context-estimate.ts:451`). The fixture's own pins now carry it
+(`src/engine/harness.inclusion.test.ts:3309`, `:3328`). And a refined-sync delegation PARKS the parent, so `toolCancel` is no longer
+advertised on its own turn — it becomes reachable only on a **heartbeat** wake, at the shipped
+600000 ms cadence: a probe at `wakeIntervalMs: 40` produced 2 wakeups and 2 placeholder turns
+for a refined-sync delegation, against 1 self-release turn plus 3 wakeups with
+`"async": true`. Without a heartbeat, release comes from abort/host cancel or a steer only. The
+named fix for the heartbeat's blind spot is a `mode` field on the `async.pending` payload —
+`HarnessPendingTool` is `{ callId, name, elapsedMs }` (`src/engine/types/index.ts:365-369`), so
+the plugin resolves the mode BY NAME from the generated table
+(`src/engine/plugins/async-ping.plugin.ts:310-319`), while core announces every launch, sync
+included (`announcePending`, `src/engine/harness.ts:11756`, emitted before every
+`schedule()`); an open follow-up, not done — see
+`docs/tasks/2026-11-27-tool-call-mode-switch.md`.
+
+**That fixture figure UNDERSTATES a real session (measured 2026-11-27, both trees).** On the
+LIVE preset registry — a harness with its presets on and `enableAllTools: true`, so the request
+declares all **26** preset rows (20 core + 6 searchable), every one of them carrying the key —
+the catalogue measured **133,015 B → 136,836 B**, i.e. **+3,821 B**, which is **≈ +955 estimated
+tokens per request** at that request's own endpoints (33,254 → 34,209; +956 by the `ceil` rule
+applied to the delta alone). The per-declaration mean is **147.0 B**: 25 rows at **+147 B** and
+one at **+146 B** (`agentManage`, an EMPTY-`properties` row — it declares `properties: {}`, so
+only the entry and its comma are written). The **+193 B** shape is narrower than "no other
+argument": it belongs to a row with **no `parameters` key at all**, which is the budget
+fixture's `echo` (`src/engine/core/tool.ts:166`). Every published per-roster figure in this
+package — +487 B / +122 tokens on 3 rows, +1,616 B / +404 on 11 — is a FIXTURE roster and
+understates a live delegating session by roughly a factor of eight. The one lever on the
+per-row figure that changes no behaviour was measured and **deliberately left alone** (a
+decision of the 2026-11-27 pass, not an oversight): the model-facing sentence
+`TOOL_ASYNC_PARAMETER_DESCRIPTION` is 103 characters / **105 B once serialized in its JSON
+quotes — 72 % of the 146 B entry**, the irreducible overhead is the remaining **41 B** (the
+8-byte `"async"` key plus the 33-byte `{"type":"boolean","description":…}` envelope), and each
+~4 B cut returns ~1 estimated token per request per advertised row — ~955 tokens across a
+26-row session.
+
+**One transcript-side effect is documented here for the first time: the switch is part of a
+call's WORK fingerprint.** `call.arguments` keeps `async` (the strip never touches the record),
+and `toolCallFingerprint(name, arguments)` (`src/engine/core/argument-fingerprint.ts:171`)
+hashes that raw text, so the same call recorded WITH `"async": true` and WITHOUT it are two
+different keys to `supersedeMatch: 'fingerprint'` and `dropDuplicateCalls`
+(`src/engine/plugins/context-trimmer.plugin.ts:1115`, the setting text at `:675`). The error
+is a **missed** prune, never a wrong one, which is the direction this module already chose:
+"EXACT match only", `src/engine/core/argument-fingerprint.ts:57-61`.
+
+`src/engine/harness.sync-async.test.ts` pins the batch contract — the completion orders of a
 mixed sync/async batch, a singleton sync, an all-sync batch, an async-only batch, two
 batches in one run, two concurrent runs, failure and cancellation as settled members, and
 the no-leakage-onto-a-replacement rule. Its `batch gate races` block adds the two
 park-specific checks: an abort releases a parked gate (the run rolls back instead of
 waiting on a call it will never deliver), and a sync call that settles inside its own
-launch round spends no extra turn. `src/harness.background.test.ts` and
-`src/harness.races.test.ts` now declare `mode: 'async'` on the probe tools whose whole
+launch round spends no extra turn. `src/engine/harness.background.test.ts` and
+`src/engine/harness.races.test.ts` now declare `mode: 'async'` on the probe tools whose whole
 point is a call that stays pending while the run keeps taking turns: under the sync
 default those frames would never be emitted, so the mode is stated rather than assumed.
-`src/tools/presets.test.ts` pins the sync side from the other direction: `read` does real
-I/O, and its transcript is `user → assistant → tool → assistant` with no placeholder turn.
+The delegation, `toolCancel` and whole-run-cancel scenarios in
+`src/engine/harness.background.test.ts` (the `"async": true` additions at `:1444`, `:1472`,
+`:1511`, `:2210`, `:2486`, `:2537`) now state the reserved switch on their `delegate` calls for the
+same reason: with the lone-delegate refinement, an unswitched lone `delegate` in those fixtures
+refines to `'sync'`, parks the parent, and the background shape each case pins becomes
+unobservable. `src/engine/harness.tool-async-switch.test.ts` is the switch's own contract — 27
+cases: advertised on the model-facing copy and absent from the validation schema (`:410`), `true`
+forcing a sync tool out of the group (`:492`, `:519`), `false` joining an async-declared tool
+(`:624`), the lone `delegate` resolving `sync` (`:698`) including beside an ordinary sync call
+(`:760`), fan-out keeping background freedom (`:822`, `:887`, and the offered-definitions rule at
+`:963`), the explicit switch outranking the refinement (`:1036`, `:1132`), the closed-schema and
+single-property hazards (`:1188`, `:1212`), the own-key carve-out (`:1226`), the exact refusal
+sentence (`:1250`), and the three control behaviours (`:1296`, `:1331`, `:1361`).
+`src/tools/presets.test.ts` pins the sync side from the other direction: `read`
+does real I/O, and its transcript is `user → assistant → tool → assistant` with no placeholder
+turn.
 
 ---
 
@@ -3009,8 +3159,8 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 
 | Tool | Input | Result |
 |---|---|---|
-| `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, hiddenResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` — plus `startedAt`/`ageMs` on a RUNNING row and nowhere else (see the age bullet below) — top-level `truncated` is the PER-AGENT LISTING flag (some agent has more retained invocations than the 5 its own entry shows), NOT a text cut, and `hiddenResults` is the separate global count of retained rows that appear in no agent's list at all (`totalResults` is the whole retained ring: the sum of the per-agent `invocationCount`s PLUS every row retired with a transcript that was dropped, so that sum is its floor and it grows past the sum only while retired rows remain) — see the listing bullet below |
-| `agentResult` | `{ agent, invocationId?, offset?, limit? }` | `{ agent, invocationId, kind, status, content, contentLength, offset, limit, hasMore, nextOffset? }` — for a failed/cancelled run `content` is the paged partial answer and `error` (plus `cancelledAtMessage` when the run appended anything) comes with it; a RUNNING row answers `{ agent, invocationId, kind, status, content: '', contentLength: 0, offset: 0, limit, hasMore: false }` plus `startedAt`/`ageMs`, never a streamed partial; `status: 'empty'` with empty `content` only when NOTHING has finished for that agent to select (no completed AND no failed/cancelled record — an agent whose only finished runs failed selects the newest of those, per the selector bullet below) |
+| `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, hiddenResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` — plus `startedAt`/`ageMs` on a RUNNING row and nowhere else (see the age bullet below), plus `answerMessageIndex` on a COMPLETED row (the `threadRead` address of the answer this preview starts; the candidate LIST is deliberately NOT projected here, because a listing row is a pointer and `agentResult` is the door that pays for the list — see the answer-address bullet below) — top-level `truncated` is the PER-AGENT LISTING flag (some agent has more retained invocations than the 5 its own entry shows), NOT a text cut, and `hiddenResults` is the separate global count of retained rows that appear in no agent's list at all (`totalResults` is the whole retained ring: the sum of the per-agent `invocationCount`s PLUS every row retired with a transcript that was dropped, so that sum is its floor and it grows past the sum only while retired rows remain) — see the listing bullet below |
+| `agentResult` | `{ agent, invocationId?, offset?, limit?, message? }` | `{ agent, invocationId, kind, status, content, contentLength, offset, limit, hasMore, nextOffset? }` — on a COMPLETED row also `answerMessageIndex` (the 0-based index IN THE RUN'S OWN TRANSCRIPT of the message `content` came from) and `answerCandidates` when the run committed substantive turns besides its answer; pass `message` (a 0-based POSITION in that list) to page one of THOSE instead, and the envelope then echoes `message` and its `messageIndex` beside the page — see the answer-address bullet below — for a failed/cancelled run `content` is the paged partial answer and `error` (plus `cancelledAtMessage` when the run appended anything) comes with it; a RUNNING row answers `{ agent, invocationId, kind, status, content: '', contentLength: 0, offset: 0, limit, hasMore: false }` plus `startedAt`/`ageMs`, never a streamed partial; `status: 'empty'` with empty `content` only when NOTHING has finished for that agent to select (no completed AND no failed/cancelled record — an agent whose only finished runs failed selects the newest of those, per the selector bullet below) |
 
 - **Identity.** `invocationId` is the run id for a root run and the thread id for
   a delegated/ctx.run child; a fork/autoanswer uses its `branchId`. The harness
@@ -3109,6 +3259,67 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
   to reload — an over-cap `byName`, a blank name, a `settled` above `calls` or a missing `truncated`
   fails the whole restore, or lands on a lane as a permanent `invalid-mutation`, instead of being
   tidied.
+- **A completed row now says WHERE its answer is, and lists the run's other substantive turns
+  (C0, 2026-11-27).** `threadRead` has always been the door that reads a transcript, and the defect
+  this closes is that a report living in one was unreachable by the id the caller already held: an
+  investigator posted an 8,117-char report at transcript index 165, then wrote housekeeping and a
+  1,099-char cleanup note, and the ledger — faithfully applying "one row, the FINAL message" — handed
+  that cleanup note to every answer surface. THE ANSWER RULE IS UNCHANGED (the final message is still
+  the answer, and an agent that tidies up after reporting still answers with the tidy-up); what was
+  missing is the ADDRESS. Two COMPLETED-only keys carry it:
+  - `answerMessageIndex` — the 0-based index of the message `content` came from, derived at the
+    terminal commit by `committedMessageIndex` (`src/engine/harness.ts:15601`), which matches the
+    committed entry by content plus its tool-call ids scanning BACKWARDS (newest match wins, because
+    a mid-run commit and a published turn can collide) and answers `-1` when the transcript no longer
+    holds it. `-1` IS AN ANSWER, not a failure: both keys are then DELETED from the row rather than
+    written with an invented `0`, which would point a caller at the system seed with total confidence.
+    `threadRead({ thread, message: answerMessageIndex })` returns those bytes exactly.
+  - `answerCandidates` — the run's substantive turns BESIDES the answer, at most
+    `AGENT_ANSWER_CANDIDATE_CAP` (4) of them, each one admitted by `resolveRunAnswer`'s own test
+    (tool-free, `stopReason === 'stop'`, non-blank, not a compaction reply) so the ledger can never
+    list a turn the answer rule would have refused, nor hide one it would have rescued
+    (`recordAnswerCandidate`, `:15660-15677`; the push drops the OLDEST because the question is about
+    the TAIL of a run). Each text is cut at `AGENT_ANSWER_CANDIDATE_CHARS` (32000) with `truncated`
+    as the cap speaking, pair-safely (`clipPrefix`, `src/engine/util/unicode.ts`) — and that ceiling
+    is `THREAD_READ_MAX_CONTENT_LIMIT` on purpose, so a message `threadRead` can hand back whole is
+    one row can hold whole. The turn the answer came from is FILTERED OUT of the list (`:5242-5246`):
+    it is already `content`, and spending the cap on it would cost the caller a row it can read
+    without the list. The key is ABSENT, never `[]`, when the run wrote nothing besides its answer —
+    which is the ordinary single-answer run, and what keeps every pre-existing completed row
+    byte-identical.
+  The DURABLE indexes are re-derived at the terminal commit, not carried from the run
+  (`committedAnswerCandidateIndexes`, `:15700`), because a turn committed while an async call is
+  pending is shifted down the transcript by the delivery that lands afterwards — an index a caller
+  cannot resolve through `threadRead` is worse than no list — and a turn the transcript no longer
+  holds is DROPPED rather than listed with a wrong index. Recording runs for EVERY run, root
+  included (`RunState.answerCandidates`, `:7550`): the incident was a root run, and a rule that
+  covered only delegations would have left the exact case unfixed.
+  What each door projects: `agentManage` adds `answerMessageIndex` to a COMPLETED row and
+  deliberately NOT the list (`:5402-5413` — a listing row is a pointer); `agentResult` adds the index
+  plus candidate VIEWS beside a completed answer (`:6067-6071`, each entry `messageIndex` /
+  `contentLength` / a `preview` at `AGENT_MANAGE_PREVIEW_CHARS` / `truncated`,
+  `answerCandidateViewsOf`, `:5681`), and takes a new `message` input whose number is a 0-based
+  POSITION in that list, not a transcript index (the two are different numbers, and an ordinal is the
+  one value in the list a caller cannot get wrong). It pages the selected turn through the same
+  offset/limit/nextOffset machinery and echoes `message` and `messageIndex` beside the page; every
+  selector it cannot serve is REFUSED, never guessed with, by one sentence with four causes
+  (`answerCandidateRefusalFor`, `:5697-5715`): no finished result at all, a `failed`/`cancelled` row
+  (whose text is `partialContent`), a row whose only substantive turn IS the answer, or an ordinal
+  outside the list — the last naming the legal range `0-(n-1)`.
+  The leak boundary moved only as far as it had to, and the registry header says so out loud, in the
+  comment that used to claim the row holds nothing but the answer value (`src/engine/harness.ts:4788-4810`,
+  "WHAT 'ONLY' MEANT, AND WHAT IT MEANS NOW"): still no system instructions, no user
+  prompts, no tool arguments, no tool RESULT bodies — the run's own assistant prose, capped and
+  listed. The archive seam was NOT widened: `HarnessInvocationArchiveInput` (`src/engine/types/index.ts:4896`,
+  the row type ends at `:4885`) carries neither key and no `src/server/workers/*.ts` file reads them, so a lane-archived
+  row answers without either (see the lane note under [Lane workers](#lane-workers-threadexecution-worker)).
+  Pinned by `src/engine/harness.agent-results.test.ts:4141-4624`, `describe('the answer address and
+  the run's displaced reports (C0)')`, eight cases: the final message stays the answer and names its
+  index; the transcript answers at the answer index AND at every candidate index; a selected
+  candidate pages through the same offset/limit machinery as the answer; candidates list oldest-first
+  and evict the oldest past the cap; the pair rides on BOTH the listing row and the snapshot row; the
+  pair round-trips `snapshot -> restore` and re-snapshots byte-identically; a row that never carried
+  the keys restores without inventing them; and every value the runtime can never write is refused.
 - **Completed answers only.** The registry records the value `runAgentCore`
   returns, never a streamed delta, so an explicitly addressed running invocation
   has `status: 'running'` and no content and is OMITTED from a snapshot (never
@@ -3195,6 +3406,21 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
    inside its first tool round commits messages without committing substantive text, which
    is 0020's still-open case. And a row that carries NEITHER key, i.e. every snapshot
    written before 2026-11-14, is still valid and restores with its exact prior meaning.
+   C0 (2026-11-27) added the two COMPLETED-only keys under the SAME discipline, with ONE validator
+   for the list — `readSnapshotAnswerCandidates` (`src/engine/core/snapshot-validation.ts:350`): the
+   list is NON-EMPTY (a run with nothing to list OMITS the key, so `[]` on disk is a hand edit) and at
+   most `AGENT_ANSWER_CANDIDATE_CAP`; `messageIndex` is an integer >= 0, the same domain
+   `threadRead`'s `message` argument takes; `content` is 1..`AGENT_ANSWER_CANDIDATE_CHARS` characters
+   (`min: 1` because the recording site only ever stores a non-blank turn); `truncated` is REQUIRED,
+   because a row that omitted it would let a cut candidate read as a whole message; and the entry is
+   REBUILT in the writer's key order (`messageIndex, content, truncated`), because the durability test
+   is `restore -> snapshot` byte equality. The reader also MIRRORS the completed-only rule: a
+   `failed`/`cancelled` row carrying either key is refused outright
+   (`src/engine/core/snapshot.ts:574-588`), which is what stops a stale address outliving a re-run of
+   the same invocation. Both keys are in the may-be-absent list (`:242-243`, `:287`), so a row written
+   before them — and every stopped row written after them — restores in its exact prior shape and
+   answers without them rather than with an invented index. Pinned by the round-trip, old-shard, and
+   refusal cases of `src/engine/harness.agent-results.test.ts:4424-4624`.
 - **The listing is a WINDOW, not a cursor (spelled out 2026-11-14).** `agentManage`
   takes no input, so there is no page to continue and no token to carry back: it lists the
   **5 most recent invocations per agent** (`AGENT_MANAGE_LIST_PER_AGENT`,
@@ -3226,7 +3452,26 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 - **No private data.** Neither tool reads system instructions, transcript
   messages, tool arguments, or tool bodies. Only answer text crosses the
   boundary — a finished answer in `content`, an unfinished one in
-  `partialContent` — plus run identity.
+  `partialContent` — plus run identity. SINCE C0 (2026-11-27) "answer text" is
+  a WIDER set than it was, and it widened in the one direction the rule always
+  faced: a completed row may also carry `answerMessageIndex` (an INTEGER, no text
+  at all) and up to 4 `answerCandidates`, each one a substantive turn THIS run
+  committed under `resolveRunAnswer`'s own admission test, cut at 32000 characters.
+  Still nothing else: no system instructions, no user prompts, no tool arguments,
+  no tool RESULT bodies, and no transcript read at large — the list is the run's
+  own assistant prose, capped and bounded on both axes (4 x 32000 characters worst
+  case per row). The registry's own header states the rule and its exception in the
+  comment that stopped being true when it landed (`src/engine/harness.ts:4788-4810`).
+- **Absence is an answer, at every door (C0, 2026-11-27).** `answerMessageIndex` is absent on a row
+  whose committed message the harness could not find in its own transcript (`committedMessageIndex`
+  answers `-1` and the key is DELETED, never written as an invented `0`), and `answerCandidates` is
+  absent when the run wrote nothing besides its answer — never `[]` — so absence reads as "nothing to
+  select here", and `message` on such a row (or an ordinal outside the list) is the refusal that says
+  so, not an empty page. Both keys ride only on a `completed` row:
+  `src/engine/core/snapshot.ts:574-588` refuses a `failed`/`cancelled` row that carries either, and
+  `finishInvocation` (`src/engine/harness.ts:5294-5297`) DELETES them on every terminal transition
+  that is not a completion, so a row that goes completed → cancelled cannot snapshot a key the next
+  projection would drop.
 - **Names are NOT reserved** (CORRECTED IN PLACE 2026-11-13: this bullet claimed
   `agentManage` and `agentResult` were in a `RESERVED_TOOL_NAMES` list; that
   mechanism is gone — the registry starts empty and the comment at
@@ -4520,7 +4765,27 @@ const team = harness({
   a slot under the 256-thread cap. The `agent:<name>` spelling addresses the target agent's
   standing DEFAULT conversation, which is NOT the live delegation thread (`threadSend` adds a
   receipt `note` naming the live thread when that distinction matters — and only when
-  that thread is addressable from the caller's family, 2026-11-14).
+  that thread is addressable from the caller's family, 2026-11-14 — and never when the default
+  addressed IS the live run making the call, the one case with nowhere to redirect, 2026-11-27).
+- **A `threadFork` BRANCH may not delegate from inside its run (2026-11-27, the fork-isolation
+  doors).** A child of a branch is a conversation in the family the branch was forked AWAY
+  from — a branch run's persistent thread IS its requester's (`RunState.threadId`; a branch
+  has no `resolvedThread`), so `delegate` from one would mint a roster entry in the very
+  conversation the fork promised to leave alone. The door REFUSES rather than letting the
+  branch believe it spawned: `branchWriteRefusalFor(caller, 'delegate')` at
+  `src/engine/harness.ts:6545`, one shared sentence for all three write doors at
+  `:8790-8822`, naming the branch, its owner conversation, the READ doors that stay open, and
+  the remedy — the FORK call's `allowFamilyWrites: true`, which a branch cannot grant to
+  itself (see [threadFork](#threadfork)). The CALLING BRAIN is the only thing that makes the
+  claim decidable: `forkAgent` attaches branch metadata to the branch Agent
+  (`src/engine/core/branch.ts` `agentBranchOf`, a WeakMap), `ToolContext.agent` hands that
+  brain to the door, and the branch id it names keys this harness's branch ledger — a thread
+  id cannot do the job, because the owner conversation is typically RUNNING while its branch
+  runs. `threadSend` and `threadDelete` carry the same guard (see
+  [the model-facing thread tools](#the-model-facing-thread-tools-2026-11-13)); the autoanswer
+  branch never reaches it, being tool-free by pin. Pinned by
+  `src/engine/harness.branch-writes.test.ts` (refusal text, and the opted-in fork that may
+  delegate).
 - **Identity is CARRIED AND VERIFIED, never discovered (D1, 2026-11-14 — closes the
   fabrication half of issue 0029).** `delegate` hands the child an OUT-carrier,
   `HarnessRunIdentity` (`src/types/index.ts`), through `context.run(..., { identity })`;
@@ -4775,8 +5040,11 @@ With `threadDelete` added the generated `core/tool-manifest.ts` carried 32 descr
   A RELEASED thread is absent by construction — but released means
   MARKED, not destroyed (IT19 R2, 2026-11-15): `purgeThread` sets `inactive`/`inactiveAt` and
   the record, its transcript and its invocation rows are RETAINED, so the roster and `actOn`
-  stop naming it while a host can still read it by id, and every AGENT door refuses it with its
-  own sentence rather than the "never created, or it was deleted" wording. That omission is
+  stop naming it while a host can still read it by id; `threadSend` and `threadDelete` refuse it
+  with their own sentence rather than the "never created, or it was deleted" wording, and since
+  2026-11-27 `threadRead` ANSWERS it for the lineage that released it (see the `threadRead`
+  bullet — that door used to refuse every conversation caller and is now narrowed by the same
+  family test the write doors use). That omission is
   UNCHANGED for the tool (2026-11-17): what moved is the HOST side, where a soft-deletion now
   travels as its own field instead of being inferred from a roster that stopped naming an id —
   `SessionResource.inactive_thread_ids` and `SessionSnapshot.inactiveThreads` /
@@ -4807,12 +5075,30 @@ With `threadDelete` added the generated `core/tool-manifest.ts` carried 32 descr
     the strip, and NEITHER mentions `epoch` (there is no `threadList` test file at all) — the strip
     is therefore an observed behaviour of `modelThreadRosterOf`, not a pinned contract; reported
     here rather than papered over.
-  - **Fork branches are absent from the roster on purpose.** A `threadFork` branch is an
-    INVOCATION with an ephemeral transcript, not a thread slot, so it never enters
-    `threadStates` and never appears here; its `branch-N` id is still readable through
-    `threadRead`/`agentResult` via the branch ledger (see
-    [threadFork](#threadfork)), and `threadDelete` refuses it as an address, not as a
-    release.
+  - **Fork branches never enter `threadStates`, and the MODEL roster lists the live ones
+    (2026-11-27, C4).** A `threadFork` branch is an INVOCATION with an ephemeral transcript,
+    not a thread slot, so it never enters `threadStates` — and the HOST plane
+    (`harness.threads()`, `api.threads.list`) still shows no branch row, which is what the
+    sibling pin asserting `threads()` excludes it keeps true for. What changed is the MODEL
+    plane only: `modelThreadRosterOf` appends the rows `branchRosterRows` derives
+    (`src/engine/harness.ts:7912`, `:8911`), so a caller holding the `branch-N` handle a fork
+    returned can see the branch it was told to remember. The rules that travel with those rows,
+    all stated on the row itself: RUNNING branches only (a terminal branch stays addressable by
+    id through `thread()`/`threadRead`/`agentResult` and through `harness.branches()`, and
+    listing every retained record would bury the conversation rows under up to
+    `maxBranchRecords` audit rows); appended AFTER the conversation rows, in branch creation
+    order, so the pinned ordering of the conversation rows is untouched; `branchId` present is
+    the ONLY "this row is a branch" declaration — `origin` stays `'host'`, because that union is
+    a WIRE type hand-mirrored in `src/server/protocol.ts` and an `origin: 'branch'` member would
+    advertise a value the wire can never emit (`HarnessThreadOrigin`,
+    `src/engine/types/index.ts:3943-3960`; the key is `HarnessThreadRecord.branchId`, `:4063-4070`);
+    `ownerThreadId` names the conversation that forked it; `sequence` is the row's position in
+    the retained ledger plus one, a DIFFERENT counter from a thread's, so recency sorts happen
+    within the branch set, not across the two kinds; and the row is READABLE but never in `actOn`
+    — posting into a branch address is refused, by name, below. `threadDelete` still refuses a
+    `branch-N` id as an address, not as a release. Pinned by
+    `src/engine/harness.branch-writes.test.ts` (the model roster row and the host exclusion in
+    one run) and `src/engine/harness.fork.test.ts:1735-1752` (the host `thread()` record).
   - **The roster is a LIVE, caller-relative snapshot**, computed per call
     (`threadRoster(currentThreadId)` reads the current `threadStates` map and the caller's
     family at that instant). Nothing is cached, nothing is a projection of an earlier turn,
@@ -4869,6 +5155,44 @@ With `threadDelete` added the generated `core/tool-manifest.ts` carried 32 descr
     resolve it through the branch ledger (`threadRecordOfBranch`), which is exactly
     why forks stay invocations and not roster threads (see
     [threadFork](#threadfork)).
+  - A RELEASED conversation is readable BY THE LINEAGE THAT OWNS IT (2026-11-27). The
+    one narrowing left on this door is a soft-deleted target, and it is now the SAME
+    lineage test the write doors use (`familyOfCaller`, `src/engine/harness.ts:8829`):
+    pass a `thread` that is `inactive` from a conversation IN that lineage — the caller
+    that ran `threadDelete`, or any conversation above or below it — and the retained
+    transcript comes back; ask from outside the lineage and the refusal stands, now
+    naming who can still answer ("The conversation that released it — and any
+    conversation in that lineage — still can, and a host can always read it by id").
+    The sentence this replaced promised "no conversation can read it", which sent
+    exactly the caller issue 0027 built `threadDelete` for — read the child, release it,
+    come back for the tail — to a host door it does not have. The HOST view (no caller
+    id: the server's transcript reader, `harness.threadMessages(id)`, every route that
+    passes no caller) is unchanged, and a live conversation is still session-wide, so
+    this is the only lineage gate left on a read (`threadMessages`,
+    `src/engine/harness.ts:9786-9826`, pinned by
+    `src/engine/harness.branch-writes.test.ts` `reads a released conversation from its
+    own lineage, and refuses a stranger`).
+  - THE DOOR FOLLOWS THE SEAM, IN ONE PLACE (2026-11-27, R1). The admission test above
+    lives in ONE function — `refuseUnreadableThread` (`src/engine/harness.ts:9799-9814`) —
+    and BOTH read seams call it: the transcript seam (`threadMessages`, `:9816`) and the
+    RECORD half added for this door (`threadReadRecord`, `:9868`), which answers the same
+    set of addresses `threadMessages` serves — a live row, the retained row of a released
+    conversation, and a finished fork's `branch-N` through the branch ledger — under the
+    same test. WHY A SECOND RECORD SEAM WHEN `thread()` EXISTS: `thread()` is a DISCOVERY
+    door, and IT19 R2 deliberately keeps an `inactive` row out of discovery (`threads()`,
+    `threadList`, `thread()`); that rule is right for "what conversations does this session
+    have" and wrong for "may I read this one". Before this fix `threadRead.tool.ts` sourced
+    its identity block from `thread()`, so a released conversation was served its transcript
+    by the seam and then refused by the tool with the not-found sentence — contradicting the
+    refusal's own promise, `threadDelete`'s receipt, and the tool's description. The routed
+    lane door now answers the same way: `thread:read` reads MESSAGES FIRST (so the seam owns
+    the refusal), then the read record, and returns BOTH `record` — the DISCOVERY answer, so
+    replacing the handle's `thread()` with a routed read cannot show a lane a roster row the
+    coordinator hides — and `readRecord`, the row the admitted transcript belongs to
+    (`src/server/workers/lane-authority.ts`, `src/server/workers/lane-worker-loop.ts`).
+    Pinned through the TOOL, not just the seam, by `src/engine/harness.thread-read.test.ts`
+    ("threadRead of a released conversation follows the read door"), and the routed leg by
+    `src/server/workers/lane-authority.request-scope.test.ts`.
 - **`threadSend` reaches the LINEAGE, with per-address self-rules (B4).** Own
   thread, an ancestor, one of your descendants, or a DEFAULT conversation
   (`agent:<name>`) the caller's roster lists — the defaults of EVERY agent the family
@@ -4904,7 +5228,13 @@ With `threadDelete` added the generated `core/tool-manifest.ts` carried 32 descr
   could not send to (a sibling is excluded from the family by design), so the receipt
   promised a door it then refused. A receipt with NO note now means "no live thread of
   that agent is reachable from here", which is a truthful answer rather than a missing
-  hint; a threadless (host) caller is unscoped and keeps every candidate.
+  hint; a threadless (host) caller is unscoped and keeps every candidate. ONE case can
+  never produce a note, and the description now says so because the silence was being read
+  as "nothing of this agent is running" (2026-11-27): the candidate list excludes the
+  addressed target itself (`entry.record.id !== target.record.id`, `liveSiblingNoteFor`,
+  `src/engine/harness.ts:8287-8310`), so when the DEFAULT conversation being addressed IS
+  the live run making the call, that run is the turn in flight and there is nothing to
+  redirect it to — the note is a REDIRECT, withheld by construction, not a missing fact.
   A STOPPED thread is no longer uniformly host-revive-only (IT19 R3/R5, 2026-11-15): the
   record's `stopReason` decides. A run that was cut short — `caller-released`, `timeout`,
   `turn-cap`, `budget-exhausted`, `api-error`, `retries-exhausted`, `provider-network` or
@@ -4928,6 +5258,29 @@ With `threadDelete` added the generated `core/tool-manifest.ts` carried 32 descr
   host `sendThreadInput` remains the revival that lifts `inactive` (see the thread-lifecycle
   bullet below). Every refusal queues nothing, so a failed send never leaves a message waiting to
   land.
+  - **A BRANCH RUN MAY NOT SPEAK, AND A BRANCH ADDRESS IS NOT A POSTBOX (2026-11-27, C1/C4).**
+    Two refusals run BEFORE the target is resolved (`postThreadMessage`,
+    `src/engine/harness.ts:8098-8150`), in that order and deliberately so. (1) The SENDER:
+    a tool call executing inside a `threadFork` branch is refused outright — the branch's
+    persistent thread IS its requester's conversation (`RunState.threadId`), so a branch send
+    lands as steering in the ledger the fork existed to keep clean, and the door refuses by
+    name with the remedy on the same breath rather than dropping the write in silence
+    (`branchWriteRefusalOf`, `:8809`; the guard is at `:8139`). The only exception is the
+    fork's own `allowFamilyWrites: true`, decided when the branch is created and read off the
+    branch RECORD, never from an argument the branch could pass later (see
+    [threadFork](#threadfork)). (2) The TARGET: a `branch-N` id is refused with a sentence
+    that names what it is and which door reads it, instead of `threadStateOf`'s "it was never
+    created, or it was deleted" — the false answer, since the model roster now lists that row
+    and a caller may legitimately try to answer one. When a branch DOES speak (the opted-in
+    fork), the delivered line attributes it as a branch inside the same address paren —
+    `from agent "x" (thread thread-5, branch branch-2):` (`:8238-8260`) — because a reader of
+    the owner's transcript has to tell isolated reasoning from its own owner turning up
+    again, and the branch id printed beside the owner id is the fact that makes the difference
+    (`senderThreadId` on the receipt is unchanged: it is still the persistent owner
+    conversation). A threadless/host caller has no branch metadata and keeps every byte of the
+    historical behaviour. Pinned by `src/engine/harness.branch-writes.test.ts` (the refusal
+    sentences verbatim, the delivered attribution line, and the branch-target refusal for a
+    RUNNING and for a terminal branch).
 - **`threadDelete` releases a FINISHED thread you own (B5 — closes issue 0027).**
   The model-facing counterpart of the host `deleteThread`: explicit and MANUAL
   (the issue's rejection of auto-delete holds — a settled child stays readable
@@ -5053,6 +5406,32 @@ With `threadDelete` added the generated `core/tool-manifest.ts` carried 32 descr
   still crosses as `{ ok: false, error: message }` (`src/server/workers/protocol.ts`
   `request.reply`) — and `threadExecution` still DEFAULTS to `inline`
   (`DEFAULT_THREAD_EXECUTION`, `src/server/config.ts:118`).
+  - **A BRANCH MAY NOT RELEASE ANYTHING FROM INSIDE ITS RUN (2026-11-27, C1).** The door
+    now takes the CALLER'S BRAIN as a third argument
+    (`HarnessToolRuntime.threadDelete(callerThreadId, threadId, caller?)`,
+    `src/engine/types/index.ts:1527-1544`, forwarded by
+    `src/engine/tools/runtime/threadDelete.tool.ts`), and it exists for the one fact a thread
+    id cannot carry: whether the caller is a `threadFork` branch RUN, whose persistent thread
+    is its OWNER's. Without it the strict-descendant gate alone would let a branch reap
+    conversations in the very family it was forked away from, attributed to the owner
+    conversation that is still answering. The refusal is the shared write-door sentence
+    (`branchWriteRefusalFor`, `src/engine/harness.ts:8819`, applied in `threadDeleteFor` at
+    `:9487`), and `allowFamilyWrites: true` on the FORK call is the only way past it —
+    omitted, an `executeTool` with no brain, a plugin and a routed lane call are all "not a
+    branch" and keep the historical door exactly.
+  - **DELETING BEFORE YOU READ COSTS THE POINTER, NOT THE DATA (2026-11-27, stated on the
+    instruction).** The rule the tool has always had — "read what you still need with
+    `threadRead` or `agentResult` first, then delete it" — now carries its consequence in the
+    same sentence, because the consequence sat ~1,500 bytes later in the description and a
+    model that deleted first read the later sentence as reassurance: what the release takes
+    away is DISCOVERABILITY. The finished run stops being LISTED by `agentManage`, from then
+    on its answer is reachable only through an `invocationId` saved BEFORE the release —
+    paged by `agentResult` with that id — and the receipt's `removedInvocationIds` names
+    exactly which rows dropped out of discovery. Nothing about a receipt, a door, or the
+    retained data changed (IT19 R2 already owns that rule, above); this is the ordering trap
+    in the prose, closed in `src/engine/tools/runtime/threadDelete.tool.ts`, and the data
+    half is now easier to act on since `threadRead` answers a released conversation for the
+    lineage that released it (see the `threadRead` bullet).
 - **Terminal state is ONE synchronous commit (B2).** A finished run's terminal
   ledger entry (`finishInvocation`) AND its thread-status release to `idle` now
   happen together in `commitRunTerminal`, BEFORE the post-run hooks and branch
@@ -5216,20 +5595,93 @@ type HarnessActionRequest = {
 ### threadFork
 
 ```ts
-threadFork({ input: string; label?: string; timeoutMs?: number })
+threadFork({ input: string; label?: string; timeoutMs?: number; allowFamilyWrites?: boolean })
 // -> HarnessForkResult { branchId, threadId, content }
 ```
 
 - `input` is required and non-empty. `label` is display-only, trimmed, ≤120.
   `threadFork` is a normal tool call: the requester stays in flight and the branch
   runs as a separate actor.
+- **THE ISOLATION A FORK PROMISES IS ENFORCED, AND `allowFamilyWrites` IS THE ONLY DOOR
+  (2026-11-27).** A branch run's persistent thread is its REQUESTER's, so the three doors
+  that WRITE into a conversation — `threadSend`, `delegate`, `threadDelete` — refuse a call
+  made inside a branch run: a send becomes a committed user turn in the owner's ledger, a
+  delegate mints a conversation in the owner's roster, a release reaps the owner's children.
+  The flag is a `threadFork` ARGUMENT, read once at creation (strictly `=== true`, so a host
+  `executeTool` passing a string, a number or nothing gets the guarded default), recorded on
+  the branch record as `HarnessBranchSummary.allowFamilyWrites`
+  (`src/engine/types/index.ts:2005-2033`), and read back by the doors through the CALLER'S
+  BRAIN — never from an argument afterwards, so a branch cannot change its mind mid-flight and
+  cannot grant itself the exception. Absence means `false`, and the key is written ONLY when
+  the fork asked for the exception, which keeps every pre-existing `branch_start`/`branch_end`
+  payload byte-identical. A refusal names the door the caller used, the branch, its owner
+  conversation, the READ doors that stay open, and the remedy, in one sentence
+  (`branchFamilyWriteRefusal`, `src/engine/harness.ts:8790-8806`; the guard the three doors
+  share is `branchWriteRefusalOf`/`branchWriteRefusalFor`, `:8809-8822`, applied at `:6545`
+  for `delegate`, `:8139` for `threadSend` and `:9487` for `threadDelete`). Reads are never
+  gated: `threadRead` and `agentResult` answer a `branch-N` id whatever the flag says. The
+  guard reaches only a caller whose brain carries branch metadata (`agentBranchOf`,
+  `src/engine/core/branch.ts`), so a host turn, a plugin, a manual `executeTool` and a routed
+  lane call are untouched, and a TERMINAL branch has no run to speak through
+  (`branchWriteRefusalOf` refuses only while `status === 'running'`). Pinned by
+  `src/engine/harness.branch-writes.test.ts` (six cases: the three refusals, the opted-in
+  fork, the roster and attribution facts, `toolCancel` by branch handle, and the
+  released-thread read).
 - At request instant the runtime calls `forkAgent(run.agent, …)`; the branch gets
   this agent's ENTIRE committed transcript (never a slice), current model, and
   instruction snapshot. `materializeBranchHistory` deep-copies and validates every
   message, remaps every tool-call id to `call_<branchToken>_<n>`, rewrites every
-  tool result to the remapped id, and pairs outstanding calls with the
-  `threadFork` non-success placeholder. Duplicate/orphan results and repeated ids
-  are rejected. The origin transcript is never mutated.
+  tool result to the remapped id, and pairs outstanding calls with a seeded row.
+  Duplicate/orphan results and repeated ids are rejected. The origin transcript is
+  never mutated.
+  - **TWO SEED WORDINGS, AND THE CREATING CALL IS NOT A FAILURE (2026-11-27, M5).** Every
+    call of the requester that was still UNSETTLED at the fork instant is seeded as a
+    synthetic `tool` row, and one of them is the call that CREATED this branch — unsettled
+    by construction, because its answer IS the branch. Answering it with
+    `BRANCH_PENDING_PLACEHOLDER` ("This placeholder is NOT a successful result") told the
+    branch model its own creation failed, and a model reading that re-enacts the
+    requester's pending intent: the phantom relay, a branch `threadSend`-ing its own fork
+    brief back to its owner. That one row now carries `BRANCH_SELF_CALL_PLACEHOLDER`
+    (`src/engine/core/branch.ts:86-102`), which states the three facts the branch needs —
+    which call this is, where its result goes, and that it must neither re-issue it nor relay
+    the brief — and its tag is `(branch-self-call)`, deliberately NOT `(created-branch)`, so a
+    reader that distinguishes a branch round from a root round by that tag does not start
+    matching a row with a different meaning. The GENERIC placeholder stays for every OTHER
+    unsettled call, and a caller that names no self call — `Agent.fork()`, a projection of
+    somebody else's transcript, or `incorporateBranchHistory` (an autoanswer branch's pending
+    owner-side call is the delegation that started the REQUESTER, not the branch being built)
+    — keeps the historical seeding exactly. The runtime names the id where it knows it:
+    `launchThreadFork` and the autoanswer fork both pass the call being executed
+    (`materializeBranchHistory({ selfCallId })`, `src/engine/core/branch.ts:905-928`). The
+    match is on the ORIGIN id, unique inside one source transcript, so exactly zero or one
+    seeded row can carry the marker. Pinned by `src/engine/harness.branch-seed.test.ts` and
+    the amended `src/engine/harness.fork.test.ts`.
+  - **A SEED IS A PLACEHOLDER, SO A LIVE BRANCH IS BACKFILLED (2026-11-27, M5).** When one of
+    those sibling calls LATER commits in the requester, the seeded row is not merely
+    incomplete — it has become FALSE, and it is the copy that survives, because
+    `finishBranch` re-captures the branch's running transcript at its terminal transition.
+    So `insertToolMessage` (`src/engine/harness.ts:11236-11290`, the backfill call at
+    `:11285`) rewrites that row IN PLACE in every LIVE branch seeded from that brain: only
+    `content` changes, so the remapped `toolCallId`, the `name`, the inclusion flag and the
+    provider pairing all survive, and the row keeps exactly the keys the materializer gave it.
+    The index that makes it reachable is `liveBranchSeeds` (`:11152`), keyed by branch id,
+    holding `{ branch, parent }`; an entry registers when the branch is created (`:13475`,
+    and `:13825` for an autoanswer, whose parent brain is the OWNER's) and is REMOVED at the
+    branch's single terminal transition (`forgetLiveBranchSeed` in `finishBranch`, `:10734`),
+    which bounds it by `forks.maxConcurrent` in the steady state — and the walk itself
+    self-heals, dropping an entry whose record is gone or no longer `running`, which is the
+    door for a branch purged by `deleteThread` without a terminal transition. Matching needs
+    BOTH the requester's brain and the origin call id (brains are fresh Agent objects per
+    conversation, and a `c1` repeats across conversations, so either key alone could rewrite
+    the wrong branch); only a row whose content is one of the seeded wordings is eligible —
+    read from `./core/branch.ts` so the set can never drift — which INCLUDES the self-call
+    marker, whose "no result was committed yet" stops being true the moment the requester's
+    ledger records that call (the case that actually happens is a `toolCancel` of the fork
+    call while its branch still runs). A SETTLED branch is FROZEN: its record stopped
+    following the transcript, so a call that commits after the branch ended never reaches it,
+    and a row committed at fork time was materialized verbatim and is already the truth.
+    Pinned by `src/engine/harness.branch-seed.test.ts` (the backfill, the never-settled
+    sibling, and the freeze).
 - Branches inherit the source agent's RANK (`actorRanks.set(branch, rankOf(run.agent))`,
   `src/harness.ts:11670`, and the same for an autoanswer branch at `:11987`), so `declared(branch)`
   resolves the same rank-aware projection: a fork of a Rank A agent keeps `delegate` (narrowed to
@@ -5254,7 +5706,66 @@ threadFork({ input: string; label?: string; timeoutMs?: number })
   through the branch ledger — the fork remains an INVOCATION, deliberately not a
   roster thread), and `agentResult` accepts it as `invocationId` to page the
   answer, including the `partialContent` of a branch that was cancelled, failed,
-  or timed out before it answered.
+  or timed out before it answered. SINCE 2026-11-27 THE HANDLE IS ALSO A CONTROL
+  ADDRESS AND A ROSTER ROW. (1) `toolCancel` takes the branch id as well as the callId
+  (`callIdOfBranchAddress`/`branchAddressOfCall`, `src/engine/harness.ts:13117-13131`, read at
+  the door `:12620-12640`): one argument, two spellings, both resolving to the same call,
+  because until now the id the fork TOLD the caller to keep was the id the door could not
+  resolve — a caller that never read the pending placeholder could read the branch, page its
+  answer, and watch it run forever. An id this run never started keeps the canonical refusal,
+  now naming the second form ("… or the branchId a threadFork answer reported."). The reverse
+  scan is bounded by the fork calls of ONE run — `branchCallIds` is keyed `scope\0callId` and
+  released with the run in `releaseBranchesForScope`. (2) The success receipt echoes the ids of
+  the work it released, APPENDED after the historical `{ cancelled, callId, name }` and only
+  when they are PROVABLE — in BOTH success forms, the immediate release (`:12700-12715`) and
+  the already-settled acknowledgement (`:12652-12670`, whose `alreadySettled: true` sits BEFORE
+  the echo, exactly as the byte-pinned receipts order it
+  (`{"cancelled":true,"callId":"k1","name":"stubborn","alreadySettled":true,"threadId":"agent:writer"}`):
+  `threadId` (the conversation the released work belongs to — for a branch run that is its
+  requester's persistent thread, which is the row the caller can act on next) on any cancel with a
+  thread, and `branchId` + `invocationId` beside it when the
+  cancelled call owned a fork, which are exactly the `threadRead`/`agentResult`/roster
+  addresses. A non-fork call adds nothing, so `delegate`'s cancel moves by the `threadId` key
+  alone (`src/engine/harness.delegation.test.ts`'s byte pin) and a fork's cancel answers
+  `{ cancelled, callId, name, branchId, invocationId, threadId }` whole
+  (`src/engine/harness.branch-writes.test.ts`). (3) A RUNNING branch is a row in the MODEL
+  roster carrying `branchId` — see
+  [the model-facing thread tools](#the-model-facing-thread-tools-2026-11-13) — while
+  `harness.threads()` and `api.threads.list` keep excluding branch runs, and (4) posting INTO
+  a branch is refused with a sentence that names what a branch is rather than the false
+  "never created, or it was deleted". The settle-time answer receipt itself is unchanged:
+  `{ branchId, threadId, content }` with `threadId === branchId`, committed as that call's
+  tool message when the branch settles. (5) SINCE 2026-11-27 (C3/R1) THE FORK ALSO COMMITTED
+  A CREATION-TIME POINTER, in the requester's own ledger: the instant the branch exists,
+  `launchThreadFork` appends ONE standalone `role: 'system'` row to the REQUESTER's transcript
+  (`src/engine/harness.ts:13605-13625`, immediately after `branchCallIds.set`) carrying
+  `{ event: 'branch_started', name, callId, branchId, threadId, note }`. WHY: `branchRecords` is
+  deliberately outside `HarnessSnapshot` and the pending placeholder that names the call id is
+  request-only, so a requester whose run ended while its branch was in flight (a turn cap, a
+  stop, a crash) kept an assistant turn with an unsettled `threadFork` call and NOTHING on the
+  record naming the branch — a restart dropped the fork entirely. WHY `system` AND NOT a tool
+  row: settledness in this engine is one committed `role: 'tool'` row carrying the call's
+  `toolCallId` (`hasToolResult`/`toolResultOf`, `src/engine/harness.ts:11262-11272`), so a tool row on that id would settle
+  the call at creation (the real delivery would decline, and `toolCancel` would answer
+  `alreadySettled` for a branch still running), while a tool row on a SYNTHETIC id is swallowed by
+  the request projection — the tool block after an assistant `toolCalls` entry is consumed by call
+  id (`:11462`) — so a later run would never read it. A `system` row keys to nothing: it travels in
+  every later request, survives `snapshot`/`restore`, can never be read as a result, and touches no
+  settledness rule; it is the same channel as the owed-account row that reports a background run
+  whose result could not be attached to its call (`:12341`). What that leaves true, and pinned
+  (`src/engine/harness.branch-writes.test.ts`, "the threadFork creation-time pointer (C3/R1)"): the
+  settle-time receipt above is byte-identical and still at the CALL's position, so the two rows'
+  `messageId`s read out of order by design (the pointer is minted at creation, the result at
+  delivery — `src/engine/harness.fork.test.ts` pins the sequence), `toolCancel` by `callId` still
+  CANCELS rather than reporting `alreadySettled`, the row is written ONCE and no settle, cancel or
+  later run rewrites it, and every later run of that conversation reads the three ids back out of
+  its own transcript (`threadRead` needs `includeSystem: true`; `threadRead`/`agentResult` by the
+  branch id need nothing). Cancellation is still the owning run's control: a branch id handed to
+  `toolCancel` from a LATER run resolves through the branch ledger, not the run-scoped
+  `branchCallIds` map, so it answers `alreadySettled` for a fork that has settled. Persistence
+  follows the transcript rule every committed row follows — the pointer notifies `agent_message`
+  only when the requester's conversation is a real conversation, never for a branch's ephemeral
+  one (`src/engine/harness.fork.test.ts`).
 - **`timeoutMs` (B1, 2026-11-13)** is the fork half of the 2026-11-09 time policy:
   an optional 1–3,600,000 ms wall clock on the branch run (the ceiling is
   `MODEL_TIMEOUT_MAX_MS`, shared with `delegate`'s `timeoutMs` and restated as a
@@ -5845,7 +6356,10 @@ registry-resolving twin that keeps caller/thread/signal),
 `branch(id)`, `memory` (`:3313`), `runtime` (`:3316`), `nestedRuns()` (`:3590`),
 `records()` / `recordsChanges(since)` / `onRecordsChange(listener)` (`:3441-3443`),
 `reset()` — plus the thread surface (`threads()`, `thread(id, callerThreadId?)`,
-`threadMessages(id, callerThreadId?)`, `setThreadMessages(id, messages)`,
+`threadMessages(id, callerThreadId?)`, `threadReadRecord(id, callerThreadId?)` — the
+RECORD half of the read door, answering the row behind a transcript the seam admitted
+(including a released conversation's, which `thread()` above voids as a DISCOVERY door;
+see the `threadRead` bullet) — `setThreadMessages(id, messages)`,
 `createThread()`, `sendThreadInput()`, `steerThread()`, `stopThread()`,
 `deleteThread()` — the optional caller thread is what narrows a host read to one
 family; omitted means the unscoped host view, and `deleteThread()` answers with the
@@ -5926,7 +6440,12 @@ call (`toolCancel({ callId })` targets one): `toolCancel` logically settles/abor
 that call's own task and its late result is ignored; cancelling an already settled
 (or already cancelled) call is a SUCCESS with `alreadySettled: true`, because
 cancellation is a state to reach rather than a one-shot transition, while a
-`callId` this run never started is an error. The ack is a CONTROL receipt
+`callId` this run never started is an error. A background `threadFork` is the one call this
+door may name TWO ways — its callId or the `branch-N` id the fork's answer reported, which are
+the same call (2026-11-27; see [threadFork](#threadfork)) — and a success receipt echoes the
+ids of the work it released, appended after the historical keys and only when provable:
+`threadId` for any cancel whose run has a conversation, plus `branchId`/`invocationId` when the
+call owned a branch. The ack is a CONTROL receipt
 (`{ cancelled: true, callId, name }`) and not the result channel: for a released
 `delegate` call the child's terminal envelope arrives in that call's OWN tool message,
 tagged `callCancelled: true` — see [Delegation](#delegation). Command tools honour the abort
@@ -6695,6 +7214,7 @@ type HarnessBranchSummary = {
     forkDepth: number;                  // ordinary forks; autoanswer inherits
     model: string;
     tools: string[];                    // declared wire names ([] for autoanswer)
+    allowFamilyWrites?: boolean;        // the fork's write opt-in; ABSENT means false (2026-11-27)
 };
 
 type HarnessBranchStatus = 'running' | 'completed' | 'failed' | 'cancelled';
@@ -8682,6 +9202,26 @@ The three load-bearing decisions:
   `threadId` while the CALLER travels inside `identity`, so the authority scopes the
   release to the lane caller's own descendants and `applySync` rebases the lane's
   mirror of every conversation the cascade removed.
+- **Branch runs and the answer address do not cross the lane seam (F1, C0, 2026-11-27) — recorded
+  so the next reader does not "fix" a gap that has no traffic.** Three facts, all of them true and
+  none of them a bug: (1) the routed `threadSend` (`src/server/workers/lane-authority.ts:897`) hands
+  `runtime.threadSend` the REGISTRY brain `callerFor(identity)` builds (`:581-587`), never a
+  branch-carrying clone, and the routed `threadDelete` (`:902-903`) passes only the two THREAD ids —
+  `runtime.threadDelete(callerThreadId, threadId)` with the third, brain-taking argument omitted
+  (`src/engine/harness.ts:4745` reaches `threadDeleteFor`'s `callerBrain`, `:9487`) — so
+  `branchOfCallerBrain` (`:8777-8785`) reads no branch metadata, the write guard passes VACUOUSLY at
+  both doors, and a lane `threadSend` can neither be refused as a family write nor print the
+  `… (branch branch-N)` paren. (2) That vacuity cannot be reached: `threadFork` is NOT in
+  `AUTHORITY_RUNTIME_METHODS` (`src/server/workers/capability.ts:418-435`) — it is a nested-run door,
+  removed from the replica at hello and refused by the armed core (`NESTED_RUN_TOOL_NAMES`, `:576`),
+  so a lane holds no branch record and no branch caller exists to route. (3) The archive seam was
+  deliberately left unextended: `HarnessInvocationArchiveInput` (`src/engine/types/index.ts:4896`)
+  carries neither `answerMessageIndex` nor `answerCandidates` and no `src/server/workers/*.ts` file
+  reads them, so a lane-archived COMPLETED row answers without the address pair, exactly as a
+  pre-C0 row does — and a lane read of `agentResult`/`agentManage` goes THROUGH the authority
+  (`capability.ts:424-426`), where a row the canonical harness itself wrote carries both keys like
+  any other. Widening any of this is a change to make, not a hole to plug, and it needs the lane
+  commit digest and its `invalid-mutation` vocabulary in the same pass.
 - **The boot posture crosses as data or the session is refused (B6).** A durable record
   reproduces the TEAM, not the per-build facts (`src/server/harnesses/registry.ts`
   `presetToRecord` serialises no plugin/toolbox/budget/extra-source data), so a replica

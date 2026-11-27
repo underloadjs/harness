@@ -406,34 +406,42 @@ const laneFixture = (): {
 // THE NUMBERS, derived before the run rather than read off it (re-derived 2026-11-17 after
 // the estimator started pricing the TOOL CATALOGUE in an unanchored round — see
 // ../core/context-estimate.ts `constantAllowanceBytes`; the estimate that used to read 528 for
-// this transcript reads 12 330 now, and a fixture sized by the old figure simply never fires):
-//   - `contextLimit: 9 700` is the firing point (the operator's one-number ruling —
+// this transcript reads 12 424 now, and a fixture sized by the old figure simply never fires).
+// Re-derived again 2026-11-27 (F5 review pass): the `threadRead` row grew +376 serialized bytes —
+// 60,344 -> 60,720 B on shape A and 69,215 -> 69,591 B on shape B of probe
+// `Temp/fix-f5/probe-floors.ts`, +94 estimated tokens at the same /4 rule — because that row now
+// states the deleted-thread narrowing. Every figure below that CONTAINS the floor therefore moved
+// by exactly +94, and the limit moves with it; the case's own structure is the check, and it is the
+// documented loud failure this paragraph promises: at the old `9 700` the pass does not fire AT ALL
+// (probe `Temp/f5/probe-compaction.ts` — one provider request, three frames, lane 0), which is the
+// dead-run guard refusing rather than a row painted for the wrong reason.
+//   - `contextLimit: 9 794` is the firing point (the operator's one-number ruling —
 //     ../plugins/context-compaction.plugin.ts resolves the trigger with no headroom, and this
 //     preset declares no model window, so there is no 15 % buffer either);
 //   - the harness estimate prices the whole billed request, so it has TWO parts here. The
 //     FLOOR — the tool catalogue, the agent instructions, the harness turns and the per-call
-//     overhead — measures 8 079 tokens for this preset and does not move with the transcript.
+//     overhead — measures 8 173 tokens for this preset and does not move with the transcript.
 //     The prompt does: `x` repeated 17 000 times is 17 000 ASCII bytes = 4 250 tokens, plus
-//     the 3-character `sys` instruction = 4 251, so the first boundary projects 12 330 —
-//     over 9 700, so the pass fires on the FIRST submit. With the 1 714-character compaction
-//     instruction on top (438 tokens, 4 689 in total) the request the pass sends is 12 768
+//     the 3-character `sys` instruction = 4 251, so the first boundary projects 12 424 —
+//     over 9 794, so the pass fires on the FIRST submit. With the 1 714-character compaction
+//     instruction on top (438 tokens, 4 689 in total) the request the pass sends is 12 862
 //     billed tokens with 4 689 of removable transcript in it;
-//   - the limit is SIZED BY THE FLOOR, in both directions. Above it: 8 079 + 438 = 8 517 is
+//   - the limit is SIZED BY THE FLOOR, in both directions. Above it: 8 173 + 438 = 8 611 is
 //     the smallest request this pass can ever build, so a limit under that is a limit no
 //     compaction can ever satisfy — the dead-run guard in
 //     ../plugins/context-compaction.plugin.ts refuses the pass outright (clipping cannot close
 //     an overage that belongs to the catalogue) and the two stacked rows this case exists to
 //     paint never appear. Below it: the retained head the pass leaves — the committed
-//     transcript, the 8-character answer and the continuation nudge, plus that same 8 079
-//     floor — measures 8 566, and the next two boundaries are 8 566 and 8 570. Both sit under
-//     9 700, so exactly ONE pass runs and no third row is painted. Those three margins
-//     (8 517 → 9 700 → 8 566) are what the constants are sized by; if the catalogue grows
+//     transcript, the 8-character answer and the continuation nudge, plus that same 8 173
+//     floor — measures 8 660, and the next two boundaries are 8 660 and 8 664. Both sit under
+//     9 794, so exactly ONE pass runs and no third row is painted. Those three margins
+//     (8 611 → 9 794 → 8 660) are what the constants are sized by; if the catalogue grows
 //     past them the case fails LOUDLY, in the frame count or in `fixture.prompts`, rather
 //     than by painting rows for the wrong reason;
 //   - `minTokens: 0` keeps the summarize floor from refusing the pass by accident;
 //   - `context-trimmer.enabled: false` is the same isolation the producer half uses, so
 //     exactly one withheld unit shows up in the folded bar.
-const COMPACTION_LIMIT = 9_700;
+const COMPACTION_LIMIT = 9_794;
 const COMPACTING_PROMPT = 'x'.repeat(17_000);
 
 const compactionFixture = (): { preset: HarnessPreset; prompts: string[] } => {
@@ -3892,6 +3900,11 @@ describe('delegated child threads', () => {
         const leadRow = (document.sessions[0].core.agentResults ?? []).find((record) => record.invocationId === '1');
 
         expect(leadRow).toEqual({
+            // C0 (2026-11-27): the completed row persists its answer's transcript address — the
+            // lead card carries an instruction, so the seed owns 0, `go` 1, the delegate call 2,
+            // its result 3, the answer 4 — which is what makes the row in THIS file addressable
+            // by `threadRead` after a restart.
+            answerMessageIndex: 4,
             agent: 'lead',
             completedOrder: 2,
             content: 'lead answer',
@@ -5547,8 +5560,8 @@ describe('display lane (C1)', () => {
         expect(lanesOf(continuationContext)).toEqual([1]);
 
         // EXACTLY ONE PASS for the whole session: the third request is this submit's answer,
-        // not a second compaction. The head the pass leaves measures 8 566 estimated tokens —
-        // 8 079 of irreducible catalogue plus the retained transcript — against the 9 700
+        // not a second compaction. The head the pass leaves measures 8 660 estimated tokens —
+        // 8 173 of irreducible catalogue plus the retained transcript — against the 9 794
         // limit, so the context-trimmer is not what stopped it (the estimate is), and the bar
         // above stays one row because nothing raised a lane 2.
         expect(fixture.prompts).toEqual([COMPACTION_INSTRUCTION, CONTINUATION_NUDGE, 'again']);

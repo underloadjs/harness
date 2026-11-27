@@ -1420,6 +1420,8 @@ describe('host-parent delegation (R4)', () => {
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
         ).resolves.toEqual({
+            // C0: 3 = the host thread's own transcript (instruction seed 0, brief 1, tool-call 2, answer 3).
+            answerMessageIndex: 3,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -1708,6 +1710,8 @@ describe('delete release and snapshot durability', () => {
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
         ).resolves.toEqual({
+            // C0: 1 = this writer card carries NO instruction, so there is no seed — the answer sits at 1, right after the user prompt at 0.
+            answerMessageIndex: 1,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -2021,6 +2025,8 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: 'branch-1' })
         ).resolves.toEqual({
+            // C0: 4 = the branch's OWN transcript (seed 0, task 1, fork call 2, result 3, answer 4).
+            answerMessageIndex: 4,
             agent: 'writer',
             invocationId: 'branch-1',
             kind: 'fork',
@@ -2127,6 +2133,13 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: '1' })
         ).resolves.toEqual({
+            // C0 + R1 (2026-11-27): 4, where the C0 pass measured 3. The index is a POSITION in the
+            // released conversation's own ledger, and that ledger gained one row before the answer —
+            // the `threadFork` CREATION-TIME POINTER this run appended when it created the branch
+            // named on the receipt above (`launchThreadFork`, src/engine/harness.ts). What the C0
+            // claim was worth is untouched: releasing the conversation moves nothing, and the id a
+            // caller still holds keeps answering.
+            answerMessageIndex: 4,
             agent: 'writer',
             invocationId: '1',
             kind: 'root',
@@ -2140,6 +2153,9 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         await expect(
             writer.executeTool('agentResult', { agent: 'writer', invocationId: branchId })
         ).resolves.toEqual({
+            // C0: the same branch answer as the row above — 4 in the branch's own transcript, and this
+            // receipt test deletes the thread that owned it, which is the moment the address has to survive.
+            answerMessageIndex: 4,
             agent: 'writer',
             invocationId: branchId,
             kind: 'fork',
@@ -4655,13 +4671,27 @@ describe('the missing-thread refusal is one sentence, not three (issue 0034, F2)
             { role: 'assistant', content: 'unused' }
         ]);
 
-        // THE MODEL-FACING DOOR STILL REFUSES, with the same words it has always used: the tool
-        // resolves its address through the record seam, and a released conversation is not one a
-        // model can be handed. What the retained row changed is which doors still walk that path,
-        // not what the sentence says.
-        expect(await refusal(() => writer.executeTool('threadRead', { thread: deleted.id }))).toBe(
-            missingThread(deleted.id)
-        );
+        // THE MODEL-FACING DOOR ANSWERS THE HOST VIEW, AND REFUSES A STRANGER (R1, 2026-11-27).
+        // This case used to pin the tool answering with the not-found sentence, because the tool
+        // resolved its address through `thread()` — a DISCOVERY seam that voids every `inactive`
+        // row — while the transcript seam one line above had already admitted the read. That made
+        // the same call disagree with itself: `threadMessages` served these bytes, `threadRead`
+        // denied they existed. `executeTool` names no caller thread, so it IS the host view, and
+        // the host view of a soft delete is the retained transcript at every door; the page and
+        // `threadMessages` now answer the same two rows. What a CONVERSATION outside the releasing
+        // lineage is refused, and with which sentence, is pinned in ./harness.thread-read.test.ts
+        // and in ../server/harness.it19-retention.test.ts (AC6.2). What stays pinned here is the
+        // agreement: a released id stops being a not-found fact at every door that reads, and an
+        // id nothing has stays the canonical sentence at all three.
+        const releasedPage = (await writer.executeTool('threadRead', {
+            thread: deleted.id
+        })) as { total: number; messages: { role: string; content: string }[] };
+
+        expect(releasedPage.total).toBe(2);
+        expect(releasedPage.messages.map((message) => [message.role, message.content])).toEqual([
+            ['user', 'a turn'],
+            ['assistant', 'unused']
+        ]);
 
         // THE COLLISION NOW RESOLVES. Because the released row keeps its id, an address that the
         // other harness ALSO uses stops being "unknown here" and answers this harness's retained

@@ -673,8 +673,10 @@ harness({ tools: { read } });                // the model calls read
 - `visibility` is `'core'` or `'searchable'` (the default). Core tools are declared
   on every request; searchable ones wait for discovery.
 - `mode` is `'sync'` or `'async'`, and the default is **`'sync'`**
-  (`DEFAULT_TOOL_MODE`). It says **when a finished call may start the next agent
-  turn** — never how the call executes: both modes launch the implementation as
+  (`DEFAULT_TOOL_MODE`). It is the **default turn policy of that tool's calls** —
+  a single call may override it with the reserved `async` argument (next bullet).
+  It says **when a finished call may start the next agent turn** — never how the
+  call executes: both modes launch the implementation as
   concurrent background work (promise-backed, cancelable, delivered through the
   per-agent mailbox), and a delivery is never delayed by the other mode's policy.
   - **`sync`** — the completion joins the *sync group* of the assistant message
@@ -687,18 +689,52 @@ harness({ tools: { read } });                // the model calls read
     sibling calls from the same message are still in flight. Groups are per
     assistant message and per run, so a delegation or a second thread never joins
     another run's group.
-  - The policy belongs to the **resolved definition**, not to the wire name:
+  - **Every call may name its own mode.** Each declaration the harness offers
+    advertises one extra optional boolean argument, `async`: `true` runs THAT call
+    as background work, `false` runs it inline in its message's sync group, and
+    omitting it means "this tool's own default" (`src/engine/core/tool.ts:129`,
+    `:156`). It is a harness-level switch, not a tool parameter — the harness reads
+    it, then strips it centrally before schema validation
+    (`src/engine/core/schema-validation.ts:353`), so it never reaches
+    `context.parameters` or an implementation, a closed (`additionalProperties:
+    false`) schema still accepts it, and the single-property rule below is
+    untouched. A non-boolean value is refused: `$.async must be a boolean (true for
+    async, false for sync); received <type>.` A tool whose OWN schema declares
+    `async` owns that property and gets no switch. Precedence for one call: the
+    explicit switch → the registration policy → the declared mode → `'sync'`, and a
+    refinement runs after that chain for one shape: a `delegate` call that
+    resolved to `async`, carrying no switch, in a message holding exactly ONE
+    async-resolving call, resolves to `sync`, because a spawner that started one
+    child is waiting for its answer and a placeholder turn is waste
+    (`src/engine/harness.ts:11960-11966`). Two delegates, or a delegate plus
+    another long-running call, keep the background shape — but the count is
+    **per message**, so two `delegate` calls in SEPARATE assistant messages are
+    NOT a fan-out: each message refines on its own and the children run
+    **strictly sequentially** (measured 2026-11-27, `Temp/docfinal/probe-sequential.ts`:
+    `child#0 START @358ms → ANSWER @609ms → child#1 START @612ms → ANSWER @863ms; a probe
+    figure, pinned by no test). To keep two
+    children in flight, put BOTH calls in one message or send `"async": true`.
+    Two boundaries keep that rule conservative: a name the request never
+    advertised counts 0 (`src/engine/harness.ts:2113`), and a call that is
+    advertised but later refused (bad arguments, a scope gate) still counts, so
+    a doomed sibling suppresses the refinement and keeps the old background
+    shape.
+  - The DEFAULT belongs to the **resolved definition**, not to the wire name:
     replacing a built-in under the same name publishes a tool that carries only
     its own declared mode (an undeclared replacement is `'sync'`). The shipped
     built-ins state theirs in their own `registration` literal, which is what the
     scanner, the generated manifest and the lazy loader all carry through: `read`,
-    `edit`, `search`, `fetch` and `actionRequest` are `'sync'`; `shell`, `delegate`
-    and `threadFork` are `'async'` (a long command, a child run and a detached clone
-    must never hold a batch hostage). `actionRequest` is `'sync'` on purpose: the
+    `edit`, `search`, `fetch` and `actionRequest` default to `'sync'`; `shell`,
+    `delegate` and `threadFork` default to `'async'` (a long command, a child run
+    and a detached clone must never hold a batch hostage). "Defaults to" is the
+    whole claim — one call may say `"async": false` and wait, or `"async": true`
+    and not. `actionRequest` defaults to `'sync'` on purpose: the
     question is directed AT the owner, so while a run owns an unsettled request the
     turn loop issues no model request at all — the run is held until the answer, a
     `toolCancel` or an expiry releases it, instead of spending a turn on a
-    `{"status":"pending"}` placeholder for its own open question.
+    `{"status":"pending"}` placeholder for its own open question. `threadFork`
+    joins the batch only on an explicit `"async": false`; `toolCancel` accepts the
+    argument and ignores it, because it answers inline and never schedules.
 - `parameters` is plain JSON Schema. A TypeBox schema works as-is, so no schema
   dependency is needed.
 - **Single-property rule.** When the schema declares exactly one property, the
@@ -1239,7 +1275,9 @@ used to report `role: 'primary' | 'subagent'`, and the model's own view of the t
 fact that actually decides delegation), `model`, `invocationCount`, and up to five recent invocations
 newest first. Each invocation preview carries `invocationId`, `kind` (`root`,
 `delegation`, `fork`, or `autoanswer`), `status`, `contentLength`, a
-200-character `preview`, and a `truncated` flag. A running invocation has status
+200-character `preview`, and a `truncated` flag, and a COMPLETED row adds `answerMessageIndex` (the
+0-based index of the message that preview starts — the `threadRead` address; the candidate list is
+deliberately not projected on a listing row, `agentResult` is the door that pays for it). A running invocation has status
 `running` and no content — a streamed partial is never presented as a result — and it is the
 ONE row that gains two more keys: `startedAt` (the epoch milliseconds the run began, stamped
 when the run registered) and `ageMs` (`max(0, now - startedAt)`, computed when you READ it, so
@@ -1255,7 +1293,16 @@ limit, hasMore, nextOffset? }`: pages are 4000 characters by default and at most
 8000, so a long answer is read in full across pages instead of being silently
 truncated by the harness's 64 KiB tool-result bound. Offsets are UTF-16 code-unit
 indices; page edges snap to surrogate-pair boundaries, so a non-BMP glyph is never
-split (the returned `offset` is the one actually used). A failed/cancelled invocation
+split (the returned `offset` is the one actually used). A completed answer also says WHICH message
+it is: `answerMessageIndex` is that message's 0-based index in the conversation that ran it, so
+`threadRead` with `message` set to it returns those bytes exactly, and the run's other substantive
+turns arrive beside it as `answerCandidates` — up to 4 entries, oldest first, each with its
+`messageIndex`, `contentLength`, a short `preview` and a `truncated` flag. Pass `message` as one of
+those entries' 0-based POSITION (not a transcript index) to page THAT text through the same
+offset/limit machinery; the result then echoes `message` and its `messageIndex`. A row that recorded
+nothing besides its answer has no `answerCandidates`, and `message` is then an error, as is an
+ordinal outside the list — the refusal names the legal range. The answer rule itself is unchanged: a
+run's answer is still its final message. A failed/cancelled invocation
 reports `error` and no content; an unknown id or agent is an error; an agent that
 has not run returns `status: 'empty'`. A run that is still in flight, addressed by
 `invocationId`, answers `status: 'running'` with `content: ''` plus the same
@@ -1266,13 +1313,17 @@ start stamp at all, so absence reads as "unknown", never as an age of 0. The pai
 the `delegate` envelope too — a released or abandoned `delegate` describes a child that already
 settled and answers with that child's `status`, `invocationId` and `durationMs`.
 
-Both tools expose ONLY the completed assistant answer value. They never return
-system instructions, transcript messages, tool arguments, or tool bodies. Results
+Both tools expose ONLY the run's own assistant ANSWER TEXT, plus the ADDRESS of the message that
+answer came from. They never return system instructions, transcript messages, tool arguments, or
+tool bodies — the candidate list C0 added is the run's own substantive turns, capped at 4 entries of
+32000 characters each, not a transcript read at large (`src/engine/harness.ts:4788-4810`). Results
 are held in a bounded per-harness registry (64 completed records, active runs are
 never evicted) and are **durable across snapshot/restore**: terminal results —
 completed, failed, or cancelled — are stored in the snapshot's ADDITIVE `agentResults` array
 (`invocationId`, `sequence`, `completedOrder`, agent, `rank` (the field the rank pass
-renamed from `role`), kind, status, content, error?), so a restart keeps every answer that already
+renamed from `role`), kind, status, content, error?, and on a COMPLETED row the optional
+`answerMessageIndex` / `answerCandidates` pair — both absent on every older row and on every stopped
+row, which is what an exact-key reader accepts without a version bump), so a restart keeps every answer that already
 exists. Running invocations are omitted from a snapshot (they have no answer yet),
 a snapshot written without that optional key restores with an empty registry (the KEY is
 additive; the DOCUMENT version is not — a v2 file is refused outright, because the rank pass
@@ -2225,8 +2276,15 @@ the loop re-reads real state after waking. This changes four things a caller mus
 - **A sync batch is one turn.** A message whose calls are all `sync` produces no
   intermediate request: the follow-up turn is built after the last one settled, so
   the model sees every result of the batch at its original call position. `shell`,
-  `delegate` and `threadFork` are `async`, so they keep the per-completion wake
-  below. `actionRequest` is `sync`: the question is directed at the owner, so a
+  `delegate` and `threadFork` **default to** `async`, so they keep the per-completion wake
+  below — unless the call says otherwise. Every tool's calls may be switched per call by the
+  reserved `async` argument (`true` → background, `false` → inline, absent → that tool's
+  default), and an unswitched `delegate` that is the ONLY async-resolving call of its message
+  resolves to `sync`: one child is the shape where the spawner is waiting on that child's
+  answer, so a placeholder turn is a wasted request (`src/engine/harness.ts:11960-11966`).
+  That refinement is what makes this bullet's rule the common delegation case, and it costs
+  the parent the heartbeat too — see the trade-off below. `actionRequest` is `sync`: the
+  question is directed at the owner, so a
   message of questions costs one turn after the LAST answer, and a run that owns an
   unsettled question issues no request at all until the answer, a `toolCancel` or an
   expiry releases the hold.
@@ -2244,7 +2302,16 @@ the loop re-reads real state after waking. This changes four things a caller mus
   there would buy nothing but a `status:'pending'` placeholder turn. The mode a call
   RESOLVES TO is what counts, so a mixed board (one `async` plus one `sync`) still pings
   — that async completion is what releases the parked gate — and a heartbeat armed for an
-  async call stops the moment only sync work is left. The rule lives in the `async-ping`
+  async call stops the moment only sync work is left. What the plugin CANNOT see is the
+  per-call switch: `HarnessPendingTool` carries `{ callId, name, elapsedMs }` only
+  (`src/engine/types/index.ts:365-369`), so the plugin resolves the mode BY NAME from the
+  live registry plus the generated table
+  (`src/engine/plugins/async-ping.plugin.ts:310-319`) while core announces EVERY launch,
+  sync included (`announcePending`, `src/engine/harness.ts:11756`). A call that a
+  `"async": false` switch — or the lone-`delegate` refinement — pulled down to `sync` on an
+  async-declared tool therefore keeps pinging (cost: one placeholder turn per ping; the named
+  fix is a `mode` field on the `async.pending` payload, recorded as an open follow-up). The
+  rule lives in the `async-ping`
   plugin, not in the loop, and `harness({ wakeIntervalMs })` (or that plugin's
   `intervalMs` setting) sets the cadence.
   - **The trade-off this makes.** There is **no automatic hard tool timeout**: pending
@@ -2255,7 +2322,18 @@ the loop re-reads real state after waking. This changes four things a caller mus
     three release the park, and the turn they buy can call `toolCancel`. A `read`/`edit`/
     `fetch`/`sleep` call wedged with no bound of its own therefore stays parked until the
     host acts; `shell` (`timeoutMs`), `fetch` and `delegate` (`timeoutMs`) carry their
-    own bound and are unaffected. Recorded with its evidence in
+    own bound and are unaffected. **The per-call switch and the lone-`delegate` refinement
+    moved this line for `delegate` (2026-11-27):** an unswitched lone delegation now parks
+    the spawner, so `toolCancel` is no longer advertised on its own turn — it becomes
+    reachable only on a **heartbeat** wake, at the shipped 600000 ms cadence. The change's own
+    probe at `wakeIntervalMs: 40`: a refined-sync lone `delegate` produced 2 wakeups and 2 placeholder
+    turns, where the same call with `"async": true` produced 1 self-release turn and 3 wakeups.
+    A hung lone `delegate` with no `timeoutMs` therefore waits for the next ping (or an abort,
+    a host cancel, or a steer) instead of being background work the agent can abandon any time
+    — the responsiveness cost of the default the change asked for. Measured figures, the +122
+    token/request catalogue cost, and the follow-ups are in
+    [`docs/tasks/2026-11-27-tool-call-mode-switch.md`](./docs/tasks/2026-11-27-tool-call-mode-switch.md).
+    Recorded with its earlier evidence in
     [`docs/tasks/2026-11-19-heartbeat-async-only.md`](./docs/tasks/2026-11-19-heartbeat-async-only.md).
   - **A THREAD has no wall-clock limit either (policy 2026-11-09).** A conversation —
     a delegated child, a `threadFork` branch, a host thread, a steered turn — stops
@@ -2327,9 +2405,13 @@ returned, and `threadRead` is how you re-read the answer. Only a delegation issu
 an agent's own DEFAULT conversation runs in that agent's standing
 `agent:<name>` conversation, which is the one case where a second call does continue
 the first transcript. Abandoning an in-flight call with `toolCancel` answers the ACK
-immediately (`{ cancelled: true, callId, name }`) and puts the child's terminal envelope
+immediately (`{ cancelled: true, callId, name }`, plus `threadId` — and for released fork work
+`branchId` and `invocationId` beside it, the ids `threadRead` and `agentResult` take: a
+background `threadFork` may be named by its `callId` OR by the `branch-N` its result reported, and
+either spelling releases the same call) and puts the child's terminal envelope
 in the call's own tool message — `status`, the harness's own `error` sentence,
-`partialContent`, `cancelledAtMessage`, the identity fields, and `callCancelled: true` —
+`partialContent`, `cancelledAtMessage`, `toolActivity` (a count-and-name tally, no result bodies),
+the identity fields, and `callCancelled: true` —
 so the recovery the description recommends is not the path that loses the result.
 
 Failures split in two:

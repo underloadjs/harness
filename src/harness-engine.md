@@ -128,7 +128,7 @@ agent counts, bound nesting: a chain of delegations visits strictly descending r
 |---|---|---|---|
 | `maxIterations` | `number` | unset (no limit) | Runaway guard: MODEL REQUESTS one agent run may make before the harness rolls history back to where the call started and throws. Every request counts — the first answer, each tool continuation, a pause with pending work, and every wake-driven turn. `Infinity` states "no limit" explicitly; a finite value must be a positive safe integer. The bound is harness-wide and per run: each run gets its own count. |
 | `threadForkTimeoutMs` | `number` | unset (no limit) | Default wall clock for a `threadFork` branch when the caller names none. The `threadFork` tool's own schema value wins over it; this is the host's backstop for every other fork door. |
-| `wakeIntervalMs` | `number` | `600000` | How often a run with pending background calls emits `wakeup` and gets another model turn. Since R4 this is the shipped `async-ping` plugin's `intervalMs` **default**: a stored `pluginSettings` value wins. |
+| `wakeIntervalMs` | `number` | `600000` | How often a run **whose board still holds an `async`-resolving call** emits `wakeup` and gets another model turn (`DEFAULT_WAKE_INTERVAL_MS`, `src/engine/harness.ts:676`). Since R4 this is the shipped `async-ping` plugin's `intervalMs` **default** (`src/engine/plugins/async-ping.plugin.ts:216`, `:242`): a stored `pluginSettings` value wins. A board whose outstanding calls are ALL `sync` is NOT pinged — its group re-enters the run itself — which is why a call that resolves to `sync` has no heartbeat behind it **unless the row that names its tool declares `async`**: the plugin's predicate resolves the mode by NAME, from the registration policy and else the generated `BUILTIN_TOOL_DESCRIPTORS` row (`src/engine/plugins/async-ping.plugin.ts:310-319`, the table index at `:211`), never from the call, so a lone unswitched `delegate` refined to `sync` — and a `shell` call carrying an explicit `"async": false` — **is** pinged, one `status:'pending'` placeholder turn per ping. That divergence is pinned at `src/engine/harness.tool-async-switch.test.ts:1579` ("pings a run parked on a refined lone delegate") and stated in `docs/plugins.md` (the `async.pending` section, "Neither read can see a per-call override") and in `README.md`'s "A periodic wake keeps a turn honest" bullet. |
 | `maxCreatedTools` | `number` | `32` | Lifetime runtime tool-creation budget for THIS harness instance. Not process-wide; `reset()` does not restore it and removing a name frees no slot. Configured and catalogue tools never spend it. A positive safe integer, validated at construction. |
 | `maxEnabledTools` | `number` | `32` | Bound on the persistent SEARCHABLE enabled set. Core tools are always declared and never count. This is not a per-query match cap: `toolRequest` reports the full union in `matched` and what the bound withheld in `omitted`. |
 
@@ -275,8 +275,53 @@ harness({ tools: { read } });        // the model calls it by the registry key
 | `execute` | `(context: ToolContext) => unknown \| Promise<unknown>` | — (required) | The implementation. Throwing is fine: the harness turns it into a tool result the model can read and recover from, which does not end the run. |
 | `name` | `string` | the registry key | Optional label. Inside a harness the registry key names the tool. |
 | `visibility` | `'core' \| 'searchable'` | `'searchable'` | `core` tools are declared on every request — keep that list tiny. `searchable` tools stay hidden until `toolRequest` enables them, and the persistent enabled set is bounded by `maxEnabledTools`. |
-| `mode` | `'sync' \| 'async'` | `'sync'` | WHEN a finished call may start the next turn. `sync` joins its batch's sync group — the run is re-entered only once every sync call launched from the same assistant message has settled; `async` triggers its own turn immediately, even while siblings are still in flight. The mode belongs to the resolved definition, never to the wire name. |
-| `parameters` | `Record<string, unknown>` | none | JSON Schema for the arguments; TypeBox output works as-is. **Single-property rule:** for a schema with exactly one property, `execute` receives that property's VALUE, not a wrapper. |
+| `mode` | `'sync' \| 'async'` | `'sync'` | The turn policy this tool's calls DEFAULT to — a call may override it with the reserved `async` argument (below), so this field is a default, not a verdict. It says WHEN a finished call may start the next turn, never how it executes: `sync` joins its batch's sync group — the run is re-entered only once every sync call launched from the same assistant message has settled; `async` triggers its own turn immediately, even while siblings are still in flight. The declared default belongs to the resolved definition, never to the wire name. |
+| `parameters` | `Record<string, unknown>` | none | JSON Schema for the arguments; TypeBox output works as-is. **Single-property rule:** for a schema with exactly one property, `execute` receives that property's VALUE, not a wrapper. **Reserved-key carve-out:** the harness offers every tool one extra optional argument, `async`, which is NOT part of this literal — it is added to the model-facing declaration copy and stripped before validation, so a closed (`additionalProperties: false`) schema still accepts it, the single-property rule is unaffected, and `execute` never sees it. A schema that declares `async` itself owns that property and gets no switch. |
+
+#### The reserved per-call `async` argument
+
+Every declaration the harness offers — every registered tool, and the pending-only
+`toolCancel` control — advertises one optional boolean argument, `async`
+(`TOOL_ASYNC_PARAMETER_KEY`, `src/engine/core/tool.ts:129`; the injected copy,
+`withToolAsyncSwitch`, `:156`). It is a **turn-mode switch, not a tool parameter**:
+
+| Call says | That call resolves to | Effect |
+|---|---|---|
+| `"async": true` | `'async'` | Background: the completion triggers its own turn; the assistant turn stays free. Overrides a declared `'sync'`. |
+| `"async": false` | `'sync'` | Inline: the completion joins the sync group of its assistant message. Overrides a declared `'async'`. |
+| absent | the tool's own chain | `modeDefinitions` (the discovered registration policy) → `definition.mode` → `DEFAULT_TOOL_MODE` (`'sync'`), `effectiveToolMode`, `src/engine/harness.ts:2073`/`:2082-2083`. |
+
+Resolution per call, in order (`src/engine/harness.ts:11911-11958`): the explicit switch →
+the registration/discovered policy → the declared mode → `DEFAULT_TOOL_MODE`; and a
+**`delegate`-only refinement** runs after that chain, overriding its answer for one call (step 3,
+`loneDelegation`) — see `knowledge.md` "Turn modes: sync vs async (T2)". A switch is read from the raw arguments tolerantly
+before validation (`readCallAsyncSwitch`, `src/engine/harness.ts:1229`) and applied to the
+RESOLVED definition, so a tool that owns the key has no switch to read.
+
+The key is injected into the **model-facing declaration copy only**
+(`withToolAsyncSwitch` at `src/engine/harness.ts:7008` for an ordinary row and `:7037` for
+the pending-only `toolCancel` row) and removed centrally, as the first statement of
+`resolveToolParameters` (`src/engine/core/schema-validation.ts:336`, the strip at `:353`,
+via `stripToolAsyncSwitch`, `src/engine/core/tool.ts:206`). Every plane passes that one
+function: the model wire (`src/engine/harness.ts:1213`), `callTool` (`:17549`),
+`executeTool` (`:17650`) and the server's manual tool route
+(`src/server/api.ts:2937`). Four consequences follow, and all four are the contract:
+
+- a closed schema (`additionalProperties: false`) still accepts the call;
+- a ONE-property schema keeps the single-property rule — the published `parameters`
+  literal never grows a second property, so `toolParameterKey` (`src/engine/core/tool.ts:66`)
+  still unwraps the value for `execute`;
+- the key never reaches `context.parameters` or a tool implementation;
+- the **published/registered** `parameters` literal — what the host catalogue shows — does
+  NOT carry the key; only the offered declaration does (`docs/runtime-tools.md`).
+
+A non-boolean value is a readable refusal from that same strip, on every plane:
+`$.async must be a boolean (true for async, false for sync); received <type>.`
+(`stripToolAsyncSwitch`, `src/engine/core/tool.ts:206-222`). A malformed payload is not a
+switch: it keeps reporting the error the authoritative parse reports.
+`call.arguments` in the transcript keeps whatever the model wrote — the strip removes the
+value from resolution and validation, never from the record or the provider replay
+(`src/engine/types/index.ts:100-123`).
 
 `ToolContext` gives an implementation: `parameters`; `agent?` and `agents?` (the
 brains); `run?(name, input, options?)` to start a full child turn on a sibling brain,
@@ -332,7 +377,8 @@ Termination:
 
 A run that finishes with background calls still running emits `done` with a non-empty
 `pending` list and keeps its promise open until the tree drains; `wakeup` events keep it
-re-requested while they are pending.
+re-requested while ASYNC work is pending (a sync group re-enters the run when it drains —
+it is not on the timer, `src/engine/plugins/async-ping.plugin.ts:11-47`).
 
 ## 8. The result
 
@@ -376,7 +422,7 @@ complete cost record.
 | `done` | `message`, `pending?` | A response the consumer is meant to see. Non-empty `pending` means the run is NOT terminal. |
 | `retry` | `attempt`, `maxAttempts`, `delayMs`, `error`, `provider?` | The retried attempt is DISCARDED: text streamed before this frame belongs to the failed attempt and none of its tools were executed. |
 | `attempt_commit` | `attempt`, `maxAttempts` | One request SUCCEEDED: everything streamed since the previous boundary is final. This is the boundary a tool-calling round has and `done` does not. |
-| `wakeup` | `reason: 'pending-tools'`, `pending` | The wake interval elapsed while background calls are pending; the run gets another turn. A progress event, never a transcript entry. |
+| `wakeup` | `reason: 'pending-tools'`, `pending` | The wake interval elapsed while the board still held an **`async`**-resolving call; the run gets another turn. A sync-only board is never woken this way — the async filter is the shipped rule (`src/engine/plugins/async-ping.plugin.ts:11-47`). A progress event, never a transcript entry. |
 | `progress` | `phase`, `toolCallSlots`, `argumentChars` | Tool-call composition heartbeat while a large parallel tool block is still being composed. Counters only, never argument text; purely informational — nothing may end, time out, or reorder a run because of it. |
 | `action_request` | `callId`, `request` | The model asked its owner a bounded question. |
 | `action_answer` | `requestId`, `answer` | An answer was recorded, owner or automatic. |

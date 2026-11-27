@@ -467,16 +467,22 @@ describe('routed conversation read and delete: the caller travels with the reque
     // worker. This source pin closes exactly that gap: it fails the moment a call site stops
     // forwarding its own `callerThreadId` argument (the R2-F14 defect), which is the only way
     // the builder's correctness can still be lost in production.
-    it('forwards the caller argument at BOTH routed handle reads, and raises no caller-less read', () => {
+    it('forwards the caller argument at EVERY routed handle read, and raises no caller-less read', () => {
         const loopSource = readFileSync(new URL('./lane-worker-loop.ts', import.meta.url), 'utf8');
 
-        // Both members, exactly twice, and never with the historical empty identity.
-        expect(loopSource.match(/threadReadRoutePayload\(threadId, callerThreadId\)/g)).toHaveLength(2);
+        // Every member that raises `thread:read`, exactly, and never with the historical empty
+        // identity. THREE since R1 (2026-11-27): `threadMessages`, `thread`, and the record half
+        // of the read door (`threadReadRecord`) that `threadRead.tool.ts` now asks for its
+        // identity block. The count is the contract, not a coincidence — an un-routed fourth
+        // member would answer a lane from its private replica (a hello snapshot plus this
+        // lane's own work) and re-open the one disagreement this file exists to close.
+        expect(loopSource.match(/threadReadRoutePayload\(threadId, callerThreadId\)/g)).toHaveLength(3);
         expect(loopSource).not.toContain("{ op: 'thread:read', threadId, identity: {} }");
 
         // The lane's own conversation stays LOCAL (no request at all): that read is the one
         // place the replica is the authority, because its uncommitted tail exists nowhere else.
         expect(loopSource).toContain('threadId === state.targetId ? localMessages(threadId)');
         expect(loopSource).toContain('threadId === state.targetId ? localRecord(threadId)');
+        expect(loopSource).toContain('threadId === state.targetId ? localReadRecord(threadId)');
     });
 });

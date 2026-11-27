@@ -238,24 +238,40 @@ const SEED = 'x'.repeat(2100);
 // catalogue is inside every unanchored `turn.before` estimate — harness.ts serializes the declared
 // tools and core/context-estimate.ts adds those bytes before the /4), so a limit can no longer sit
 // below a thread's catalogue floor:
-//   parent (writer)    catalogue = 43,827 serialized bytes / 4 -> 10,957 tokens
-//   child  (researcher) catalogue = 36,115 serialized bytes / 4 ->  9,029 tokens
+//   parent (writer)    catalogue = 47,214 serialized bytes / 4 -> 11,804 tokens
+//   child  (researcher) catalogue = 38,333 serialized bytes / 4 ->  9,584 tokens
 // floors: probe Temp/fix-f5/probe-floors.ts (shape C — the same `presets: false` writer/researcher
 // roster with ranks A/B and the one `seed` tool this file builds), re-measured 2026-11-25 for the
 // +1,976 B F1's threadList/threadSend disclosure added to every declared catalogue. The floors this
 // block used to quote (9,946 / 8,095) were already stale at pristine HEAD, where that probe
 // measured 41,851 and 34,139 bytes.
+// RE-MEASURED 2026-11-27 on both legs of the same probe (pristine `e66bce8`: child 36,691 B /
+// 9,173, parent 45,425 B / 11,357 — so the 9,029 below was already 144 tokens under its floor
+// before anything else moved). Two findings sit between that leg and this one: the reserved
+// `async` switch (../core/tool.ts `withToolAsyncSwitch`, +1,074 B on this child and +1,221 B on the
+// parent) and F1's branch-write disclosure (+568 B on both, the `thread` parameter copies on
+// `threadSend` and `threadDelete`; the `threadFork` description itself rides a SEARCHABLE row and is
+// never declared, so it prices nothing here). 36,691 + 1,074 + 568 = 38,333 and
+// 45,425 + 1,221 + 568 = 47,214, exactly the two floors above.
 // probe: src/plugins/context-compaction.plugin.ts `turnBefore`, sampled per boundary
-//   writer    10 958 = floor 10 957 + transcript 1      (parent, round 1)
-//   researcher  9 036 = floor  9 029 + transcript 7      (child, round 1)
-//   researcher  9 570 = floor  9 029 + transcript 541    (child, round 2 — the seed tool result)
-//   writer    11 031 = floor 10 957 + transcript 74      (parent, round 2)
+//   writer    11 805 = floor 11 804 + transcript 1      (parent, round 1)
+//   researcher  9 591 = floor  9 584 + transcript 7      (child, round 1)
+//   researcher 10 125 = floor  9 584 + transcript 541    (child, round 2 — the seed tool result)
+//   writer    11 878 = floor 11 804 + transcript 74      (parent, round 2)
 // `LIMIT` therefore sits ABOVE the child's floor (so its clipped compaction request can fit, and
 // the dead-run guard in ./plugins/context-compaction.plugin.ts lets the pass run) and BELOW its
-// seeded round (9 570), so exactly ONE summarize pass runs — on the subthread. The parent crosses
-// the same limit from its own 10 957 floor and its pass is REFUSED by that guard, which is what keeps
-// the case at one pass and three child requests; the parent's estimate is not what stops it.
-const CHILD_CATALOGUE = 9_029;
+// seeded round (10 125), so exactly ONE summarize pass runs — on the subthread. The parent crosses
+// the same limit from its own 11 804 floor and its pass is REFUSED by that guard, which is what
+// keeps the case at one pass and three child requests; the parent's estimate is not what stops it.
+// F1b (2026-11-27, the branch-seed findings) — 38,333 -> 38,949 B on the child and 47,214 -> 47,830 B on the
+// parent, both exactly +616 B / +154 tokens, so the floors above are 9,738 (child) and 11,958 (parent). The
+// two sentences are `threadSend`'s no-redirect note (+277 B) and `threadDelete`'s discovery-pointer sentence
+// (+339 B) — declared rows, so they ride every catalogue. Probe `Temp/fix-f5/probe-transcript.ts` re-run on
+// this tree samples the same boundaries at child 9,744 (floor + 6) and 10,272 (floor + 534) and parent
+// 11,958 and 12,033, i.e. every figure in the block above moves by the same +154 and the structure is
+// intact: round 1 stays under `LIMIT` (9,744 < 10,268), the seeded round crosses it (10,272 >= 10,268), and
+// the parent's 11,958 floor still sits above the 10,268 ceiling its pass would have to fit.
+const CHILD_CATALOGUE = 9_738;
 const LIMIT = CHILD_CATALOGUE + 530;
 
 const BRIEF_TASK = 'dig into the seeded report';

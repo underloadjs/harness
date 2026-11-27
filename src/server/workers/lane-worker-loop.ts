@@ -505,9 +505,17 @@ export const installAuthorityRuntime = (replica: Harness): void => {
     const handle = replica as unknown as {
         threadMessages: (threadId: string, callerThreadId?: string) => unknown;
         thread: (threadId: string, callerThreadId?: string) => unknown;
+        // R1 (2026-11-27) — the record half of the read door, which `threadRead.tool.ts` asks
+        // for the identity block. It rides the SAME `thread:read` request as the two reads above
+        // (the authority answers ONE object carrying `messages`, the discovery `record`, and the
+        // read-visible `readRecord`): the transcript and the row it belongs to must come from one
+        // decision on the canonical harness, or a lane could be served a transcript whose record
+        // the coordinator refused — exactly the defect R1 fixed inline.
+        threadReadRecord: (threadId: string, callerThreadId?: string) => unknown;
     };
     const localMessages = replica.threadMessages.bind(replica);
     const localRecord = replica.thread.bind(replica);
+    const localReadRecord = replica.threadReadRecord.bind(replica);
 
     // Captured BEFORE the routed replacements: ./lane-worker-loop.ts's own derivation, reset
     // handling and transcript rebase all need the synchronous local answer, and reading the
@@ -518,6 +526,11 @@ export const installAuthorityRuntime = (replica: Harness): void => {
         threadId === state.targetId ? localMessages(threadId) : raise({ op: 'thread:read', ...threadReadRoutePayload(threadId, callerThreadId) } as LaneAuthorityRequest).then((reply) => (reply.value as { messages: unknown[] }).messages);
     handle.thread = (threadId: string, callerThreadId?: string): unknown =>
         threadId === state.targetId ? localRecord(threadId) : raise({ op: 'thread:read', ...threadReadRoutePayload(threadId, callerThreadId) } as LaneAuthorityRequest).then((reply) => (reply.value as { record: unknown }).record);
+    // The lane's OWN conversation stays local for the same reason as the two reads above: this
+    // replica is the only place its uncommitted tail exists, and reading the conversation you
+    // stand in is never a lineage question.
+    handle.threadReadRecord = (threadId: string, callerThreadId?: string): unknown =>
+        threadId === state.targetId ? localReadRecord(threadId) : raise({ op: 'thread:read', ...threadReadRoutePayload(threadId, callerThreadId) } as LaneAuthorityRequest).then((reply) => (reply.value as { readRecord: unknown }).readRecord);
 
     // Asserted, not assumed: a NEW runtime method must be classified as routed or local or local
     // before a lane may run it, and this is where that rule bites at hello time.

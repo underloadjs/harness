@@ -61,7 +61,10 @@
 // `toolParameterKey` and `normalizeTags` are internal plumbing: the harness uses
 // the first to apply the single-property rule, and discovery uses the second to
 // compare tags. They are exported for tests and for tooling that inspects a
-// schema, and are not re-exported from the package root.
+// schema, and are not re-exported from the package root. The same is true of the
+// reserved per-call `async` switch below: ../harness.ts (the declaration and the mode
+// resolver) and ./schema-validation.ts (the strip) import them from './tool' directly,
+// and a host that wants to name the key reads it here rather than re-spelling 'async'.
 export { agent } from './agent';
 // U6 — the seeded-prefix-band seam `Harness.setAgentPrefix` and the server's prefix read call.
 // `writeAgentPrefix` replaces one brain's band + reset baseline + thread seed; `agentPrefixOf`
@@ -73,6 +76,19 @@ export { agentPrefixOf, writeAgentPrefix } from './agent';
 // of parsing prose, and both names are part of `agent()`'s contract.
 export { STRUCTURED_OUTPUT_INVALID_CODE, STRUCTURED_SCHEMA_INVALID_CODE } from './agent';
 export { tool, toolParameterKey, normalizeTags, DEFAULT_TOOL_MODE } from './tool';
+// The reserved per-call `async` switch (./tool.ts owns the contract): the key's ONE
+// spelling, its model-facing sentence, the declaration-copy injector, the tolerant
+// reader, the "this tool declared it itself" test, and the strip+type-gate the shared
+// resolver calls. Exported like `toolParameterKey` — for tests and tooling, not the
+// package root.
+export {
+    TOOL_ASYNC_PARAMETER_KEY,
+    TOOL_ASYNC_PARAMETER_DESCRIPTION,
+    toolOwnsAsyncParameter,
+    withToolAsyncSwitch,
+    readToolAsyncSwitch,
+    stripToolAsyncSwitch
+} from './tool';
 export { MAX_DISCOVERY_MATCHES, searchTools, selectTools } from './discovery';
 export type {
     ToolSelectionOptions,
@@ -431,6 +447,9 @@ export {
 // frozen bounds. None of these are re-exported from the package root.
 export {
     BRANCH_PENDING_PLACEHOLDER,
+    // M5 — the seed row of the call that CREATED a branch (./branch.ts). Exported beside the
+    // placeholder it replaces so the two wordings are readable from one place.
+    BRANCH_SELF_CALL_PLACEHOLDER,
     MAX_BRANCH_RECORDS,
     MAX_FORK_CONCURRENT,
     MAX_FORK_DEPTH,

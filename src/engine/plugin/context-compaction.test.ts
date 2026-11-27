@@ -757,7 +757,69 @@ const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', strea
 // DELTA (+494 tokens = +1,976 bytes / 4) rather than to the new floor: the ceiling the case sizes
 // its SEED + PROMPT against is `DELEGATE_FLOOR + 520`, and only the offset between the two floors
 // is what the case was written against. The case asserts no exact estimate.
-const CATALOGUE = 14_386;
+//
+// THE +1,616 BYTES ON TOP OF THAT — 59,160 serialized bytes = 14,790 tokens, STILL a multiple of 4
+// — are the reserved per-call `async` switch of 2026-11-27: every OFFERED declaration now carries
+// one extra OPTIONAL property on the model-facing copy ./core/tool.ts `withToolAsyncSwitch` builds
+// in ../harness.ts `offerDeclarations`, and `toolSchemaPayloadBytes` prices THAT copy, so every
+// harness-level estimate in this file is the transcript plus the NEW floor. All 11 rows of the
+// writer roster got the key — +147 B on ten of them and +146 B on `threadList`, 10 x 147 + 146 =
+// 1,616 — and that per-row figure is uniform ONLY for rows that already declare a `properties`
+// object: a PARAMETERLESS row pays 193 B, because the injection has to materialize the object (the
+// variant ../harness.budget.test.ts prices with its `echo` row). MEASURED per entry on a live
+// request in BOTH trees by probe `Temp/coding/probe-catalogue-ab.ts` shape A, whose pristine-HEAD
+// (e66bce8) leg reproduces 57,544 B / 14,386 tokens EXACTLY — which is what makes +1,616 a
+// measurement rather than an arithmetic claim. `core/context-estimate.ts` moved not one line: the
+// only new model-facing text is the switch's one-sentence description, so every `CATALOGUE + n`
+// below is the SAME arithmetic on a constant 404 tokens higher — precisely the case this header
+// exists for. THE CONSTANT BELOW IS NOT THAT FIGURE'S ONLY NEIGHBOUR: the delegating roster carries
+// one more row (`delegate`, 8,723 -> 8,870 B) and moved by its own measured +1,763 B / +441 rounded
+// tokens; see the `DELEGATE_FLOOR` block in the summarize-flow describe below, which moved the same
+// way and for the same reason.
+//
+// F1 (2026-11-27, the branch write doors) — 59,160 -> 59,728 serialized bytes = 14,932 tokens, and
+// the move is +568 B exactly: the two PARAMETER copies this finding added to rows this roster
+// DECLARES (`threadSend`'s `thread` +362 B and `threadDelete`'s `thread` +206 B — both spell out
+// that a `threadFork` branch may not use the door). `threadFork`'s own +664 B and `toolCancel`'s
+// +327 B move nothing here: a SEARCHABLE row is not declared, so the fork's description never
+// enters a `turn.before` estimate — it is priced only in the tool-list documents
+// (../harness.tool-list.test.ts). Re-measured on shape A of probe `Temp/fix-f5/probe-floors.ts`
+// against pristine `e66bce8` (57,544 B / 14,386, which the lane above reproduces) and against this
+// tree (59,728 B / 14,932); 57,544 + 1,616 + 568 = 59,728 exactly, so every `CATALOGUE + n` below
+// is the SAME arithmetic on a constant another 142 tokens higher.
+// F1b (2026-11-27, the branch-seed findings) — 59,728 -> 60,344 serialized bytes = 15,086 tokens, and the
+// move is +616 B exactly: the two DESCRIPTION sentences this finding added to rows this roster DECLARES
+// (`threadSend` +277 B for the no-redirect note sentence, `threadDelete` +339 B for the
+// discovery-pointer sentence — both `visibility: 'core'`, so both ride every declared catalogue). Nothing
+// else moved: the M5 seed wording is transcript text, not tool text, and `threadFork`/`toolCancel` prose is
+// priced only in the tool-list documents (../harness.tool-list.test.ts). Re-measured on shape A of probe
+// `Temp/fix-f5/probe-floors.ts` against THIS tree (60,344 B / 15,086, exact at /4); 57,544 + 1,616 + 568 +
+// 616 = 60,344, so every `CATALOGUE + n` below is the SAME arithmetic on a constant another 154 tokens
+// higher.
+// F5 (2026-11-27, the threadRead row's deleted-thread caveat) — 60,344 -> 60,720 serialized bytes =
+// 15,180 tokens, and the move is +376 B exactly: the ONE row this pass reworded is a row the writer
+// roster DECLARES, so its bytes ride every `turn.before` estimate. The growth is the deleted-thread
+// narrowing stated twice — the `threadRead` row DESCRIPTION now says a DELETED id answers only inside
+// the lineage that released it (+175 chars over the tree this constant was captured against) and the
+// `thread` ARGUMENT says the same rule from the caller's side (+127 chars). Nothing else moved: no
+// other row changed text, and `threadRead`'s page-semantics prose is unchanged. Re-measured on shape A
+// of the same probe the F1b paragraph above used — `Temp/fix-f5/probe-floors.ts` — which now reports
+// `A writer-only catalogueBytes=60720 tokens=15180 ceil=15180`; 57,544 + 1,616 + 568 + 616 + 376 =
+// 60,720, still a MULTIPLE OF 4, so every `CATALOGUE + n` below keeps its `n` and only the constant
+// moves. The two floors this is visible in were caught by their own assertions reporting 15,181 and
+// 15,280 where they used to report 15,087 and 15,186.
+// R1 (2026-11-27, the `agentManage` answer-address sentence) — 60,720 -> 60,722 serialized bytes =
+// 15,181 tokens (the ceiling of 15,180.5), and the move is +2 B EXACTLY, from ONE clause: the dash
+// this pass restored in `threadSend`'s `thread` parameter sentence ("…a turn-cap, a timeout, a parent
+// that closed - answers \"started\"."), which is a declared row and so rides every `turn.before`
+// estimate. The +339 B of prose this pass added to `agentManage` prices NOTHING here — that entry is
+// `visibility: 'searchable'`, so it enters the REGISTERED tool-list documents (../harness.tool-list.test.ts
+// records the identical +339 in both currencies) and never a declared catalogue. Measured on this tree
+// by the estimator itself rather than derived: every `CATALOGUE + n` pin in this file now reports one
+// token more than it did (the `[CATALOGUE + 100]` estimates report 15,281 where they reported 15,280,
+// and the T9 shrink report prints `floorTokens: 15,181` with `from`/`to` both one higher), which is
+// the re-measurement. The constant moves by 1; every `+ n` offset below is untouched.
+const CATALOGUE = 15_181;
 
 // The settings an operator would type in the Plugins pane, as a stored document. Every key
 // this plugin reads may appear; anything it does NOT store falls back to its DECLARED
@@ -3445,6 +3507,9 @@ describe('context-compaction action (executeCompaction)', () => {
     // these prompts is exact by construction:
     //   400 chars -> 100, 412 -> 103, 476 -> 119 against a limit of 100 (margin 5).
     // The estimates below are therefore `CATALOGUE + 100`, `CATALOGUE + 103`, `CATALOGUE + 119`.
+    // (The 2-character prompt is the one case where the transcript term does NOT show up as a `+ 1`:
+    // the estimate is the ceiling of the WHOLE request over 4, and at 60,722 catalogue bytes the extra
+    // 2 characters land on an exact multiple of 4 — that case pins `CATALOGUE` exactly, below.)
     // The margin, and the crossing itself, are keyed on the OPERATOR's limit, which stays a
     // transcript-scale number, so the regrowth arithmetic these cases measure is unchanged.
     const SHORT = 'go';
@@ -3471,7 +3536,15 @@ describe('context-compaction action (executeCompaction)', () => {
         const message = await writer.sendThreadInput(thread.id, SHORT);
 
         expect(message.content).toBe('ok');
-        expect(estimates).toEqual([CATALOGUE + 1]);
+        // `CATALOGUE`, with no `+ 1` above it — and the R1 constant move is why that offset went away.
+        // The estimate is the CEILING of the whole billed request over 4, not a floor plus a transcript
+        // term: 2 prompt characters over the 60,720-byte catalogue this constant used to carry came to
+        // 60,722 bytes, which is 15,180.5 and therefore 15,181 = `old CATALOGUE + 1`. The same request
+        // over the 60,722-byte catalogue is 60,724 bytes = exactly 15,181, so the transcript term now
+        // rounds INTO the floor instead of above it. The claim this line protects is unchanged — one
+        // character of prompt under a 100-token ceiling stays under it — and the number is re-measured,
+        // not re-derived.
+        expect(estimates).toEqual([CATALOGUE]);
         expect(events).toEqual([]);
         expect(writer.thread(thread.id)?.status).toBe('idle');
 
@@ -4064,15 +4137,21 @@ describe('context-compaction action (executeCompaction)', () => {
 //
 // Every number here is derived, never read back: the transcript is seeded with 2100
 // characters of one user turn (525 tokens) and the prompt `go` adds one more, so the live
-// projection at the first boundary is `CATALOGUE + 526` — the 526 of transcript plus the tool
-// catalogue every request carries (see the constant above) — against an effective limit of
-// `CATALOGUE + 520`: over by the same 6 tokens it always was, and `minTokens: 0` so the floor
-// cannot refuse the pass. After a successful compaction the retained head (the instruction
-// 438 tokens, the answer, the nudge) measures 486, i.e. 34 under the limit, which is what makes
-// "the context is small again" an assertion rather than a hope. Because the floor is ADDITIVE
-// (`CATALOGUE` is a multiple-of-4 byte count, so it rides on top of the transcript term and on
-// top of the ceiling), this block writes its limit ONCE as `CATALOGUE + 520` and every
-// limit-vs-estimate comparison in it keeps the exact margin it had at transcript scale. The seed
+// projection at the first boundary is `CATALOGUE + 525` against an effective limit of
+// `CATALOGUE + 520`: over by 5 tokens, and `minTokens: 0` so the floor cannot refuse the
+// pass. THE OFFSET MOVED FROM 526 TO 525 ON 2026-11-27 (R1), and the reason is a premise this
+// block used to state as fact: the estimate is the CEILING of the whole billed request over 4,
+// and it only behaves as "floor + transcript" while the catalogue's byte count is a multiple of
+// 4. It was (60,720 B = exactly 15,180); the 2-byte clause that moved this constant put the
+// catalogue at 60,722 B, and a remainder of 2 in the catalogue leg now pairs with the 2-character
+// prompt to round the composite back down. So the `+ n` offsets in this block are PER-FIXTURE
+// MEASUREMENTS, not arithmetic on the constant — which is how they were captured, and the reason
+// they are re-measured whenever the constant moves. After a successful compaction the retained
+// head (the instruction 438 tokens, the answer, the nudge) measures 486, i.e. 34 under the limit,
+// which is what makes "the context is small again" an assertion rather than a hope. Because the
+// floor is ADDITIVE for the LIMIT side, this block writes its limit ONCE as `CATALOGUE + 520`
+// and every limit-vs-estimate comparison in it keeps the transcript-scale ceiling it was sized
+// against. The seed
 // and the limit are SIZED BY THE SHIPPED INSTRUCTION: the head is instruction + answer + nudge,
 // so the OpenCode checkpoint template (1,714 characters / 1,752 payload bytes of instruction,
 // adopted 2026-11-12) moved both numbers — a limit under ~490 transcript tokens would sit below
@@ -4118,9 +4197,11 @@ describe('context-compaction summarize flow (T9)', () => {
     const BIG_SEED = 'x'.repeat(300_000);
 
     // 520 TRANSCRIPT tokens plus the catalogue floor the estimate is measured against — the one
-    // place this block adds the constant, so every margin in it (the 6-token crossing, and the
-    // 34-token headroom the retained head leaves) stays exactly the transcript-scale number the
-    // header derives.
+    // place this block adds the constant, so the ceiling every case here caps its conversation with
+    // stays the transcript-scale number the header derives. The margins that hang off it are
+    // measured, not derived: the crossing is 5 tokens (the estimate side rounds down against a
+    // catalogue that is no longer a multiple of 4, see the header), and the retained head leaves
+    // 34 tokens of headroom.
     const LIMIT = CATALOGUE + 520;
 
     // THE DELEGATING ROSTER'S FLOOR, which is NOT `CATALOGUE`. A roster with a delegating agent
@@ -4189,7 +4270,54 @@ describe('context-compaction summarize flow (T9)', () => {
     // irreducible size is at or above the ceiling, and a `CATALOGUE + 520` ceiling in a
     // delegating harness sits 1,926 tokens UNDER its own floor — a request no amount of clipping
     // could ever fit, so the pass there was a dead run by construction.
-    const DELEGATE_FLOOR = 16_101;
+    //
+    // 2026-11-27, THE RESERVED `async` SWITCH — both floors moved, so the "UNMOVED" readings above
+    // are historical. The switch rides EVERY offered declaration (see the `CATALOGUE` header at the
+    // top of this file), and a delegating roster declares one row more than the writer roster, so
+    // it pays 11 x 147 B + 146 B = +1,763 B: probe `Temp/coding/probe-catalogue-ab.ts` shape B, BOTH
+    // trees — pristine HEAD (e66bce8) 66,268 B / 16,567 tokens EXACTLY, which is the figure C2
+    // recorded, today 68,031 B = 17,007.75 -> 17,008. The cap therefore moves by the MEASURED DELTA
+    // (+441 tokens, 16,101 -> 16,542), which is what keeps the 466-token offset this block has always
+    // sized itself against (17,008 − 16,542 = 466) and keeps `DELEGATE_FLOOR + 520` = 17,062 clearing
+    // the floor by the same 54 tokens. NOT moving it is what broke the shipped-park delegate case:
+    // with the cap at 16,621 and the roster's irreducible floor at 17,008, the dead-run guard above
+    // declines to park at all, and the failure is `Thread "thread-1" never reached "paused" (last:
+    // running)` rather than a token figure — the exact presentation this block already warned about,
+    // reproduced 2026-11-27 and closed by this constant, not by touching the case.
+    //
+    // F1 (2026-11-27, the branch write doors) — the delegating roster moved again for the SAME
+    // reason and by the SAME +568 B: probe shape B is 68,599 B = 17,149.75 -> 17,150 now against
+    // 68,031 B / 17,008 when this block last measured it. The cap therefore moves by the measured
+    // +142 tokens (16,542 -> 16,684), so the 466-token offset this block sizes itself against is
+    // untouched (17,150 − 16,684 = 466) and `DELEGATE_FLOOR + 520` = 17,204 still clears the floor
+    // by the same 54 tokens.
+    // F1b (2026-11-27, the branch-seed findings) — the delegating roster moved a THIRD time for the same
+    // reason and again by exactly +616 B: probe `Temp/fix-f5/probe-floors.ts` shape B measures 69,215 B =
+    // 17,303.75 -> 17,304 now, against 68,599 B / 17,150 when F1 closed this block. The two sentences are
+    // `threadSend`'s no-redirect note (+277 B) and `threadDelete`'s discovery-pointer sentence (+339 B), both
+    // declared rows. The cap therefore moves by the measured +154 tokens (16,684 -> 16,838), so the
+    // 466-token offset this block sizes itself against is untouched (17,304 − 16,838 = 466) and
+    // `DELEGATE_FLOOR + 520` = 17,358 still clears the floor by the same 54 tokens.
+    // F5 (2026-11-27, the threadRead deleted-thread caveat) — the delegating roster moved a FOURTH time,
+    // by the same +376 B as shape A: probe `Temp/fix-f5/probe-floors.ts` shape B measures 69,591 B =
+    // 17,397.75 -> 17,398 now, against 69,215 B / 17,304 when F1b closed this block. The delegating roster
+    // declares `threadRead` too, so the one reworded row is priced here as well. The cap therefore moves by
+    // the measured +94 tokens (16,838 -> 16,932), so the 466-token offset this block sizes itself against is
+    // untouched (17,398 − 16,932 = 466) and `DELEGATE_FLOOR + 520` = 17,452 still clears the floor by the
+    // same 54 tokens. Left stale, this block's park case stops parking for the reason the block exists to
+    // rule out: the ceiling falls under the request floor, the dead-run guard refuses the pass, and the
+    // thread never reaches `paused` (the failure this constant closed on 2026-11-27, reproduced again).
+    // R1 (2026-11-27, the `agentManage` sentence) — the delegating roster moved a FIFTH time, by the
+    // same +2 B as shape A: this roster declares `threadSend` too, so the restored dash in its `thread`
+    // parameter sentence is priced here as well (69,591 -> 69,593 B = 17,398.25 -> 17,399 request
+    // floor). The `agentManage` row this pass grew by 339 B is `searchable`, so it is not in a declared
+    // roster and moves neither figure. The cap therefore moves by the measured +1 token
+    // (16,932 -> 16,933), so the 466-token offset this block sizes itself against is untouched
+    // (17,399 − 16,933 = 466) and `DELEGATE_FLOOR + 520` = 17,453 still clears the floor by the same
+    // 54 tokens. Left stale, this is the failure mode the block exists to rule out: the ceiling drops
+    // under the request floor, the dead-run guard refuses the pass, and the thread never reaches
+    // `paused`.
+    const DELEGATE_FLOOR = 16_933;
 
     // Scripted transport with a window INTO the request: `on` runs while the model turn is
     // in flight, which is the only moment a case can observe the roster status mid-pass, the
@@ -4391,13 +4519,19 @@ describe('context-compaction summarize flow (T9)', () => {
         // would otherwise still see the pre-compaction size and fire the pass again. The report
         // carries the CATALOGUE floor on the estimate side (it is the request the provider bills),
         // and the margin over the ceiling is still the 6 transcript tokens the header derives.
+        // The estimate offset is 525, not the 526 this block measured before R1: the same ceiling-of-
+        // the-request-over-4 arithmetic as above, so the 2 catalogue bytes this pass restored land in
+        // the remainder rather than in the integer. The crossing margin is therefore 5 tokens
+        // (`CATALOGUE + 525` over a `CATALOGUE + 520` limit) where it was 6 — a firing decision that
+        // still fires, and `minTokens: 0` keeps the floor from refusing the pass either way. Both
+        // figures re-measured on this tree.
         expect(diagnostics[0].message).toContain(
-            `~${CATALOGUE + 526} estimated tokens against an effective limit of ${CATALOGUE + 520}`
+            `~${CATALOGUE + 525} estimated tokens against an effective limit of ${CATALOGUE + 520}`
         );
         expect(diagnostics[0].data).toEqual({
             mode: 'summarize',
             threadId,
-            tokens: CATALOGUE + 526,
+            tokens: CATALOGUE + 525,
             effective: CATALOGUE + 520,
             entries: 3
         });
@@ -4643,9 +4777,12 @@ describe('context-compaction summarize flow (T9)', () => {
         // CATALOGUE + 520 ceiling this block runs under makes it
         // `max(1, floor(13,838 × 0.05)) = 691` tokens, and the only rows that can grow the
         // projection are the 438 tokens of instruction the failed pass left on the record plus
-        // the new prompt. The second boundary therefore measures CATALOGUE + 1,466
-        // (2,100 + 2 + 1,752 + 2,010 = 5,864 payload bytes) against the mark
-        // CATALOGUE + 526 + 691 = CATALOGUE + 1,217, and re-arms on 940 tokens of growth.
+        // the new prompt. The second boundary carries 2,100 + 2 + 1,752 + 2,010 = 5,864 payload bytes
+        // of rows over the catalogue floor, against the mark of the FIRST boundary's estimate plus that
+        // 691-token margin — over it by growth, and re-armed. The exact token figures on both sides of
+        // that comparison are per-fixture ceiling-of-request measurements (the catalogue is no longer a
+        // multiple of 4, see the T9 header), so this case asserts the BEHAVIOUR it exists for —
+        // re-fire, cut, answer, idle — and leaves the arithmetic to the pin above.
         // Re-captured from an actual run: the second instruction is in flight (still
         // included — it is what the model was just shown), and the block that pass compacted
         // (SEED, both prompts, the first instruction) is switched off by it. The answer is
@@ -5058,11 +5195,12 @@ describe('context-compaction summarize flow (T9)', () => {
         expect((await writer.sendThreadInput(thread.id, PROMPT)).content).toBe('SUMMARY');
         expect(await settle(writer, thread.id, 7)).toBe(true);
 
-        // The trigger measured the PROJECTION, not the transcript: `CATALOGUE + 526` (the 526 of
-        // the seed and the prompt, on top of the catalogue floor), not `CATALOGUE + 829` with the
-        // already-withheld turn counted. A live estimate that read canonical history would fire
+        // The trigger measured the PROJECTION, not the transcript: `CATALOGUE + 525` (the seed and the
+        // prompt on top of the catalogue floor — 525 as measured on this tree since R1 moved the
+        // constant, see the T9 header), and NOT the same figure with the already-withheld turn added
+        // back (303 tokens higher). A live estimate that read canonical history would fire
         // compaction on conversations that are already compacted.
-        expect(diagnostics[0].data).toMatchObject({ tokens: CATALOGUE + 526, effective: CATALOGUE + 520 });
+        expect(diagnostics[0].data).toMatchObject({ tokens: CATALOGUE + 525, effective: CATALOGUE + 520 });
 
         // And it stayed off: no request this pass produced — the compaction turn, the
         // continuation, or the follow-up — ever carried that text again.

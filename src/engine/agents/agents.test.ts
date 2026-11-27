@@ -181,11 +181,17 @@ const PROMPT_LENGTHS = [
     // and names the handle that makes continuation real (`threadSend` on the returned
     // `threadId`). Every role that composes the delegation line grows by exactly that delta;
     // `general` and `summarizer` do not compose it and are unmoved.
-    { name: 'instruct', length: 1604 },
+    // +82 (C0, 2026-11-27): `INSTRUCT_CORE` gained the cleanup-before-the-report clause —
+    // a report that does not name what scratch was removed leaves the operator guessing
+    // whether the workspace is still clean. It lands on the two roles that compose
+    // `INSTRUCT_CORE` (instruct, planner); research/workspace/reviewer/debugger compose
+    // their own cores and are unmoved.
+    { name: 'instruct', length: 1686 },
     { name: 'research', length: 1675 },
     { name: 'workspace', length: 1591 },
     { name: 'reviewer', length: 1563 },
-    { name: 'planner', length: 1704 },
+    // 1786 is the tightest fit on the roster: 14 characters below the 1800 budget below.
+    { name: 'planner', length: 1786 },
     // 1783: the widest prompt on the roster, because the debugger composes every shared line
     // (web + delegation + discovery + toolCreate + permissions) on top of its own five bullets.
     // Still under the 1800 budget below, by 17 characters — the delegation line was reworded

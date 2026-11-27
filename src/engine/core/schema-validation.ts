@@ -38,13 +38,15 @@
 // that ship with the package (presets, core tools) are trusted code.
 //
 // Cross-references:
-//   - ./tool.ts       — toolParameterKey, the single-property rule
+//   - ./tool.ts       — toolParameterKey, the single-property rule, AND the reserved
+//                       per-call `async` switch this module strips before validation
+//                       (./tool.ts `stripToolAsyncSwitch` / `toolOwnsAsyncParameter`)
 //   - ./creation.ts   — gates a created tool's schema complexity
 //   - ../harness.ts   — model path and the manual executeTool path both call here
 
 import { HarnessError } from '../util';
 import { utf8ByteLength } from './result-budget';
-import { toolParameterKey } from './tool';
+import { stripToolAsyncSwitch, toolOwnsAsyncParameter, toolParameterKey } from './tool';
 
 // Bounds on a MODEL-CREATED schema. A created tool's schema becomes part of the
 // request payload on every turn, and a deeply nested or enormous schema is a
@@ -336,8 +338,23 @@ export const resolveToolParameters = (
     raw: unknown,
     mode: ToolArgumentMode
 ): unknown => {
+    // THE RESERVED `async` SWITCH (see ./tool.ts). Every declaration advertises it, so
+    // it is removed HERE — the one shared site EVERY plane passes through: the model
+    // wire (../harness.ts `parseToolCallArguments`) and the direct doors (`callTool`,
+    // `executeTool`, and the server's manual tool route). Three consequences if it
+    // survived: an `additionalProperties:false` tool would reject a legal call; a
+    // ONE-property tool would stop matching `toolParameterKey`'s single-property rule
+    // and hand `execute` the wrapper instead of the value; and the key would persist in
+    // the transcript's call arguments. `toolOwnsAsyncParameter` is the carve-out — a
+    // tool that declares `async` in its own schema keeps the value untouched, and this
+    // is also where a non-boolean value becomes a readable error. The assignment is
+    // deliberate and last-resort simple: every branch below must see the STRIPPED
+    // payload, and re-wrapping it in a second parameter would double the diff.
+    raw = stripToolAsyncSwitch(raw, toolOwnsAsyncParameter(schema));
+
     // No schema: nothing to unwrap and nothing to check (a created tool may omit
-    // `parameters` entirely, and so may a hand-written tool).
+    // `parameters` entirely, and so may a hand-written tool). The strip above still
+    // applied, because a schema-less tool is advertised with the switch too.
     if (!isPlainObject(schema)) return raw;
 
     const key = toolParameterKey(schema);

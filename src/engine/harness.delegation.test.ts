@@ -345,7 +345,13 @@ describe('a settled delegation is never silently stranded (issue 0019)', () => {
         const researcher = brain(streamedThenParked('late: the module is fine', gate.promise));
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                // `"async": true` pins the BACKGROUND shape of the delegation, which is the
+                // whole scenario: the call has to stay parked when the turn budget runs out.
+                // An unswitched `delegate` that is the only async-resolving call of its
+                // message now refines to mode 'sync' (../harness.ts lone-delegate
+                // refinement), the parent would park INSIDE the call, and the
+                // "terminated with its tool call parked" exit this case pins would not exist.
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts","async":true}'),
                 answer('noted')
             ])
         );
@@ -379,7 +385,11 @@ describe('a settled delegation is never silently stranded (issue 0019)', () => {
                     {
                         id: 'c1',
                         name: 'delegate',
-                        arguments: '{"agent":"researcher","input":"review src/a.ts"}'
+                        // The retained turn persists the arguments exactly as the model sent
+                        // them, reserved switch included (the strip in
+                        // src/engine/core/schema-validation.ts keeps `async` out of
+                        // `context.parameters` and validation, not out of the transcript).
+                        arguments: '{"agent":"researcher","input":"review src/a.ts","async":true}'
                     }
                 ]
             },
@@ -507,7 +517,11 @@ describe('a settled delegation is never silently stranded (issue 0019)', () => {
         const researcher = brain(streamedThenParked('late: the module is fine', gate.promise));
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts"}'),
+                // Same reserved switch as the counterfactual test above: this case IS the
+                // "SAME exhausted run" with a restore in the way, so the delegation has to
+                // park as a BACKGROUND call (an unswitched lone `delegate` now refines to
+                // 'sync' and never leaves the turn budget with an owed, unpaid account).
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"review src/a.ts","async":true}'),
                 answer('noted')
             ])
         );
@@ -2002,6 +2016,7 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
                     invocationCount: 2,
                     results: [
                         {
+                            answerMessageIndex: 3,
                             invocationId: '2',
                             kind: 'root',
                             status: 'completed',
@@ -2010,6 +2025,11 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
                             truncated: false
                         },
                         {
+                            // C0 (2026-11-27): a preview row now carries the transcript address of the answer it
+                            // previews, so a caller can jump from the listing to the bytes with `threadRead`
+                            // `message` instead of reading the whole transcript. 3 for both rows here: the card
+                            // carries an instruction (seed 0), the brief is 1, the tool-call turn 2.
+                            answerMessageIndex: 3,
                             invocationId: '1',
                             kind: 'root',
                             status: 'completed',
@@ -2141,7 +2161,11 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
         );
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
+                // `"async": true` is what leaves a call for `toolCancel` to release: an
+                // unswitched lone `delegate` now refines to 'sync', the parent parks inside
+                // the child's run, and the model never gets a turn in which to issue the
+                // `toolCancel` this scenario is built around.
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts","async":true}'),
                 callTool('c2', 'toolCancel', '{"callId":"c1"}'),
                 answer('final')
             ])
@@ -2194,8 +2218,11 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
 
         // The `toolCancel` control is untouched: same acknowledgement, byte for byte, and the
         // released call still keeps exactly one result (0021 AC3).
+        // F1-M6 (2026-11-27) — one field is new at the tail: `threadId`, the conversation the
+        // released work belongs to (./harness.ts `toolCancel`). It trails the historical keys, so
+        // this byte pin moves by that key alone.
         expect(content(toolMessageOf(writerAgent, 'c2'))).toBe(
-            '{"cancelled":true,"callId":"c1","name":"delegate"}'
+            '{"cancelled":true,"callId":"c1","name":"delegate","threadId":"agent:writer"}'
         );
         expect(writerAgent.messages.filter((message) => (message as Record<string, any>).role === 'tool').length).toBe(2);
 
@@ -2248,7 +2275,10 @@ describe('delegation identity by value and cancel delivery (0029, 0021)', () => 
         const researcher = brain(stalled);
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
+                // Same reserved switch as the test above: this case is that cancelled shape
+                // with ONE variable changed (zero dispatched calls), and it needs the same
+                // in-flight `delegate` for the `toolCancel` door to release anything.
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts","async":true}'),
                 callTool('c2', 'toolCancel', '{"callId":"c1"}'),
                 answer('final')
             ])
@@ -2958,7 +2988,12 @@ describe('delegation time limits (policy 2026-11-09)', () => {
 
     it('runs a delegated child with no clock at all when timeoutMs is omitted', async () => {
         const { writer, writerAgent, gate } = hangingChild({
-            arguments: '{"agent":"researcher","input":"find facts"}',
+            // `"async": true` keeps the parent OUT of the park: an unswitched lone
+            // `delegate` now refines to mode 'sync', so this case would measure a parked
+            // parent ('waiting', not 'final') instead of the child's own unbounded life.
+            // The switch is orthogonal to `timeoutMs`: an omitted bound still arms no
+            // timer, which is the assertion below.
+            arguments: '{"agent":"researcher","input":"find facts","async":true}',
             ping: false
         });
 
@@ -3144,7 +3179,11 @@ describe('pending delegation placeholder (delegate-stress T1.3/T1.4)', () => {
     it('advertises toolCancel beside the callId while the child is still running', async () => {
         const seenParent: HarnessStreamRequest[] = [];
         const { writer, writerAgent, gate } = hangingChild({
-            arguments: '{"agent":"researcher","input":"find facts"}',
+            // `"async": true` is the point of this fixture: the placeholder this case pins
+            // only reaches a request when the parent keeps working while the child runs. An
+            // unswitched lone `delegate` now refines to 'sync', the parent parks, and there
+            // is no second parent request to carry a projection-only placeholder.
+            arguments: '{"agent":"researcher","input":"find facts","async":true}',
             ping: false,
             seenParent
         });

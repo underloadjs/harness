@@ -54,11 +54,14 @@ const sourceOf = (file: string): string =>
 // The `thread` row, restated in full so a wording change has to be a deliberate one.
 // IT19 R2: the last sentence changed with the soft-delete rule — a released id is not
 // part of the failure list any more, because re-deleting one restates its receipt.
+// F1 (2026-11-27): the sentence about a branch run was APPENDED, not rewritten — inside a
+// `threadFork` branch the door refuses every release, because the threads it could name belong
+// to the conversation that forked the branch (./harness.ts `branchFamilyWriteRefusal`).
 const THREAD_PARAMETER = {
     type: 'string',
     minLength: 1,
     description:
-        'Id of the finished thread to release, as reported by threadList - one of YOUR descendants. A running thread, a finished target with a running descendant, this agent\'s default conversation (agent:<name>), a thread outside your lineage, a fork\'s branch-N id, and an unknown id all fail; re-deleting a descendant you have already released instead restates its receipt, because a released thread is inactive rather than destroyed. There is no default: your own current thread is never the target.'
+        'Id of the finished thread to release, as reported by threadList - one of YOUR descendants. A running thread, a finished target with a running descendant, this agent\'s default conversation (agent:<name>), a thread outside your lineage, a fork\'s branch-N id, and an unknown id all fail; re-deleting a descendant you have already released instead restates its receipt, because a released thread is inactive rather than destroyed. There is no default: your own current thread is never the target. A threadFork branch may not release anything at all from inside its run - a branch\'s threads are the threads of the conversation that forked it - unless that threadFork call passed allowFamilyWrites: true.'
 };
 
 // The two errors the entry can raise itself. The runtime owns every other refusal
@@ -70,9 +73,18 @@ const NEEDS_THREAD = 'threadDelete needs a thread: pass "thread" (see threadList
 // (`{ deleted, removedThreadIds }`, cascade included). The four-field shape a current runtime
 // returns — `removedInvocationIds` and `removedBranchIds` too — is pinned whole by its own case
 // below, so this stub stays the minimal one the argument-wiring assertions need.
+// F1 (2026-11-27): the context builder takes the CALLING BRAIN as its third argument, because that
+// is the slot `../harness.ts` `threadDeleteFor` reads to recognise a `threadFork` branch run. An
+// omitted agent is the host/legacy shape, and it is pinned as `undefined` rather than guessed.
+const CALLER_BRAIN = { name: 'writer' };
+
 const stubRuntime = (deleted: string, removedThreadIds: readonly string[]) => {
     const threadDelete = vi.fn(
-        async (_callerThreadId: string | undefined, _threadId: string): Promise<unknown> => ({
+        async (
+            _callerThreadId: string | undefined,
+            _threadId: string,
+            _caller?: unknown
+        ): Promise<unknown> => ({
             deleted,
             removedThreadIds: [...removedThreadIds]
         })
@@ -80,10 +92,15 @@ const stubRuntime = (deleted: string, removedThreadIds: readonly string[]) => {
 
     return {
         threadDelete,
-        context: (parameters?: Record<string, unknown>, threadId?: string): ToolContext =>
+        context: (
+            parameters?: Record<string, unknown>,
+            threadId?: string,
+            agent?: unknown
+        ): ToolContext =>
             ({
                 harness: { runtime: { threadDelete } },
                 ...(threadId === undefined ? {} : { threadId }),
+                ...(agent === undefined ? {} : { agent }),
                 parameters
             }) as unknown as ToolContext
     };
@@ -292,12 +309,15 @@ describe('threadDelete execute', () => {
         const { threadDelete, context } = stubRuntime('thread-7', ['thread-7', 'thread-9']);
 
         await expect(
-            threadDeleteEntry.execute(context({ thread: '  thread-7  ' }, 'thread-3'))
+            threadDeleteEntry.execute(context({ thread: '  thread-7  ' }, 'thread-3', CALLER_BRAIN))
         ).resolves.toEqual({ deleted: 'thread-7', removedThreadIds: ['thread-7', 'thread-9'] });
 
         // Argument ORDER and content are the contract: caller first, target second,
         // and the runtime receives the trimmed id, not the padded one.
-        expect(threadDelete.mock.calls).toEqual([['thread-3', 'thread-7']]);
+        // F1 (2026-11-27) — the calling BRAIN rides third, by reference: `threadDeleteFor`
+        // recognises a `threadFork` branch run from its branch metadata, which no thread id can
+        // carry (a branch's persistent thread IS its requester's conversation).
+        expect(threadDelete.mock.calls).toEqual([['thread-3', 'thread-7', CALLER_BRAIN]]);
     });
 
     it('passes an undefined caller thread through for a threadless host view', async () => {
@@ -309,7 +329,7 @@ describe('threadDelete execute', () => {
         });
         // The runtime reads `undefined` as "no calling conversation" and leaves that
         // caller unscoped; the entry never substitutes a guess.
-        expect(threadDelete.mock.calls).toEqual([[undefined, 'thread-1']]);
+        expect(threadDelete.mock.calls).toEqual([[undefined, 'thread-1', undefined]]);
     });
 
     // THE SHAPE THE LIVE CALL ACTUALLY HANDS OVER. `threadDelete` declares exactly ONE
@@ -330,14 +350,16 @@ describe('threadDelete execute', () => {
             deleted: 'thread-7',
             removedThreadIds: ['thread-7', 'thread-9']
         });
-        expect(threadDelete.mock.calls).toEqual([['thread-3', 'thread-7']]);
+        // The third slot stays `undefined` here: this context carries no `agent`, which is the
+        // host/`executeTool` shape, and the runtime reads it as "no calling brain" (F1, 2026-11-27).
+        expect(threadDelete.mock.calls).toEqual([['thread-3', 'thread-7', undefined]]);
 
         // Both shapes are read, so the wrapper a hand-built context produces still works
         // in the same build — asserted as one call list to pin the order too.
         const both = stubRuntime('thread-8', ['thread-8']);
 
         await threadDeleteEntry.execute(both.context({ thread: 'thread-8' }, 'thread-4'));
-        expect(both.threadDelete.mock.calls).toEqual([['thread-4', 'thread-8']]);
+        expect(both.threadDelete.mock.calls).toEqual([['thread-4', 'thread-8', undefined]]);
 
         // A bare non-string (the unwrap of a wrong-typed argument) is still the entry's own
         // refusal, and the runtime is not called.
@@ -375,7 +397,7 @@ describe('threadDelete execute', () => {
             removedInvocationIds: ['12', 'branch-3'],
             removedBranchIds: ['branch-3']
         });
-        expect(threadDelete.mock.calls).toEqual([['thread-3', 'thread-7']]);
+        expect(threadDelete.mock.calls).toEqual([['thread-3', 'thread-7', undefined]]);
     });
 
     it('refuses a call with no live harness', () => {

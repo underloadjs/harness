@@ -27,8 +27,11 @@ import { HarnessError } from '../util';
 // issue 0032 (2026-11-26): the tally validator below needs the SAME cap the writers enforce, and
 // this leaf is the only place both the core reader and the lane fold can reach it. `./agent-limits`
 // imports nothing, so this adds no cycle; the type import is erased at transpile.
-import { TOOL_ACTIVITY_NAME_CAP } from './agent-limits';
-import type { HarnessToolActivity } from '../types';
+// C0 (2026-11-27): the candidate-list validator needs the two answer bounds for exactly the same
+// reason — the writer and the reader must agree on one number or a row is legal to write and
+// illegal to reload.
+import { AGENT_ANSWER_CANDIDATE_CAP, AGENT_ANSWER_CANDIDATE_CHARS, TOOL_ACTIVITY_NAME_CAP } from './agent-limits';
+import type { HarnessAnswerCandidate, HarnessToolActivity } from '../types';
 
 // A JSON object. Arrays are rejected: a JSON array is valid data but never a
 // record, and accepting it would hide a schema mismatch behind an arbitrary key
@@ -316,4 +319,66 @@ export const readSnapshotToolActivity = (value: unknown, label: string): Harness
     });
 
     return { calls, settled, byName, truncated };
+};
+
+// C0 (2026-11-27, the mid-run-report defect) — THE ONE VALIDATOR FOR THE ANSWER-CANDIDATE LIST.
+//
+// WHAT IT GUARDS. A completed row now carries the run's substantive tool-free turns
+// (`../types` `HarnessAnswerCandidate`: a transcript index, the text, and the cap flag), so that a
+// report the ledger displaced stays retrievable by `invocationId`. Like `readSnapshotToolActivity`
+// beside it, this is the single bounds-check every door shares — the snapshot reader
+// (`./snapshot.ts`, reading a row off disk) and, if a lane ever archives one, the archive seam —
+// because a field that is legal to WRITE and illegal to READ back makes the whole document
+// unrestorable, not merely bigger.
+//
+// THE BOUNDS, and where each comes from:
+//   * the list is NON-EMPTY and at most `AGENT_ANSWER_CANDIDATE_CAP`: the writer OMITS the key when
+//     there is nothing to list, so `[]` on disk is a hand edit, and an over-cap list is a writer that
+//     stopped bounding its row — retention (64 rows) only bounds the ledger if each row does;
+//   * `messageIndex` is an integer >= 0 — a transcript index, and `threadRead`'s `message` argument
+//     takes the same domain (index 0 is the system seed);
+//   * `content` is 1..`AGENT_ANSWER_CANDIDATE_CHARS` characters. `min: 1` because only a NON-BLANK
+//     turn is ever a candidate (the recording site trims), so a blank stored text is a contradiction
+//     rather than a fact; the maximum is the cap the writer applies, enforced on the way back in for
+//     the same reason `byName`'s cap is;
+//   * `truncated` is REQUIRED: it is the cap stating that it closed the text, and a row that
+//     omitted it would let a cut candidate read as a whole message.
+//
+// KEY ORDER IS PART OF THE CONTRACT, exactly as it is for the tally: the entry is rebuilt as
+// `messageIndex, content, truncated`, the order the writer projects, because the durability test is
+// `restore -> snapshot` equality and a reordered key emits a different JSON string.
+export const readSnapshotAnswerCandidates = (
+    value: unknown,
+    label: string
+): HarnessAnswerCandidate[] => {
+    const entries = readSnapshotArray(value, label);
+
+    if (entries.length === 0) {
+        throw new HarnessError(
+            `${label} is empty; a run with no substantive turn besides its answer omits the key rather than listing none.`
+        );
+    }
+
+    if (entries.length > AGENT_ANSWER_CANDIDATE_CAP) {
+        throw new HarnessError(
+            `${label} contains ${entries.length} entries; at most ${AGENT_ANSWER_CANDIDATE_CAP} are recorded.`
+        );
+    }
+
+    return entries.map((entry, index) => {
+        const entryLabel = `${label}[${index}]`;
+        const record = readSnapshotRecord(entry, entryLabel);
+        readSnapshotKeys(record, ['messageIndex', 'content', 'truncated'], entryLabel);
+
+        return {
+            messageIndex: readSnapshotInteger(record.messageIndex, `${entryLabel}.messageIndex`, {
+                min: 0
+            }),
+            content: readSnapshotString(record.content, `${entryLabel}.content`, {
+                min: 1,
+                max: AGENT_ANSWER_CANDIDATE_CHARS
+            }),
+            truncated: readSnapshotBoolean(record.truncated, `${entryLabel}.truncated`)
+        };
+    });
 };

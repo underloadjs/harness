@@ -61,6 +61,11 @@ import { agent, harness, openAICompatible, tool } from './index';
 // it to name-replace EVERY auto-loaded plugin, so a new built-in cannot silently start
 // trimming inside the "no policy installed" fixture.
 import { BUILTIN_PLUGINS } from './plugin/manifest';
+// M5 (2026-11-27) — the seed row that answers a branch's OWN creating call. These tests identify a branch
+// round BY CONTENT (a fork run reports its requester's `threadId`, so the two rounds are otherwise
+// indistinguishable), and this is the one row only a branch transcript can hold. Read from its module and
+// never retyped.
+import { BRANCH_SELF_CALL_PLACEHOLDER } from './core/branch';
 import type {
     HarnessContextEditPatch,
     HarnessContextEntry,
@@ -1984,13 +1989,15 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
                                   // reads `run.threadId`, which `runAgent` resolves
                                   // from the parent thread), so the root round and
                                   // the branch round carry the same string. The
-                                  // branch's copied transcript holds the
-                                  // `created-branch` placeholder for its own
-                                  // still-pending fork call — content that only a
-                                  // branch round can contain.
+                                  // branch's copied transcript holds the M5 (2026-11-27) self-call
+                                  // marker for its own still-pending fork call — content that only a
+                                  // branch round can contain. (Before M5 that row was the
+                                  // `created-branch` placeholder, and the discriminator moved with the
+                                  // wording — it is now an EXACT match on the constant rather than a
+                                  // substring of prose.)
                                   if (
-                                      !context.entries.some((entry) =>
-                                          entry.message.content.includes('created-branch')
+                                      !context.entries.some(
+                                          (entry) => entry.message.content === BRANCH_SELF_CALL_PLACEHOLDER
                                       )
                                   ) {
                                       return;
@@ -2024,12 +2031,12 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         const flagged = await runFork(true);
 
         // The branch really did get a control surface, and it belongs to the FIRST
-        // fork round: that is the only `turn.before` whose entries contain the
-        // `created-branch` placeholder — the root's later round carries the real fork
+        // fork round: that is the only `turn.before` whose entries hold the M5 self-call marker
+        // for the still-pending fork call — the root's later round carries the real fork
         // result instead. Entries are live, so the list read back after the round
         // shows the branch's own write taking effect immediately.
         const branchContexts = flagged.contexts.filter((context) =>
-            context.entries.some((entry) => entry.message.content.includes('created-branch'))
+            context.entries.some((entry) => entry.message.content === BRANCH_SELF_CALL_PLACEHOLDER)
         );
         expect(branchContexts).toHaveLength(1);
         expect(
@@ -2041,7 +2048,10 @@ describe('context inclusion — the turn.before control surface (Stage 1b)', () 
         ).toEqual([
             { index: 0, included: false, content: 'root input' },
             { index: 1, included: true, content: '' },
-            { index: 2, included: true, content: 'No tool res' },
+            // The 11-char prefix of `BRANCH_SELF_CALL_PLACEHOLDER` (M5): "This is the call that
+            // started...", where the pre-M5 seed row began "No tool result...". The slice is the pin's
+            // deliberate truncation, not a retyped constant.
+            { index: 2, included: true, content: 'This is the' },
             { index: 3, included: true, content: 'inspect' }
         ]);
 
@@ -2830,12 +2840,12 @@ describe('context control — the branch discriminator (pipeline T3.4 / context 
             }
         };
 
-        // A round is the branch's own when its transcript holds the `created-branch`
-        // placeholder for the still-pending fork call — content the root never carries.
-        // The discriminator under test is then checked AGAINST that ground truth, which is
+        // A round is the branch's own when its transcript holds the M5 (2026-11-27) self-call marker for
+        // the still-pending fork call — content the root never carries (its round holds the real fork
+        // receipt). The discriminator under test is then checked AGAINST that ground truth, which is
         // why this test does not need branch ids to be predictable.
         const isBranchRound = (context: HarnessTurnBeforeContext): boolean =>
-            context.entries.some((entry) => entry.message.content.includes('created-branch'));
+            context.entries.some((entry) => entry.message.content === BRANCH_SELF_CALL_PLACEHOLDER);
 
         const runFork = async (withPlugin: boolean) => {
             const seen: HarnessMessage[][] = [];
@@ -3227,17 +3237,18 @@ describe('context inclusion — the entry-time and live context estimates (conte
                     // transcript looks like now.
                     late = context;
 
-                    // The projection at entry is 24 bytes of counted text — 6 + 8 + 8 +
-                    // the run's own 2-character prompt — and src/core/context-estimate.ts
-                    // is `ceil(serialized-payload bytes / 4)`. On top of the transcript sits
-                    // the tool catalogue this round declares (`toolSchemaChars`,
-                    // src/harness.ts `toolSchemaBytes`): `controlRun` declares `alpha` plus
-                    // the two runtime controls, 14,951 serialized payload bytes, a constant
-                    // 3,738-token floor. So entry is ceil((24 + 14,951) / 4) = 3,744. Nothing
-                    // has been written yet, so the live accessor answers the same number.
+                    // The projection at entry is 6 + 8 + 8 + the run's own 2-character prompt —
+                    // the estimator counts 26 payload bytes for that projection (the byte-exact
+                    // split is `bytesOf`, module-private in src/core/context-estimate.ts), and
+                    // src/core/context-estimate.ts is `ceil(serialized-payload bytes / 4)`. On top
+                    // of the transcript sits the tool catalogue this round declares
+                    // (`toolSchemaChars`, src/harness.ts `toolSchemaBytes`): `controlRun` declares
+                    // `alpha` plus the two runtime controls, 15,438 serialized payload bytes, a
+                    // constant 3,859-token floor. So entry is ceil((26 + 15,438) / 4) = 3,866.
+                    // Nothing has been written yet, so the live accessor answers the same number.
                     // (Before the catalogue floor this read 6, the transcript alone.)
                     //
-                    // WHY THE FLOOR IS 14,951 AND NOT the 12,669 this case carried until
+                    // WHY THE FLOOR IS 15,438 AND NOT the 12,669 this case carried until
                     // 2026-11-25: the record tools' model-facing descriptions now disclose the
                     // response budget and how to page past a withheld page (F-STORE M1/M8/M9/M12,
                     // ../tools/runtime/records.tool.ts and its tasks/chapters/profiles/locations
@@ -3251,8 +3262,26 @@ describe('context inclusion — the entry-time and live context estimates (conte
                     // the two-fact `expects` split and the single-id ceiling sentence,
                     // ../tools/runtime/tasks.tool.ts) and nothing else this roster declares changed
                     // text, so 14,389 + 562 = 14,951 — measured per entry on a live request in both
-                    // trees by probe Temp/fix-f5/probe-floors.ts. The estimator again moved no line.
-                    // Re-derive with Math.ceil((<transcript bytes> + 14_951) / 4).
+                    // trees by probe Temp/fix-f5/probe-floors.ts. The estimator again moved no line,
+                    // and the paragraph below carries the constant FORWARD one more time.
+                    //
+                    // THE 2026-11-27 MOVE, same method, one new term: every OFFERED declaration now
+                    // advertises one extra optional property, the reserved per-call `async` switch
+                    // (src/engine/core/tool.ts `withToolAsyncSwitch` injects it on the model-facing
+                    // copy only, in ../harness.ts `offerDeclarations`). `toolSchemaPayloadBytes`
+                    // serializes THAT copy, so the value tracks the injected description text
+                    // (`TOOL_ASYNC_PARAMETER_DESCRIPTION`) — and it is a MEASURED figure, not a
+                    // derivation: the round's catalogue is 15,438 bytes (14,951 + 487), read on a
+                    // live request in this tree by probe Temp/coding/probe-floor-live.ts, which
+                    // intercepts the array the estimator itself receives and finds the injected key
+                    // on all three rows (`toolRequest`, `tasks`, `alpha`). Per row the cost is not
+                    // uniform — the first `async` key into an empty `properties` object is dearer
+                    // (it materializes the object) than an append beside existing keys — which is
+                    // exactly why this case measures rather than derives. Every figure below is the
+                    // same arithmetic on the new constant: 3,744/3,742 became 3,866/3,864, +122
+                    // tokens each, and the SAVING each figure pairs against is untouched (2 tokens
+                    // here), because the catalogue is the same constant on both sides.
+                    // Re-derive with Math.ceil((<transcript bytes> + 15_438) / 4).
                     record.entryBefore = context.estimatedTokens;
                     record.liveBefore = context.currentEstimatedTokens();
                     record.listBefore = context.currentMessages().length;
@@ -3269,8 +3298,8 @@ describe('context inclusion — the entry-time and live context estimates (conte
                     record.staticListAfter = context.messages.length;
 
                     // ...and the live accessor is the same estimator over the same list
-                    // `currentMessages()` returns: 16 bytes now, so
-                    // ceil((16 + 14,951) / 4) = 3,742. The write saved exactly 2 tokens by
+                    // `currentMessages()` returns: 18 bytes on that projection now, so
+                    // ceil((18 + 15,438) / 4) = 3,864. The write saved exactly 2 tokens by
                     // this measure — the catalogue is the same constant on both sides, so it
                     // cancels out of the saving — which is what a minimum-savings floor needs
                     // to see in the handler that made the write.
@@ -3281,13 +3310,19 @@ describe('context inclusion — the entry-time and live context estimates (conte
         });
 
         expect(record).toEqual({
-            entryBefore: 3744,
-            liveBefore: 3744,
+            // Re-baselined 2026-11-27: every offered declaration now advertises the reserved
+            // optional `async` property (src/engine/core/tool.ts `withToolAsyncSwitch`, injected
+            // on the model-facing copy in ../harness.ts `offerDeclarations`), which lifts the
+            // catalogue floor 14,951 -> 15,438 B (+487 B over this round's three declarations,
+            // measured live by probe Temp/coding/probe-floor-live.ts). The arithmetic and the
+            // savings this case pins are unchanged: 3,744/3,742 -> 3,866/3,864.
+            entryBefore: 3866,
+            liveBefore: 3866,
             listBefore: 4,
             staticListBefore: 4,
-            entryAfter: 3744,
+            entryAfter: 3866,
             staticListAfter: 4,
-            liveAfter: 3742,
+            liveAfter: 3864,
             listAfter: 3
         });
 
@@ -3296,11 +3331,11 @@ describe('context inclusion — the entry-time and live context estimates (conte
         // still useful to a late reader (a parked context, a test inspecting one after the
         // run). The run has since committed its answer, so the canonical transcript is FIVE
         // entries and a naive re-projection now would measure four; this answers three
-        // entries and 3,742 tokens (16 transcript bytes + the 14,951-byte catalogue), exactly
+        // entries and 3,864 tokens (18 counted bytes + the 15,438-byte catalogue), exactly
         // the request that went out.
         expect(late?.currentMessages()).toHaveLength(3);
-        expect(late?.currentEstimatedTokens()).toBe(3742);
-        expect(late?.estimatedTokens).toBe(3744);
+        expect(late?.currentEstimatedTokens()).toBe(3864);
+        expect(late?.estimatedTokens).toBe(3866);
         expect(writer.agent.messages).toHaveLength(5);
 
         // The provider received the live view, not the entry-time one: the disabled turn
@@ -3341,30 +3376,36 @@ describe('context inclusion — the entry-time and live context estimates (conte
                 turnBeforePlugin('thinking-estimate', (context) => {
                     if (Object.keys(record).length > 0) return;
 
-                    // The projection at entry is 43 bytes of counted text — 6 + 8 + the
-                    // 27-character thought + the run's own 2-character prompt — over the same
-                    // 14,951-byte catalogue `controlRun` declares, so
-                    // ceil((43 + 14,951) / 4) = 3,749 (11 tokens before the catalogue floor),
-                    // and 27 of those bytes are the thinking. `core/agent.ts`
+                    // The projection at entry is 6 + 8 + the 27-character thought + the
+                    // run's own 2-character prompt — the estimator counts 45 payload bytes for
+                    // that projection — over the same 15,438-byte catalogue `controlRun`
+                    // declares, so ceil((45 + 15,438) / 4) = 3,871 (11 tokens before the
+                    // catalogue floor, and 14,951 -> 15,438 on 2026-11-27 because every offered
+                    // declaration now advertises the reserved optional `async` property — see
+                    // the measured constant and its arithmetic in the case above), and 27 of
+                    // those bytes are the thinking (one counted character = one counted byte for
+                    // that thought, exactly as the pre-move figures had it). `core/agent.ts`
                     // `withoutWithheldReasoning` deletes the `reasoning` key from the request
                     // COPY of a flagged entry, so this is exactly the text the provider bills.
                     record.before = context.currentEstimatedTokens();
 
                     context.setReasoningIncluded(entryWith(context, 'answered'), false);
 
-                    // 16 bytes now, so ceil((16 + 14,951) / 4) = 3,742. The entry still
-                    // travels, in the same slot, with its `content` — only its thinking
-                    // stopped riding, and the number knows it. The saving reads 6 tokens here
-                    // where the transcript-only fixture read 7 (11 - 4): the same 27 bytes
-                    // cross one fewer `ceil` boundary once the constant catalogue sits under
-                    // both figures, which is the rounding of `ceil((n + 14,951) / 4)`, not a
-                    // smaller withholding.
+                    // 18 bytes on that projection now, so ceil((18 + 15,438) / 4) = 3,864. The
+                    // entry still travels, in the same slot, with its `content` — only its
+                    // thinking stopped riding, and the number knows it. The saving reads 6
+                    // tokens here where the transcript-only fixture read 7 (11 - 4): the same
+                    // 27 bytes cross one fewer `ceil` boundary once the constant catalogue sits
+                    // under both figures, which is the rounding of `ceil((n + 15_438) / 4)`, not
+                    // a smaller withholding.
                     record.after = context.currentEstimatedTokens();
                 })
             ]
         });
 
-        expect(record).toEqual({ before: 3749, after: 3742 });
+        // Re-baselined 2026-11-27 for the injected `async` property (3,749/3,742 -> 3,871/3,864);
+        // the 6-token saving this case exists to pin is unchanged.
+        expect(record).toEqual({ before: 3871, after: 3864 });
 
         // The provider received the view the accessor measured: the answer is still there, its
         // thinking is not, and neither the flag nor the withheld text reaches the wire.

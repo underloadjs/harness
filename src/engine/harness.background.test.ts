@@ -1432,8 +1432,16 @@ describe('delegation under background tools', () => {
                     stream: streamFrom(
                         (turn, request) => {
                             if (turn === 0) {
+                                // `"async": true` is not decoration: an UNSWITCHED `delegate`
+                                // that is the ONLY async-resolving call of its message now
+                                // refines to mode 'sync' (../harness.ts lone-delegate
+                                // refinement), which parks the parent and makes this R4
+                                // "parent stays free while the child runs" scenario
+                                // unobservable. The reserved switch asks for the background
+                                // shape this file exists to pin; see the d1 assertion below
+                                // for the arguments it persists.
                                 return calls(
-                                    call('d1', 'delegate', '{"agent":"researcher","input":"one"}')
+                                    call('d1', 'delegate', '{"agent":"researcher","input":"one","async":true}')
                                 );
                             }
 
@@ -1456,8 +1464,12 @@ describe('delegation under background tools', () => {
                             );
                             if (!queued && settled === 0) {
                                 queuedWhileChildPending = !slowGate.settled;
+                                // Same reserved switch as `d1`: this is the SECOND delegate of
+                                // the run but still the only call of ITS message, so without the
+                                // explicit switch it would refine to 'sync' and the followup
+                                // queue / parent-free shape below would not be reachable.
                                 return calls(
-                                    call('d2', 'delegate', '{"agent":"researcher","input":"two"}')
+                                    call('d2', 'delegate', '{"agent":"researcher","input":"two","async":true}')
                                 );
                             }
 
@@ -1492,8 +1504,11 @@ describe('delegation under background tools', () => {
             {
                 role: 'assistant',
                 content: '',
+                // The persisted arguments keep the reserved switch the model sent: the
+                // strip at src/engine/core/schema-validation.ts keeps `async` out of
+                // `context.parameters` and out of VALIDATION, not out of the transcript.
                 toolCalls: [
-                    { id: 'd1', name: 'delegate', arguments: '{"agent":"researcher","input":"one"}' }
+                    { id: 'd1', name: 'delegate', arguments: '{"agent":"researcher","input":"one","async":true}' }
                 ]
             },
             { role: 'tool', content: expect.any(String), toolCallId: 'd1', name: 'delegate' }
@@ -1914,13 +1929,18 @@ describe('toolCancel', () => {
         // `pending` on this result depends on delivery order between the cancel
         // control and the cancelled call's own result, so only the fixed fields
         // are pinned; the live sibling is proven directly below.
+        // F1-M6 (2026-11-27) — the receipt now also names `threadId`, the conversation the
+        // released work belongs to, and `branchId` + `invocationId` when the cancelled call IS a
+        // branch (./harness.ts `toolCancel` door). Key order is the object order of the receipt, so
+        // `threadId` trails the keys that were always there and these byte pins stay legible; a
+        // plain call carries no branch keys at all.
         expect(resultsOf(events, 'toolCancel')).toMatchObject([
             {
                 type: 'tool_result',
                 agent: 'writer',
                 name: 'toolCancel',
                 callId: 'k3',
-                content: '{"cancelled":true,"callId":"k1","name":"stubborn"}',
+                content: '{"cancelled":true,"callId":"k1","name":"stubborn","threadId":"agent:writer"}',
                 isError: false,
                 outcome: 'completed',
                 durationMs: 0
@@ -2048,8 +2068,9 @@ describe('toolCancel', () => {
         expect(cancels.map((event) => event.outcome)).toEqual(['completed', 'completed']);
         expect(cancels.map((event) => event.isError)).toEqual([false, false]);
         expect(cancels.map((event) => event.content)).toEqual([
-            '{"cancelled":true,"callId":"k1","name":"stubborn"}',
-            '{"cancelled":true,"callId":"k1","name":"stubborn","alreadySettled":true}'
+            // The `threadId` tail is the F1-M6 echo (see the byte-pin comment above).
+            '{"cancelled":true,"callId":"k1","name":"stubborn","threadId":"agent:writer"}',
+            '{"cancelled":true,"callId":"k1","name":"stubborn","alreadySettled":true,"threadId":"agent:writer"}'
         ]);
         // The already-cancelled call keeps exactly one result, classified as a
         // control outcome rather than a failure.
@@ -2150,8 +2171,9 @@ describe('toolCancel', () => {
         expect(cancels.map((event) => event.outcome)).toEqual(['completed', 'completed']);
         expect(cancels.map((event) => event.isError)).toEqual([false, false]);
         expect(cancels.map((event) => event.content)).toEqual([
-            '{"cancelled":true,"callId":"q1","name":"quick","alreadySettled":true}',
-            '{"cancelled":true,"callId":"f1","name":"broken","alreadySettled":true}'
+            // `threadId` last, as on every F1-M6 receipt.
+            '{"cancelled":true,"callId":"q1","name":"quick","alreadySettled":true,"threadId":"agent:writer"}',
+            '{"cancelled":true,"callId":"f1","name":"broken","alreadySettled":true,"threadId":"agent:writer"}'
         ]);
 
         siblingGate.resolve('sibling-done');
@@ -2185,8 +2207,14 @@ describe('toolCancel', () => {
                     stream: streamFrom(
                         (turn) => {
                             if (turn === 0) {
+                                // `"async": true` keeps the delegation in the BACKGROUND shape
+                                // this case pins: an unswitched lone `delegate` now refines to
+                                // 'sync', the parent parks, and by the time the parent takes its
+                                // `toolCancel` turn the child's `h1` call has already settled —
+                                // so the "d1 is still pending while both cancels run" window
+                                // this test asserts would not exist.
                                 return calls(
-                                    call('d1', 'delegate', '{"agent":"helper","input":"work"}')
+                                    call('d1', 'delegate', '{"agent":"helper","input":"work","async":true}')
                                 );
                             }
                             if (turn === 1) {
@@ -2220,7 +2248,10 @@ describe('toolCancel', () => {
                 name: 'toolCancel',
                 callId: 'c1',
                 content:
-                    'No tool call "h1" was started in this run, so there is nothing to cancel. Pass the callId of a call this run started (see the pending list or the tool_call event).',
+                    // F1-C3 (2026-11-27) — the fail sentence now names the OTHER address this door
+                    // accepts: the `branch-N` id a `threadFork` answer reported, which resolves to
+                    // that fork call's id before the lookup below runs.
+                    'No tool call "h1" was started in this run, so there is nothing to cancel. Pass the callId of a call this run started (see the pending list or the tool_call event), or the branchId a threadFork answer reported.',
                 isError: true,
                 outcome: 'rejected'
             },
@@ -2230,7 +2261,7 @@ describe('toolCancel', () => {
                 name: 'toolCancel',
                 callId: 'c2',
                 content:
-                    'No tool call "ghost" was started in this run, so there is nothing to cancel. Pass the callId of a call this run started (see the pending list or the tool_call event).',
+                    'No tool call "ghost" was started in this run, so there is nothing to cancel. Pass the callId of a call this run started (see the pending list or the tool_call event), or the branchId a threadFork answer reported.',
                 isError: true,
                 outcome: 'rejected'
             }
@@ -2456,8 +2487,13 @@ describe('whole-run cancel', () => {
                     stream: streamFrom(
                         (turn) => {
                             if (turn === 0) {
+                                // `"async": true` is what keeps BOTH actors mid-call at the
+                                // cancel point: an unswitched lone `delegate` now refines to
+                                // 'sync', the parent parks behind the child, and the parent's
+                                // own `work` call never starts — which is the whole point of
+                                // "both actors are mid-call when the operator cancels".
                                 return calls(
-                                    call('d1', 'delegate', '{"agent":"researcher","input":"dig"}')
+                                    call('d1', 'delegate', '{"agent":"researcher","input":"dig","async":true}')
                                 );
                             }
                             if (turn === 1) {
@@ -2506,7 +2542,9 @@ describe('whole-run cancel', () => {
                 role: 'assistant',
                 content: '',
                 toolCalls: [
-                    { id: 'd1', name: 'delegate', arguments: '{"agent":"researcher","input":"dig"}' }
+                    // The retained turn persists the arguments exactly as the model sent
+                    // them, reserved switch included.
+                    { id: 'd1', name: 'delegate', arguments: '{"agent":"researcher","input":"dig","async":true}' }
                 ]
             },
             {

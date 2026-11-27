@@ -93,6 +93,11 @@ A replacement that DECLARES a mode is answered correctly by step 1, in both dire
    duplicate `effectiveToolMode`'s precedence in the wrong place. The right shape is a
    plugin-visible `api.toolMode(name): ToolMode` reading the same WeakMap + `mode` +
    default chain as `src/harness.ts:1927`; Finding 4's two divergences disappear with it.
+   **`corrected` 2026-11-27 — insufficient as written:** once a call may override the mode, a
+   NAME-keyed accessor answers the tool's DEFAULT and not the call's effective mode, so this
+   shape as stated can leave the plugin over-pinging forever, and a name-only implementation
+   that also dropped the pending-list check would UNDER-ping, the unsafe direction. The
+   2026-11-27 addendum below restates the fix (a `mode` on the `async.pending` payload).
    Recorded meanwhile as an ACCEPTED, DOCUMENTED limitation — directions and measurements in
    the addendum ("Task 2" below).
    Closing check when built: the plugin drops its `BUILTIN_TOOL_DESCRIPTORS` import, and
@@ -252,3 +257,35 @@ Closing check from task 4, met (verified 2026-11-19 by another worker's edit; no
 | `yarn vite-node scripts/generate-plugin-manifest.ts --check` | `plugin-manifest.ts is current (3 plugins).` |
 | `grep` sweep for the two retired sentences across `src`, `docs`, the Rust `src` and `tests` | only ONE hit left: `docs/tasks/2026-11-19-heartbeat-async-only.md:98`, where the old sentence is quoted as the historical defect being described |
 | `cargo test` | **NOT RUN** — no Rust toolchain here (see the limits note above) |
+
+---
+
+## Addendum (2026-11-27) — the async-only trigger rule now diverges from the EFFECTIVE per-call mode
+
+A per-call turn-mode switch landed on 2026-11-27: every declaration the harness offers
+advertises one optional boolean argument, `async` (`src/engine/core/tool.ts:129`, `:156`), and a
+`delegate` call that resolves to `async` with NO switch, in a message holding exactly ONE
+async-resolving call, now resolves to `'sync'` (the lone-`delegate` refinement,
+`src/engine/harness.ts:11960-11966`, counting `countAsyncResolvedCalls` `:2104`). Declared
+policies are unchanged — `delegate`/`threadFork`/`shell` still declare `mode: 'async'` and the
+generated `src/engine/core/tool-manifest.ts` is byte-identical — so this addendum corrects the
+IMPLICATION of the rule above, not the rule.
+
+| Fact | Evidence |
+|---|---|
+| "`async` work" and "the mode this call resolves to" are no longer the same set | the resolution chain is now per call: switch → `modeDefinitions` → `definition.mode` → `DEFAULT_TOOL_MODE` (`src/engine/harness.ts:11911-11958`) |
+| A `mode:'async'` ROW can therefore hold a sync-resolved call: `"async": false` (any tool), or the lone-`delegate` refinement (no switch at all) | `src/engine/harness.ts:11940`, `:11957-11966`; the switch is read at `:1229` and stripped centrally at `src/engine/core/schema-validation.ts:353` |
+| The plugin cannot see it: the pending payload is still `{ callId, name, elapsedMs }`, so its predicate resolves the mode **by name** — registry `mode`, else the GENERATED row | `src/engine/types/index.ts:365-369`; `src/engine/plugins/async-ping.plugin.ts:310-319`; core announces EVERY launch, sync included (`announcePending`, `src/engine/harness.ts:11756`) |
+| So the divergence is systematic and points ONE way: every sync-resolved call on an async-declared tool **keeps pinging** | the two rows above — a placeholder turn per ping at the shipped 600000 ms cadence (`src/engine/harness.ts:676`), against the no-wake rule this entry landed |
+| **Accepted, not fixed.** Over-ping is the safe direction this file already argues for (Finding 4's asymmetry: one extra turn versus losing hang-visibility), and the honest fix is a payload field, not another name-based read | this entry's Finding 4; task 2 below |
+| The named fix: carry `mode` on the `async.pending` (and `async.drained`) payload so `isAsyncPending` reads the CALL's truth and neither the registry read nor the generated table is load-bearing | `announcePending` builds the payload at `src/engine/harness.ts:11761-11767`; `async.drained` fires on a full drain at `:11395`; the plugin's decision points are `src/engine/plugins/async-ping.plugin.ts:310-319` |
+| Finding 3's escape-hatch analysis now applies to the DEFAULT `delegate` shape: an unswitched lone delegation parks the spawner, so `toolCancel` is advertised only on a heartbeat wake | measured at `wakeIntervalMs: 40` — refined-sync: 2 wakeups / 2 placeholder turns; `"async": true`: 1 self-release turn + 3 wakeups. Full figures in `docs/tasks/2026-11-27-tool-call-mode-switch.md` |
+| Task 2's `api.toolMode(name)` shape is **insufficient as written** (a name answers the default, not the call), and an accessor that skipped the pending-list check would move the plugin from over-ping to **under-ping** — the unsafe direction | task 2 above, marked `corrected`; `src/engine/plugins/async-ping.plugin.ts:310-319` |
+
+**Nothing shipped was changed by this addendum** — no plugin line, no `HarnessPendingTool` field,
+no test pin. The divergence is documentation of a behaviour that is now true of the build.
+
+Closing check for the addendum's fix (not met as of 2026-11-27): `async.pending` carries a per-entry
+mode, `HarnessPendingTool` carries `mode` (`src/engine/types/index.ts:365-369`), and
+`yarn vitest run src/engine/plugin/async-ping.test.ts src/engine/harness.sync-async.test.ts` pins a
+refined-sync (or `"async": false`) call on an async-declared tool as producing **no** wake.

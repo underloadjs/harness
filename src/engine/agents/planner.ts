@@ -85,6 +85,17 @@ export const planner: AgentProfile = {
         // Steer, do not drift: a failed review is a re-delegation, not an edit by the Manager.
         'Steer between steps — correct the brief, split a step, or change the target — but never do a step yourself.',
         DELEGATION_GUIDELINE,
-        'Own the final answer: what was achieved, who did each part, what the reviewer confirmed, and what is still unverified.'
+        'Own the final answer: what was achieved, who did each part, what the reviewer confirmed, and what is still unverified.',
+        // C0 (2026-11-27) — the SAME answer-order line `instruct` carries, in BOTH cards on purpose:
+        // the fact is about the result ledger, not about a role, and a Manager that writes its
+        // wrap-up, then deletes the finished child threads it reaped, answers with the deletion
+        // receipt. One sentence, byte-identical to ./instruct.ts, because `guidelines.ts` is pinned
+        // elsewhere (presets.test.ts:272) and cannot host it.
+        //
+        // LENGTH IS THE BINDING CONSTRAINT HERE, not the rule: this card composes to 1704 of the 1800
+        // ceiling `agents.test.ts` measures, so the line stays 79 characters (+82 composed: the card
+        // lands at 1786, 14 characters of headroom). Anyone tempted to widen it must shorten another
+        // bullet in the same card first.
+        'Do cleanup before your final report: the result ledger keeps your last message.',
     ]
 };

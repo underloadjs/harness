@@ -51,6 +51,35 @@ export const AGENT_RESULT_PAGE_MAX_CHARS = 8000;
 // top of this file), and `./metadata.ownership.test.ts` pins the literal against this constant.
 export const TOOL_ACTIVITY_NAME_CAP = 8;
 
+// C0 (2026-11-27, the mid-run-report defect) — THE BOUND ON A RUN'S ANSWER-CANDIDATE LIST.
+//
+// WHAT IT BOUNDS. A run now keeps the list of its own SUBSTANTIVE tool-free `stop` turns — the
+// turns that read like an answer but were not the run's last message (the investigator's 8,117-char
+// report, followed by housekeeping and a 1,099-char cleanup note, is the incident). The ledger row
+// carries that list so `agentResult` can page any of those turns by `invocationId`, and the snapshot
+// persists it, so an UNBOUNDED list would be an unbounded payload on a row bounded only by
+// `AGENT_RESULT_RETENTION` — the same mistake `TOOL_ACTIVITY_NAME_CAP` exists to prevent.
+//
+// WHY FOUR. The defect is about the report the agent wrote near the END of its run, so the ceiling
+// is a window over the tail, not an inventory: the last FOUR substantive turns cover "the report,
+// plus the few turns of cleanup that displaced it" with room to spare, and a run that wrote eleven
+// reports is a transcript question (`threadRead`), not a ledger question. Four rows x the cap below
+// is the worst case one row can add to the ledger — and see the byte argument on `toolActivity`
+// beside it for the discipline: bound the list, then bound each entry.
+export const AGENT_ANSWER_CANDIDATE_CAP = 4;
+
+// The per-candidate CONTENT ceiling, in characters.
+//
+// WHY 32000 AND WHY IT IS ALIGNED WITH `threadRead`: `THREAD_READ_MAX_CONTENT_LIMIT`
+// (../tools/runtime/threadRead.ts:129) is 32000 characters precisely because that is the largest
+// single message a threadRead page can carry inside its 32 KiB text budget. The candidate cap takes
+// the SAME number so the two doors agree about "one whole message": a report `threadRead` can hand
+// back in one field, `agentResult` can hand back in one candidate. Anything longer is cut and says
+// so with `truncated: true`, which is what keeps the ledger row's footprint finite (4 x 32000
+// characters worst case per row) while a genuinely long report stays readable in full from the
+// transcript at `answerMessageIndex`.
+export const AGENT_ANSWER_CANDIDATE_CHARS = 32_000;
+
 // T28 (ORIGINAL wording, kept auditable): "the wall-clock bound a delegation applies
 // to its CHILD when the caller does not pass `timeoutMs`. Before this, a child that
 // ran `sleep 600` sat `running` indefinitely and the only recovery was `toolCancel`

@@ -571,7 +571,11 @@ describe('actionRequest question hold (R1/R2/R3)', () => {
         expect(JSON.parse(toolResultContents(entry.messages)[1])).toEqual({
             cancelled: true,
             callId: 'q1',
-            name: 'actionRequest'
+            name: 'actionRequest',
+            // F1-M6 (2026-11-27) — the released call's conversation, added by the `toolCancel`
+            // door (./harness.ts) so a host reading one receipt can tell WHICH conversation the
+            // abandoned work belonged to.
+            threadId: 'agent:writer'
         });
 
         // An abandoned handler must not have produced an answer frame.

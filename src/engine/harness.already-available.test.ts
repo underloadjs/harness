@@ -23,6 +23,7 @@ import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from './
 import {
     AGENT_MANAGE_METADATA,
     AGENT_RESULT_METADATA,
+    THREAD_FORK_METADATA,
     TOOL_CREATE_METADATA,
     TOOL_REQUEST_METADATA,
     agentDelegateMetadata
@@ -77,11 +78,20 @@ const match = (metadata: { name: string; description: string; tags: readonly str
 const AGENT_MATCHES = [match(AGENT_MANAGE_METADATA), match(AGENT_RESULT_METADATA)];
 const TOOL_CREATE_MATCH = match(TOOL_CREATE_METADATA);
 
+// F1 (2026-11-27) — `threadFork` is now a SEARCH-HIT for a `delegate` query, because the fork
+// description spells out the three write doors it gates (`threadSend`, `delegate`,
+// `threadDelete`) and names the `allowFamilyWrites` argument. `core/discovery.ts` `scoreTool`
+// scores a searchable row's DESCRIPTION (a 1-point `includes` hit), which is what makes the
+// capability findable at all, so a fork that documents delegation ranks as a delegation row. It
+// stays BELOW the exact-tag rows and joins in name order, and the tag stops being reported as
+// `unmatchedTags` — some registered tool does answer to it now.
+const THREAD_FORK_MATCH = match(THREAD_FORK_METADATA);
+
 // What an "agents" capability query enables now: the two demoted agent rows (their
 // tags/description carry the agent vocabulary) plus toolCreate, whose description
-// names `agent` and `agents` in the execution context.
-const AGENT_QUERY_ENABLED = ['agentManage', 'agentResult', 'toolCreate'];
-const AGENT_QUERY_TOOLS = [...AGENT_MATCHES, TOOL_CREATE_MATCH];
+// names `agent` and `agents` in the execution context, plus the fork row above.
+const AGENT_QUERY_ENABLED = ['agentManage', 'agentResult', 'threadFork', 'toolCreate'];
+const AGENT_QUERY_TOOLS = [...AGENT_MATCHES, THREAD_FORK_MATCH, TOOL_CREATE_MATCH];
 
 // R9-R11: the searchable vocabulary a no-match query reports for this harness.
 // It is the sorted union of the twelve demoted rows' tags - toolRegistry, toolList,
@@ -175,15 +185,18 @@ describe('toolRequest already-available core tools', () => {
         // The entry agent HAS delegate declared, so the answer names it. Nothing is
         // enabled, nothing is left over, and the tag is not called unmatched. The
         // demoted rows now offer their vocabulary instead of an empty list.
+        // F1 (2026-11-27) — the query is no longer EMPTY: the fork description documents the
+        // `delegate` door it gates, so `threadFork` is a 1-point description hit (see
+        // `THREAD_FORK_MATCH` above). `delegate` itself still lands in `alreadyAvailable` alone,
+        // and `availableTags` drops out because that field is only offered when NOTHING matched.
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
-            enabled: [],
-            tools: [],
-            matched: 0,
+            enabled: ['threadFork'],
+            tools: [THREAD_FORK_MATCH],
+            matched: 1,
             omitted: 0,
-            alreadyAvailable: [DELEGATE_MATCH],
-            availableTags: SEARCHABLE_TAGS
+            alreadyAvailable: [DELEGATE_MATCH]
         });
-        expect(writer.discoveredTools).toEqual([]);
+        expect(writer.discoveredTools).toEqual(['threadFork']);
     });
 
     it('enables the demoted agent rows and reports only delegate as already available', async () => {
@@ -202,11 +215,12 @@ describe('toolRequest already-available core tools', () => {
 
         // delegate stays declared core, so it is reported and NOT re-enabled.
         // agentManage/agentResult/toolCreate are searchable rows now: the query
-        // enables them, spends the match count, and lists their cards.
+        // enables them, spends the match count, and lists their cards — plus the fork
+        // row, which the `delegate` half of this query picks up as a description hit.
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
             enabled: AGENT_QUERY_ENABLED,
             tools: AGENT_QUERY_TOOLS,
-            matched: 3,
+            matched: 4,
             omitted: 0,
             alreadyAvailable: [DELEGATE_MATCH]
         });
@@ -237,13 +251,15 @@ describe('toolRequest already-available core tools', () => {
         // Not `forbidden` (that field stays scope + deployment-deny), not `matched`, not
         // `alreadyAvailable` — the capability is simply not listed, and the tag is honestly
         // reported as unmatched because nothing in THIS conversation answers to it any more.
+        // F1 (2026-11-27) — the SWITCHED-OFF half is unchanged: `delegate` appears in no field of
+        // this answer. What moved is the emptiness: the fork row documents the `delegate` door, so
+        // the tag resolves to a searchable row the session CAN enable, which retires both
+        // `unmatchedTags` and the `availableTags` retry hint.
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
-            enabled: [],
-            tools: [],
-            matched: 0,
-            omitted: 0,
-            unmatchedTags: ['delegate'],
-            availableTags: SEARCHABLE_TAGS
+            enabled: ['threadFork'],
+            tools: [THREAD_FORK_MATCH],
+            matched: 1,
+            omitted: 0
         });
 
         // The SAME switch removed the tool from the request the model is answering from, so
@@ -272,12 +288,15 @@ describe('toolRequest already-available core tools', () => {
         // has no alreadyAvailable key at all and reports the tag as unmatched. Tags
         // come back normalized (trimmed + lower-cased).
         expect(writer.tools.delegate).toBeUndefined();
+        // F1 (2026-11-27) — `matched` is 4, not 3: the fork row answers to the `delegate` tag as a
+        // description hit, so the tag is no longer unmatched even in a roster that has no
+        // `delegate` at all — which is exactly why the honest report is the fork card rather than
+        // an `unmatchedTags` line.
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
             enabled: AGENT_QUERY_ENABLED,
             tools: AGENT_QUERY_TOOLS,
-            matched: 3,
-            omitted: 0,
-            unmatchedTags: ['delegate']
+            matched: 4,
+            omitted: 0
         });
     });
 
@@ -302,12 +321,13 @@ describe('toolRequest already-available core tools', () => {
         await writer('delegate?');
 
         // Child (Rank B) history: [0] user, [1] assistant tool call, [2] tool result.
+        // The rank test is the `alreadyAvailable` key: it stays absent here, while the
+        // `delegate` tag itself resolves to the fork row (F1, see the note above).
         expect(JSON.parse(content(researcher.messages[2]))).toEqual({
             enabled: AGENT_QUERY_ENABLED,
             tools: AGENT_QUERY_TOOLS,
-            matched: 3,
-            omitted: 0,
-            unmatchedTags: ['delegate']
+            matched: 4,
+            omitted: 0
         });
     });
 

@@ -369,9 +369,14 @@ describe('harness', () => {
             // tag hit and above the name-ordered remainder. Tags: src/tools/runtime/knowledge.tool.ts:186.
             'knowledge',
             'locations',
+            // F1 (2026-11-27) — `threadFork` joins as a 1-point description hit for the same
+            // reason: its description now spells out the write doors (`threadSend`, `delegate`,
+            // `threadDelete`) and names the `allowFamilyWrites` argument, and both `write` and
+            // `delegate` are substrings of that prose. Name order puts it ahead of `toolManage`.
+            'threadFork',
             'toolManage'
         ]);
-        expect(refined.matched).toBe(12);
+        expect(refined.matched).toBe(13);
         expect(refined.omitted).toBe(0);
 
         // The newest selection leads the current order; all eight still fit, plus the
@@ -388,6 +393,7 @@ describe('harness', () => {
             'chapters',
             'knowledge',
             'locations',
+            'threadFork',
             'toolManage'
         ]);
     });

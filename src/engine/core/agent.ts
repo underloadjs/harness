@@ -1933,12 +1933,20 @@ const createAgent = (
                 ? parentDepth
                 : assertForkDepth(parentDepth + 1, options.maxDepth);
 
-        const branchId = createBranchId();
+            const branchId = createBranchId();
         const materialized = materializeBranchHistory({
             messages,
             branchId,
             reason: options.reason,
-            maxHistoryBytes: options.maxHistoryBytes
+            maxHistoryBytes: options.maxHistoryBytes,
+            // M5 (2026-11-27) — the runtime names the call it is executing on every fork it starts
+            // (`launchThreadFork` and the actionRequest autoanswer both pass `callId`), so the branch's
+            // own creating call is seeded with the self-describing marker rather than the non-success
+            // placeholder. For an autoanswer branch this id belongs to the REQUESTER's transcript, not to
+            // the owner transcript materialized here, so it matches nothing and every pending call keeps
+            // its placeholder — the runtime replaces this seed with `incorporateBranchHistory` anyway,
+            // which names no self call at all. A plain `Agent.fork()` names no id and is unchanged.
+            ...(options.callId !== undefined ? { selfCallId: options.callId } : {})
         });
 
         // The child shares the resolved transport (so provider credentials and

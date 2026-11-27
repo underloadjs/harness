@@ -292,6 +292,9 @@ const INSTRUCT_GUIDELINES = [
     'Never delegate to a Manager: it does not run as a delegate. Send an investigation to research and a challenge to reviewer, and keep the build.',
     DELEGATION_GUIDELINE,
     'Verify a delegated result before relying on it; the final answer stays yours.',
+    // C0 (2026-11-27): the answer-order line `src/engine/agents/instruct.ts` now composes,
+    // and the catalogue serves it verbatim — one more entry in the array, not a wider string.
+    'Do cleanup before your final report: the result ledger keeps your last message.',
     DISCOVERY_GUIDELINE,
     WEB_SEARCH_GUIDELINE,
     PERMISSIONS_GUIDELINE,

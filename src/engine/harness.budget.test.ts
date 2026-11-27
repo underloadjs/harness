@@ -632,20 +632,34 @@ describe('provider-anchored context estimate (T5.4)', () => {
     it('extrapolates the next turn from the reported prompt size', async () => {
         // Hand-derived, not read off the implementation. ONE constant first: the catalogue
         // this harness declares (the `echo` definition plus the runtime controls a session
-        // always offers) serializes to 14,939 payload bytes — `toolSchemaPayloadBytes` of
+        // always offers) serializes to 15,426 payload bytes — `toolSchemaPayloadBytes` of
         // the request's own `tools`, asserted exactly by the case below — so its floor is
-        // ceil(14,939 / 4) = 3,736 tokens.
+        // ceil(15,426 / 4) = 3,857 tokens.
         //   THE MOVE, derived rather than read back: this catalogue sat at 14,377 bytes through
         //   2026-11-25, and the record/task disclosure wave put +562 bytes on `tasks` ALONE (the
         //   `ids` paging rule, the two-fact `expects` split and the single-id ceiling sentence in
         //   ../tools/runtime/tasks.tool.ts). Nothing else this roster declares changed text — the
         //   other tools the wave touched are searchable, so they are not in it — which is why the
-        //   figure is 14,377 + 562 = 14,939 exactly, measured per entry on a live request in both
+        //   figure was 14,377 + 562 = 14,939, measured per entry on a live request in both
         //   trees by probe Temp/fix-f5/probe-floors.ts. The estimator itself moved not one line.
+        //   THE 2026-11-27 MOVE (+487 B, 14,939 -> 15,426), same method, one new term: every
+        //   OFFERED declaration now advertises one extra OPTIONAL property, the reserved per-call
+        //   `async` switch (../core/tool.ts `withToolAsyncSwitch` injects it into the model-facing
+        //   copy in ../harness.ts `offerDeclarations`), and `toolSchemaPayloadBytes` prices THAT
+        //   copy. All 3 rows of this roster carry the injected key, so the estimate every case in
+        //   this describe block reads now rides the new constant; the figure is MEASURED, not
+        //   derived — probe Temp/coding/probe-catalogue-ab.ts shape E, both trees, whose pristine-
+        //   HEAD leg reproduces 14,939 bytes exactly (which is what makes +487 a measurement). It
+        //   is not 3 x a fixed per-row figure: the first `async` key into a declaration with an
+        //   EMPTY `properties` object is dearer than appending beside existing keys, so the sum is
+        //   read off the live request. The estimator moved no line, so each figure below is the
+        //   same arithmetic on the new constant: 3,736 -> 3,857, 3,739 -> 3,860, 4,736 -> 4,857,
+        //   4,739 -> 4,860 (the floor itself is ceil(15,426/4) = 3,857, was ceil(14,939/4) =
+        //   3,735; neither catalogue is a multiple of 4, so the transcript keeps its own rounding).
         //   turn 1 sends one 2-byte user message and this agent has no instructions, so the
         //   anchored prefix is 2 bytes. Nothing has been reported yet, so turn 1 is the
         //   BLIND round, and the blind round now prices the catalogue that rides with it:
-        //   ceil((2 + 14,939) / 4) = 3,736. (It was 1 before the catalogue floor, which is
+        //   ceil((2 + 15,426) / 4) = 3,857. (It was 1 before the catalogue floor, which is
         //   the number the measured provider refusal proved wrong: a first request the
         //   harness believed was 464 tokens was billed 31,693.)
         //   The provider reports 900 prompt tokens for THAT request.
@@ -659,7 +673,10 @@ describe('provider-anchored context estimate (T5.4)', () => {
         const seen: HarnessStreamRequest[] = [];
 
         expect(await estimatesWith([calls('usage', ['c1', 'echo', '{}']), answerTurn], '', seen)).toEqual([
-            3736, 904
+            // Re-baselined 2026-11-27: the blind round's floor is the catalogue, which grew by the
+            // advertised `async` switch (see the block above), so 3,736 -> 3,857. The ANCHORED leg
+            // is untouched at 904 — the anchor absorbs the catalogue, which is the whole point.
+            3857, 904
         ]);
     });
 
@@ -683,13 +700,15 @@ describe('provider-anchored context estimate (T5.4)', () => {
         );
 
         // The catalogue the shipped request carries, asserted exactly: 3 declarations —
-        // `echo` plus the runtime controls — and 14,939 serialized payload bytes.
+        // `echo` plus the runtime controls — and 15,426 serialized payload bytes (was
+        // 14,939 until 2026-11-27, when every offered declaration started advertising the
+        // reserved optional `async` property; +487 B measured live, block above).
         expect(seen[0].tools).toHaveLength(3);
-        expect(toolSchemaPayloadBytes(seen[0].tools)).toBe(14_939);
+        expect(toolSchemaPayloadBytes(seen[0].tools)).toBe(15_426);
         // The transcript alone would say 1 token; the round the provider receives is
-        // ceil((2 + 14,939) / 4), and that is the number the compaction limit is compared
+        // ceil((2 + 15,426) / 4), and that is the number the compaction limit is compared
         // against on the round that has no anchor to hide behind.
-        expect(firstTurn).toBe(Math.ceil((2 + 14_939) / 4));
+        expect(firstTurn).toBe(Math.ceil((2 + 15_426) / 4));
         expect(firstTurn).toBeGreaterThan(1);
     });
 
@@ -697,12 +716,12 @@ describe('provider-anchored context estimate (T5.4)', () => {
         // The identical conversation with the `usage` field absent: still the plain
         // heuristic, but the heuristic now counts what the body carries — the transcript
         // AND the catalogue, since no anchor exists to absorb either.
-        //   turn 1: ceil((2 + 14,939) / 4) = 3,736;
-        //   turn 2: ceil((14 + 14,939) / 4) = ceil(14,953 / 4) = 3,739.
-        // The transcript-only half is the old 1 and 4; the delta is the same 14,939 bytes
+        //   turn 1: ceil((2 + 15,426) / 4) = 3,857;
+        //   turn 2: ceil((14 + 15,426) / 4) = ceil(15,440 / 4) = 3,860.
+        // The transcript-only half is the old 1 and 4; the delta is the same 15,426 bytes
         // of declaration both rounds really send.
         expect(await estimatesWith([calls('plain', ['c1', 'echo', '{}']), answerTurn])).toEqual([
-            3736, 3739
+            3857, 3860
         ]);
     });
 
@@ -711,12 +730,12 @@ describe('provider-anchored context estimate (T5.4)', () => {
         // provider reports 900, which is inside the sanity band (900*4 >= 1001), so it
         // is a real measurement of a denser tokenizer and the number steps DOWN.
         // Turn 1 is still blind, so it reports the catalogue floor:
-        // ceil((4,002 + 14,939) / 4) = 4,736. Turn 2 then measures 4,014 bytes, 12 more
+        // ceil((4,002 + 15,426) / 4) = 4,857. Turn 2 then measures 4,014 bytes, 12 more
         // than the anchored prefix -> 900 + ceil(12 x 1.166 / 4) = 904, and the low-side
         // clamp (ceil(ceil(4,014/4) / 4) = 251) is far below it.
         expect(
             await estimatesWith([calls('usage', ['c1', 'echo', '{}']), answerTurn], 'p'.repeat(4000))
-        ).toEqual([4736, 904]);
+        ).toEqual([4857, 904]);
     });
 
     it('refuses a count the transcript cannot support and stays on the heuristic', async () => {
@@ -725,8 +744,8 @@ describe('provider-anchored context estimate (T5.4)', () => {
         // request's prompt size (a provider counting only the uncached delta, say). The
         // estimate keeps the heuristic it has always used — the heuristic that counts the
         // catalogue, because on this leg nothing else can: turn 1
-        // ceil((4,002 + 14,939) / 4) = 4,736, then turn 2
-        // ceil((4,014 + 14,939) / 4) = 4,739.
+        // ceil((4,002 + 15,426) / 4) = 4,857, then turn 2
+        // ceil((4,014 + 15,426) / 4) = 4,860.
         const refused: HarnessStreamEvent[] = [
             {
                 type: 'done',
@@ -736,6 +755,6 @@ describe('provider-anchored context estimate (T5.4)', () => {
             }
         ];
 
-        expect(await estimatesWith([refused, answerTurn], 'p'.repeat(4000))).toEqual([4736, 4739]);
+        expect(await estimatesWith([refused, answerTurn], 'p'.repeat(4000))).toEqual([4857, 4860]);
     });
 });

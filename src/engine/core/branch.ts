@@ -83,6 +83,25 @@ export const BRANCH_PENDING_PLACEHOLDER: Readonly<Record<BranchPendingReason, st
         'No tool result was committed when this branch was created (not-committed). This placeholder is NOT a successful result.'
 };
 
+// M5 (2026-11-27) — the ONE seed row that is not a non-success placeholder: the call that CREATED this
+// branch. At the snapshot instant that call is unsettled by construction (its answer is the branch
+// itself), so pairing it with `BRANCH_PENDING_PLACEHOLDER` told the branch model "your own creation is
+// NOT a successful result". A model reading that re-enacts the requester's pending intent, which is the
+// documented root of the phantom relay (a branch `threadSend`-ing its own fork brief back to its owner).
+// The row therefore states the three facts the branch actually needs — which call this is, where its
+// result goes, and that it must not re-issue or relay it — and it is tool-agnostic, because the creating
+// call is `threadFork` for a fork and `actionRequest` for an owner-answer branch.
+//
+// The tag `(branch-self-call)` follows the placeholder convention of naming the state in parentheses,
+// and it is deliberately NOT `created-branch`: readers that tell a branch round from a root round by
+// that tag (src/harness.inclusion.test.ts) must not start matching a row whose meaning is different, and
+// a row that is not a placeholder should not read like one.
+export const BRANCH_SELF_CALL_PLACEHOLDER =
+    'This is the call that started the branch now executing (branch-self-call). No result was ' +
+    'committed for it yet because its answer is this branch: the result is delivered to the ' +
+    'conversation that started it when this branch settles. Treat this call as satisfied - do not ' +
+    're-issue it, and do not relay this brief to anyone else.';
+
 // ---------------------------------------------------------------------------
 // Branch identity
 // ---------------------------------------------------------------------------
@@ -730,7 +749,14 @@ const materializeMessages = (
     // Internal namespace override used ONLY by incorporation, where owner and
     // child must be disjoint even when their branch ids collide after sanitizing.
     // Public materialization keeps deriving the namespace from `branchId`.
-    namespace?: string
+    namespace?: string,
+    // M5 — the ORIGIN id of the call that is creating this branch, when the caller knows it (the
+    // runtime does: `launchThreadFork` and the autoanswer fork both pass the call being executed).
+    // That call is always unsettled at the snapshot instant, and `flushPending` below answers it with
+    // the self-describing marker instead of the non-success placeholder. Every other unsettled call
+    // keeps the generic placeholder, and a caller that names no id (a plain `Agent.fork()`, a
+    // projection of someone else's transcript) keeps the historical behaviour exactly.
+    selfCallId?: string
 ): MaterializedBranchHistory => {
     const messages: HarnessMessage[] = [];
     const toolCallIds: Array<{ origin: string; branch: string }> = [];
@@ -761,11 +787,20 @@ const materializeMessages = (
     // Pair every outstanding call with the explicit non-success placeholder. The
     // placeholder is a tool message so the result is provider-valid, but its
     // text states plainly that no result was committed.
+    //
+    // M5 — the ONE exception is the creating call (`origin === selfCallId`): its honest row is the
+    // self-describing marker, not a non-success claim. The match is on the ORIGIN id, and origin ids are
+    // unique inside one source transcript (a repeat is rejected as "repeats tool call id"), so exactly
+    // zero or one seeded row can carry the marker. Zero is the normal case for a fork of a transcript
+    // whose creating call is not in it (incorporation) or for a caller that named no id.
     const flushPending = (): void => {
         for (const call of pending) {
             messages.push({
                 role: 'tool',
-                content: BRANCH_PENDING_PLACEHOLDER[reason],
+                content:
+                    selfCallId !== undefined && call.origin === selfCallId
+                        ? BRANCH_SELF_CALL_PLACEHOLDER
+                        : BRANCH_PENDING_PLACEHOLDER[reason],
                 toolCallId: call.id,
                 name: call.name,
                 ...(call.included === false ? { included: false } : {})
@@ -867,11 +902,15 @@ const materializeMessages = (
 // Materialize ONE transcript for a branch. Used by Agent.fork() and available to
 // the runtime for a projected branch record. `reason` decides the pending
 // placeholder wording: threadFork, actionRequest, or the neutral other.
+// `selfCallId` (M5) is the origin id of the call that is creating this branch: that one pending call
+// gets `BRANCH_SELF_CALL_PLACEHOLDER` instead of the non-success placeholder. Omitted, every pending
+// call keeps the reason's placeholder, exactly as before.
 export const materializeBranchHistory = (options: {
     messages: readonly HarnessMessage[];
     branchId: string;
     reason?: BranchPendingReason;
     maxHistoryBytes?: number;
+    selfCallId?: string;
 }): MaterializedBranchHistory => {
     const branchId = requiredString(options.branchId, 'branchId');
     const maxBytes = positiveInteger(
@@ -879,7 +918,14 @@ export const materializeBranchHistory = (options: {
         'maxHistoryBytes'
     );
 
-    return materializeMessages(options.messages, branchId, options.reason ?? 'other', maxBytes);
+    return materializeMessages(
+        options.messages,
+        branchId,
+        options.reason ?? 'other',
+        maxBytes,
+        undefined,
+        options.selfCallId
+    );
 };
 
 // ---------------------------------------------------------------------------
@@ -961,14 +1007,19 @@ export const incorporateBranchHistory = (
         ownerBranchId,
         options.reason ?? 'other',
         maxBytes,
-        namespaces.owner
+        namespaces.owner,
+        // Incorporation never names a self call: the owner's still-pending call is the delegation that
+        // STARTED the requester, not the branch being built here, so the neutral placeholder stays the
+        // honest row for it (M5 left that case alone).
+        undefined
     );
     const child = materializeMessages(
         options.branchMessages,
         branchId,
         'other',
         maxBytes,
-        namespaces.child
+        namespaces.child,
+        undefined
     );
 
     // Child system instructions are DATA. Demoting them to user messages is the

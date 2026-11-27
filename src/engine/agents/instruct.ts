@@ -57,6 +57,18 @@ export const instruct: AgentProfile = {
         DELEGATION_GUIDELINE,
         // A delegate's report is a claim; the caller owns the answer either way.
         'Verify a delegated result before relying on it; the final answer stays yours.',
+        // C0 (2026-11-27) — the ANSWER-ORDER line, and the reason it is one short sentence rather than
+        // the paragraph the fact deserves: `agentInstruction()` composes the whole card into ONE
+        // prompt with a hard ceiling of 1800 characters (agents.test.ts pins the exact measured length
+        // of every profile beside that ceiling), and this card sat at 1604 before the line: the
+        // sentence is 79 characters and composes to +82, landing the card at 1686. The rule it carries
+        // is a runtime fact, not a style preference: the result ledger keeps the FINAL message of a
+        // run, so an agent that posts its report and then pages a result or tidies a child thread ends
+        // up ANSWERING with the housekeeping — the incident behind the change was an 8,117-character
+        // report at message 165 displaced by a 1,099-character cleanup note at 175. The engine now
+        // discloses that (`answerMessageIndex`, `answerCandidates` on `agentResult`), and this line is
+        // the agent-side half: report last, and the ledger never has to guess.
+        'Do cleanup before your final report: the result ledger keeps your last message.',
         DISCOVERY_GUIDELINE,
         WEB_SEARCH_GUIDELINE,
         PERMISSIONS_GUIDELINE,

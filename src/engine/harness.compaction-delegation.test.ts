@@ -149,30 +149,51 @@ const SEED = 'x'.repeat(2100);
 // no longer sit below a thread's catalogue floor. With `presets: false` the two floors differ,
 // because `turn.before` carries the thread's OWN declared tools and the delegated child prices
 // ITS OWN catalogue (no `delegate` row):
-//   parent catalogue = 43,827 serialized bytes / 4 = 10,956.75 -> 10,957 tokens
-//   child  catalogue = 36,115 serialized bytes / 4 =  9,028.75 ->  9,029 tokens
+//   parent catalogue = 47,214 serialized bytes / 4 = 11,803.5 -> 11,804 tokens
+//   child  catalogue = 38,333 serialized bytes / 4 =  9,583.25 ->  9,584 tokens
 // probe: Temp/fix-f5/probe-floors.ts (shape C), re-measured 2026-11-25 for the +1,976 B that
 // F1's threadList (+1,038) and threadSend (+938) disclosure added to every declared catalogue.
 // The figures this block used to carry (39,785 / 9,947 and 32,379 / 8,095) were already stale at
 // pristine HEAD, where the SAME probe measured 41,851 and 34,139 bytes; the case still passed
 // because it only needs the inequalities below, but a constant that claims to be the floor has to
 // BE the floor, so both are restated from the measurement and the margins fall out as designed.
+// THE TWO MOVES SINCE THAT NOTE, both re-measured on shape C of the same probe against pristine
+// `e66bce8` (child 36,691 B / 9,173, parent 45,425 B / 11,357) and against this tree, which is what
+// makes them arithmetic rather than claims:
+//   - the reserved per-call `async` switch (2026-11-27, ../core/tool.ts `withToolAsyncSwitch`):
+//     +1,074 B on the child and +1,221 B on the parent — one declared row wider, one more +147. At
+//     `e66bce8` the child stood at 36,691 B, i.e. the 9,029 this block carried was ALREADY 144
+//     tokens under the floor before either finding landed, exactly the staleness the note above
+//     calls out; it is restated here rather than patched around.
+//   - F1, the branch write doors (2026-11-27): +568 B on BOTH rosters, from the two PARAMETER
+//     copies `threadSend` (+362) and `threadDelete` (+206) gained; `threadFork`'s own description
+//     is on a SEARCHABLE row, never declared, so it prices nothing here.
+//     36,691 + 1,074 + 568 = 38,333 for the child, and 45,425 + 1,221 + 568 = 47,214 for the
+//     parent.
 // The fixture is therefore sized off the CHILD's floor: the child must stay under the limit while
-// its round-1 estimate (floor + 7 = 9,036) and cross it when the seed tool result lands (round 2 =
-// floor + 534 = 9,563), and the parent still crosses the same limit from its own floor (10,957 + 1
-// = 10,958 on its first request). Both transcript terms are MEASURED, not hand-counted: probe
+// its round-1 estimate (floor + 7 = 9,591) and cross it when the seed tool result lands (round 2 =
+// floor + 534 = 10,118), and the parent still crosses the same limit from its own floor (11,804 + 1
+// = 11,805 on its first request). Both transcript terms are MEASURED, not hand-counted: probe
 // Temp/fix-f5/probe-transcript.ts arms the shipped plugin at an unreachable limit and reads every
-// `turn.before` estimate off the fixture itself (9,036 / 9,563 for the child, 10,958 / 11,032 for
+// `turn.before` estimate off the fixture itself (9,591 / 10,118 for the child, 11,805 / 11,879 for
 // the parent, i.e. floor + 7 / floor + 534 and floor + 1 / floor + 75).
 // THE DEAD-RUN GUARD (./plugins/context-compaction.plugin.ts `turnBefore`) is what keeps this case
-// to ONE pass: the PARENT's summarize pass is refused outright — its 10,957-token floor is above the
-// 9,559 ceiling, so no ladder rung could build a request the provider would take — and reported once
-// as `stage: 'unreachable-target'`, while the CHILD's floor (9,029) sits under the ceiling, so its
-// clipped compaction request fits and its pass runs. The two boundaries the case walks, sampled from
-// the guard:
-//   writer    10 958 = floor 10 957 + transcript 1     → refused (floor >= ceiling)
-//   researcher 9 563 = floor  9 029 + transcript 534   → the pass, the only one in the case
-const CHILD_CATALOGUE = 9_029;
+// to ONE pass: the PARENT's summarize pass is refused outright — its 11,804-token floor is above the
+// 10,114 ceiling, so no ladder rung could build a request the provider would take — and reported
+// once as `stage: 'unreachable-target'`, while the CHILD's floor (9,584) sits under the ceiling, so
+// its clipped compaction request fits and its pass runs. The two boundaries the case walks, sampled
+// from the guard:
+//   writer    11 805 = floor 11 804 + transcript 1     → refused (floor >= ceiling)
+//   researcher 10 118 = floor  9 584 + transcript 534  → the pass, the only one in the case
+// F1b (2026-11-27, the branch-seed findings) — both floors moved by the SAME measured +616 B / +154 tokens:
+// probe `Temp/fix-f5/probe-floors.ts` shape C now measures child 38,949 B / 9,738 and parent 47,830 B /
+// 11,958. The two sentences are `threadSend`'s no-redirect note (+277 B) and `threadDelete`'s
+// discovery-pointer sentence (+339 B) — declared rows on both sides. The transcript terms are unchanged
+// (`Temp/fix-f5/probe-transcript.ts`: child floor + 6 then + 534, parent floor + 0 then + 75), so every
+// estimate in the block above shifts by the same +154 and the structure this case walks is intact at the new
+// numbers: round 1 = 9,744 < LIMIT 10,268 <= round 2 = 10,272, and the parent's 11,958 floor is still above
+// the 10,268 ceiling, so its pass is still refused as unreachable.
+const CHILD_CATALOGUE = 9_738;
 const LIMIT = CHILD_CATALOGUE + 530;
 const MODEL = 'merge/ds4-flash';
 

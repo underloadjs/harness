@@ -846,6 +846,22 @@ with different rules.
   `threadFork` and `actionRequest` as sync and silently removes their
   heartbeat. An unregistered name is treated as async, so a policy the plugin
   cannot answer for over-pings rather than going quiet.
+  - **Neither read can see a per-call override (2026-11-27).** Since the reserved
+    `async` argument, the effective mode is a property of the CALL, not of the tool:
+    `"async": false` pulls an async-declared tool's call into the sync group, and the
+    lone-`delegate` refinement does it without the model saying anything
+    (`src/engine/harness.ts:11960-11966`). The pending payload is still
+    `{ callId, name, elapsedMs }` (`src/engine/types/index.ts:365-369`) and core announces
+    EVERY launch, sync included (`announcePending`, `src/engine/harness.ts:11756`), so the
+    plugin's two reads resolve the mode BY NAME
+    (`src/engine/plugins/async-ping.plugin.ts:310-319`) and cannot tell a backgrounded
+    delegation from a refined-sync one. Consequence, accepted and documented, not fixed:
+    a sync-resolved call on an async-declared tool KEEPS the heartbeat — one placeholder
+    turn per ping, the safe direction (over-ping), never the reverse. The named fix is a
+    `mode` field on the `async.pending` payload, which would let the plugin read the truth
+    instead of a name; until then `api.toolMode(name)` (the heartbeat task's task 2) is
+    insufficient as written, because a name-keyed accessor answers the DEFAULT and not the
+    call. See `docs/tasks/2026-11-27-tool-call-mode-switch.md`.
 - `config` — read-only, exactly `{ wakeIntervalMs }` (legacy compat).
 
 ---

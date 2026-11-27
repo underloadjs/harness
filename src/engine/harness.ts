@@ -395,6 +395,10 @@ import {
     reserveBranchSequence,
     validateActionChoice,
     validateActionRequestParameters,
+    // M5 (2026-11-27) — the two seed wordings, read from their module so the backfill's "is this row a
+    // seeded placeholder?" test can never drift from what ./core/branch.ts actually writes.
+    BRANCH_PENDING_PLACEHOLDER,
+    BRANCH_SELF_CALL_PLACEHOLDER,
     // Slash-command registry primitives: the shared parser (a host rendering a
     // composer needs the SAME grammar) and the built-in set that is registered
     // below before any configured command. See core/command.ts.
@@ -492,6 +496,17 @@ import { assignMessageId } from './core/message-id';
 // `isError`. Direct module import, same convention as the two helpers above — the runtime
 // needs these two rules, not the whole core barrel.
 import { isErrorOutcome, storedOutcomeEntry } from './core/tool-outcome';
+// THE RESERVED PER-CALL `async` SWITCH (see ./core/tool.ts for the whole contract).
+// Direct module import, same convention as the helpers above: the runtime needs the key's
+// ONE spelling plus the three rules that read it — the declaration copy `offerDeclarations`
+// advertises, the tolerant pre-read the mode resolver and the message count use, and the
+// "this tool declared `async` itself, so the switch does not apply" carve-out. The strip
+// itself lives in ./core/schema-validation.ts, which imports the same module.
+import {
+    readToolAsyncSwitch,
+    toolOwnsAsyncParameter,
+    withToolAsyncSwitch
+} from './core/tool';
 // The snapshot readers' value bounds (core/snapshot-validation.ts), reused verbatim by
 // `archiveInvocation` for the FORENSIC PAIR of a stopped run. Direct module import, same
 // convention as the helpers above. The point is a single discipline: `core/snapshot.ts:242-298`
@@ -501,13 +516,19 @@ import { readSnapshotInteger, readSnapshotString, readSnapshotToolActivity } fro
 // The run-stop vocabulary (IT19 R3): the SAME table `core/snapshot.ts` enforces when it READS
 // `stopReason` off disk (:101-115) is reused at the live archive seam, so an accepted value can
 // never mint a row the next snapshot refuses. core/snapshot.ts:96-98 states this rule explicitly:
-// every other validating boundary imports the table instead of re-spelling the nine members.
+// every other validating boundary imports the table instead of re-spelling the ten members
+// (`provider-network` joined the union on 2026-11-21; the count was corrected here 2026-11-27).
 import { HARNESS_RUN_STOP_REASONS, isHarnessRunStopReason } from './core/snapshot';
 // T-W8 — the per-process EPOCH stamped onto run identity. Direct module import of a
 // dependency-free leaf, the same convention as the core helpers above: the runtime may not
 // import the server tree, and `server/api-events.ts` aliases THIS constant, so the epoch a
 // REST cursor carries and the epoch a recorded frame carries name the same process.
-import { HARNESS_PROCESS_EPOCH, TOOL_ACTIVITY_NAME_CAP } from './core/agent-limits';
+import {
+    AGENT_ANSWER_CANDIDATE_CAP,
+    AGENT_ANSWER_CANDIDATE_CHARS,
+    HARNESS_PROCESS_EPOCH,
+    TOOL_ACTIVITY_NAME_CAP
+} from './core/agent-limits';
 // W19 (2026-11-17) — the invocation-RUN key, the same rule `./server/protocol.ts` publishes. Direct
 // module import of a dependency-free leaf, the same convention as `./shared/attachments` below and
 // the core helpers above: the result ledger (`invocationRecords`), the durable rows it projects, and
@@ -537,6 +558,9 @@ import type {
     HarnessActionRequest,
     HarnessActionRequestContext,
     HarnessActionResult,
+    // C0 (2026-11-27) — the run's substantive tool-free turns, and the ledger row that keeps them
+    // addressable (`AgentInvocationRecord.answerCandidates`, `HarnessAgentResultSnapshot`).
+    HarnessAnswerCandidate,
     HarnessAgentResultSnapshot,
     HarnessAgentSnapshot,
     HarnessAssistantMessage,
@@ -825,8 +849,10 @@ const turnCapErrorOf = (name: string, limit: number, isCallerCap: boolean): stri
 // from the tool result, the branch record and `agentResult` without guessing.
 // IT19 R3 — THE CAUSE RIDES ON THE ABORT REASON.
 //
-// A run ends without concluding for nine different reasons (the closed `HarnessRunStopReason`
-// vocabulary), and the catch in `runAgentCore` is the ONE place that terminalizes the run — but
+// A run ends without concluding for ten different reasons (the closed `HarnessRunStopReason`
+// vocabulary — ten members since `provider-network` joined it, and
+// ./core/snapshot.ts `HARNESS_RUN_STOP_REASONS` is the table that spells them), and the catch in
+// `runAgentCore` is the ONE place that terminalizes the run — but
 // by the time it runs, every specific cause has collapsed into "the signal aborted". A caller's
 // `toolCancel`, a wall-clock expiry, a host `stopThread`, and a plugin `turn.before` stop all
 // look identical from there, which is exactly the ambiguity IT19 removes.
@@ -1200,6 +1226,42 @@ const parseToolCallArguments = (
 
     const parsed: unknown = call.arguments.trim().length > 0 ? JSON.parse(call.arguments) : {};
     return resolveToolParameters(schema, parsed, 'model');
+};
+
+// The reserved `async` switch of ONE model call, read TOLERANTLY (./core/tool.ts owns the
+// key and the rule). This is the pre-read the turn-mode decision and the per-message
+// count are built from, and it runs BEFORE the authoritative parse, so it is allowed to
+// know nothing: malformed JSON, a non-object payload, an absent key, and a non-boolean
+// value all answer `undefined` ("no switch"). That tolerance is load-bearing twice over:
+// counting the calls of a message must never throw, and a malformed payload must keep
+// reporting the exact error it reports today from `parseToolCallArguments` (the type error
+// for a bad-but-parseable value is raised there, via the strip in
+// ./core/schema-validation.ts, not here).
+//
+// `definition` is the RESOLVED definition of this call, because the key yields to the
+// tool: when the schema declares `async` itself, the property is the tool's argument and
+// the reserved switch answers "no switch" no matter what the payload says.
+const readCallAsyncSwitch = (
+    call: HarnessToolCall,
+    definition: Tool | undefined
+): boolean | undefined => {
+    if (definition === undefined) return undefined;
+    if (toolOwnsAsyncParameter(definition.parameters)) return undefined;
+
+    const text = call.arguments;
+    if (typeof text !== 'string' || text.trim().length === 0) return undefined;
+
+    let parsed: unknown;
+
+    try {
+        parsed = JSON.parse(text);
+    } catch {
+        // Malformed, truncated, or empty — the authoritative parse reports it (or the
+        // call has no arguments at all). Either way there is no switch to honour.
+        return undefined;
+    }
+
+    return readToolAsyncSwitch(parsed);
 };
 
 // The discovery entry point. The harness owns this name: the whole visibility
@@ -2034,6 +2096,52 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // policy can leak onto a replacement.
     const effectiveToolMode = (definition: Tool): ToolMode =>
         modeDefinitions.get(definition) ?? definition.mode ?? DEFAULT_TOOL_MODE;
+
+    // How many calls of ONE assistant message resolve to 'async' BEFORE any per-message
+    // refinement: an explicit `async` switch on the call (step 1 of the dispatch
+    // precedence below), else the resolved definition's mode (step 2). Computed once per
+    // message at the launch loop, and read by the delegate-only refinement (step 3) — see
+    // `launchToolCall` for the whole contract.
+    //
+    // WHY IT COUNTS ASYNC-RESOLVING CALLS AND NOT DELEGATES. The user's intent is "the
+    // spawner is waiting on exactly ONE thing", and anything long-running it also launched
+    // is a second thing it has to juggle. A message with one `delegate` plus one
+    // `threadFork` (or one `shell`) therefore keeps today's async freedom for the
+    // delegate, even though it holds exactly one delegate. Conversely a `delegate` plus a
+    // `read` is still "one thing to wait for", because the `read` joins the same sync group
+    // and the ONE turn after the batch settles carries both.
+    //
+    // It reads NOTHING but `call.arguments` (tolerantly, via `readCallAsyncSwitch`, which
+    // cannot throw) plus the offered definitions, so counting is pure: no scheduler state,
+    // no transcript, no gate. A name this request never advertised contributes nothing —
+    // such a call answers at the scope/discovery gates and never becomes background work,
+    // so it must not suppress the refinement for the real delegate beside it.
+    const countAsyncResolvedCalls = (
+        calls: readonly HarnessToolCall[],
+        offered?: ReadonlyMap<string, Tool>
+    ): number => {
+        let asyncCalls = 0;
+
+        for (const call of calls) {
+            // The SAME map the launches resolve through, so the count and the launches
+            // cannot disagree about which definition a name addressed.
+            const definition = offered?.get(call.name);
+            if (definition === undefined) continue;
+
+            const switchValue = readCallAsyncSwitch(call, definition);
+
+            if (switchValue !== undefined) {
+                // An explicit `false` is a call the spawner is ALSO waiting on, and it
+                // belongs to the sync group — it is not a second async thing.
+                if (switchValue) asyncCalls++;
+                continue;
+            }
+
+            if (effectiveToolMode(definition) === 'async') asyncCalls++;
+        }
+
+        return asyncCalls;
+    };
 
     // Progress reporting is awaited for every step, so a UI can pace the run.
     const progress: HarnessProgress = async (event: HarnessEvent) => {
@@ -4630,7 +4738,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // B5 (2026-11-13): the model-facing release. A threadless caller is the host view
         // and deletes anything terminal; a caller WITH a thread only reaches its own
         // descendants (`threadDeleteFor`).
-        threadDelete: (callerThreadId, threadId) => threadDeleteFor(callerThreadId, threadId),
+        //
+        // F1 (2026-11-27): the caller's BRAIN rides as the third argument because a branch run
+        // and its owner conversation report the SAME caller thread id, and only the brain carries
+        // the branch metadata the write guard reads.
+        threadDelete: (callerThreadId, threadId, caller) => threadDeleteFor(callerThreadId, threadId, caller),
         search: (context) => {
             const operation = webOperations.search;
 
@@ -4672,6 +4784,32 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // system instructions, user prompts, tool arguments, and tool bodies. The
     // registry records ONLY the completed answer value a run returns (plus its
     // identity), so agentManage/agentResult can never read anything else.
+    //
+    // WHAT "ONLY" MEANT, AND WHAT IT MEANS NOW (C0, 2026-11-27 — rewritten because the sentence
+    // above had stopped being true, and a comment that overstates a boundary is worse than no
+    // comment). The rule was written when a row carried one answer string. A row can now carry
+    // three more things, all of them ASSISTANT TEXT the run itself committed, and none of them a
+    // transcript read at large:
+    //   - `answerMessageIndex` — an INTEGER naming which committed message `content` came from. It
+    //     stores no text at all; it is the address that lets a caller verify the answer against
+    //     `threadRead`, which is what the "no transcript access" claim always described from the
+    //     other side.
+    //   - `answerCandidates` — at most `AGENT_ANSWER_CANDIDATE_CAP` (4) entries, each one a
+    //     substantive tool-free `stop` turn of THIS run (the `resolveRunAnswer` admission rule, no
+    //     wider), each cut at `AGENT_ANSWER_CANDIDATE_CHARS` (32000) characters and flagged when the
+    //     cap spoke. Bounded on both axes, never more than 4 x 32000 characters per row.
+    //   - `partialContent` — already an exception this file documents (issue 0033): one run's last
+    //     committed assistant text, on a row for a run that never answered.
+    //
+    // WHY THE EXTENSION IS ALLOWED AND A TRANSPORT IS NOT. The defect that forced it: an investigator
+    // posted its 8,117-char report mid-run, then wrote housekeeping and a 1,099-char cleanup note,
+    // and the ledger — faithfully applying "one row, the final message" — handed the cleanup note to
+    // every answer surface while the report survived only as an index in a transcript no answer door
+    // reads. Keeping the rule absolutely means a report is UNREACHABLE by `invocationId`; the fix
+    // therefore keeps the registry-first rule and bounds the leak: still no system instructions, no
+    // user prompts, no tool arguments, and no tool RESULT bodies (the boundary issue 0020 AC3 pins) —
+    // only the run's own assistant prose, capped, listed, and snapshot-persisted like every other
+    // field here.
     //
     // Invocation identity:
     //   - root run            -> String(run.id)
@@ -4791,6 +4929,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // exactly the row that must keep living under its BARE id, so an epoch-less document resolves
         // byte-identically to how it resolves today.
         epoch?: string;
+        // C0 (2026-11-27, the mid-run-report defect) — WHICH MESSAGE `content` IS, written on a
+        // COMPLETED row at the terminal commit (`finishInvocation`). A 0-based index into the
+        // transcript that owns the run — `run.agent.messages`, which is what `threadMessages` serves
+        // for a thread AND for a finished `branch-N` — i.e. the same domain `threadRead`'s `message`
+        // argument takes. Absent means "this build could not locate the answer message" (a terminal
+        // write for an entry the identity scan cannot find) or "this row predates the field"; both
+        // read as "not observable", and every door omits the key rather than inventing index 0.
+        answerMessageIndex?: number;
+        // C0 — the run's substantive tool-free turns OTHER than the one the answer came from, in
+        // transcript order, at most `AGENT_ANSWER_CANDIDATE_CAP` entries, each capped at
+        // `AGENT_ANSWER_CANDIDATE_CHARS` characters. This is the addressability half of the fix: a
+        // report the ledger displaced because the agent did housekeeping afterwards stays retrievable
+        // BY `invocationId` (through `agentResult`'s `message` selector), instead of only by a
+        // transcript index the caller was never given.
+        //
+        // WHY IT IS NOT "THE TRANSCRIPT, PLEASE". The leak boundary issue 0020 AC3 pins is tool
+        // BODIES and system/user text, and this list carries neither: it is the run's own committed
+        // assistant prose, admitted by the same rule `resolveRunAnswer` uses, bounded on both axes,
+        // and stored on the row the retention ring already caps. See the registry header above.
+        answerCandidates?: HarnessAnswerCandidate[];
     };
 
     // THE LEDGER KEY (W19, 2026-11-17). `invocationRecords` is keyed by invocation RUN —
@@ -5049,6 +5207,45 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (outcome.message !== undefined) {
             record.status = 'completed';
             record.content = typeof outcome.message.content === 'string' ? outcome.message.content : '';
+
+            // C0 (2026-11-27) — THE ANSWER'S ADDRESS, and the run's other substantive turns.
+            //
+            // WHY HERE AND NOT EARLIER. This is the one moment both facts are settled: the answer
+            // message has been COMMITTED (the loop's terminal branch has the entry in the transcript),
+            // the run's candidate window is complete, and the transcript is still exactly what the
+            // model was shown — after this, a later compaction or a re-run of the same invocation can
+            // move positions, and the row would start naming an entry that is no longer there.
+            //
+            // BOTH KEYS ARE WRITTEN OR DELETED, never left stale. `finishInvocation` can land on a row
+            // that a previous terminal transition already wrote (the cancelled → completed transition
+            // this function's `else` branch documents), so each key is set when derivable and DELETED
+            // when not — the same discipline `toolActivity` and `stopReason` below apply, and for the
+            // same two reasons: absence must mean "this build has nothing to say", and `core/snapshot.ts`
+            // refuses a row carrying a key the next projection would drop.
+            const answerIndex = committedMessageIndex(run.agent.messages, outcome.message);
+
+            if (answerIndex < 0) delete record.answerMessageIndex;
+            else record.answerMessageIndex = answerIndex;
+
+            // The list EXCLUDES the turn the answer came from. That turn is already this row's
+            // `content` (and the `agentResult` default already pages it), so listing it again would
+            // spend the cap on a row the caller can read without the list; what the list is FOR is the
+            // report the ledger displaced. For a DELEGATED run rescued onto an earlier turn
+            // (`resolveRunAnswer`), that exclusion removes the rescued turn, and
+            // `answerMessageIndex` names it — the pair stays consistent by construction.
+            //
+            // THE INDEXES ARE RE-DERIVED HERE, from the transcript as it stands at this instant
+            // (`committedAnswerCandidateIndexes`), because a mid-run commit index and a published
+            // index are different numbers on an async run — the pending delivery shifts later turns
+            // down — and an index a caller cannot resolve through `threadRead` is worse than no list.
+            const positioned = committedAnswerCandidateIndexes(run.agent.messages, run.answerCandidates);
+            const candidates =
+                answerIndex < 0
+                    ? positioned
+                    : positioned.filter((entry) => entry.messageIndex !== answerIndex);
+
+            if (candidates.length === 0) delete record.answerCandidates;
+            else record.answerCandidates = candidates;
         } else {
             record.status =
                 run.aborted || run.signal?.aborted === true ? 'cancelled' : 'failed';
@@ -5090,6 +5287,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // transitions cancelled → completed restores with its exact pre-field shape.
             if (run.stopReason === undefined) delete record.stopReason;
             else record.stopReason = run.stopReason;
+
+            // C0 (2026-11-27): the answer-address pair DELETED here, on the same ground as the two
+            // keys above. A stopped run has no answer message — its `content` is empty by rule and its
+            // text is `partialContent` — so there is no index to name, and `core/snapshot.ts` REFUSES
+            // a `failed`/`cancelled` row carrying either key. A row that goes completed → cancelled
+            // must therefore lose both, or the next snapshot is unrestorable.
+            delete record.answerMessageIndex;
+            delete record.answerCandidates;
         }
 
         pruneInvocationRecords();
@@ -5191,7 +5396,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             invocationId: record.invocationId,
             kind: record.kind,
             status: record.status,
-            ...previewFieldsOf(record.content)
+            ...previewFieldsOf(record.content),
+            // C0 (2026-11-27) — WHICH MESSAGE this preview is the beginning of. The listing door is
+            // where a caller decides whether to page an answer at all, so the address belongs here
+            // too: `threadRead({ thread, message: answerMessageIndex })` is the whole message, and
+            // the row's absence of the key means "this row predates the field (or was archived by a
+            // lane), so do not read an index into it".
+            //
+            // The candidate LIST is deliberately not projected here. A listing row is a pointer
+            // (200 characters of one answer), and the candidate view is a per-invocation fact the
+            // caller only needs once it has addressed the invocation — `agentResult` is that door,
+            // and it pays for the list. Adding it here would put up to 4 previews on every one of
+            // the 5 rows per agent this page lists.
+            ...(record.answerMessageIndex === undefined
+                ? {}
+                : { answerMessageIndex: record.answerMessageIndex })
         };
     };
 
@@ -5445,6 +5664,56 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const agentResultClampNote = (requested: number, total: number, clampedOffset: number): string =>
         `Requested offset ${requested} is past the end of this ${total}-character result; showing what remains from ${clampedOffset}. The result is fully read once "content" is empty.`;
 
+    // C0 (2026-11-27) — THE CANDIDATE LISTING THE ENVELOPE SHOWS.
+    //
+    // A LISTING, NOT THE TEXT. `agentResult` already learned this lesson from `threadRead` and from
+    // its own paging: an envelope that dumps every body costs the caller a page it did not ask for.
+    // So each entry carries the ADDRESS (`messageIndex`, for `threadRead`), the SIZE
+    // (`contentLength`), a glance preview at `AGENT_MANAGE_PREVIEW_CHARS` — the same clip
+    // `previewFieldsOf` gives every other listing surface, so a 300-char report previews identically
+    // in `agentManage` and here — and `truncated`. The full text is ONE CALL AWAY: pass the entry's
+    // position as `message`.
+    //
+    // `truncated` MEANS "this entry does not carry the whole committed message", and either bound can
+    // say it: the 32000-character capture cap (the stored content is a prefix), or the preview clip.
+    // Both are reported under one flag because both are answered the same way — read it with
+    // `message`, or read the transcript at `messageIndex`.
+    const answerCandidateViewsOf = (record: AgentInvocationRecord) =>
+        (record.answerCandidates ?? []).map((candidate) => {
+            const view = previewFieldsOf(candidate.content);
+
+            return {
+                messageIndex: candidate.messageIndex,
+                contentLength: view.contentLength,
+                preview: view.preview,
+                truncated: candidate.truncated || view.truncated
+            };
+        });
+
+    // C0 — the refusal for a `message` selector this row cannot serve. ONE sentence, three causes,
+    // because the three remedies differ: nothing to select from (drop the parameter), an ordinal
+    // outside the list (name the legal range), and a selector aimed at a run that never answered
+    // (the row's status says why).
+    const answerCandidateRefusalFor = (
+        record: AgentInvocationRecord | undefined,
+        requested: number,
+        candidates: number
+    ): string => {
+        if (record === undefined) {
+            return `No invocation of this agent has an answer candidate ${requested}: "message" selects a turn of a completed result, and this agent has no finished result at all.`;
+        }
+
+        if (record.status !== 'completed') {
+            return `Invocation "${record.invocationId}" has no answer candidate ${requested}: a "${record.status}" run never recorded one, because it produced no answer. Its partial text is in "partialContent".`;
+        }
+
+        if (candidates === 0) {
+            return `Invocation "${record.invocationId}" has no answer candidate ${requested}: its only substantive turn is the answer itself, so omit "message" to read that.`;
+        }
+
+        return `Invocation "${record.invocationId}" has no answer candidate ${requested}: "message" is a 0-based position in the ${candidates} listed under "answerCandidates" (0-${candidates - 1}).`;
+    };
+
     // B2 (2026-11-26) — the refusal `agentResult` gives when NO row of the addressed id belongs to
     // the agent it was addressed by. ONE sentence used to cover two opposite failures — "you asked
     // the wrong agent" (switch agent) and "that invocation never happened" (give up) — and the
@@ -5570,6 +5839,43 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     [...recent]
                         .filter((entry) => entry.status !== 'running')
                         .sort((left, right) => right.completedOrder - left.completedOrder)[0];
+            }
+
+            // C0 (2026-11-27) — THE `message` SELECTOR: a 0-based ORDINAL into the row's listed
+            // `answerCandidates`, not a transcript index (the two are different numbers, and the
+            // listing shows both: each entry carries its `messageIndex`, and the caller selects by
+            // its POSITION in that list). Absent — today's behaviour, unchanged — the door pages the
+            // terminal answer exactly as it always did.
+            //
+            // WHY AN ORDINAL AND NOT THE TRANSCRIPT INDEX: the selector has to be usable straight off
+            // the listing this same envelope returns, and an ordinal is the one value in that list a
+            // caller cannot get wrong — there is no "did you mean the index or the position"
+            // ambiguity, and a row whose candidates are 165 and 175 cannot be asked for 166.
+            //
+            // Everything else about the read is deliberately IDENTICAL: the selected candidate's text
+            // goes through the same offset/limit/nextOffset machinery, with the same clamp note,
+            // because two doors that page the same kind of text must explain it in one vocabulary.
+            const requestedMessage =
+                typeof parameters?.message === 'number' ? parameters.message : undefined;
+            const candidateList = record?.answerCandidates ?? [];
+            let selectedCandidate: HarnessAnswerCandidate | undefined;
+
+            if (requestedMessage !== undefined) {
+                // The selector is refused, never guessed with, for every cause: a caller that asked
+                // for candidate 4 of 2 needs to be told the range, and one that asked a stopped run
+                // for its candidates needs the status, not an empty page that reads like "no report".
+                if (
+                    record?.status !== 'completed' ||
+                    !Number.isInteger(requestedMessage) ||
+                    requestedMessage < 0 ||
+                    requestedMessage >= candidateList.length
+                ) {
+                    throw new HarnessError(
+                        answerCandidateRefusalFor(record, requestedMessage, candidateList.length)
+                    );
+                }
+
+                selectedCandidate = candidateList[requestedMessage];
             }
 
             const limit =
@@ -5705,7 +6011,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // has carried `stopReason` since the retention fix (`finishInvocation`
                     // ~:4085, `finishInvocationRecord` ~:8013), and `harness.thread(id)`
                     // (~:13880) plus `snapshot().agentResults[]` (~:14279) both projected it —
-                    // only THIS door answered `undefined` for all nine causes, so a caller of
+                    // only THIS door answered `undefined` for all ten causes (the closed
+                    // `HarnessRunStopReason` vocabulary — ten members since `provider-network`), so a
+                    // caller of
                     // `agentResult` still had to string-match `error` prose to tell
                     // "the parent released the call" from "the provider ran out of retries".
                     // Absence-conditional like the three keys above: a pre-feature row and a
@@ -5719,7 +6027,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 };
             }
 
-            const total = record.content.length;
+            // C0 (2026-11-27) — WHAT THIS PAGE READS. The terminal answer (the row's `content`), or
+            // the candidate `message` named. One variable makes the whole branch identical for both,
+            // which is the point: the report a mid-run turn holds is paged, clamped, and cursored by
+            // the same lines that have always served the answer, so neither text can drift into a
+            // second, subtly different paging contract.
+            const source = selectedCandidate === undefined ? record.content : selectedCandidate.content;
+            const total = source.length;
             // B1 (2026-11-26) — the clamp is REPORTED, in the same vocabulary webfetch uses
             // (./tools/webfetch/index.ts:689-690 for the flag, :871-876 for the pair). Two rules
             // matter and neither is the obvious one:
@@ -5733,11 +6047,36 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             //     is why the key is absent there instead of `false`.
             const requestedOffset = typeof parameters?.offset === 'number' ? parameters.offset : 0;
             const offset = Math.min(requestedOffset, total);
-            const page = resultPageOf(record.content, offset, limit);
+            const page = resultPageOf(source, offset, limit);
             const offsetClamped = requestedOffset > total;
 
             return {
                 ...base,
+                // C0 — THE ANSWER'S ADDRESS, on every completed envelope a row can supply it for.
+                // This is the transparency half of the fix: `content` is the run's final message, and
+                // this integer says which message that is, so a caller can `threadRead` the whole
+                // thing, and — the case that started this — can tell an 1,099-char cleanup note apart
+                // from the 8,117-char report it displaced instead of finding out by paging to the end
+                // of the transcript. Absent only on a row this build could not derive it for (a row
+                // restored from a document that predates the field, or a lane archive that never
+                // carried one), and then it is simply not reported.
+                ...(record.answerMessageIndex === undefined
+                    ? {}
+                    : { answerMessageIndex: record.answerMessageIndex }),
+                // The run's OTHER substantive turns, listed as pointers (see
+                // `answerCandidateViewsOf`). ABSENT, never `[]`: a single-answer run has nothing the
+                // ledger displaced, and that absence is the signal that `message` would be refused.
+                ...(record.answerCandidates === undefined
+                    ? {}
+                    : { answerCandidates: answerCandidateViewsOf(record) }),
+                // Which candidate THIS page is the window into. Echoed only when a candidate was
+                // selected — an unselected read is the answer, and the keys beside it already say so.
+                // `messageIndex` is the `threadRead` address of the text being paged here, so a caller
+                // comparing "what the ledger gave me" against "what the thread holds" has both numbers
+                // in one envelope; `message` is the ordinal to keep passing while paging.
+                ...(selectedCandidate === undefined
+                    ? {}
+                    : { message: requestedMessage, messageIndex: selectedCandidate.messageIndex }),
                 content: page.content,
                 contentLength: total,
                 offset: page.offset,
@@ -6190,6 +6529,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // the pair is what identifies the child exactly.
         selfScope?: string
     ): Promise<HarnessDelegationResult> => {
+        // -----------------------------------------------------------------------
+        // F1 (2026-11-27) — A BRANCH RUN MAY NOT SPAWN CONVERSATIONS IN ITS OWNER'S FAMILY.
+        //
+        // A `delegate` from inside a branch mints a NEW host conversation owned by the branch's
+        // requester thread (the child-thread path in `runAgent`), so a branch that delegates
+        // leaves work in the owner's roster — a row the owner sees in `threadList`, a transcript
+        // somebody has to `threadDelete`, and a child that answers into the branch, not into the
+        // owner. That is a family write by any reading, and the fork contract promised isolation,
+        // so the door refuses unless the fork passed `allowFamilyWrites: true`.
+        //
+        // FIRST, ahead of the rank rule: a branch that may not delegate at all should not be sent
+        // to the roster by a rank complaint about a target it could not have used.
+        // -----------------------------------------------------------------------
+        const branchDelegateRefusal = branchWriteRefusalFor(caller, 'delegate');
+
+        if (branchDelegateRefusal !== undefined) throw branchDelegateRefusal;
+
         // -----------------------------------------------------------------------
         // THE RANK RULE (R2). One comparison replaces the two removed throws (the
         // caller-role check and the `runDepth > 1` check): the caller may delegate only to
@@ -6904,7 +7260,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             list.push({
                 name: definition.name,
                 description: declared?.description ?? definition.description,
-                parameters: declared?.parameters ?? definition.parameters
+                // THE RESERVED `async` SWITCH. It is added to this model-facing COPY and
+                // never to `definition.parameters`, which is also the runtime validation
+                // schema — a second property there would break `toolParameterKey`'s
+                // single-property rule for `read`/`sleep`/`threadDelete`-shaped tools and
+                // hand `execute` the wrapper instead of the value. The rank projection
+                // above is copied too, so a caller-specific `delegate` declaration carries
+                // the switch exactly like an ordinary row. A tool that declares `async`
+                // itself is returned untouched (./core/tool.ts `withToolAsyncSwitch`).
+                parameters: withToolAsyncSwitch(declared?.parameters ?? definition.parameters)
             });
         }
 
@@ -6927,7 +7291,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             list.push({
                 name: pendingCancel.name,
                 description: pendingCancel.description,
-                parameters: pendingCancel.parameters
+                // The reserved switch is advertised here too, for one reason: it is
+                // advertised on EVERY tool, and a declaration list where one row lacks it
+                // teaches the model that the key is per-tool. On `toolCancel` it is
+                // INERT — the control answers inline and never schedules, so there is no
+                // completion whose turn trigger could be grouped. The harness therefore
+                // accepts and strips it silently rather than rejecting a legal call.
+                parameters: withToolAsyncSwitch(pendingCancel.parameters)
             });
         }
 
@@ -7150,6 +7520,34 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // the same transcript by the time a caller looks. Undefined until such a
         // response occurs; reset naturally with each new RunState.
         answer?: HarnessAssistantMessage;
+        // C0 (2026-11-27, the mid-run-report defect) — EVERY substantive turn THIS run produced, in
+        // transcript order, oldest first, capped at `AGENT_ANSWER_CANDIDATE_CAP` entries by dropping
+        // the OLDEST.
+        //
+        // WHY IT IS NOT GATED ON `delegateAnswer`. The field above is: it exists so a delegated run's
+        // blank final turn can be rescued, and only the two delegate call sites opt in. This one
+        // exists so a caller can find a run's report after the run has moved on, and the reported
+        // incident was a ROOT run — an investigator that posted an 8,117-char report at transcript
+        // index 165, then wrote housekeeping and a 1,099-char cleanup note at 175, and whose
+        // `agentResult` answer was therefore the cleanup note byte-for-byte. Recording it only for
+        // delegated runs would leave the exact case unfixed, so the recording site runs for EVERY
+        // run and keeps the SAME admission rule (tool-free, `stopReason === 'stop'`, non-blank, not
+        // a compaction reply) — one vocabulary for "a turn that reads like an answer".
+        //
+        // WHY IT LIVES ON THE RUN, like `answer`. The run's actor queue releases before the caller
+        // looks, a queued follow-up may already be appending to the same transcript, and a branch's
+        // tail is spliced away on a non-concluded exit — so a post-return transcript scan would read
+        // somebody else's turns. Mutable and internal: it never reaches a wire shape;
+        // `finishInvocation` projects it.
+        //
+        // `messageIndex` here is only the index the turn was COMMITTED at, which is NOT necessarily
+        // its final position: an async tool result that lands between the report turn and the answer
+        // is inserted BEFORE the report (a pending call's delivery), so positions recorded mid-run
+        // shift by the number of entries that arrive afterwards. The durable index is derived from
+        // the transcript at the terminal transition (`committedAnswerCandidateIndexes` below), which
+        // is the only moment the numbering is final; the value carried here is what a cancelled run's
+        // forensics and a mid-run reader can still use.
+        answerCandidates: HarnessAnswerCandidate[];
         // T28 FORENSICS. Captured by runAgentCore's catch IMMEDIATELY BEFORE the
         // transcript rollback, because that rollback is what used to erase every trace
         // of a cancelled run. `messagesProduced` is how many messages this run had
@@ -7513,7 +7911,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // and `api.threads.list` (the host and plugin surfaces, and the store's own scan) keep the full record.
     const modelThreadRosterOf = (roster: HarnessThreadRoster): HarnessThreadRoster => ({
         ...roster,
-        threads: roster.threads.map((row) => {
+        // F1-C4 (2026-11-27): the model plane additionally lists the branches that are RUNNING
+        // now (see `branchRosterRows`). They are APPENDED after the conversation rows, in branch
+        // creation order, so every pinned ordering of the conversation rows is untouched and a
+        // caller reading the list newest-last still finds the most recently started thing last.
+        threads: [...roster.threads, ...branchRosterRows()].map((row) => {
             const bare = { ...row };
 
             delete bare.epoch;
@@ -7583,10 +7985,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // is idle"). After a detach the host is not any agent's default conversation, so that
         // refusal correctly stops firing for the departed name — the same honesty the host
         // refusals already carry.
+        // F1-C4 (2026-11-27) — a branch run is attributed as a BRANCH. `threadId` stays the
+        // persistent OWNER conversation (that is the id the lineage gate, the `replyThreadId` door
+        // and the receipt's `senderThreadId` have always meant), and `branchId` is the additional
+        // fact `postThreadMessage` puts into the delivered line so a reader of the owner's
+        // transcript can tell the branch's message from one the owner's own turn wrote — and can
+        // `threadRead` it. A registered caller has no branch metadata, so both keys stay exactly as
+        // they were for every message sent before this finding.
+        const senderBranch = branchOfCallerBrain(caller);
+
         return postThreadMessage(
             {
                 agent: caller?.name ?? hostActor().name,
-                ...(threadId === undefined ? {} : { threadId })
+                ...(threadId === undefined ? {} : { threadId }),
+                ...(senderBranch === undefined ? {} : { branchId: senderBranch.branchId })
             },
             target,
             message
@@ -7684,7 +8096,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // (src/server/workers/capability.ts) — so `threadSend` stays an authority-routed
     // read/deliver (`AUTHORITY_RUNTIME_METHODS`) instead of moving to that set.
     const postThreadMessage = (
-        sender: { agent: string; threadId?: string },
+        sender: { agent: string; threadId?: string; branchId?: string },
         targetThreadId: string,
         message: string
     ): HarnessThreadMessageResult => {
@@ -7695,6 +8107,41 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // lineage" by a set that holds ids, and a receipt that echoed the label would hand back a
         // name the caller cannot compare against its roster.
         targetThreadId = threadAddressOf(targetThreadId);
+
+        // F1 (2026-11-27) — THE SENDER'S BRANCH IS CHECKED BEFORE THE TARGET EXISTS.
+        //
+        // Two refusals, both BEFORE `threadStateOf`, and the order is deliberate:
+        //
+        //   1. A BRANCH ADDRESS IS NOT A POSTBOX. The model roster now lists a running branch as
+        //      a row (F1-C4, `branchRosterRows`), so a caller can legitimately try to answer one —
+        //      and `threadStateOf` would have refused it with "it was never created, or it was
+        //      deleted", the same false sentence issue 0027 removed from `threadDelete` (#4). A
+        //      branch holds no conversation slot, so the honest answer names what it IS and which
+        //      door reads it.
+        //   2. A BRANCH RUN MAY NOT WRITE INTO ITS OWNER'S FAMILY unless the fork opted in
+        //      (`allowFamilyWrites`). This is the caller-side fact, it does not depend on the
+        //      target, and it is stated first because a branch that may not send at all has no
+        //      reason to learn which of its targets are stopped.
+        const targetBranch = branchRecordOf(targetThreadId);
+
+        if (targetBranch !== undefined) {
+            throw new HarnessError(
+                `Thread "${targetThreadId}" is a threadFork branch, not a conversation: it has no queue and no turn ` +
+                    `to wake, so threadSend cannot post into it. It is${targetBranch.status === 'running' ? ' still ' : ' '}` +
+                    'working, and its transcript is readable with threadRead by that id; the answer (including the ' +
+                    'partial of a branch that was cancelled, failed or timed out) is readable with agentResult using ' +
+                    `it as invocationId. To speak with the conversation that owns it, address "${targetBranch.threadId
+                        ? targetBranch.threadId
+                        : 'its owner conversation'}" (see threadList).`
+            );
+        }
+
+        const branchSendRefusal = branchWriteRefusalOf(
+            sender.branchId === undefined ? undefined : branchRecordOf(sender.branchId),
+            'threadSend'
+        );
+
+        if (branchSendRefusal !== undefined) throw branchSendRefusal;
 
         const target = threadStateOf(targetThreadId);
 
@@ -7789,7 +8236,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         const content = `from agent "${sender.agent}"${
-            sender.threadId === undefined ? '' : ` (thread ${sender.threadId})`
+            // F1-C4 (2026-11-27) — a branch message says so, INSIDE the same address paren: the
+            // pair is one fact ("this branch of this conversation spoke"), and a reader is told to
+            // `threadRead` the branch id, so it is printed next to the thread it belongs to.
+            // Without it, a branch's message and a message written by the owner conversation's own
+            // turn were byte-identical in the ledger — the "pollution" half of the finding: the
+            // reader could not tell isolated reasoning from its own owner speaking. A non-branch
+            // sender adds nothing here, so every delivered message in the pinned suites is
+            // unchanged, and the branch id is never printed for a thread that has none.
+            sender.threadId === undefined
+                ? sender.branchId === undefined
+                    ? ''
+                    : ` (branch ${sender.branchId})`
+                : ` (thread ${sender.threadId}${
+                      sender.branchId === undefined ? '' : `, branch ${sender.branchId}`
+                  })`
         }:\n${message}`;
 
         // Every field of a receipt is the target plus the SENDER's own identity; only
@@ -8283,6 +8744,83 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 `The branch ledger keeps only its newest ${forks.maxBranchRecords} records.`
         );
 
+    // -----------------------------------------------------------------------
+    // F1 (2026-11-27) — A BRANCH MAY NOT WRITE INTO THE FAMILY IT WAS FORKED FROM.
+    // -----------------------------------------------------------------------
+    //
+    // WHAT THE DOORS ACTUALLY SEE. A `threadFork` branch run carries the PERSISTENT thread of its
+    // REQUESTER (`runAgent`: `runThreadId = resolvedThread?.record.id ?? parent?.threadId`, and a
+    // branch has no `resolvedThread`), so `ToolContext.threadId` — and therefore every caller id
+    // these three doors receive — is the OWNER conversation's id. Nothing about a branch is
+    // visible in it, and it cannot be made visible from the thread tables: the owner conversation
+    // is typically RUNNING while its branch runs (that is the normal fork shape), so "some run in
+    // thread-5 called threadSend" does not identify the speaker. The one object that does is the
+    // CALLING BRAIN: `forkAgent` attaches branch metadata to the branch Agent in a WeakMap
+    // (`../core/branch.ts` `agentBranchOf`), the tool context hands that brain over as
+    // `context.agent`, and the branch id it names is the key of this harness's branch ledger.
+    //
+    // WHY A REFUSAL RATHER THAN A SILENT FILTER. A branch's whole purpose is reasoning that does
+    // not pollute the requesting transcript, and posting into the owner conversation is exactly
+    // that pollution — it lands as STEERING (a committed user turn in the owner's ledger, see
+    // `postThreadMessage`'s running branch) or as a fresh child conversation in the owner's
+    // thread table. Silently dropping the write would leave the branch believing it spoke. So the
+    // door refuses, by name, with the remedy on the same breath: the fork that creates a branch
+    // may opt in with `allowFamilyWrites: true`, which the fork records on the branch record
+    // (`HarnessBranchSummary.allowFamilyWrites`) and the doors read back here.
+    //
+    // WHO IS AFFECTED. Only a caller whose brain carries branch metadata — i.e. a tool call
+    // executed inside a branch run. A registered agent's brain never does, so a host turn, a
+    // plugin, a manual `executeTool` and a routed lane call (`lane-authority.ts` resolves a
+    // REGISTERED brain from the request identity, never the branch Agent) keep today's behaviour
+    // exactly. An autoanswer branch cannot reach this code at all: it is tool-free by pin
+    // (`runAgentCore` refuses every tool call in an autoanswer run).
+    const branchOfCallerBrain = (caller: Agent | undefined): HarnessBranchRecord | undefined => {
+        const metadata = caller === undefined ? undefined : agentBranchOf(caller);
+
+        // The record, not just the metadata: the opt-in lives on the record the requester created
+        // (`HarnessBranchSummary.allowFamilyWrites`). A branch whose record is gone (pruned after
+        // its terminal transition) has no live run to ask the question, so `undefined` here means
+        // "no branch claim" and the caller proceeds.
+        return metadata === undefined ? undefined : branchRecordOf(metadata.branchId);
+    };
+
+    // The one sentence the three write doors share, so a branch that tries two doors is told the
+    // same thing twice. `door` is the wire name the caller used, and the remedy names the call
+    // that CREATES the branch — not this call, which cannot change a branch that already exists.
+    const branchFamilyWriteRefusal = (branch: HarnessBranchRecord, door: string): HarnessError =>
+        new HarnessError(
+            `A threadFork branch cannot use ${door} from inside its run: "${branch.branchId}" is a private branch of ` +
+                `conversation "${branch.threadId ?? 'the run that forked it'}", so anything it sends, delegates or ` +
+                'releases lands in that conversation — which is the pollution the fork was asked to avoid. ' +
+                'Read what you need with threadRead or agentResult by the branch id, and answer in this turn. ' +
+                'To let a branch write anyway, the run that FORKS must pass allowFamilyWrites: true on that ' +
+                'threadFork call; a branch cannot grant it to itself.'
+        );
+
+    // The WRITE guard, in one place: returns the refusal a door should throw, or `undefined` when
+    // the caller may write. Three conditions, and all three must hold for a refusal:
+    //   1. the caller IS a branch run (its brain carries branch metadata, or the door was handed
+    //      the branch id it resolved from that brain);
+    //   2. the fork did not opt in (`allowFamilyWrites` is absent — absence is `false`, and the
+    //      key is absent on every fork created before this finding, and on every fork that did
+    //      not ask);
+    //   3. the branch is still RUNNING. A terminal branch has no run to speak through, and the
+    //      flag is a property of a live run, not of an audit record somebody else reads.
+    const branchWriteRefusalOf = (
+        branch: HarnessBranchRecord | undefined,
+        door: string
+    ): HarnessError | undefined =>
+        branch === undefined || branch.allowFamilyWrites === true || branch.status !== 'running'
+            ? undefined
+            : branchFamilyWriteRefusal(branch, door);
+
+    // The brain-taking form, for the doors that already receive the calling brain (`delegate`,
+    // and `threadDelete` through its third argument).
+    const branchWriteRefusalFor = (
+        caller: Agent | undefined,
+        door: string
+    ): HarnessError | undefined => branchWriteRefusalOf(branchOfCallerBrain(caller), door);
+
     // The family of a CALLER IDENTIFIER, or `undefined` when the caller has no thread at
     // all (unscoped). A caller id that no longer resolves (deleted mid-run, or a stale
     // replica) is treated as unscoped rather than as "sees nothing": the alternative would
@@ -8326,10 +8864,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //   - `invocationId` — the branch id itself, because `invocationIdOf` keys a branch
     //     run's ledger entry by it, which is what makes `agentResult` and this record name
     //     the same run.
+    // F1-C4 (2026-11-27) — the row declares itself with `branchId`. `origin` STAYS `'host'`: the
+    // earlier bullet below argued that "'host' is the only value that means a conversation on top
+    // of an agent", and it still is the least-wrong answer, because `origin` is the wire union
+    // hand-mirrored in `../server/protocol.ts` and a value the wire can never emit would advertise
+    // a door that does not exist. What was wrong was that a caller could not tell this row from a
+    // host conversation at all, then reach a WRITE door and be refused by a fact the row never
+    // stated — so the row now names the branch record it addresses by KEY, and the two doors that
+    // refuse a branch address (`postThreadMessage`, `deleteThread`) say so in their own sentences.
     const threadRecordOfBranch = (branch: HarnessBranchRecord): HarnessThreadRecord => ({
         id: branch.branchId,
         agent: branch.agent,
         origin: 'host',
+        branchId: branch.branchId,
         status: branch.status === 'running' ? 'running' : 'idle',
         sequence: branchRecords.indexOf(branch) + 1,
         // IT19 R2: NO `inactive` key, and it is not an oversight. A branch is released by having
@@ -8339,6 +8886,32 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         ...(branch.threadId === undefined ? {} : { ownerThreadId: branch.threadId }),
         invocationId: branch.branchId
     });
+
+    // F1-C4 (2026-11-27) — THE LIVE BRANCH ROWS THE MODEL ROSTER ADDS.
+    //
+    // `threadFork` answers with `{ branchId, threadId, content }` and tells the caller to treat
+    // that id as a handle for `threadRead`/`agentResult`. It was a handle for a row that did not
+    // exist: the roster listed only conversations, so once the fork started answering, the id the
+    // caller was holding appeared nowhere it could look, and the one thing it could not tell was
+    // whether the branch was still working. These rows close that gap for the plane that got the
+    // id — the MODEL plane, added in `modelThreadRosterOf` below and deliberately NOT added to
+    // `harness.threads()`/`api.threads.list`, which keep their pinned "no branch rows" shape.
+    //
+    // RUNNING branches only. A terminal branch stays reachable by id (`thread()`, `threadRead`,
+    // `agentResult`, and the branch ledger's own roster `harness.branches()`); listing every
+    // retained record would bury the conversation rows under up to `maxBranchRecords` audit rows.
+    //
+    // READABLE, NEVER WRITABLE. The row is not in `actOn` (that set is derived from the thread
+    // family, and a branch is not in it), and `postThreadMessage` refuses a branch address with
+    // its own sentence, so the roster never advertises a door the next call refuses. `sequence`
+    // is the row's position in the retained ledger plus one (the same derived value
+    // `threadRecordOfBranch` has always published) — a branch number and a thread number are
+    // different counters, so a caller sorts these rows by recency within the branch set, not
+    // against the conversation rows, and `branchId` is the key that tells the two kinds apart.
+    const branchRosterRows = (): HarnessThreadRecord[] =>
+        branchRecords
+            .filter((branch) => branch.status === 'running' && activeBranches.has(branch.branchId))
+            .map(threadRecordOfBranch);
 
     // The B4 read gate for ONE address. A caller with no thread is the host view and sees
     // everything. A live conversation is visible when it is in the caller's family; a
@@ -8900,8 +9473,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     const threadDeleteFor = (
         callerThreadId: string | undefined,
-        threadId: string
+        threadId: string,
+        // F1 (2026-11-27) — the caller's BRAIN, and the only way this door can tell a branch run
+        // from the conversation that forked it: both report the same `callerThreadId` (a branch
+        // inherits its requester's persistent thread). Omitted means "not a branch", which is what
+        // every caller that does not pass it — the routed lane case — keeps today. Named
+        // `callerBrain` because the body's `caller` is the caller's THREAD STATE.
+        callerBrain?: Agent
     ): HarnessThreadDeleteResult => {
+        // A branch may not release anything in the family it was forked from unless its fork
+        // opted in. First, because a branch that may not delete at all should not be told which
+        // of its targets are running.
+        const branchDeleteGuard = branchWriteRefusalFor(callerBrain, 'threadDelete');
+
+        if (branchDeleteGuard !== undefined) throw branchDeleteGuard;
+
         if (callerThreadId === undefined) return deleteThread(threadId);
 
         // Canonicalize once, up front: the branch ledger, the owner-chain walk and every
@@ -9197,18 +9783,56 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // `threadRead` names itself, and gets the honest sentence; the HOST view (the server's
     // transcript reader, the sessions surface, and every route that passes no caller) still
     // resolves the retained transcript, which is the readability half of the soft delete.
+    // THE ONE ADMISSION TEST LEFT ON A READ (F1, 2026-11-27) — pulled out of `threadMessages`
+    // so the two read seams can never disagree about WHO may read a soft-deleted conversation.
+    // R1 (2026-11-27) exists because they used to: the transcript seam admitted a lineage read of
+    // a released conversation while the tool's record gate (`thread()`, a DISCOVERY door) still
+    // answered `undefined` for it, so `threadRead` refused with "it was never created, or it was
+    // deleted" a transcript its own seam had just served, contradicting the engine's refusal
+    // sentence, the tool's description and `threadDelete`'s receipt. Both doors now ask THIS
+    // question, and the refusal is byte-for-byte the one `harness.branch-writes.test.ts` pins.
+    //
+    // The rule, unchanged: an `inactive` row is readable to the HOST view (no caller id — the
+    // server's transcript reader and every route that passes no caller) and to any conversation
+    // IN THE CALLER'S OWN LINEAGE (`familyOfCaller`, the same test the WRITE doors use); every
+    // other caller gets the sentence below. A live row is never refused anything.
+    const refuseUnreadableThread = (state: ThreadState, callerThreadId?: string): void => {
+        if (
+            state.record.inactive !== true ||
+            callerThreadId === undefined ||
+            familyOfCaller(callerThreadId)?.has(state.record.id) === true
+        ) {
+            return;
+        }
+
+        throw new HarnessError(
+            `Thread "${state.record.id}" is inactive (deleted); its transcript is retained, but it is no ` +
+                'longer part of this session\'s roster, and it is not in your lineage, so threadRead cannot ' +
+                'answer it from a conversation (see threadList). The conversation that released it — and any ' +
+                'conversation in that lineage — still can, and a host can always read it by id.'
+        );
+    };
+
     const threadMessages = (threadId: string, callerThreadId?: string): HarnessMessage[] => {
         const address = threadAddressOf(threadId);
         const state = threadStates.get(address);
 
         if (state !== undefined) {
-            if (state.record.inactive === true && callerThreadId !== undefined) {
-                throw new HarnessError(
-                    `Thread "${state.record.id}" is inactive (deleted); its transcript is retained, but it is no ` +
-                        'longer part of this session\'s roster, so no conversation can read it (see threadList). A host ' +
-                        'can still read it by id.'
-                );
-            }
+            // IT19 R2's refusal, NARROWED (F1, 2026-11-27) — the sentence promised "no
+            // conversation can read it", and the door was wider than that in one case and narrower
+            // in another. A soft delete is scoped: the conversation that OWNS a released child (the
+            // caller that ran `threadDelete`, or any conversation in that same lineage) is the one
+            // reader with a reason to still ask — a parent that released a one-shot child after
+            // reading its answer, then wants the tail of it, is the exact flow issue 0027 built
+            // `threadDelete` for, and the old refusal sent it to the host with a transcript it
+            // could not reach. So the gate is now the SAME lineage test the write doors use:
+            //   - the address is in the caller's family  → readable (the retained transcript);
+            //   - outside it, or the caller id resolves to nothing → the refusal below, which is
+            //     the honest answer for a stranger asking about somebody else's released
+            //     conversation, and stays byte-for-byte as it was for that caller.
+            // Reads are otherwise SESSION-WIDE, so this is the only narrowing left on the read door
+            // and `familyOfCaller` is the shared rule; nothing about a LIVE conversation changes.
+            refuseUnreadableThread(state, callerThreadId);
 
             return cloneMessages(state.agent.messages);
         }
@@ -9220,6 +9844,43 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // An id nobody has: the SAME error every other thread operation throws, so a
         // deleted conversation and a mistyped one are indistinguishable here on purpose.
         return cloneMessages(threadStateOf(threadId).agent.messages);
+    };
+
+    // THE RECORD DOOR OF THE READ PATH (R1, 2026-11-27): the same tables as `threadMessages`,
+    // under the same admission test, answering the record instead of the transcript.
+    //
+    // WHY THIS EXISTS WHEN `thread()` ALREADY DOES. `thread()` is a DISCOVERY door, and IT19 R2
+    // deliberately makes discovery exclude a soft-deleted row (`inactive` is why it is off
+    // `threads()`, off `threadList`, and off `thread()`) — that rule is right for "what
+    // conversations does this session have" and wrong for "may I read this one", which is the
+    // question `threadRead` asks after its transcript read has ALREADY been admitted. A tool
+    // envelope needs the identity block (`id`, `agent`, `origin`, `status`, `sequence`,
+    // `ownerThreadId`, `label`) of a conversation the seam just served, so it needs a door keyed
+    // to readability. This is that door; `thread()` keeps its discovery contract untouched.
+    //
+    // CONTRACT follows `thread()`, not `threadMessages()`: "a record or `undefined`", with no
+    // sentence of its own for a missing row (`harness.thread-runtime.test.ts` pins that the
+    // record door stays silent, because the caller that needs a reason reads `threadMessages`).
+    // It therefore resolves the SAME three address kinds `threadMessages` does — a live row, a
+    // retained `inactive` row (which `thread()` voids and this one does not), and a finished
+    // fork's `branch-N` through the branch ledger — and refuses a stranger with the same
+    // admission sentence rather than answering `undefined`.
+    const threadReadRecord = (
+        threadId: string,
+        callerThreadId?: string
+    ): HarnessThreadRecord | undefined => {
+        const address = threadAddressOf(threadId);
+        const state = threadStates.get(address);
+
+        if (state !== undefined) {
+            refuseUnreadableThread(state, callerThreadId);
+
+            return threadRecordCopy(state.record);
+        }
+
+        const branch = branchRecordOf(address);
+
+        return branch === undefined ? undefined : threadRecordCopy(threadRecordOfBranch(branch));
     };
 
     // C4: wholesale transcript replacement (the server's transcript editor).
@@ -9717,7 +10378,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // IT19 R3: the third member of the forensic trio, and it is validated against the SNAPSHOT
         // READER'S OWN table (`core/snapshot.ts:113` `isHarnessRunStopReason`, the one place the
-        // nine members are spelled) rather than a local list. A value outside the union is REFUSED,
+        // ten members are spelled — ten since `provider-network` joined the union) rather than a
+        // local list. A value outside the union is REFUSED,
         // not dropped, for the same reason the pair above is: the lane COMMITS the object this call
         // returns, so a reason neither side can name becomes a row the next snapshot cannot persist
         // — and the worker would re-derive its archive forever.
@@ -10121,6 +10783,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (detail.result !== undefined) record.result = { ...detail.result };
         if (detail.error !== undefined) record.error = { ...detail.error };
 
+        // M5 — a terminal branch is FROZEN: its record stopped following the transcript here, so its
+        // placeholder rows stop being backfilled here too. This is the one transition point every path
+        // funnels through (the branch task's own terminal, a failure, and `releaseBranchesForScope` for a
+        // run that ended before the task started), which is what keeps the live index from growing an
+        // entry whose branch already left.
+        forgetLiveBranchSeed(branchId);
+
         // Prune on every terminal transition: a long session must not grow an
         // unbounded audit list, while a live branch stays addressable.
         branchRecords = pruneBranchRecords(branchRecords, forks.maxBranchRecords);
@@ -10486,6 +11155,106 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return insertAt;
     };
 
+    // -----------------------------------------------------------------------
+    // M5 (2026-11-27) — LIVE BRANCH INDEX, and the backfill it exists for
+    // -----------------------------------------------------------------------
+    //
+    // WHY. A branch is seeded with "no result was committed" for every call of its requester that was
+    // unsettled at the fork instant. When one of those calls LATER commits, that seeded row is no longer
+    // merely incomplete — it is a statement that has become false, and it is the copy that survives: the
+    // branch's terminal snapshot re-captures the running transcript (`finishBranch`, :10459), and the
+    // branch answers from that transcript. So the row is rewritten where it lives, in the branch's OWN
+    // materialized copy, the moment the requester's ledger receives the row.
+    //
+    // WHAT IS NOT REWRITTEN, and why: a row whose content is not one of the seeded strings was committed
+    // at fork time (or was materialized verbatim) and is already the truth, so it is left alone — which is
+    // also what makes the creating call's self-call marker permanent. A SETTLed branch is frozen: its
+    // record stopped following the transcript, so the index holds live branches only, and a call that
+    // commits after a branch settled never reaches it.
+    //
+    // BOUNDED. One entry per live branch, so the map is capped by `forks.maxConcurrent` in the steady
+    // state, and every entry is REMOVED (not merely skipped) at that branch's single terminal transition
+    // (`finishBranch` returns true exactly once), which is also what keeps a long session from accumulating
+    // entries for branches that ended before they ever started. The `origin -> branch` id map the backfill
+    // re-reads is `HarnessBranchRecord.toolCallIds`, already retained and already bounded by
+    // materialization.
+    //
+    // MATCHING. A requester brain AND its origin call id must both match. Brains are FRESH Agent objects
+    // per conversation (see the roster-rank comment at :1674), so an origin id like `c1` repeats across
+    // conversations, and one provider could even reuse an id within a session — neither can reach the wrong
+    // branch here, because a brain-only key would, and an id-only key would too.
+    type LiveBranchSeed = {
+        branchId: string;
+        // The branch Agent, i.e. the transcript the branch run is executing right now.
+        branch: Agent;
+        // The requester's brain: the transcript `insertToolMessage` commits into.
+        parent: Agent;
+    };
+
+    // The rows a backfill may rewrite: every seeded row wording, read from ./core/branch.ts so this set can
+    // never drift from what a seed is actually made of. That INCLUDES the creating call's self-call marker:
+    // the marker states "no result was committed for it yet", which stops being true the moment the
+    // requester's ledger records a row for that call — the case that actually happens is a `toolCancel` of
+    // the fork call while its branch is still running, whose receipt tells the branch "your owner released
+    // the call and your work is still readable", which is both accurate and not a failure claim. A branch
+    // that settles normally never rewrites its own marker, because the entry is pruned at the terminal
+    // transition before the fork receipt is delivered (finishBranch -> onSettled -> deliverTask).
+    const seededPlaceholderContents = new Set<string>([
+        ...Object.values(BRANCH_PENDING_PLACEHOLDER),
+        BRANCH_SELF_CALL_PLACEHOLDER
+    ]);
+
+    // branchId -> the live seed. A Map, not a WeakMap on the brain: a WeakMap cannot be enumerated, and the
+    // removal door (`finishBranch`) knows only the branch id.
+    const liveBranchSeeds = new Map<string, LiveBranchSeed>();
+
+    const registerLiveBranchSeed = (entry: LiveBranchSeed): void => {
+        liveBranchSeeds.set(entry.branchId, entry);
+    };
+
+    // Drop one branch from the index, so a branch is never backfilled after it stopped executing. A
+    // missing entry is normal: a branch whose fork failed never registered.
+    const forgetLiveBranchSeed = (branchId: string): void => {
+        liveBranchSeeds.delete(branchId);
+    };
+
+    // Rewrite the seeded row of ONE committed call, in every live branch of the brain that committed it.
+    // Only `content` changes: the row keeps the remapped `toolCallId` the materializer gave it, its `name`,
+    // its inclusion state and its address, so the provider pairing and any context flag that was disabled
+    // WITH its unit all survive. `outcome`/`attachments` are deliberately not copied — the row's shape is
+    // the materializer's, and a rewritten row keeps exactly the keys it was created with.
+    const backfillBranchSeeds = (parent: Agent, call: HarnessToolCall, content: string): void => {
+        if (liveBranchSeeds.size === 0) return;
+
+        for (const entry of liveBranchSeeds.values()) {
+            if (entry.parent !== parent) continue;
+
+            const record = branchRecordOf(entry.branchId);
+
+            // SELF-HEALING. `finishBranch` is the prompt door, but it is not the ONLY way an entry can
+            // outlive its branch: `deleteThread` purges branch RECORDS (:8905-8925) without a terminal
+            // transition, and a purged or already-terminal record can never be rewritten again. Dropping
+            // the entry here is what bounds the index on every door, so a long session cannot accumulate
+            // entries for branches that left through a path this file does not own.
+            if (record === undefined || record.status !== 'running') {
+                liveBranchSeeds.delete(entry.branchId);
+                continue;
+            }
+
+            const mapped = record.toolCallIds.find((pair) => pair.origin === call.id);
+
+            if (mapped === undefined) continue;
+
+            for (const message of entry.branch.messages) {
+                if (message.role !== 'tool' || message.toolCallId !== mapped.branch) continue;
+                if (!seededPlaceholderContents.has(message.content)) continue;
+
+                message.content = content;
+                break;
+            }
+        }
+    };
+
     // The committed result for one call id, if any. R2: this is the canonical
     // "this call already settled" record (see the toolCancel branch), because the
     // harness inserts exactly one tool message per settled call and never commits
@@ -10565,6 +11334,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 brain.messages
             )
         );
+
+        // M5 — the requester's ledger now holds this row, so any LIVE branch seeded from this brain with
+        // this call still unsettled stops claiming "no result was committed". Runs AFTER the splice
+        // because the branch copy is a rewrite of an already-committed fact, and it must see the same
+        // content the requester recorded (the capped/bounded delivery, not the raw tool value).
+        backfillBranchSeeds(brain, call, content);
 
         // Snapshot-managed mutation: notify after the splice, exactly like the
         // synchronous path used to.
@@ -11677,6 +12452,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         call: HarnessToolCall,
         offered?: ReadonlyMap<string, Tool>,
         batch?: Set<string>,
+        // How many calls of the assistant message being answered resolve to 'async' at
+        // switch/declared level (see `countAsyncResolvedCalls`). It is computed ONCE per
+        // message by the launch loop and drives only step 3 of the mode precedence: the
+        // lone-`delegate` refinement. Omitted means "no message context" — a caller that
+        // does not supply it can never trigger the refinement, so an un-instrumented call
+        // keeps the declared behaviour instead of guessing a count.
+        asyncResolvedCalls?: number,
         // Why the model stopped generating. It distinguishes a call the model
         // wrote badly from a call the OUTPUT CEILING cut off mid-JSON, and that
         // difference is worth telling the model: "your reply hit the token limit
@@ -11794,13 +12576,64 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
-        // T2/R2/R3: the EFFECTIVE mode of the RESOLVED definition decides whether this
-        // call joins the current message's SYNC GROUP. Resolved once, here, because the
-        // branch controls below dispatch through their own handlers and must honour the
+        // T2/R2/R3 + the reserved `async` switch: the EFFECTIVE MODE of this CALL decides
+        // whether it joins the current message's SYNC GROUP. Resolved once, here, because
+        // the branch controls below dispatch through their own handlers and must honour the
         // same policy. A call that never schedules (every validation failure and the
         // toolCancel acknowledgement) never joins, so the batch gate can never strand on
         // a call that has no task to wait for.
-        const syncGroup = effectiveToolMode(definition) === 'sync' ? batch : undefined;
+        //
+        // PRECEDENCE, in order (./core/tool.ts owns the key):
+        //   1. the explicit `async` switch on THIS call — `true` means 'async', `false`
+        //      means 'sync', and it beats both the declared default and the count rule
+        //      below, in both directions (a sync tool forced async, a declared-async tool
+        //      forced sync);
+        //   2. the tool's own chain — the discovered registration policy, else the mode the
+        //      definition declares, else DEFAULT_TOOL_MODE ('sync');
+        //   3. the DELEGATE-ONLY refinement: a `delegate` call that step 2 resolved to
+        //      'async', with no switch on it, in a message that holds EXACTLY ONE
+        //      async-resolving call, resolves to 'sync'. One child is the shape where the
+        //      spawner is waiting on that child's answer, so the placeholder turn the
+        //      async policy exists for is pure cost: the run parks on the batch gate and
+        //      the next request carries the child's REAL result. Two delegates (or a
+        //      delegate plus another long-running call) keep today's async fan-out freedom,
+        //      which is why the count — not a delegate tally — gates this step.
+        //
+        // The switch is read from the RAW arguments of this call, tolerantly, and against
+        // the RESOLVED definition (the tool that owns `async` has no switch to read). The
+        // authoritative parse and schema validation stay exactly where they already are —
+        // after every gate and before the launch — so a malformed payload still reports the
+        // error it reports today, and a non-boolean switch still reports the type error from
+        // the shared resolver.
+        const switchValue = readCallAsyncSwitch(call, definition);
+
+        // STEP 1 — an explicit switch decides this call on its own: `true` resolves to
+        // 'async', `false` to 'sync'. `undefined` means "no switch", which is also what a
+        // malformed payload and a tool that owns the key both answer.
+        const switchMode: ToolMode | undefined =
+            switchValue === undefined ? undefined : switchValue ? 'async' : 'sync';
+
+        // STEP 2 — the tool's own chain: the discovered registration policy bound to the
+        // resolved definition, else the mode that definition declares, else
+        // DEFAULT_TOOL_MODE ('sync').
+        const declaredMode = effectiveToolMode(definition);
+
+        // STEP 3 — the delegate-only refinement, computed separately so its three
+        // conditions stay readable: step 2 resolved to 'async', this call carries no
+        // switch, and it is the message's ONLY async-resolving call.
+        // `rankProjectedDefinitions` is the marker for the BASELINE `delegate` row, so a
+        // replacement published under the same wire name is an ordinary tool here and
+        // inherits nothing — the same definition-not-name rule every other policy in this
+        // file follows.
+        const loneDelegation =
+            switchMode === undefined &&
+            declaredMode === 'async' &&
+            asyncResolvedCalls === 1 &&
+            rankProjectedDefinitions.has(definition);
+
+        const callMode: ToolMode = switchMode ?? (loneDelegation ? 'sync' : declaredMode);
+
+        const syncGroup = callMode === 'sync' ? batch : undefined;
 
         // THERE IS NO ROLE GATE HERE ANY MORE (rank model). The removed gate keyed
         // on a `primaryOnly` definition set plus `role === 'primary'`, which could
@@ -11842,8 +12675,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 return;
             }
 
-            const callId = typeof parameters === 'string' ? parameters : '';
+            // F1-C3 (2026-11-27) — ONE argument, TWO address forms. The value stays a single
+            // string (the schema is unchanged, and the single-property unwrap still hands this
+            // function the bare value), and it is now read as either the call id from the pending
+            // placeholder — what it has always been — or the `branch-N` id a `threadFork` answer
+            // handed back. An unknown id keeps the canonical "was not started in this run"
+            // refusal, so a foreign branch id is still refused rather than reported as cancelled.
+            const address = typeof parameters === 'string' ? parameters.trim() : '';
+            const callId = callIdOfBranchAddress(run.scope, address) ?? address;
             const task = scheduler.find(run.scope, callId);
+
+            // The branch this call owns, if any, for the receipt's echo (M6). A settled fork keeps
+            // its pair until the run ends, so this resolves for a completed branch too — and for a
+            // call that was never a fork it is `undefined`, which is the honest answer: the door
+            // echoes the ids it can PROVE for the call it released, and invents none.
+            const cancelledBranchId = branchAddressOfCall(run.scope, callId);
+            // The conversation the cancelled work belongs to. For a branch run this is the
+            // REQUESTER's persistent thread (`RunState.threadId`), which is exactly the row the
+            // caller can act on next, so the echo names the conversation the release happened in.
+            const cancelledThreadId = run.threadId;
 
             if (!task) {
                 // No pending task under this run's scope. The canonical record of a
@@ -11863,7 +12713,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                             cancelled: true,
                             callId,
                             name: settled.name,
-                            alreadySettled: true
+                            alreadySettled: true,
+                            // M6 (2026-11-27) — the receipt echoes the ids of the work the caller
+                            // named, so a `toolCancel('branch-3')` does not answer with a call id
+                            // the caller never asked for and cannot re-read. Appended AFTER the
+                            // historical keys, and only when the engine can prove them.
+                            ...(cancelledBranchId === undefined
+                                ? {}
+                                : { branchId: cancelledBranchId, invocationId: cancelledBranchId }),
+                            ...(cancelledThreadId === undefined ? {} : { threadId: cancelledThreadId })
                         }),
                         // The control outcome is a success, not an error: nothing
                         // is left running and nothing needs to be reported as
@@ -11877,7 +12735,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 }
 
                 await fail(
-                    `No tool call "${callId}" was started in this run, so there is nothing to cancel. Pass the callId of a call this run started (see the pending list or the tool_call event).`
+                    `No tool call "${callId}" was started in this run, so there is nothing to cancel. Pass the callId of a call this run started (see the pending list or the tool_call event), or the branchId a threadFork answer reported.`
                 );
                 return;
             }
@@ -11899,7 +12757,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             await immediateResult(
                 run,
                 call,
-                JSON.stringify({ cancelled: true, callId, name: task.name }),
+                JSON.stringify({
+                    cancelled: true,
+                    callId,
+                    name: task.name,
+                    // M6 (2026-11-27) — see the settled branch above: the ids of the work THIS call
+                    // released, echoed back so the caller can act on them (the branch id is the
+                    // `threadRead` address, the `agentResult` invocationId, and the row the model
+                    // roster lists for a running branch). Proven-only: a non-fork call adds nothing.
+                    ...(cancelledBranchId === undefined
+                        ? {}
+                        : { branchId: cancelledBranchId, invocationId: cancelledBranchId }),
+                    ...(cancelledThreadId === undefined ? {} : { threadId: cancelledThreadId })
+                }),
                 'completed',
                 // The acknowledgement is a control result; report its (zero)
                 // span so a UI can render it like any other completed call.
@@ -11918,18 +12788,33 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // own declaration:
         //   - `threadFork` stays `mode: 'async'`: its branch is background work whose
         //     completion wakes the requester on its own, and a fork must never hold its
-        //     origin's batch (the requester keeps taking turns as the branch lands).
+        //     origin's batch (the requester keeps taking turns as the branch lands). The
+        //     reserved `async` switch is the ONLY thing that can change that: an explicit
+        //     `async: false` hands the group down, and nothing else does — the default path
+        //     passes `undefined`, which is byte-for-byte today's behaviour. (The lone-call
+        //     refinement deliberately does NOT reach a fork: a branch is the one background
+        //     shape whose whole point is that the requester keeps running.)
         //   - `actionRequest` declares `mode: 'sync'` (R2): the question is directed at the
         //     owner, so this call DOES join the message's sync group. The join happens
         //     inside `launchActionRequest` at its schedule site — not here — because every
         //     validation failure in that helper answers inline and never schedules, and a
         //     call with no task must not hold the gate (same rule the ordinary path states
-        //     at `joinSyncBatch` below).
+        //     at `joinSyncBatch` below). An explicit `async: true` on the call clears
+        //     `syncGroup` above, and that single argument is the whole override: the join
+        //     helper ignores an absent group.
         // The descriptors test pins both rows, so declaration and dispatch cannot drift.
         const runtimeControl = runtimeControlDefinitions.get(definition);
 
         if (runtimeControl === 'threadFork' && forks.enabled) {
-            await launchThreadFork(run, call, parseArguments);
+            // Only an explicit `async: false` puts a branch in the message's sync group;
+            // every other value (absent, `true`, or a fork that owns the key itself) keeps
+            // the historical no-group launch.
+            await launchThreadFork(
+                run,
+                call,
+                parseArguments,
+                switchValue === false ? batch : undefined
+            );
             return;
         }
 
@@ -12272,6 +13157,35 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // filled it.
     const branchCallIds = new Map<string, string>();
 
+    // F1-C3 (2026-11-27) — the two directions of that address, for the `toolCancel` door.
+    //
+    // A fork hands the caller a BRANCH id (`threadFork` returns `{ branchId, threadId, content }`
+    // where both ids are `branch-N`, and it is also the invocation id `agentResult` answers with),
+    // while `toolCancel` has always taken the CALL id from the pending placeholder. So the one id
+    // the caller was told to remember is the one id this door could not resolve, and a caller that
+    // lost or never read the placeholder had no door left: it could read the branch, page its
+    // answer, and watch it run forever. Both spellings now address the same call, and the receipt
+    // echoes the branch id back so the caller can confirm which work it released.
+    //
+    // The reverse scan is bounded by the fork calls of ONE run (the map is keyed by that run's
+    // scope and released with the run in `releaseBranchesForScope`), so no unbounded table is
+    // walked and no other run's call can be reached — the same scope rule the callId form has
+    // always enforced.
+    const branchAddressOfCall = (scope: string, callId: string): string | undefined =>
+        branchCallIds.get(`${scope}\u0000${callId}`);
+
+    const callIdOfBranchAddress = (scope: string, address: string): string | undefined => {
+        if (address.length === 0) return undefined;
+
+        const prefix = `${scope}\u0000`;
+
+        for (const [key, branchId] of [...branchCallIds.entries()]) {
+            if (branchId === address && key.startsWith(prefix)) return key.slice(prefix.length);
+        }
+
+        return undefined;
+    };
+
     // Release every branch owned by this run. AWAITED by runAgent's finally: a
     // task the scheduler abandons before `run` is invoked has no catch to report
     // its lifecycle, so this cleanup is the only place that can emit the single
@@ -12475,10 +13389,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // independent actor, and return ONLY {branchId, threadId, content}. The fork's
     // transcript is never merged into the origin; the origin receives one normal
     // tool result.
+    //
+    // `group` is the calling message's SYNC GROUP, and the dispatch above passes it on
+    // for ONE reason only: the model put `async: false` on this fork call and asked to be
+    // held with the rest of its batch. Every other route passes `undefined`, which keeps
+    // the historical behaviour (a branch never holds its origin, and the requester keeps
+    // taking turns as the branch lands). Like `launchActionRequest`, the join happens at
+    // THIS function's schedule site rather than in the dispatcher, because every early
+    // return above answers through `failBranchTool` without ever scheduling a task, and a
+    // call with no task must not park the batch gate.
     const launchThreadFork = async (
         run: RunState,
         call: HarnessToolCall,
-        parseArguments: (schema: Record<string, unknown> | undefined) => unknown
+        parseArguments: (schema: Record<string, unknown> | undefined) => unknown,
+        group?: Set<string>
     ): Promise<void> => {
         let parameters: unknown;
 
@@ -12516,6 +13440,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             await failBranchTool(run, call, `threadFork received an invalid label: ${toErrorInfo(error).message}`);
             return;
         }
+
+        // F1 (2026-11-27) — the OPT-IN family-write exception, decided HERE and carried on the
+        // branch record for the whole life of the branch. Strictly `=== true`: the schema declares
+        // a boolean with no default, and a host `executeTool` reaching this door with anything
+        // else (a string, a number, a missing key) gets the DEFAULT, which is the guarded
+        // behaviour. The flag is not re-read from the model's arguments after this point — the
+        // three write doors read the record, so a fork cannot change its mind mid-flight and a
+        // caller that wants the exception has to ask for it when it forks.
+        const allowFamilyWrites =
+            (parameters as { allowFamilyWrites?: unknown })?.allowFamilyWrites === true;
 
         // Concurrency is checked BEFORE any fork is created, so a refused fork
         // leaves no branch record and no history materialization work.
@@ -12579,13 +13513,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             callId: call.id,
             forkDepth: metadata.forkDepth,
             model: metadata.model,
-            tools: declared(branch).map((definition) => definition.name)
+            tools: declared(branch).map((definition) => definition.name),
+            // F1 (2026-11-27): the key is added ONLY when the fork asked for the exception, so
+            // every `branch_start`/`branch_end` payload of a default fork keeps the exact key set
+            // the pinned event tests compare (absence means `false`, see the type).
+            ...(allowFamilyWrites ? { allowFamilyWrites: true } : {})
         };
 
         // The branch's own callable surface is declared exactly like an ordinary
         // agent's (role-aware, discovery-aware); a fork therefore can fork again
         // until forkDepth is exhausted.
         createBranchRecord(summary, branch.messages, metadata.toolCallIds, run.scope);
+
+        // M5 — the branch is now live, so its requester's later commits have somewhere to land. The
+        // REQUESTER's brain is the key: `insertToolMessage` is called with the agent it commits into, and
+        // a conversation's brain is a fresh Agent object (see :1670), so this can never be reached by
+        // another conversation's call of the same id.
+        registerLiveBranchSeed({ branchId: metadata.branchId, branch, parent: run.agent });
 
         await progress({
             type: 'branch_start',
@@ -12626,10 +13570,75 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // pair is keyed by scope + call id because a call id is unique only within one run.
         branchCallIds.set(`${run.scope}\u0000${call.id}`, metadata.branchId);
 
+        // C3 / R1 (2026-11-27) — THE CREATION-TIME POINTER, COMMITTED WHERE THE CALL LIVES.
+        //
+        // WHY. Everything a fork tells its caller is in memory: `branchRecords` is deliberately
+        // NOT in `HarnessSnapshot`, so a caller whose run ends with the branch still in flight
+        // (a `maxTurns` cap, a stop, a crash) had NOTHING on the record naming the branch — not
+        // the id it was told to keep, not the call it belongs to, not the fact that an answer is
+        // owed. A restart dropped the branch, and the ledger kept an assistant turn with an
+        // unsettled `threadFork` call and no explanation. The pending placeholder that names the
+        // call id is request-only by design (it is a function of elapsed time and would be stale
+        // the moment it was committed), so the durable half has to be its own row.
+        //
+        // THE SHAPE, AND WHY IT CANNOT SETTLE THE CALL. Settledness in this engine is one
+        // committed `role:'tool'` row carrying the call's `toolCallId` (`hasToolResult` /
+        // `toolResultOf`, :11204), so a second tool row on the same id would make
+        // `insertToolMessage` decline the real delivery, and `toolCancel` would answer
+        // `alreadySettled` for a branch that is still running. A tool row keyed to a DIFFERENT id
+        // avoids that but is then swallowed by the request projection (the block right after an
+        // assistant `toolCalls` entry is consumed by call id, :11414), so the next run would
+        // never read it. This row is therefore `role:'system'` with no call key at all — the
+        // channel the harness already uses for exactly this kind of ledger note: the owed-account
+        // row that reports a background run whose result could not be attached to its call
+        // (:12285, "labelled so neither the model nor a reader can mistake it for the caller's own
+        // words"). A system row travels in every later request, passes `snapshot`/`restore`
+        // unchanged, can never be read as a result, and touches no settledness rule: the settle-time
+        // receipt and `toolCancel` behave byte-for-byte as they did.
+        //
+        // WHAT IT CARRIES. The three ids of the fork — the branch id (which is also the
+        // `threadRead` address, the `agentResult` invocationId, and the model roster's `branchId`
+        // row), the branch `threadId` (equal to it, and stated so the row cannot be mistaken for a
+        // roster thread), and the CALL id that `toolCancel` takes — plus a note that says plainly
+        // that the answer arrives later, as this call's own tool result. `event` is a PAST-TENSE
+        // fact, so the row stays true after the branch settles and the result row lands beside it.
+        run.agent.messages.push(
+            assignMessageId(
+                {
+                    role: 'system',
+                    content: JSON.stringify({
+                        event: 'branch_started',
+                        name: call.name,
+                        callId: call.id,
+                        branchId: metadata.branchId,
+                        threadId: metadata.branchId,
+                        note:
+                            'The pointer written when this threadFork call created a branch. Not the call\'s result: the branch\'s answer arrives as THIS call\'s tool result when the branch settles, and toolCancel with callId or branchId releases the call while it runs. threadRead on branchId reads the branch transcript, agentResult with branchId as invocationId pages its answer or partial, and threadId equals branchId because a branch is an ephemeral conversation, not a roster thread.'
+                    })
+                },
+                run.agent.messages
+            )
+        );
+
+        // The same persistence rule every committed transcript entry follows, including the
+        // owed-account row this one mirrors: a BRANCH transcript is ephemeral (branch state is
+        // excluded from `HarnessSnapshot` v1), so only a requester whose conversation is a real
+        // thread tells the session's state observer that a row was added.
+        if (run.branch === undefined) notifyStateChange('agent_message', { agent: run.agent.name });
+
         // issue 0032: a `threadFork` call is a tool invocation of this run like any other, so it
         // joins the tally under its own wire name (`threadFork`). Counted at the schedule point,
         // after every early return above that answers through `failBranchTool` without a task.
         recordToolDispatch(run, call.name);
+
+        // THE SYNC GROUP (see this function's doc). Membership is recorded IMMEDIATELY
+        // BEFORE `schedule()`, exactly like the ordinary dispatch path: a task can settle
+        // inside the 0ms settle window, and a completion whose call was never registered
+        // would settle its own turn while the group still waited on an id that never
+        // drains. `group` is `undefined` for every route but an explicit `async: false`,
+        // and the helper's `undefined` guard makes that a no-op — so the default fork stays
+        // async with zero behavioural change.
+        joinSyncBatch(run, group, call.id);
 
         scheduler.schedule({
             scope: run.scope,
@@ -12922,6 +13931,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 };
 
                 createBranchRecord(summary, incorporated.messages, incorporated.toolCallIds, run.scope);
+
+                // M5 — an autoanswer branch is seeded from the OWNER's transcript, so it is the OWNER's
+                // later commits that can fill its placeholders (the requester's own pending
+                // `actionRequest` belongs to the child half of the seed, and its answer IS this branch).
+                registerLiveBranchSeed({
+                    branchId: created.branchId,
+                    branch: autoBranch,
+                    parent: ownerRun.agent
+                });
+
                 autoSummary = summary;
             } catch (error) {
                 // A fork that could not be created is an honest tool error; no
@@ -14659,6 +15678,166 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return false;
     };
 
+    // C0 (2026-11-27, the mid-run-report defect) — WHERE IN THE TRANSCRIPT IS THIS MESSAGE?
+    //
+    // THE ADDRESS, defined once. The ledger's `answerMessageIndex` and each candidate's
+    // `messageIndex` are 0-based indices into the transcript that OWNS the run: `run.agent.messages`
+    // is the canonical thread transcript for a thread-bound run (exactly the array `threadMessages`
+    // hands `threadRead`, index 0 the system seed), and for a fork it is the BRANCH's own transcript,
+    // which is what `threadMessages` resolves a finished `branch-N` to (`branchRecordOf(...).messages`).
+    // So every index recorded here is one `threadRead({ thread, message })` call away from the bytes
+    // it names, on both kinds of run, and the definition matches the durable field's doc comment
+    // (../types `HarnessAgentResultSnapshot.answerMessageIndex`).
+    //
+    // WHY THE LOOKUP IS A VALUE MATCH, NOT AN IDENTITY MATCH. The message the run loop holds is the
+    // `done` payload `agent.request()` yields (core/agent.ts `yield { type: 'done', message }`), and
+    // the transcript entry is a DIFFERENT object: the commit re-builds the entry from the outcome
+    // (core/agent.ts `messages.push(assignMessageId({ role, content, toolCalls?, reasoning? }, ...))`)
+    // and core/message-id.ts `assignMessageId` spreads into a new object to add the id — the payload
+    // deliberately never carries that id, so no identity relation survives. What BOTH sides hold is
+    // the same `content` string and the SAME `toolCalls` array reference (the entry copies the
+    // payload's array), so equality on those two fields locates the entry exactly.
+    //
+    // `toolCalls` MUST BE NORMALISED BEFORE COMPARING, or every tool-free turn misses. The payload
+    // ALWAYS carries the key — an empty array for a tool-free turn (core/agent.ts builds `message`
+    // with `toolCalls: outcome.toolCalls`) — while the entry OMITS it in that same case (the commit
+    // spreads `...(outcome.toolCalls.length > 0 ? { toolCalls } : {})`). "no key" and "empty array"
+    // are the same turn, so `callsOf` maps both to `undefined`; a turn that DID call tools is still
+    // told apart by its id list. Scanning from the END takes the newest match, which is the entry
+    // this commit just appended — the same reason `isCompactionAnswerOf` above scans backwards (an
+    // async delivery can append a `tool` entry after the commit, so the newest occurrence is the one
+    // the loop is holding).
+    //
+    // `-1` IS AN ANSWER, NOT A FAILURE. A message this runtime cannot find in its own transcript has
+    // no honest index, and every caller below OMITS the derived key rather than inventing `0`, which
+    // would point a caller at the system seed with total confidence.
+    const committedMessageIndex = (
+        messages: readonly HarnessMessage[],
+        message: HarnessMessage
+    ): number => {
+        // `Array.isArray`/`?? undefined` rather than a presource helper: this file imports no
+        // `@presource/core` value (see the note near line 1514). The role guard is REQUIRED by the
+        // union, not by the logic: `toolCalls` exists on the assistant variant only
+        // (./types/index.ts:225), so any other entry has no calls to compare and reads as `undefined`
+        // — which `sameTurn` already refuses for a non-assistant entry.
+        const callsOf = (candidate: HarnessMessage): HarnessToolCall[] | undefined => {
+            if (candidate.role !== 'assistant') return undefined;
+
+            const calls = candidate.toolCalls;
+
+            return calls === undefined || calls.length === 0 ? undefined : calls;
+        };
+        const sameTurn = (entry: HarnessMessage): boolean => {
+            if (entry.role !== 'assistant' || entry.content !== message.content) return false;
+
+            const mine = callsOf(message);
+            const theirs = callsOf(entry);
+
+            if (mine === undefined || theirs === undefined) return mine === theirs;
+
+            return (
+                mine.length === theirs.length
+                && mine.every((toolCall, order) => toolCall.id === theirs[order]?.id)
+            );
+        };
+
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+            if (sameTurn(messages[index])) return index;
+        }
+
+        return -1;
+    };
+
+    // C0 — RECORD ONE SUBSTANTIVE TURN OF THIS RUN.
+    //
+    // The admission test is the CALLER's, and it is `resolveRunAnswer`'s exactly (tool-free,
+    // `stopReason === 'stop'`, non-blank, not a compaction reply): one vocabulary for "a turn that
+    // reads like an answer", so the ledger can never list a candidate the answer rule would have
+    // refused, nor hide one it would have rescued.
+    //
+    // THE LIST CAP, applied HERE rather than at projection time, dropping the OLDEST. The question
+    // the list answers is "what did this run report before its last message?" — a question about the
+    // TAIL of a run — so the window is a tail window (`AGENT_ANSWER_CANDIDATE_CAP`, 4). An agent that
+    // wrote eleven reports has a transcript, and `threadRead` is the door for a transcript.
+    //
+    // THE CONTENT CAP, with `truncated` as the cap speaking. `AGENT_ANSWER_CANDIDATE_CHARS` (32000)
+    // is `threadRead`'s own per-message ceiling (`../tools/runtime/threadRead.ts`
+    // `THREAD_READ_MAX_CONTENT_LIMIT`), so a message that door can hand back whole is one this row
+    // can hold whole; anything longer is kept as a pair-safe prefix (T3, ./util/unicode.ts — cutting
+    // mid-surrogate-pair would put a lone surrogate into a tool result) with `truncated: true`, and
+    // the full bytes stay readable at `messageIndex`.
+    // THE INDEX IS NOT TAKEN HERE. A turn committed while an async call is still pending can be
+    // shifted down the transcript by the delivery that lands later (the pending call's `tool` entry
+    // is inserted BEFORE it), so an index captured mid-run is only an estimate; `finishInvocation`
+    // re-derives every one of them from the final transcript (`committedAnswerCandidateIndexes`).
+    const recordAnswerCandidate = (
+        run: RunState,
+        message: HarnessAssistantMessage
+    ): void => {
+        const truncated = message.content.length > AGENT_ANSWER_CANDIDATE_CHARS;
+
+        run.answerCandidates.push({
+            // Best-effort position, kept so a mid-run reader (and the cancelled-run forensics path)
+            // still has an address; the terminal projection replaces it.
+            messageIndex: committedMessageIndex(run.agent.messages, message),
+            content: truncated
+                ? clipPrefix(message.content, AGENT_ANSWER_CANDIDATE_CHARS)
+                : message.content,
+            truncated
+        });
+
+        if (run.answerCandidates.length > AGENT_ANSWER_CANDIDATE_CAP) run.answerCandidates.shift();
+    };
+
+    // C0 — THE NUMBERING THE LEDGER PUBLISHES, derived when the transcript stops moving.
+    //
+    // WHY NOT THE COMMIT-TIME INDEX. The reported shape is the reason: a tool-free report turn
+    // commits, and the async call that was pending at that moment delivers its `tool` entry LATER —
+    // inserted at the head of the pending delivery, i.e. before the report — so the report's
+    // position is 2 at commit time and 3 by the time the run answers. Publishing the commit-time
+    // number would put `threadRead` one entry off, on exactly the runs this feature is for.
+    //
+    // HOW AN ENTRY IS FOUND AGAIN WITHOUT AN IDENTITY. Same rule as `committedMessageIndex`: a
+    // substantive turn is tool-free, so its content is the whole of its distinguishing data, and the
+    // scan takes the NEWEST match (the report turn is the last entry carrying its text; an identical
+    // earlier turn loses, which is the conservative direction for a duplicate — both matches name the
+    // same bytes anyway). A `truncated` entry holds `clipPrefix`'s output, so it is matched as a
+    // PREFIX of the transcript entry rather than as an equality.
+    //
+    // A TURN THE TRANSCRIPT NO LONGER HOLDS IS DROPPED, not kept with a wrong index: `threadRead`
+    // would answer the address with somebody else's bytes, which is worse than not listing the turn
+    // at all. (In practice this can only mean a rollback spliced the turn away, and a run that rolled
+    // back does not reach the completed branch of `finishInvocation`.)
+    const committedAnswerCandidateIndexes = (
+        messages: readonly HarnessMessage[],
+        candidates: readonly HarnessAnswerCandidate[]
+    ): HarnessAnswerCandidate[] => {
+        const positioned: HarnessAnswerCandidate[] = [];
+
+        for (const candidate of candidates) {
+            let found = -1;
+
+            for (let index = messages.length - 1; index >= 0; index -= 1) {
+                const entry = messages[index];
+
+                if (entry.role !== 'assistant') continue;
+
+                const holdsEntryText = candidate.truncated
+                    ? entry.content.startsWith(candidate.content)
+                    : entry.content === candidate.content;
+
+                if (holdsEntryText) {
+                    found = index;
+                    break;
+                }
+            }
+
+            if (found >= 0) positioned.push({ ...candidate, messageIndex: found });
+        }
+
+        return positioned;
+    };
+
     // Resolve the message a DELEGATED run hands back (T2/R1). Only the exact
     // reported failure case is rescued: a normal `stop` whose content is
     // whitespace only, after the same run already produced a substantive
@@ -15151,15 +16330,36 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // reads `run.answer` (the blank-turn rescue here, and `finishInvocation`'s
                 // `partialContent` fallback on a cancelled child) then hands the spawner the
                 // compaction text.
-                if (
-                    run.delegateAnswer &&
+                // ONE admission test, two consumers. `isSubstantiveAnswerTurn` is the rule both
+                // doors used to spell separately: the delegated rescue above records `run.answer`
+                // under exactly these conditions, and the candidate list below now records the same
+                // rule for EVERY run. Keeping it as one expression is what stops the ledger's
+                // candidate list and the rescue's answer from drifting apart (the defect this closes
+                // is a ledger that lists turns the answer rule would have refused, or hides one it
+                // would have rescued).
+                const isSubstantiveAnswerTurn =
                     message.toolCalls.length === 0 &&
                     message.stopReason === 'stop' &&
                     message.content.trim().length > 0 &&
-                    !isCompactionAnswerOf(brain.messages, message)
-                ) {
+                    !isCompactionAnswerOf(brain.messages, message);
+
+                if (run.delegateAnswer && isSubstantiveAnswerTurn) {
                     run.answer = message;
                 }
+
+                // C0 (2026-11-27, the mid-run-report defect) — record it for EVERY run, not only a
+                // delegated one. The reported session was a ROOT investigator that posted its report
+                // as a mid-run assistant message, kept going (housekeeping and a cleanup note), and
+                // whose `agentResult` answer was therefore the cleanup note; gating this on
+                // `delegateAnswer` — as the field above legitimately is — would leave that case
+                // exactly as broken as it was. See the note on `RunState.answerCandidates` for why
+                // the value lives on the run, and `recordAnswerCandidate` for the two caps.
+                //
+                // EDGE CASE, handled by omission rather than invention: a turn this runtime cannot
+                // locate by identity in its own transcript has no honest index, so nothing is
+                // recorded — a candidate nobody can address through `threadRead` would be a promise
+                // the ledger cannot keep.
+                if (isSubstantiveAnswerTurn) recordAnswerCandidate(run, message);
 
                 if (message.toolCalls.length === 0) {
                     const pending = runPending(run);
@@ -15233,14 +16433,27 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // failure is already a tool result, so the round always completes.
                 //
                 // T2/R3: ONE fresh SYNC GROUP per assistant message. Every call whose
-                // resolved definition is 'sync' joins it at schedule time; the gate below
-                // then holds the NEXT turn until the whole group delivered. Async calls
-                // never join and keep triggering their own turns.
+                // resolved mode is 'sync' joins it at schedule time; the gate below then
+                // holds the NEXT turn until the whole group delivered. Async calls never
+                // join and keep triggering their own turns.
                 const syncBatch = new Set<string>();
+
+                // The lone-`delegate` refinement (step 3 of the mode precedence) needs one
+                // number for THIS message, and it has to be the message as the model wrote
+                // it — counted before any launch can gate, schedule, or reject a call, so
+                // the count cannot drift from the batch the same calls are about to join.
+                const asyncResolvedCalls = countAsyncResolvedCalls(message.toolCalls, offered);
 
                 for (const call of message.toolCalls) {
                     throwIfAborted(run);
-                    await launchToolCall(run, call, offered, syncBatch, message.stopReason);
+                    await launchToolCall(
+                        run,
+                        call,
+                        offered,
+                        syncBatch,
+                        asyncResolvedCalls,
+                        message.stopReason
+                    );
                 }
 
                 // R3/F1: close this request's output AFTER its tool_call frames (a
@@ -15976,6 +17189,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // the REPORTED sense comes from `toolActivityOf`, which reports nothing at all when
                 // `calls` is 0.
                 toolTally: { calls: 0, settled: 0, byName: new Map() },
+                // C0 (2026-11-27): the substantive-turn list starts empty for the same reason the
+                // tally above does — the recording site is inside the run loop and appends, it never
+                // null-checks. Reported absence comes from the projection in `finishInvocation`,
+                // which omits the key when nothing survives the answer exclusion.
+                answerCandidates: [],
                 attachments: validatedAttachments,
                 startedAt: Date.now(),
                 ...(callId === undefined ? {} : { parentCallId: callId }),
@@ -16453,7 +17671,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // for good on the next save. `core/snapshot.ts` accepts the key as optional (and moved
                 // its duplicate check onto the RUN), so a pre-feature row still loads and still restores
                 // under its bare id.
-                ...(record.epoch === undefined ? {} : { epoch: record.epoch })
+                ...(record.epoch === undefined ? {} : { epoch: record.epoch }),
+                // C0 (2026-11-27): the answer's address, and the run's other substantive turns.
+                // Written exactly when the live row holds them — which is only ever a `completed`
+                // status, because `finishInvocation` deletes both keys on every other terminal
+                // transition and `core/snapshot.ts` refuses a non-completed row that carries one (a
+                // row written with a key the next projection drops makes `restore -> snapshot` stop
+                // being byte-identical, and the reader would refuse it anyway). Both are OPTIONAL, so
+                // a document written before the field still loads, restores under its exact prior
+                // shape, and answers without the keys — no version bump, same discipline as
+                // `toolActivity` and `epoch` above.
+                ...(record.answerMessageIndex === undefined
+                    ? {}
+                    : { answerMessageIndex: record.answerMessageIndex }),
+                ...(record.answerCandidates === undefined
+                    ? {}
+                    : { answerCandidates: record.answerCandidates })
             }));
 
         // R2: persist HOST threads only. An agent's default conversation is its
@@ -16880,7 +18113,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // delete-cascade predicate (`record.threadId`) still matches after a reload. The
                 // key is optional on disk and spread only when present, which restores a record
                 // with exactly the shape a live one has — no `""` owner for a root run.
-                ...(result.threadId === undefined ? {} : { threadId: result.threadId })
+                ...(result.threadId === undefined ? {} : { threadId: result.threadId }),
+                // C0 (2026-11-27): the address pair is rebuilt WITH the row, keyed only when the
+                // document carries it — so a restored row has exactly the shape a live one has (no
+                // `answerMessageIndex: undefined` sitting where absence means "pre-feature row"), the
+                // next snapshot projects the same bytes, and `agentResult`'s "absent means not
+                // observable" rule survives a restart instead of turning a missing index into 0.
+                // This is what makes the report durable, not just retrievable: the investigator
+                // session that lost its report to a cleanup note must still be able to page that
+                // report after a reload.
+                ...(result.answerMessageIndex === undefined
+                    ? {}
+                    : { answerMessageIndex: result.answerMessageIndex }),
+                ...(result.answerCandidates === undefined
+                    ? {}
+                    : { answerCandidates: result.answerCandidates })
             });
         }
 
@@ -18234,6 +19481,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return branch === undefined ? undefined : threadRecordCopy(threadRecordOfBranch(branch));
         },
         threadMessages,
+        // R1 (2026-11-27) — the RECORD half of the read door: `threadMessages` decides who may
+        // read a conversation, and this answers the identity block of exactly those addresses,
+        // including the retained row of a soft-deleted one that `thread()` above deliberately
+        // voids. `threadRead`'s envelope is its only consumer (plus the routed `thread:read` the
+        // lane authority answers), which is why it lives beside the two read seams rather than
+        // as a looser form of `thread()`: the discovery rule and the readability rule must stay
+        // separable, and a host that wants the released ROW reads the snapshot.
+        threadReadRecord,
         // C4: the transcript editor's write primitive (validate + replace in place).
         setThreadMessages,
         // T5 lane-worker seams: targeted canonical writes the coordinator applies for a

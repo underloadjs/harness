@@ -28,10 +28,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool, utf8ByteLength } from './index';
-// The branch placeholder text is asserted verbatim, so the constant is read from
-// its own module (the same internal-import convention src/harness.snapshot.test.ts
-// uses for `./core/task`), never retyped.
-import { BRANCH_PENDING_PLACEHOLDER } from './core/branch';
+// The branch seed wordings are asserted verbatim, so they are read from their own module (the same
+// internal-import convention src/harness.snapshot.test.ts uses for `./core/task`), never retyped.
+// `BRANCH_SELF_CALL_PLACEHOLDER` is the M5 wording (2026-11-27): the self-describing marker that answers
+// a branch's own creating call, replacing the non-success placeholder for that one row. The generic
+// `BRANCH_PENDING_PLACEHOLDER` is still pinned where it belongs — for the requester's OTHER unsettled
+// calls — in ./core/branch.test.ts, ./harness.branch-seed.test.ts and ./harness.inclusion.test.ts.
+import { BRANCH_SELF_CALL_PLACEHOLDER } from './core/branch';
 // T-W8: the branch thread payload is asserted WHOLE above, so it names the minting process too
 // (./core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the branch mint in ./harness.ts
 // `branchThreadOf`). The constant, never a literal — the value is random by design — and exact
@@ -410,6 +413,9 @@ describe('threadFork runtime', () => {
         })) as Record<string, unknown>;
 
         expect(page).toEqual({
+            // C0: the branch answers at 4 in its OWN transcript (seed, task, fork call, result),
+            // so the address names the branch rather than the parent that spawned it.
+            answerMessageIndex: 4,
             agent: 'writer',
             invocationId: branchId,
             kind: 'fork',
@@ -557,15 +563,16 @@ describe('threadFork runtime', () => {
                 arguments: '{"input":"inspect"}'
             }
         ]);
-        const placeholder = branchRequest?.messages.find(
-            (message) =>
-                message.role === 'tool' &&
-                message.content.startsWith('No tool result was committed before this branch was created')
+        // M5 (2026-11-27) — the row that answers the branch's OWN creating call is the self-describing
+        // marker, not the non-success placeholder: the placeholder told the branch its creation failed.
+        // Found by exact content, from the module that writes it, so the search itself cannot drift.
+        const selfCall = branchRequest?.messages.find(
+            (message) => message.role === 'tool' && message.content === BRANCH_SELF_CALL_PLACEHOLDER
         );
-        expect(placeholder).toEqual({
+
+        expect(selfCall).toEqual({
             role: 'tool',
-            content:
-                'No tool result was committed before this branch was created (created-branch). This placeholder is NOT a successful result.',
+            content: BRANCH_SELF_CALL_PLACEHOLDER,
             toolCallId: expect.stringMatching(/^call_branch-\d+_1$/),
             name: 'threadFork'
         });
@@ -637,8 +644,8 @@ describe('threadFork runtime', () => {
 
         // (1) The branch record is the materialized source transcript plus the
         //     branch's own turns: every flag the source carried survived the copy,
-        //     tool ids are remapped, and the unanswered threadFork call got the
-        //     created-branch placeholder.
+        //     tool ids are remapped, and the unanswered threadFork call — the branch's OWN creating
+        //     call — carries the M5 self-describing marker rather than the created-branch placeholder.
         expect(withoutIds(record.messages)).toEqual([
             { role: 'system', content: 'SYS' },
             { role: 'user', content: 'seed' },
@@ -660,7 +667,7 @@ describe('threadFork runtime', () => {
             },
             {
                 role: 'tool',
-                content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+                content: BRANCH_SELF_CALL_PLACEHOLDER,
                 toolCallId: `call_${branchId}_2`,
                 name: 'threadFork'
             },
@@ -695,7 +702,7 @@ describe('threadFork runtime', () => {
             },
             {
                 role: 'tool',
-                content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+                content: BRANCH_SELF_CALL_PLACEHOLDER,
                 toolCallId: `call_${branchId}_2`,
                 name: 'threadFork'
             },
@@ -748,16 +755,27 @@ describe('threadFork runtime', () => {
         await writer('root input');
         await flush();
 
-        // The owner: instruction, two seeds, the prompt, the fork request, the fork
-        // result, the final answer. Seven creations, seven addresses, in order.
+        // The owner: instruction, two seeds, the prompt, the fork request, the CREATION-TIME
+        // POINTER, the fork result, the final answer. Eight creations.
+        //
+        // THE LAST THREE ADDRESSES ARE NOT IN POSITIONAL ORDER, and that is the honest shape of
+        // the ledger, not a defect. An id is minted when a row is CREATED, and the two rows in
+        // question were created in the opposite order from the way they sit: the pointer is
+        // appended the instant the branch exists (`msg-6`), while the fork's result is minted at
+        // delivery (`msg-7`) and spliced back at the position of the call it answers, which is
+        // where `resultInsertIndex` has always put it. So the transcript reads call → result →
+        // pointer, and the ids read 5 → 7 → 6. Ids are scoped to one transcript and only ever
+        // address a row, never order it (src/harness.ts `indexOfMessageId`), so a reader that
+        // needs the order reads the array, not the ids.
         expect(entry.messages.map((message) => message.messageId)).toEqual([
             'msg-1',
             'msg-2',
             'msg-3',
             'msg-4',
             'msg-5',
+            'msg-7',
             'msg-6',
-            'msg-7'
+            'msg-8'
         ]);
 
         const record = writer.branches()[0];
@@ -1314,10 +1332,15 @@ describe('threadFork runtime', () => {
         await writer('go');
         await flush();
 
-        // Root: user append, assistant fork call, fork tool result, final answer.
+        // Root: user append, assistant fork call, the CREATION-TIME POINTER, fork tool result,
+        // final answer. The pointer notifies for the same reason as the other four: it is a
+        // committed row of a durable conversation, and a host that did not persist it loses the
+        // only on-the-record note of a fork whose branch state is deliberately outside the
+        // snapshot (src/engine/harness.ts `launchThreadFork`, C3/R1 2026-11-27).
         // The branch's own appends (task, todo call, answer, result) are ephemeral
-        // and must not ask a server to persist an agent_message.
-        expect(reasons.filter((reason) => reason.startsWith('agent_message:'))).toHaveLength(4);
+        // and must not ask a server to persist an agent_message — the pointer is written to the
+        // REQUESTER's transcript, never to the branch's, which is what keeps that rule intact.
+        expect(reasons.filter((reason) => reason.startsWith('agent_message:'))).toHaveLength(5);
 
         // The branch shared the harness todo store, so its tool mutation is still
         // a persistence-worthy event.
@@ -1729,8 +1752,14 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
         // `invocationId` IS the branch id, which is what makes `thread()` and `agentResult`
         // name the same run; `ownerThreadId` is the REQUESTER's persistent thread — the owner
         // whose delete cascades this branch away.
+        // F1-C4 (2026-11-27) — `branchId` is the one ADDITIVE field. It is the discriminator a
+        // reader needs: `origin` stays `'host'` (the wire union `SessionThread.origin` can only
+        // ever carry `agent`/`host`, so a branch-only value would advertise a state the server
+        // never emits), and `branchId` present IS the "this row is a branch run" fact, in the
+        // host record and in the model roster row alike.
         expect(writer.thread(branchId)).toEqual({
             id: branchId,
+            branchId,
             agent: 'writer',
             origin: 'host',
             status: 'idle',
@@ -1739,8 +1768,8 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
             invocationId: branchId
         });
 
-        // THE TRANSCRIPT: the copied baseline (the fork's own unanswered call carries the
-        // created-branch placeholder) plus the branch's own two turns, in order.
+        // THE TRANSCRIPT: the copied baseline (the fork's own unanswered call carries the M5
+        // self-call marker, since that call IS this branch) plus the branch's own two turns, in order.
         expect(withoutIds(writer.threadMessages(branchId))).toEqual([
             { role: 'user', content: 'go' },
             {
@@ -1752,7 +1781,7 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
             },
             {
                 role: 'tool',
-                content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+                content: BRANCH_SELF_CALL_PLACEHOLDER,
                 toolCallId: `call_${branchId}_1`,
                 name: 'threadFork'
             },
@@ -1791,7 +1820,7 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
             messages: [
                 { index: 0, content: 'go' },
                 { index: 1, content: '' },
-                { index: 2, content: BRANCH_PENDING_PLACEHOLDER.threadFork },
+                { index: 2, content: BRANCH_SELF_CALL_PLACEHOLDER },
                 { index: 3, content: 'inspect' },
                 { index: 4, content: 'branch summary' }
             ]
@@ -1802,7 +1831,7 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
         expect(writer.threadMessages(branchId, home.id).map((entry) => entry.content)).toEqual([
             'go',
             '',
-            BRANCH_PENDING_PLACEHOLDER.threadFork,
+            BRANCH_SELF_CALL_PLACEHOLDER,
             'inspect',
             'branch summary'
         ]);
@@ -1815,7 +1844,7 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
         expect(writer.threadMessages(branchId, sibling.id).map((entry) => entry.content)).toEqual([
             'go',
             '',
-            BRANCH_PENDING_PLACEHOLDER.threadFork,
+            BRANCH_SELF_CALL_PLACEHOLDER,
             'inspect',
             'branch summary'
         ]);
@@ -2005,13 +2034,20 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
         // a FORK's work survives its own cancellation, so the sentence carries the branch id
         // and BOTH doors that read it. Pinned verbatim, because the whole point is that the id
         // is inside the text a model reads.
-        expect(forkDeliveries(writer, home.id)).toEqual([
-            `Tool call "threadFork" (f1) was cancelled before it completed; its branch "${branchId}" still holds what it produced — read it with threadRead "${branchId}" or agentResult by that id.`
-        ]);
+        const cancelledSentence =
+            `Tool call "threadFork" (f1) was cancelled before it completed; its branch "${branchId}" ` +
+            'still holds what it produced — read it with threadRead ' +
+            `"${branchId}" or agentResult by that id.`;
+
+        expect(forkDeliveries(writer, home.id)).toEqual([cancelledSentence]);
 
         // And the address it names is real. A cancelled run rolls back its OWN turns, so what
         // survives at that address is the baseline the branch was created from, up to and
-        // including the fork call it was made to answer.
+        // including the fork call it was made to answer — and M5 (2026-11-27) is why that LAST row is no
+        // longer a seed placeholder at all: the cancellation was COMMITTED into the requester's ledger
+        // while this branch was still live, so the branch's own copy of that row now carries the same
+        // sentence the requester read. A placeholder that claims "no result was committed for it yet" must
+        // not outlive the result that was committed; the marker stays only where nothing ever committed.
         expect(withoutIds(writer.threadMessages(branchId))).toEqual([
             { role: 'user', content: 'go' },
             {
@@ -2023,7 +2059,7 @@ describe('threadFork branch addressability and its opt-in clock (B1)', () => {
             },
             {
                 role: 'tool',
-                content: BRANCH_PENDING_PLACEHOLDER.threadFork,
+                content: cancelledSentence,
                 toolCallId: `call_${branchId}_1`,
                 name: 'threadFork'
             }

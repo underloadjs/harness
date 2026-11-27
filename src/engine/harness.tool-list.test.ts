@@ -433,9 +433,33 @@ describe('toolList', () => {
         // The added text carries no `"` and no `\`, so both currencies move by the identical 434 and the
         // 912-byte gap between them is untouched (66,001 payload / 65,089 UTF-8, both re-probed with
         // `Temp/fix-f5/probe-tool-list-bytes.ts`, not derived).
+        // F1 (2026-11-27, the branch write doors): +991, and it is TWO rows — `threadFork` +664 (the
+        // description now states that the fork's isolation is ENFORCED: `threadSend`, `delegate` and
+        // `threadDelete` refuse a branch run unless the fork passed `allowFamilyWrites`) and
+        // `toolCancel` +327 (the fail sentence and its `callId` parameter now name the `branch-N`
+        // address this door also accepts). Neither clause carries a `"` or a `\`, so BOTH currencies
+        // move by the identical 991 and the 912-byte gap between them is STILL untouched
+        // (66,992 payload / 66,080 UTF-8, re-probed row by row with `Temp/opencode/probe-row-deltas.ts`
+        // against `Temp/opencode/baseline` at HEAD, not derived). The `thread` parameter copies this
+        // finding also added to `threadSend` and `threadDelete` move nothing here: neither tool is one
+        // of these 26 rows, for the same registration reason `delegate` is not.
+        // C0 (2026-11-27, addressable agent answers): +1,384, and exactly ONE row again — `agentResult`
+        // (4,175 -> 5,559), whose entry description now states WHICH message the answer is
+        // (`answerMessageIndex`) and that the run's other substantive turns are readable as
+        // `answerCandidates` / `message`. Re-probed row by row the same way (baseline 65,089 UTF-8 /
+        // 66,001 payload at `e66bce8`, live 67,416 / 68,376), and the only other movers in that diff
+        // are the `threadFork` +664 and `toolCancel` +327 rows F1 already recorded above.
+        // R1 (2026-11-27, the `agentManage` answer-address sentence): +339, ONE row — `agentManage`
+        // 2,510 -> 2,849 UTF-8 bytes (measured on the entry's own `metadata.description`, and it is
+        // one of these rows even though it is `visibility: 'searchable'`, because this document is the
+        // registered catalogue, not the declared one). The sentence carries no `"` and no `\`, so both
+        // currencies move by the identical 339 and the 960-byte gap C0 opened is untouched
+        // (68,715 payload / 67,755 UTF-8, re-probed, not derived). The `thread` parameter dash this
+        // pass restored in `threadSend` (+2 B) moves NOTHING here: `threadSend` is not one of these
+        // rows, for the same registration reason `delegate` and `threadDelete` are not.
         // by the same sentence (producer budget vs serve-time delivery cap). Still the same
         // fact this assertion exists for: the bare array is over the delivery cap.
-        expect(wireBytes(registry)).toBe(66001);
+        expect(wireBytes(registry)).toBe(68715);
 
         const bare = boundToolResult(JSON.stringify(registry));
 
@@ -454,14 +478,27 @@ describe('toolList', () => {
             // is untouched (65,567 payload / 64,655 UTF-8, both re-probed, not derived).
             // C2 (2026-11-26): +434 in both figures again, from the one `threadFork` row recorded above, and
             // the gap is STILL 912 (66,001 / 65,089) — the new sentence escapes to itself.
-            originalBytes: 65089,
+            // F1 (2026-11-27): +991 in both figures, from the `threadFork` and `toolCancel` rows recorded
+            // above — neither clause escapes to anything wider, so 66,992 payload / 66,080 UTF-8 keeps the
+            // same 912-byte gap. The message below quotes this smaller figure, so both moved together.
+            // C0 (2026-11-27): +1,336 here against +1,384 above, and the SPLIT is the point — this is the
+            // first move in this chain whose new text carries escaped quotes (`"answerMessageIndex"`,
+            // `"answerCandidates"`, `"message"`, `"messageIndex"`, `"truncated"`). 48 of the added
+            // characters are `"`, 1 byte in UTF-8 and 2 in the payload currency, so the two figures
+            // separate by 48 and the gap they used to keep moves from 912 to 960 (68,376 / 67,416, both
+            // re-probed with `Temp/opencode/probe-row-deltas.ts`, not derived). The message below quotes
+            // this smaller figure, so both moved together.
+            // R1 (2026-11-27): +339 in BOTH figures — the one `agentManage` row recorded above, whose
+            // added sentence has no quote and no backslash, so nothing doubles and the 960-byte gap
+            // C0 opened is untouched (68,715 payload / 67,755 UTF-8, both re-probed, not derived).
+            originalBytes: 67755,
             budgetBytes: MODEL_TOOL_RESULT_BUDGET_BYTES,
             // The message text belongs to ./core/result-budget.ts (`refusalMessage`), which is not
             // this change's file, so only the figures it quotes are pinned here — and
             // they are worth pinning, because the advice it names ("smaller limit,
             // fewer ids, narrower fields") is the advice this schema used to REFUSE and
             // now implements.
-            message: expect.stringContaining('65089 bytes against a 32768-byte budget')
+            message: expect.stringContaining('67755 bytes against a 32768-byte budget')
         });
         expect(bare.rejected!.message).toContain('discarded, not truncated');
 
@@ -574,9 +611,23 @@ describe('toolManage list paging', () => {
         // C2 (2026-11-26): +434, the same single `threadFork` row as the registry figure above — DETAILS
         // form carries the same description, and its SCHEMA text did not move (the cap lives in the
         // entry description, not in a parameter). 139,050 -> 139,484, re-probed.
+        // F1 (2026-11-27): +1,925, and here the SCHEMA moves too, which is why this document grows more
+        // than the registry does: `threadFork` +1,426 (the enforcement sentence +664 plus the new
+        // `allowFamilyWrites` parameter) and `toolCancel` +499 (the fail sentence +327 plus its widened
+        // `callId` parameter). 139,484 -> 141,409, re-probed with `Temp/opencode/probe-row-deltas.ts`.
+        // C0 (2026-11-27): +2,065, ONE row again — `agentResult` 5,500 -> 7,565 — and the split against
+        // the +1,384 in the registry above is the schema leg: the details inventory serializes the whole
+        // `parameters` object, so the new `message` property (its type, bounds and the ordinal-vs-index
+        // sentence that keeps a caller from passing a transcript index) rides here and not there.
+        // Re-probed row by row the same way; the totals agree to the byte (143,462 + the 12-byte
+        // envelope this assertion counts = 143,474).
+        // R1 (2026-11-27): +339, ONE row again — `agentManage`'s entry description, the same sentence
+        // priced in the registry above. Its DETAILS form carries the same description, and this pass
+        // added no parameter, so the schema leg did not move and the two documents grew by the identical
+        // 339 (143,474 -> 143,813, re-probed against this tree, not derived).
         // by the same sentence (producer budget vs serve-time delivery cap). The refusal below
         // is what this pin protects, and a bigger document is still refused.
-        expect(wireBytes(unpaged)).toBe(139484);
+        expect(wireBytes(unpaged)).toBe(143813);
         expect(boundToolResult(JSON.stringify(unpaged)).rejected?.reason).toBe('oversized-json');
 
         // THE FIX: the default page is 5 rows, well inside both budgets, and the gate

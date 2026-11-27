@@ -73,6 +73,7 @@ import { AGENT_RESULT_RETENTION } from './agent-limits';
 import { MAX_THREAD_LABEL_CHARS, MAX_THREAD_RECORDS, THREAD_HOST_PREFIX } from './thread';
 import {
     isSnapshotRecord,
+    readSnapshotAnswerCandidates,
     readSnapshotArray,
     readSnapshotBoolean,
     readSnapshotInteger,
@@ -229,6 +230,17 @@ const readAgentResults = (
                 // `restore()` rebuilds the ledger key from, which is the difference between fixing the
                 // recycled-id collapse for one restart and fixing it for every restart.
                 'epoch',
+                // C0 (2026-11-27) — WHICH message the completed `content` IS (`answerMessageIndex`),
+                // and the run's other substantive turns (`answerCandidates`). Both join this
+                // whitelist for the reason `toolActivity` above states: `readSnapshotKeys` is
+                // EXACT-KEY (./snapshot-validation.ts), so a row the projection writes with a key
+                // this reader does not know makes the WHOLE document unrestorable rather than merely
+                // losing one field. Both join the may-be-absent group below for the other half of
+                // the same reason: every row written before the field exists is still a valid row
+                // and restores with its exact prior meaning — no version bump, no migration, and an
+                // old file answers with neither key.
+                'answerMessageIndex',
+                'answerCandidates',
                 // V3 (the rank model): `role` is the field v2 stored and v3 REMOVED. It is
                 // listed here on purpose rather than left unknown: an exact-key whitelist
                 // would refuse a v2-era row with `has an unknown field "role"`, which names
@@ -266,7 +278,13 @@ const readAgentResults = (
             // `completed` row never carries one because the tally describes a run that did NOT
             // conclude. The value itself is bounded by `readSnapshotToolActivity`
             // (`./snapshot-validation.ts`), the single validator all three doors share.
-            ['error', 'partialContent', 'cancelledAtMessage', 'threadId', 'stopReason', 'epoch', 'role', 'rank', 'toolActivity']
+            //
+            // C0 (2026-11-27): `answerMessageIndex` and `answerCandidates` join MAY-BE-ABSENT on the
+            // SAME ground as `toolActivity`, mirrored — they are the two COMPLETED-only keys, so
+            // every row written before them, and every `failed`/`cancelled` row written after them,
+            // omits them legitimately. Their values are bounded by `readSnapshotAnswerCandidates`
+            // and by the integer/string readers below, never by a local copy of the caps.
+            ['error', 'partialContent', 'cancelledAtMessage', 'threadId', 'stopReason', 'epoch', 'role', 'rank', 'toolActivity', 'answerMessageIndex', 'answerCandidates']
         );
 
         const invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
@@ -498,6 +516,31 @@ const readAgentResults = (
             );
         }
 
+        // C0 (2026-11-27) — THE ANSWER'S ADDRESS, and the run's other substantive turns.
+        //
+        // Read under the same discipline as every neighbour: optional on the row, REFUSED rather
+        // than coerced when a value is wrong (a restored row whose index was quietly turned into `0`
+        // would send a caller to the system seed with total confidence), and meaningless once the
+        // run did not complete — which is what the refusal below states. `answerMessageIndex` is a
+        // transcript index in `threadRead`'s own domain (integer >= 0, index 0 being the system
+        // seed), and the candidate list is bounded by `readSnapshotAnswerCandidates`
+        // (`./snapshot-validation.ts`), the ONE validator that knows the caps, so a list legal to
+        // write is always legal to read back.
+        if (record.answerMessageIndex !== undefined) {
+            result.answerMessageIndex = readSnapshotInteger(
+                record.answerMessageIndex,
+                `${entryLabel}.answerMessageIndex`,
+                { min: 0 }
+            );
+        }
+
+        if (record.answerCandidates !== undefined) {
+            result.answerCandidates = readSnapshotAnswerCandidates(
+                record.answerCandidates,
+                `${entryLabel}.answerCandidates`
+            );
+        }
+
         // Same mutual exclusion as `error` and the forensic pair: a COMPLETED run concluded,
         // so it has no stop reason, and a row that carried one would be re-written WITHOUT it
         // by the next projection — `restore -> snapshot` would stop being idempotent, which is
@@ -525,6 +568,23 @@ const readAgentResults = (
         ) {
             throw new HarnessError(
                 `${entryLabel}.partialContent and .cancelledAtMessage must be absent on a completed result.`
+            );
+        }
+
+        // C0 (2026-11-27) — the MIRROR of every check above. `answerMessageIndex` names the message
+        // the completed `content` came from, and `answerCandidates` lists the run's other
+        // substantive turns; a `failed`/`cancelled` row has NO answer message (its `content` is
+        // empty by construction and its text survives as `partialContent`), so the writer
+        // (`../harness.ts` `finishInvocation`) never puts either key on such a row. Accepting one
+        // anyway would break the property the four refusals above exist to protect: a row this
+        // reader restores is a row the NEXT projection writes back byte-identically, and a stale
+        // index on a stopped run would be dropped on the next save.
+        if (
+            status !== 'completed' &&
+            (record.answerMessageIndex !== undefined || record.answerCandidates !== undefined)
+        ) {
+            throw new HarnessError(
+                `${entryLabel}.answerMessageIndex and .answerCandidates must be absent on a ${status} result.`
             );
         }
 

@@ -15,8 +15,11 @@
 //       model that passes no `thread` reads the conversation it is in.
 //   R3  Attachment bytes never reach the result, and the 64 KiB model-facing result
 //       cap is never what truncates a page â€” the tool's own budget reports the cut.
-//   R4  An unknown or deleted thread id and a malformed pattern come back as honest
-//       errors, and a manual host call has no thread to default to.
+//   R4  An unknown thread id and a malformed pattern come back as honest errors, a manual
+//       host call has no thread to default to, and a SOFT-DELETED thread is not an error for
+//       the doors a soft delete keeps: the host view and the releasing lineage read it through
+//       this tool, byte-identical to the live page (R1, 2026-11-27 — see the released-thread
+//       block below).
 //   R5  The DEFAULT page is the cheap one, and every part of that is visible through
 //       the real tool and the real schema: no system seed (`includeSystem`, opt-in),
 //       tool calls as { id, name, argumentsLength } REFERENCES rather than quoted
@@ -722,7 +725,7 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
         ]);
     });
 
-    it('rejects an unknown thread and a deleted thread alike', async () => {
+    it('rejects an unknown thread, and answers a released one for the host view', async () => {
         const { writer, target } = fixture();
 
         await expect(
@@ -731,11 +734,27 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
             'Thread "thread-99" is not available in this harness; it was never created, or it was deleted.'
         );
 
+        // A RELEASED THREAD IS NOT THE SAME FACT AS A MISTYPED ID (IT19 R2, and R1
+        // 2026-11-27 for the door). `executeTool` carries no caller thread, so this is the host
+        // view, and the host view of a soft delete has always been the retained transcript —
+        // `threadMessages(target.id)` answers it, `threadDelete`'s receipt promises it, and this
+        // entry's own description promises the lineage read. Until R1 the tool contradicted all
+        // three by consulting the DISCOVERY record (`harness.thread()`, which voids every
+        // `inactive` row) and answering with the sentence above. The read is byte-identical to
+        // the live one, because a release is a roster change and never a transcript edit: 4 rows,
+        // and 3 after the system seed is dropped by the default `includeSystem: false`.
+        const live = pageOf(await writer.executeTool('threadRead', { thread: target.id }));
+
         writer.deleteThread(target.id);
 
-        await expect(writer.executeTool('threadRead', { thread: target.id })).rejects.toThrow(
-            `Thread "${target.id}" is not available in this harness; it was never created, or it was deleted.`
-        );
+        const released = pageOf(await writer.executeTool('threadRead', { thread: target.id }));
+
+        expect(released).toEqual(live);
+        expect(released.total).toBe(4);
+        expect(released.matched).toBe(3);
+        // Discovery still excludes it — the two rules stay separable, which is the whole point of
+        // the record door having its own seam (`harness.threadReadRecord`) next to `thread()`.
+        expect(writer.thread(target.id)).toBeUndefined();
     });
 
     it('has no honest default for a manual host call, and says so', async () => {
@@ -787,6 +806,222 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
 // transcript addressed by the branch id, and the same default page rules a live
 // conversation gets — notably `toolArgs: "reference"`, so the fork call that created
 // the branch arrives as `{ id, name, argumentsLength }` instead of a quoted payload.
+describe('threadRead of a released conversation follows the read door (R1, 2026-11-27)', () => {
+    // WHY THIS BLOCK EXISTS. A soft delete leaves the row and its transcript (`inactive`), and
+    // `threadMessages` is the readability half: the host view and the LINEAGE that released the
+    // conversation are served, a stranger gets the named refusal. F1 (2026-11-27) moved that
+    // admission test onto the transcript seam, and the tool kept its own gate on `harness.thread()`
+    // — a DISCOVERY door that voids every `inactive` row — so BOTH reads below used to be refused
+    // by the tool with "it was never created, or it was deleted" after the seam had already
+    // admitted them. Everything here is asserted THROUGH THE TOOL (`threadRead` as a model call,
+    // or `executeTool` as the host door), which is the surface the earlier suite never touched:
+    // `harness.branch-writes.test.ts` pins the seam, and only a tool call can show that the door
+    // and the seam now make ONE decision.
+    //
+    // The turn script is a FUNCTION of the released conversation's id, because that id is minted
+    // by `createThread` and the model has to name it as a tool argument.
+    const releasedFixture = (turnsFor: (childId: string) => HarnessStreamEvent[][]) => {
+        let requests = 0;
+        let turns: HarnessStreamEvent[][] = [[]];
+
+        const stream: HarnessStream = async function* () {
+            const frames = turns[Math.min(requests, turns.length - 1)] ?? [];
+            requests += 1;
+
+            for (const frame of frames) yield frame;
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const parent = writer.createThread('writer', { label: 'Releaser' });
+        const child = writer.createThread('writer', {
+            label: 'Released',
+            ownerThreadId: parent.id
+        });
+
+        turns = turnsFor(child.id);
+
+        writer.setThreadMessages(child.id, [
+            { role: 'user', content: 'the task worth keeping' },
+            { role: 'assistant', content: 'the answer worth keeping' }
+        ]);
+
+        return { writer, parent, child };
+    };
+
+    // The exact page `threadRead` answers for the two-message transcript above. It is written
+    // out once and asserted twice — before and after the release — because that equality IS the
+    // finding: the rows, the identity block and every bound are the same bytes, and a soft delete
+    // is a roster fact, not a transcript edit. `status` stays 'idle' on the record, and the page
+    // has no `inactive` key to leak the difference; the doors that must REFUSE a released
+    // conversation (`threadSend`, `threadDelete`) refuse it by name.
+    const releasedPage = (thread: { id: string; label?: string; sequence: number }, ownerThreadId: string) => ({
+        thread: {
+            id: thread.id,
+            agent: 'writer',
+            origin: 'host',
+            status: 'idle',
+            sequence: thread.sequence,
+            ownerThreadId,
+            label: thread.label
+        },
+        // 22 + 24 characters of text, no filter, no paging, and nothing cut.
+        total: 2,
+        matched: 2,
+        offset: 0,
+        limit: 20,
+        hasMore: false,
+        contentBudget: 32768,
+        bytes: 46,
+        truncated: false,
+        messages: [
+            {
+                index: 0,
+                role: 'user',
+                content: 'the task worth keeping',
+                contentLength: 22,
+                contentOffset: 0,
+                contentHasMore: false
+            },
+            {
+                index: 1,
+                role: 'assistant',
+                content: 'the answer worth keeping',
+                contentLength: 24,
+                contentOffset: 0,
+                contentHasMore: false
+            }
+        ]
+    });
+
+    it('serves the retained rows to the lineage that released it, through the tool', async () => {
+        const { writer, parent, child } = releasedFixture((childId) => [
+            callTool('c1', 'threadRead', JSON.stringify({ thread: childId })),
+            answer('read it once'),
+            callTool('c2', 'threadRead', JSON.stringify({ thread: childId })),
+            answer('read it twice')
+        ]);
+
+        // The SAME tool call, twice: once while the conversation is live (the baseline the old
+        // record gate also served, so an ACTIVE read is provably unchanged), and once after the
+        // release, from the conversation that owns it.
+        await writer.sendThreadInput(parent.id, 'read the child');
+        const before = pageOf(toolResultOf(writer.threadMessages(parent.id), 'threadRead'));
+
+        expect(writer.deleteThread(child.id)).toEqual({
+            deleted: child.id,
+            removedThreadIds: [child.id],
+            removedInvocationIds: [],
+            removedBranchIds: []
+        });
+
+        await writer.sendThreadInput(parent.id, 'read it again');
+        const after = pageOf(toolResultOf(writer.threadMessages(parent.id), 'threadRead'));
+
+        expect(before).toEqual(releasedPage(child, parent.id));
+        expect(after).toEqual(releasedPage(child, parent.id));
+        expect(after).toEqual(before);
+
+        // The rows the refusal sentence points at are the rows the page carries, and the address
+        // is the one `threadList` no longer lists.
+        expect(after.messages.map((message) => message.content)).toEqual([
+            'the task worth keeping',
+            'the answer worth keeping'
+        ]);
+    });
+
+    it('answers a released conversation for a host read by id, through the same tool', async () => {
+        const { writer, parent, child } = releasedFixture(() => [answer('unused')]);
+
+        writer.deleteThread(child.id);
+
+        // `executeTool` runs with no `context.threadId`, which the seams read as the HOST view —
+        // the server's transcript reader, the surface the refusal sentence itself promises
+        // ("a host can always read it by id"). The door used to contradict that promise.
+        expect(pageOf(await writer.executeTool('threadRead', { thread: child.id }))).toEqual(
+            releasedPage(child, parent.id)
+        );
+
+        // Discovery is untouched by any of this: the row is still off the roster, off
+        // `threads()` and off the record door `thread()`, which is the rule that made the old
+        // gate look right.
+        expect(writer.thread(child.id)).toBeUndefined();
+        expect(writer.threads().map((thread) => thread.id)).not.toContain(child.id);
+    });
+
+    it('still refuses a stranger through the tool, with the seam sentence', async () => {
+        let releasedId = 'thread-unknown';
+        let requests = 0;
+
+        // Two conversations with no lineage between them: the released child belongs to `owner`,
+        // and the caller is a sibling the release never touched. The scripted transport is
+        // per-AGENT, so the caller's turn is routed by the prompt it was sent — the same
+        // two-sided routing ./harness.branch-writes.test.ts uses.
+        const stream: HarnessStream = async function* (request) {
+            const isCaller = request.messages.some(
+                (message) => message.role === 'user' && message.content === 'read the released thread'
+            );
+
+            if (!isCaller) {
+                yield* answer('say it once');
+                return;
+            }
+
+            const frames =
+                requests === 0
+                    ? callTool('c1', 'threadRead', JSON.stringify({ thread: releasedId }))
+                    : answer('refused');
+
+            requests += 1;
+
+            for (const frame of frames) yield frame;
+        };
+
+        const writer = harness({ agents: { writer: brain(stream) }, presets: false });
+        const owner = writer.createThread('writer', { label: 'Owner' });
+        const released = writer.createThread('writer', {
+            label: 'Released',
+            ownerThreadId: owner.id
+        });
+        const stranger = writer.createThread('writer', { label: 'Stranger' });
+
+        releasedId = released.id;
+
+        writer.setThreadMessages(released.id, [
+            { role: 'user', content: 'the task worth keeping' },
+            { role: 'assistant', content: 'the answer worth keeping' }
+        ]);
+
+        await writer.sendThreadInput(released.id, 'say it once');
+        writer.deleteThread(released.id);
+
+        await writer.sendThreadInput(stranger.id, 'read the released thread');
+
+        // The whole tool result is the engine's sentence, byte for byte, under the `Tool "…"
+        // failed:` head the harness writes when a thrown refusal becomes a transcript row
+        // (`deliverTask`'s failure arm — the same reason ../server/harness.it19-retention.test.ts
+        // asserts this row with `toContain`): the seam's words reach the model UNCHANGED, because
+        // the tool no longer gets a chance to answer the same fact with the not-found head.
+        expect(toolResultOf(writer.threadMessages(stranger.id), 'threadRead')).toBe(
+            `Tool "threadRead" failed: Thread "${released.id}" is inactive (deleted); its transcript is retained, but it is no longer part of this ` +
+                "session's roster, and it is not in your lineage, so threadRead cannot answer it from a conversation " +
+                '(see threadList). The conversation that released it — and any conversation in that lineage — still ' +
+                'can, and a host can always read it by id.'
+        );
+    });
+
+    it('refuses an id that was never created, from a conversation and from the host alike', async () => {
+        const { writer } = releasedFixture(() => [answer('unused')]);
+
+        // The release narrowed nothing about a mistyped id: an address nobody has keeps the
+        // canonical one sentence (issue 0034's one sentence, three doors), whether the caller
+        // stands in a conversation or not. `executeTool` has no caller thread, so the host form
+        // is the same call.
+        await expect(writer.executeTool('threadRead', { thread: 'thread-404' })).rejects.toThrow(
+            'Thread "thread-404" is not available in this harness; it was never created, or it was deleted.'
+        );
+    });
+});
+
 describe('threadRead addresses a finished fork by its branch id (B1)', () => {
     it('reads the branch transcript through the same tool and the same defaults', async () => {
         // One transport, three requests, in this exact order: the origin asks for a

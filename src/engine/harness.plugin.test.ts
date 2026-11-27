@@ -306,10 +306,10 @@ describe('turn.before interception', () => {
         expect(hooks[0].messages).toEqual([{ role: 'user', content: 'ABCDEFGH' }]);
         // 8 bytes of projected transcript, PLUS the tool catalogue this round declares: a
         // default harness (`presets` on, no explicit tool switches) offers 7 declarations,
-        // and `toolSchemaPayloadBytes` of the request's own `tools` is 35,820 serialized
-        // payload bytes — a constant 8,955-token floor the transcript can never show. The
-        // round has no `usage` anchor yet, so it is priced blind at
-        // ceil((8 + 35,820) / 4) = 8,957; it read 2 while the estimate counted the
+        // and `toolSchemaPayloadBytes` of the request's own `tools` is 36,849 serialized
+        // payload bytes — a 9,213-token floor (ceil(36,849 / 4)) the transcript can never
+        // show. The round has no `usage` anchor yet, so it is priced blind at
+        // ceil((8 + 36,849) / 4) = 9,215; it read 2 while the estimate counted the
         // transcript alone, which is the number the measured provider refusal proved wrong
         // (../core/context-estimate.ts "THE TOOL-CATALOGUE FLOOR", src/harness.ts
         // `toolSchemaBytes`). Re-derive with:
@@ -320,14 +320,30 @@ describe('turn.before interception', () => {
         // disclosure, after the independent review de-duplicated the `tasks` envelope clause
         // (-230 B against the +190 B of sentences it left in place): a declared description is
         // priced here byte for byte, so the floor moved +36, then +440, then -10 tokens. THE
-        // +562 BYTES ON TOP OF THAT (35,820 = an exact 8,955-token floor today) are the 2026-11-26
-        // `tasks` disclosure — +562 B on the DECLARED `tasks` entry alone (the `ids` paging rule,
-        // the two-fact `expects` split and the single-id ceiling sentence,
+        // +562 BYTES on top of those (35,820 = an exact 8,955-token floor until 2026-11-27) are
+        // the 2026-11-26 `tasks` disclosure — +562 B on the DECLARED `tasks` entry alone (the
+        // `ids` paging rule, the two-fact `expects` split and the single-id ceiling sentence,
         // ../tools/runtime/tasks.tool.ts); nothing else this 7-declaration roster offers changed
-        // text. 562/4 = 140.5, and because the catalogue is a multiple of 4 the floor moves a clean
-        // +140 tokens while the 8-byte transcript keeps its own rounding: 8,817 -> 8,957. Measured
-        // per entry on a live request, both trees, by probe Temp/fix-f5/probe-floors.ts.
-        expect(hooks[0].estimatedTokens).toBe(8957);
+        // text. 562/4 = 140.5, and because the catalogue was a multiple of 4 the floor moved a
+        // clean +140 tokens while the 8-byte transcript kept its own rounding: 8,817 -> 8,957.
+        // Measured per entry on a live request, both trees, by probe Temp/fix-f5/probe-floors.ts.
+        // THE +1,029 BYTES ON TOP OF THAT (36,849 B today; 8,957 -> 9,215 = +258 tokens) are the
+        // reserved per-call `async` switch, 2026-11-27: every OFFERED declaration now advertises
+        // one extra OPTIONAL property on the model-facing copy ../core/tool.ts
+        // `withToolAsyncSwitch` builds in ../harness.ts `offerDeclarations`, and the estimator
+        // prices exactly that copy: 7 rows x the injected `{"type":"boolean","description":…}`
+        // node, +147 B on EVERY row of this roster (11 x 147 + 146 on the 12-row delegating
+        // roster, 10 x 147 + 146 on the 11-row writer roster `plugin/context-compaction.test.ts`
+        // prices; the odd byte is `threadList`'s, and a PARAMETERLESS row pays 193 B because the
+        // injection has to materialize `properties` — see `harness.budget.test.ts`).
+        // The catalogue is NOT a multiple of 4 any more (35,820 was, which is what made the
+        // +140 above land clean), so the floor now rounds UP (36,849 / 4 = 9,212.25 -> 9,213) and
+        // the odd byte falls into the 8-byte transcript's own rounding on the estimate side. MEASURED
+        // both trees, per entry, with the injected key counted per row, by probe
+        // Temp/coding/probe-catalogue-ab.ts shape D: its pristine-HEAD leg reproduces 35,820 B /
+        // 8,955 tokens EXACTLY, which is what makes +1,029 a measurement and not arithmetic — and
+        // the estimator itself moved not one line, so nothing but this constant moved.
+        expect(hooks[0].estimatedTokens).toBe(9215);
         expect(hooks[0].iteration).toBe(1);
         expect(hooks[0].agent).toBe('writer');
         // The callable root runs in the entry agent's DEFAULT conversation.

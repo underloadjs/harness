@@ -759,7 +759,12 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
             {
                 type: 'done',
                 stopReason: 'tool_calls',
-                toolCalls: [{ id, name: 'delegate', arguments: '{"agent":"child","input":"work"}' }]
+                // `"async": true` is what keeps this fixture a DELEGATION race: an
+                // unswitched `delegate` that is the only call of its message now refines
+                // to mode 'sync', the lead parks inside the very same run, and the
+                // "restore, a new root run, and a new delegation" sequence below walks
+                // past WAITING-1 into the parked run instead of starting a new root run.
+                toolCalls: [{ id, name: 'delegate', arguments: '{"agent":"child","input":"work","async":true}' }]
             }
         ];
 
@@ -874,8 +879,12 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
             {
                 type: 'done',
                 stopReason: 'tool_calls',
+                // Reserved `"async": true` switch, same reason as the case above: without
+                // it each lone `delegate` refines to 'sync', the lead parks inside the
+                // first run, and the SECOND child request this race waits for never
+                // starts from a later root run.
                 toolCalls: [
-                    { id, name: 'delegate', arguments: `{"agent":"child","input":"${input}"}` }
+                    { id, name: 'delegate', arguments: `{"agent":"child","input":"${input}","async":true}` }
                 ]
             }
         ];
