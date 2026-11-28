@@ -425,7 +425,8 @@ tools/
                         exa.ts, linkup.ts, index.ts (createWebFetchTool — opt-in,
                         native is always the default provider)
   webdownload/          download.tool.ts (the `download` preset: 20 MiB cap,
-                        toolMedia() envelope), index.ts (type-only barrel)
+                        toolMedia() envelope, public-address gates, bytes saved
+                        in the session's downloads folder), index.ts (type-only barrel)
   presets.test.ts       covers every preset, standalone and in a harness
 ```
 
@@ -864,7 +865,7 @@ claiming nothing matched. These entries are never enabled, never count against
 | Query shape | `names` (exact, case-sensitive), `regex` (bare source or `/source/flags`), and `tags` are OR-ed into one union; each match appears once. An empty query enables nothing and returns the vocabulary. |
 | Tags | Trimmed, lowercased, deduplicated. Not required when `names` or `regex` is supplied. |
 | Default visibility | `'searchable'`. The declared core set is `read`/`write`/`edit`/`glob`/`grep`, the harness-owned `toolRequest`/`tasks`, a configured `search`/`fetch`, and `delegate` only for the agents that actually hold a strictly-lower-ranked target (the declaration is rank-projected per caller, see [Delegation](#delegation), so a junior sibling never sees it). Everything else is demand-discovered: `files`, `download`, `syntax`, `shell`, `gitDiff`, the app tools, and the eleven demoted harness-owned rows (`toolRegistry`, `toolList`, `toolManage`, `toolCreate`, `profiles`, `chapters`, `locations`, `agentManage`, `agentResult`, `actionRequest`, `threadFork`) — all still registered, so `toolRequest` can enable them (R9-R11). |
-| Core vs session-bound | `core` means declared on every request — unless this conversation switches the name off (the conversation-switch row below), which is the one thing `core` no longer implies. It also never spends a `maxEnabledTools` slot. Only the harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call); core file tools, `download`, `search`, and `fetch` run directly. |
+| Core vs session-bound | `core` means declared on every request — unless this conversation switches the name off (the conversation-switch row below), which is the one thing `core` no longer implies. It also never spends a `maxEnabledTools` slot. The harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call) and core file tools, `search`, and `fetch` run directly. `download` is the one PRESET that declares `sessionBound`: its bytes belong to a session's downloads folder (F7), and the flag states that dependency on the row — it is not yet a gate for a preset row, because the server's 403 reads the flag off a catalogue entry only the harness-owned set builds (`src/server/harnesses/core.ts:87`), so a sessionless call still reaches the tool and answers its refusal as a tool error (`200 ok:false`). |
 | Ranking | Exact requested names keep caller order. Name-regex hits follow, then tag matches ranked OR-style: a tool's rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties. |
 | Enabled bound | `maxEnabledTools` (default **32**) bounds the persistent SEARCHABLE enabled set at the model-turn boundary. Every selector kind (names, regex, tags) switches the set: this request's ordered matches lead, prior entries fill leftover capacity, overflow is `omitted`, and displaced prior names are `evicted`. Core tools are declared unless this conversation switched them off, and never count against the bound. |
 | Already available | Core tools the caller already has (`delegate` for a caller that can delegate, `tasks`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the bound. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. A **conditionally declared** control is reported the same way while it is genuinely actionable: `toolCancel` appears in this list exactly when the caller has calls in flight AND this conversation has not switched it off, because it is declared only then — querying `cancel` must never answer "no such capability" about a tool the caller is holding, and must not promise one the conversation has hidden. |
@@ -1388,8 +1389,9 @@ The three web entries are bare verbs for the same reason: `search`, `fetch`, and
 tool named for the domain it owns (`files`) is the same decision made once, not a
 deviation from it.
 `websearch` and `webfetch` remain harness CONFIGURATION field names (only the tool
-is renamed), and `download` needs no field at all — it is an always-registered
-preset. See [Web search](#web-search-search), [Page fetch](#page-fetch-fetch), and
+is renamed), and `download` needs no field either — it is an always-registered
+preset whose destination comes from the host's `downloadsDirectory` (the server
+supplies the session's own folder), not from a per-tool setting. See [Web search](#web-search-search), [Page fetch](#page-fetch-fetch), and
 [File download](#file-download-download).
 
 There are **no aliases**: the old names are gone from the wire surface, the
@@ -1438,9 +1440,9 @@ Each tool lives in its own file under a capability folder (`tools/syntax/`,
 `tools/files/`, `tools/command/`, `tools/webdownload/`, and the harness-owned
 `tools/runtime/`), and the
 barrel also exports the preset set as `presetTools`. **Every new harness preloads
-that catalogue**: `read`, `write`, `edit`, `glob`, `grep`, and `download` are
-declared immediately (core), while `files`, `syntax`, `shell`, and `gitDiff`
-cost context only after a toolRequest query enables them; `presets: false` turns
+that catalogue**: `read`, `write`, `edit`, `glob`, and `grep` are
+declared immediately (core), while `files`, `syntax`, `shell`, `gitDiff`, and `download`
+(R9-R11) cost context only after a toolRequest query enables them; `presets: false` turns
 the preload off.
 
 Registration is **descriptor-driven** (`R7`-`R9`). `harness({})` scans
@@ -1707,7 +1709,8 @@ interpreter, and JSON needs neither.
 
 Every preset is tagged. The five core file tools are always declared, so a model
 reads/writes/edits/lists names with `glob` and finds text with `grep` directly. `download`
-is `visibility: 'searchable'` (`src/tools/webdownload/download.tool.ts:566`), so a library
+is `visibility: 'searchable'` (`src/engine/tools/webdownload/download.tool.ts`, and the same
+figure on its generated descriptor row), so a library
 model opens it with `toolRequest` — and a session the server creates starts with it already
 enabled by the seed (subject to the cap and the deny list), which is where "pulls a real
 file with `download` without a discovery round" is true there (`enableAllTools`, see
@@ -1925,20 +1928,28 @@ redactor built from **all** configured web keys.
 ### File download (`download`)
 
 The byte path. `fetch` answers text and refuses a binary; `download` accepts **any
-content type**, caps the transfer, and hands the real bytes to the model as
-multimodal input. It is a normal **preset** (`presetTools.download`, a named
-export, and a callable server catalogue entry): registration is `always` and
-visibility is `core`, so it needs no configuration field, no key, and no
-discovery round.
+content type**, caps the transfer, hands the real bytes to the model as multimodal
+input, **and** saves the same bytes into the harness SESSION's downloads folder so
+`glob`/`grep`/`read` can reach the file afterwards. It is a normal **preset**
+(`presetTools.download`, a named export, and a callable server catalogue entry):
+registration is `always` and visibility is `searchable` (R9-R11 — every harness
+registers it, `toolRequest` opens it on demand), it needs no key, and the tool
+itself needs no configuration FIELD. What it does need is a folder to write into,
+supplied by the HOST through `HarnessConfiguration.downloadsDirectory` (see the
+Disk row): the shipped server points that at the session's own
+`harness/sessions/<id>/downloads`, which is deleted with the session, and a build
+without a folder refuses rather than inventing one.
 
 ```ts
 import { download } from '@underload/harness';
 
 await download({ url: 'https://example.com/diagram.png' });
 await download({ url: 'https://example.com/a.zip', name: 'release.zip' });
+await download({ url: 'https://example.com/a.zip', path: 'raw/release.zip' });
 // -> toolMedia() envelope:
 //    { content: { url, finalUrl, contentType, kind, name, bytes, declaredBytes?,
-//                 media: 'attached', mediaId },
+//                 media: 'attached', mediaId, saved, path?, saveError?,
+//                 searchable, note },
 //      __toolMedia: [attachment] }
 ```
 
@@ -1947,10 +1958,11 @@ await download({ url: 'https://example.com/a.zip', name: 'release.zip' });
 | Size cap | **20 MiB** (`20 * 1024 * 1024` raw, decoded bytes). Checked against `content-length` before the body is touched, then per streamed chunk for a host that lies or declares nothing |
 | Timeout | 60 s for the whole transfer; `context.signal` is honoured, so `toolCancel`/run abort stops the socket instead of only its delivery |
 | Attempts | One; no retry |
-| Redirects | Followed; `finalUrl` reports where the bytes came from |
-| URL | Absolute `http(s)`, no userinfo, at most 2,048 characters |
-| Disk | **Nothing is written.** There is no output path and no file on the host: the bytes are held on the committed `tool` message (in memory, and inside a persisted snapshot when the host has one) and are gone when that transcript is |
-| `name` | Optional plain filename, always sanitized (no path separators, no drive colon, ≤200 characters); otherwise the server `content-disposition` or the URL basename, with an extension fallback from the MIME |
+| Redirects | Followed **by hand**, at most 5 hops (the same cap `fetch` uses), and `finalUrl` reports where the bytes came from. Manual is the security requirement: the platform default would resolve a `Location` and connect before this tool could gate it |
+| Address | Absolute `http(s)`, no userinfo, at most 2,048 characters, and a **public** address on the first hop AND on every hop: loopback, `.localhost`, RFC1918, CGNAT, link-local and `169.254.169.254`, IPv6 loopback/ULA and the mapped forms are refused, as is a public NAME whose answer is private (`127.0.0.1.nip.io`). Parity with `fetch`, and the pre-existing behaviour of `fetch`. The limit that stays: with no resolver (no `node:dns`, a lookup error, or a lookup past its own 2 s watchdog) only the address FORM can be checked — a resolver failure is not a security verdict, so the call proceeds, and the tool description says so |
+| Disk | **Saved in the session's downloads folder.** The host supplies that folder (`ToolContext.downloadsDirectory`, from `HarnessConfiguration.downloadsDirectory`; the server supplies the session's own `harness/sessions/<id>/downloads`, deleted with the session by journal `remove()`), `path` is a subpath INSIDE it, and the result's `path` is ABSOLUTE. No folder ⇒ the call refuses BEFORE the transfer; a `path` that is absolute, carries a drive colon, or contains `..` is refused BEFORE the transfer too. A write failure never breaks the download: it lands in `saveError` with `saved: false`, and `note` tells the model the bytes are only in the message. The bytes ALSO ride on the committed `tool` message, so they survive history, snapshot restore and forks |
+| `name` | Optional plain filename, always sanitized (no path separators, no drive colon, ≤200 characters); otherwise the server `content-disposition` or the URL basename, with an extension fallback from the MIME. A `content-disposition` QUOTED string may contain `;` (`filename="report; final.png"` keeps its name), and RFC 5987 `filename*` wins over `filename` |
+| `searchable` | Whether `grep` can search the saved file (text and under 1 MiB). A saved JPEG is addressable but not searchable, and `note` says which one the caller holds and to point the file tools at the absolute `path` — a root named EXPLICITLY is walked even when an enclosing `.gitignore` ignores that folder, which is what makes a session download reachable at all |
 
 What the model and the host see are different things, and that split is the
 point:
@@ -1959,9 +1971,11 @@ point:
   so the 64 KiB result budget never touches it) — never a base64 blob;
 - the **bytes** travel on the committed `tool` message's `attachments`, which is
   what lets them survive history, snapshot restore, and forks;
-- a `tool_result` progress event, and the server's manual
-  `POST /v1/harness/tools/download/executions` answer, carry `ToolMediaDescriptor[]` (id, kind,
-  name, mime, size) — **metadata only, never base64**;
+- a `tool_result` progress event, and a server execution answer, carry `ToolMediaDescriptor[]` (id, kind,
+  name, mime, size) — **metadata only, never base64**. On the manual-call side that means the
+  SESSION route (`POST /v1/harness/sessions/{id}/tools/download/executions`): the global
+  `POST /v1/harness/tools/download/executions` has no session folder to write into, so it
+  answers the tool's refusal as `200 ok:false` (see the Disk row above);
 - the **transport** expands the attachments into a clearly labelled USER-role
   multimodal payload **after** the whole contiguous tool block, so strict
   provider tool-call pairing is never broken.

@@ -242,6 +242,32 @@ export type HarnessPresetReport = {
     // the knowledge engine who is writing. A host that builds harnesses outside
     // `SessionStore` may omit it, and every article it creates stays unowned.
     knowledgeOwner?: string;
+    // F7: THE DIRECTORY THIS BUILD'S `download` WRITES INTO, forwarded verbatim into
+    // `HarnessConfiguration.downloadsDirectory` by the shared toolbox factory (./toolbox.ts),
+    // which is the only way the field reaches the engine's three `ToolContext` sites
+    // (../engine/harness.ts:12980 / :18665 / :18786). Same optional-third-argument discipline as
+    // every field above: a factory that ignores it produces a harness whose `download` refuses
+    // rather than one that guesses a folder.
+    //
+    // WHY IT RIDES THE REPORT and not the preset: the folder is PER SESSION, while a preset is a
+    // reusable factory shared by every session of the deployment — the same reason `knowledge`
+    // does (a preset-baked path would put one conversation's bytes in another's folder). The
+    // host supplies it: ../sessions.ts `buildHarness` passes
+    // `harnessSessionDownloadsDirectoryOf(persistence.directory, id)` on BOTH build paths
+    // (`create`, whose id is now minted before the build, and `restoreSession`), and the value is
+    // `<databaseRoot>/harness/sessions/<id>/downloads` (../persistence.ts:2653).
+    //
+    // ABSENCE IS MEANINGFUL, not an oversight: a store with no persistence directory has no
+    // session directory to delete, so it states nothing and the tool refuses BEFORE transferring a
+    // byte, naming the fix (../engine/tools/webdownload/download.tool.ts `downloadsDirectoryOf`).
+    // That is the honest answer for a direct `new SessionStore`, a CLI build, and every library
+    // caller — a folder chosen by the tool is a folder nobody owns.
+    //
+    // It is a PATH STRING, so it crosses a worker boundary as data: the lane replica receives the
+    // SAME absolute folder through `LaneBlueprint.downloadsDirectory`
+    // (../workers/protocol.ts), which is why a lane's `download` saves into the conversation's
+    // folder and dies with it exactly like the inline path's does.
+    downloadsDirectory?: string;
 };
 
 // THE CARD'S IN-MEMORY REBUILD METADATA (R-boot, B4).

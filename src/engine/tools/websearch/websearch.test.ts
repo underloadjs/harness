@@ -7,12 +7,15 @@
 // exactly where silent drift is expensive.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult, modelPayloadBytes } from '../../core';
 import { createWebSearchTool } from '../../index';
 import type { Tool, WebsearchConfiguration, WebSearchParameters, WebSearchResult } from '../../index';
 import {
+    fitRowsToResultBudget,
     MAX_PUBLISHED_CHARS,
     MAX_RESPONSE_BYTES,
     MAX_RESULTS_LIMIT,
+    MAX_SEARCH_RESULT_BYTES,
     MAX_SNIPPET_CHARS,
     MAX_TITLE_CHARS,
     MAX_URL_CHARS,
@@ -31,6 +34,15 @@ const configured = (
 
     return definition;
 };
+
+// The one delivery check that matters for a tool result: the harness caps a result at
+// `MODEL_TOOL_RESULT_BUDGET_BYTES` of JSON-escaped payload and REFUSES an oversized
+// JSON document outright (no envelope, no slice, the call reported as failed). Every
+// "this shape is delivered" assertion below goes through THIS call, so the tool is
+// measured by the same helper the harness measures it with (T2/F2), and a change to
+// either side shows up here rather than in a live run.
+const deliverable = (result: unknown): ReturnType<typeof boundToolResult> =>
+    boundToolResult(JSON.stringify(result), MODEL_TOOL_RESULT_BUDGET_BYTES, { source: { name: 'search' } });
 
 const json = (body: unknown, init?: { status?: number; headers?: Record<string, string> }): Response =>
     new Response(JSON.stringify(body), {
@@ -629,10 +641,18 @@ describe('Linkup request and normalization', () => {
     });
 
     it('keeps the provider byte budget at 512 KiB, separate from the native fetch bound', async () => {
-        // The search/provider cap is deliberately untouched by the fetch tool's
-        // 100 KiB page budget. Pinning the constant here turns an accidental
-        // "consolidation" of the two into a test failure.
+        // The search/provider TRANSFER cap is deliberately untouched by the fetch
+        // tool's page budget (`MAX_RESPONSE_BYTES` in ../webfetch/request.ts, 1 MiB).
+        // Pinning the constant here turns an accidental "consolidation" of the two
+        // into a test failure. F15: the number this cap used to be compared against
+        // in the comments (100 KiB) went stale when the fetch budget moved to 1 MiB;
+        // the number that actually has to be read with it is the DELIVERABLE one
+        // below, and the 16x ratio between them is the point.
         expect(MAX_RESPONSE_BYTES).toBe(512 * 1024);
+        expect(MAX_SEARCH_RESULT_BYTES).toBe(32 * 1024);
+        // The transfer cap is 16x the deliverable size: reading a provider answer is
+        // not the same as being able to put it in front of a model.
+        expect(MAX_RESPONSE_BYTES).toBe(16 * MAX_SEARCH_RESULT_BYTES);
 
         stubFetch(
             new Response('{}', {
@@ -1068,7 +1088,11 @@ describe('provider filters', () => {
             /must not be earlier than/
         );
         await expect(tool({ query: 'q', includeDomains: [] })).rejects.toThrow(/array of 1-20 domains/);
-        await expect(tool({ query: 'q', speed: 'turbo' })).rejects.toThrow(/"balanced" or "fast"/);
+        // `speed: 'turbo'` is DELIBERATELY not a valid value (the parameter union is
+        // `balanced | fast`) — the `as never` keeps the intentional invalidity the
+        // validator is being pinned against, same spelling as the `maxResults: 'ten'`
+        // case above.
+        await expect(tool({ query: 'q', speed: 'turbo' as never })).rejects.toThrow(/"balanced" or "fast"/);
         expect(requests).toBe(0);
     });
 
@@ -1129,7 +1153,10 @@ describe('provider filters', () => {
         expect(
             await refusalMessage({ query: 'q', category: 'people', since: '2026-06-01', until: '2026-01-01' })
         ).toBe('search "until" must not be earlier than "since".');
-        expect(await refusalMessage({ query: 'q', category: 'people', speed: 'turbo' })).toBe(
+        // Deliberate invalid value again (see the `speed: 'turbo' as never` above): this
+        // case proves the PER-FIELD error wins over the combination error, so the value
+        // must be invalid on its own terms while the call stays otherwise well-formed.
+        expect(await refusalMessage({ query: 'q', category: 'people', speed: 'turbo' as never })).toBe(
             'search speed must be "balanced" or "fast".'
         );
         expect(requests).toBe(0);
@@ -1186,5 +1213,605 @@ describe('provider filters', () => {
         // Filters that were not used stay absent, so the result does not grow.
         expect(result.since).toBeUndefined();
         expect(result.speed).toBeUndefined();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F2 — the delivery fit
+// ---------------------------------------------------------------------------
+//
+// The harness caps ONE tool result at `MODEL_TOOL_RESULT_BUDGET_BYTES` (32,768) of
+// JSON-escaped payload, and an oversized JSON DOCUMENT is REFUSED, not cut: core/result-
+// budget.ts `boundToolResult` answers `rejected: { reason: 'oversized-json' }` and
+// harness.ts reports the call as failed. `search` bounded only what it READ (512 KiB),
+// never what it delivered, so every shape the per-row caps allow could lose the whole
+// answer. These tests go through the harness's own helper (`boundToolResult`), not a
+// byte total, because the contract is "the harness cannot refuse this".
+describe('delivery fit (F2)', () => {
+    // ~1,000-character URLs behind 1,000-character snippets: measured 41,650 payload
+    // bytes with all 20 rows present.
+    const fatUrl = (index: number): string => `https://example.com/${'u'.repeat(970)}${index}`;
+
+    const fatRows = (count: number) =>
+        Array.from({ length: count }, (_, index) => ({
+            title: `Title${index}`,
+            url: fatUrl(index),
+            highlights: ['x'.repeat(MAX_SNIPPET_CHARS)]
+        }));
+
+    // The normalized form of those rows. A row that survives the fit is byte-for-byte
+    // what normalization produced, which is what makes the equality below exact.
+    const fatMatches = (count: number) =>
+        Array.from({ length: count }, (_, index) => ({
+            title: `Title${index}`,
+            url: fatUrl(index),
+            snippet: 'x'.repeat(MAX_SNIPPET_CHARS)
+        }));
+
+    it('delivers twenty 1,000-character rows instead of losing them to a refusal', async () => {
+        stubFetch(json({ results: fatRows(20) }));
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 20 });
+
+        // The pre-fit shape IS the defect, proven rather than asserted as a number:
+        // the same fields with every row present are refused outright.
+        expect(
+            boundToolResult(
+                JSON.stringify({ provider: 'exa', query: 'q', maxResults: 20, results: fatMatches(20) }),
+                MODEL_TOOL_RESULT_BUDGET_BYTES,
+                { source: { name: 'search' } }
+            ).rejected?.reason
+        ).toBe('oversized-json');
+
+        // What the caller gets instead: the provider's PREFIX, flagged, deliverable.
+        expect(deliverable(result).rejected).toBeUndefined();
+        expect(result.results).toEqual(fatMatches(15));
+        expect(result.resultsTruncated).toBe(true);
+        expect(result.note).toBe(
+            '5 of 20 result rows were omitted to fit the 32768-byte result budget. Narrow the query or lower maxResults for more per-row detail.'
+        );
+        // `droppedResults` is the OTHER cause (unusable provider rows, F5). A size
+        // trim must never set it: conflating the two would hide junk rows behind a
+        // truncation flag and vice versa.
+        expect(result.droppedResults).toBeUndefined();
+    });
+
+    it('delivers the worst-case shape: 300-character titles, 2,048-character URLs, 1,000-character snippets', async () => {
+        // Every per-row cap at once — 300-char title, 2,048-char URL, 1,000-char
+        // snippet — the shape measured at 67,970 payload bytes before the fit.
+        const worstUrl = (index: number): string => `https://example.com/${'u'.repeat(2_020)}${index}`;
+        const worstTitle = (index: number): string => `${'T'.repeat(290)}${index}`;
+
+        stubFetch(
+            json({
+                results: Array.from({ length: 20 }, (_, index) => ({
+                    title: worstTitle(index),
+                    url: worstUrl(index),
+                    highlights: ['x'.repeat(MAX_SNIPPET_CHARS)]
+                }))
+            })
+        );
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 20 });
+
+        expect(
+            boundToolResult(
+                JSON.stringify({
+                    provider: 'exa',
+                    query: 'q',
+                    maxResults: 20,
+                    results: Array.from({ length: 20 }, (_, index) => ({
+                        title: worstTitle(index),
+                        url: worstUrl(index),
+                        snippet: 'x'.repeat(MAX_SNIPPET_CHARS)
+                    }))
+                }),
+                MODEL_TOOL_RESULT_BUDGET_BYTES,
+                { source: { name: 'search' } }
+            ).rejected?.reason
+        ).toBe('oversized-json');
+
+        expect(deliverable(result).rejected).toBeUndefined();
+        expect(result.results).toEqual(
+            Array.from({ length: 9 }, (_, index) => ({
+                title: worstTitle(index),
+                url: worstUrl(index),
+                snippet: 'x'.repeat(MAX_SNIPPET_CHARS)
+            }))
+        );
+        expect(result.resultsTruncated).toBe(true);
+        expect(result.note).toBe(
+            '11 of 20 result rows were omitted to fit the 32768-byte result budget. Narrow the query or lower maxResults for more per-row detail.'
+        );
+    });
+
+    it('leaves a default result whole, with no fit fields at all', async () => {
+        stubFetch(json({ results: fatRows(5) }));
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q' });
+
+        // Absent, not false/0: the shape a caller saw before this bound existed is the
+        // shape it sees for any result that fits.
+        expect(result.results).toHaveLength(5);
+        expect(result.resultsTruncated).toBeUndefined();
+        expect(result.droppedResults).toBeUndefined();
+        expect(result.note).toBeUndefined();
+        expect(deliverable(result).rejected).toBeUndefined();
+        expect(deliverable(result).truncated).toBe(false);
+    });
+
+    it('drops rows WHOLE so a redacted credential is never split by the trim', async () => {
+        // The redaction-order property (redact-then-bound) has to survive the fit. It
+        // does, structurally: the fit runs last, on already-redacted fields, and it
+        // removes whole rows. Every row below carries the configured key in BOTH the
+        // URL and the snippet, and the list is over budget, so rows must go.
+        const keyUrl = (index: number): string =>
+            `https://example.com/${'u'.repeat(960)}exa-secret-key${index}`;
+
+        stubFetch(
+            json({
+                results: Array.from({ length: 20 }, (_, index) => ({
+                    title: `Row ${index}`,
+                    url: keyUrl(index),
+                    // 500 + 14 + 486 = 1,000 characters raw, so the key sits inside
+                    // the snippet bound rather than at its edge.
+                    highlights: [`${'x'.repeat(500)}exa-secret-key${'y'.repeat(486)}`]
+                }))
+            })
+        );
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 20 });
+
+        expect(result.results).toEqual(
+            Array.from({ length: 15 }, (_, index) => ({
+                title: `Row ${index}`,
+                url: `https://example.com/${'u'.repeat(960)}[redacted]${index}`,
+                snippet: `${'x'.repeat(500)}[redacted]${'y'.repeat(486)}`
+            }))
+        );
+
+        const text = JSON.stringify(result);
+        expect(text).not.toContain('exa-secret-key');
+        // Two COMPLETE markers per surviving row. A marker cut at a boundary
+        // (`[redac`) would not split on the full marker, so this exact count is the
+        // proof that no row was half-delivered.
+        expect(text.split('[redacted]')).toHaveLength(31);
+        expect(deliverable(result).rejected).toBeUndefined();
+        expect(result.resultsTruncated).toBe(true);
+    });
+
+    it('keeps the size trim and the unusable-row count as separate facts', async () => {
+        stubFetch(
+            json({
+                results: [
+                    ...Array.from({ length: 5 }, (_, index) => ({
+                        title: `junk${index}`,
+                        url: 'javascript:alert(1)',
+                        highlights: ['junk']
+                    })),
+                    ...fatRows(20)
+                ]
+            })
+        );
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 20 });
+
+        expect(result.droppedResults).toBe(5);
+        expect(result.resultsTruncated).toBe(true);
+        expect(result.results).toEqual(fatMatches(15));
+        // The "provider returned unusable rows" sentence is for an EMPTY result; here
+        // the caller still got 15 rows, so only the size note is stated.
+        expect(result.note).toBe(
+            '5 of 20 result rows were omitted to fit the 32768-byte result budget. Narrow the query or lower maxResults for more per-row detail.'
+        );
+    });
+
+    it('keeps the echoed filters after trimming', async () => {
+        stubFetch(json({ results: fatRows(20) }));
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({
+            query: 'q',
+            maxResults: 20,
+            includeDomains: ['example.com'],
+            speed: 'fast'
+        });
+
+        // `render` spreads the ORIGINAL result, so an echoed filter is still there —
+        // and its bytes were part of every measurement the trim made.
+        expect(result.includeDomains).toEqual(['example.com']);
+        expect(result.speed).toBe('fast');
+        expect(result.results).toHaveLength(15);
+        expect(deliverable(result).rejected).toBeUndefined();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F5 — unusable provider rows no longer consume the requested slots
+// ---------------------------------------------------------------------------
+describe('unusable provider rows (F5)', () => {
+    const good = (count: number) =>
+        Array.from({ length: count }, (_, index) => ({
+            title: `good${index}`,
+            url: `https://example.com/good${index}`,
+            highlights: ['good']
+        }));
+
+    const goodMatches = (count: number, offset = 0) =>
+        Array.from({ length: count }, (_, index) => ({
+            title: `good${index + offset}`,
+            url: `https://example.com/good${index + offset}`,
+            snippet: 'good'
+        }));
+
+    // Half the junk has a non-http URL, half has none at all: both are "the provider
+    // sent a row this tool cannot show".
+    const junk = (count: number) =>
+        Array.from({ length: count }, (_, index) => ({
+            title: `bad${index}`,
+            url: index % 2 === 0 ? `ftp://example.com/${index}` : undefined,
+            highlights: ['bad']
+        }));
+
+    it('fills the request past five invalid rows instead of returning nothing', async () => {
+        // The measured shape that used to answer `results: []`: five unusable rows
+        // ahead of fifteen good ones, with `maxResults: 5`.
+        stubFetch(json({ results: [...junk(5), ...good(15)] }));
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 5 });
+
+        expect(result.results).toEqual(goodMatches(5));
+        expect(result.droppedResults).toBe(5);
+        expect(result.note).toBeUndefined();
+    });
+
+    it('fills the request past four rows with no url at all', async () => {
+        stubFetch(json({ results: [...junk(4), ...good(6)] }));
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 4 });
+
+        expect(result.results).toEqual(goodMatches(4));
+        expect(result.droppedResults).toBe(4);
+    });
+
+    it('returns one valid row where it used to return one after four bad rows', async () => {
+        stubFetch(json({ results: [...junk(4), ...good(15)] }));
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 5 });
+
+        // Before: 1 row. The old slice took the first 5 provider rows, of which 4 were
+        // junk. Now: 5 valid rows, and the junk is counted rather than invisible.
+        expect(result.results).toEqual(goodMatches(5));
+        expect(result.droppedResults).toBe(4);
+    });
+
+    it('returns all fifteen valid rows when the request leaves room for them', async () => {
+        stubFetch(json({ results: [...junk(5), ...good(15)] }));
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 20 });
+
+        expect(result.results).toEqual(goodMatches(15));
+        expect(result.droppedResults).toBe(5);
+    });
+
+    it('counts only the rows it examined, not the ones it did not need', async () => {
+        // The loop stops at `maxResults` VALID rows. Rows behind that line were not
+        // rejected — they were not requested — so they must not inflate the count.
+        stubFetch(json({ results: [...junk(1), ...good(10)] }));
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 2 });
+
+        expect(result.results).toEqual(goodMatches(2));
+        expect(result.droppedResults).toBe(1);
+    });
+
+    it('says so when every row the provider sent was unusable', async () => {
+        stubFetch(json({ results: junk(3) }));
+
+        const result = await configured({ EXA_API_KEY: 'exa-secret-key' })({ query: 'q', maxResults: 5 });
+
+        expect(result.results).toEqual([]);
+        expect(result.droppedResults).toBe(3);
+        // The whole point of the count: an empty result after a provider answered is a
+        // different situation from an empty index, and the caller can only act on the
+        // difference if the result states it.
+        expect(result.note).toBe(
+            'Exa returned 3 result rows with no usable http(s) URL, so none of them could be shown. The provider did answer: the query is not necessarily at fault.'
+        );
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F11 — the category combination rules belong to the provider that has them
+// ---------------------------------------------------------------------------
+describe('provider-gated category rules (F11)', () => {
+    it('accepts a category alongside a date filter on the provider that has no category field', async () => {
+        const fetchMock = stubFetch(
+            json({ results: [{ title: 'A', url: 'https://example.com/a', content: 'one' }] })
+        );
+        const tool = configured({ TAVILY_API_KEY: 'tavily-secret-key' });
+
+        const result = await tool({ query: 'q', category: 'company', since: '2026-01-01' });
+
+        const body = JSON.parse(String(fetchMock.mock.calls[0][1].body)) as Record<string, unknown>;
+
+        // Tavily honours the date window and has no category field, so the filter that
+        // works is sent and the one that does not exist is dropped.
+        expect(body.start_date).toBe('2026-01-01');
+        expect('category' in body).toBe(false);
+        // The argument is echoed as the one the CALLER asked for.
+        expect(result.category).toBe('company');
+    });
+
+    it('gates on the resolved provider, not on what the harness can reach', async () => {
+        const fetchMock = stubFetch(json({ results: [] }));
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key', TAVILY_API_KEY: 'tavily-secret-key' });
+
+        // One harness, two providers, opposite answers — the rule follows the provider
+        // this call actually resolves to.
+        await expect(
+            tool({ query: 'q', provider: 'tavily', category: 'company', since: '2026-01-01' })
+        ).resolves.toMatchObject({ provider: 'tavily' });
+
+        await expect(
+            tool({ query: 'q', provider: 'exa', category: 'company', since: '2026-01-01' })
+        ).rejects.toThrow(
+            'search category "company" does not support date filters. Drop "since"/"until", or use another category.'
+        );
+
+        expect(fetchMock.mock.calls.map((call) => call[0])).toEqual(['https://api.tavily.com/search']);
+    });
+
+    it('accepts the people combinations on Linkup, which receives none of those filters', async () => {
+        const fetchMock = stubFetch(
+            json({ results: [{ type: 'text', name: 'A', url: 'https://example.com/a', content: 'one' }] })
+        );
+        const tool = configured({ LINKUP_API_KEY: 'linkup-secret-key' });
+
+        const result = await tool({
+            query: 'q',
+            category: 'people',
+            since: '2026-01-01',
+            excludeDomains: ['forum.example']
+        });
+
+        // Linkup's endpoint takes no category, no date window and no domain filter, so
+        // refusing this call would reject arguments the provider never saw.
+        expect(Object.keys(JSON.parse(String(fetchMock.mock.calls[0][1].body)))).toEqual([
+            'q',
+            'depth',
+            'outputType',
+            'maxResults'
+        ]);
+        expect(result.category).toBe('people');
+    });
+
+    it('states the category warning only for a provider that enforces it', () => {
+        const exaOnly = configured({ EXA_API_KEY: 'exa-secret-key' });
+        const tavilyOnly = configured({ TAVILY_API_KEY: 'tavily-secret-key' });
+
+        expect(JSON.stringify(exaOnly.parameters)).toContain('do not support date filters');
+        expect(JSON.stringify(tavilyOnly.parameters)).not.toContain('date filters');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F10 — the caller's cancellation signal reaches the provider request
+// ---------------------------------------------------------------------------
+describe('caller cancellation (F10)', () => {
+    // A stub with real transport behaviour: it waits, and rejects with an AbortError
+    // only when the signal it was handed fires. A stub that ignored `init.signal`
+    // would pass this suite while the tool still could not be cancelled.
+    //
+    // `inFlight` settles when the provider request is ENTERED. Waiting on it is what
+    // makes the abort land mid-request: the tool's own controller is created after a
+    // couple of microtasks (`await import()` for the adapter), so aborting the caller
+    // signal on the next line would cancel before the request existed, and the case
+    // under test would be "already cancelled" instead of "cancelled in flight".
+    const hangingFetch = (): { fetchMock: ReturnType<typeof stubFetch>; inFlight: Promise<void> } => {
+        let enter: () => void = () => {
+            // Replaced below; a no-op so the promise is only ever settled by a request.
+        };
+
+        const inFlight = new Promise<void>((resolve) => {
+            enter = resolve;
+        });
+
+        const fetchMock = stubFetch(
+            (_url, init) =>
+                new Promise<Response>((_resolve, reject) => {
+                    const abort = (): void => {
+                        const error = new Error('The operation was aborted.');
+                        error.name = 'AbortError';
+                        reject(error);
+                    };
+
+                    // A signal that had already fired when `fetch` was entered never
+                    // dispatches another event, so it rejects on the spot — which is
+                    // also what a real transport does.
+                    if (init.signal?.aborted === true) abort();
+                    else init.signal?.addEventListener('abort', abort);
+
+                    enter();
+                })
+        );
+
+        return { fetchMock, inFlight };
+    };
+
+    it('stops an in-flight search when the caller signal aborts', async () => {
+        const { fetchMock, inFlight } = hangingFetch();
+        const controller = new AbortController();
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        const pending = tool.execute({ parameters: { query: 'q' }, signal: controller.signal });
+
+        // The request is in flight before the cancel lands.
+        await inFlight;
+        const reason = new Error('toolCancel: search stopped by the host');
+        controller.abort(reason);
+
+        // The caller's OWN reason comes back, not "Exa search could not be reached
+        // (network error)." — the harness classifies a cancellation as cancelled, and a
+        // provider-shaped message would blame the wrong party.
+        await expect(pending).rejects.toBe(reason);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('aborts the request before the network when the signal has already fired', async () => {
+        const abortedBeforeFetch: boolean[] = [];
+
+        stubFetch(async (_url, init) => {
+            abortedBeforeFetch.push(init.signal?.aborted === true);
+
+            const error = new Error('The operation was aborted.');
+            error.name = 'AbortError';
+            throw error;
+        });
+
+        const controller = new AbortController();
+        controller.abort(new Error('already cancelled'));
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        await expect(
+            tool.execute({ parameters: { query: 'q' }, signal: controller.signal })
+        ).rejects.toThrow('already cancelled');
+
+        // The linked controller was already aborted at the moment `fetch` was entered,
+        // so nothing is paid for on a cancelled call.
+        expect(abortedBeforeFetch).toEqual([true]);
+    });
+
+    it('still reports its own timeout when the caller signal never fires', async () => {
+        // The reason the deadline keeps its own flag: with a caller signal linked in,
+        // `controller.signal.aborted` is true for BOTH causes, and only the flag can
+        // tell a timeout from a cancellation.
+        vi.useFakeTimers();
+        const { inFlight } = hangingFetch();
+
+        const controller = new AbortController();
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        const failure = tool
+            .execute({ parameters: { query: 'q' }, signal: controller.signal })
+            .catch((error: unknown) => error);
+
+        await inFlight;
+        await vi.advanceTimersByTimeAsync(SEARCH_TIMEOUT_MS);
+
+        await expect(failure).resolves.toMatchObject({
+            message: `Exa search timed out after ${SEARCH_TIMEOUT_MS} ms.`
+        });
+        expect(controller.signal.aborted).toBe(false);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F2 — the last-resort clip, pinned at the helper level
+// ---------------------------------------------------------------------------
+//
+// The clip branch is UNREACHABLE through the tool at today's per-row caps: one row can
+// hold at most 300 + 2,048 + 1,000 characters (~3.4 KB of escaped payload), so the
+// row-drop loop always finds a fitting prefix first. It is pinned here, where the
+// budget is a parameter, because the property it exists for — "never emit a result the
+// harness would refuse" — is the one that must survive a future per-row cap change.
+describe('the last-resort snippet clip (F2)', () => {
+    type Row = { title: string; url: string; snippet: string; snippetTruncated?: boolean };
+
+    const measure = (candidate: readonly Row[]): number => modelPayloadBytes(JSON.stringify(candidate));
+
+    it('keeps the largest snippet prefix that fits, counted in escaped bytes', () => {
+        const rows: Row[] = [
+            { title: 'A', url: 'https://example.com/a', snippet: 'x'.repeat(1_000) },
+            { title: 'B', url: 'https://example.com/b', snippet: 'y'.repeat(1_000) }
+        ];
+
+        // One row's skeleton (title + URL + empty snippet, array brackets included) is
+        // 70 payload bytes and `snippetTruncated` costs 26 more, so a budget of 500
+        // over the skeleton buys exactly 474 characters. The bisection measures the row
+        // WITH the flag; without that it would land 26 bytes over and drop the row.
+        const skeleton = measure([{ ...rows[0], snippet: '' }]);
+        const flagBytes = measure([{ ...rows[0], snippet: '', snippetTruncated: true }]) - skeleton;
+
+        expect(skeleton).toBe(70);
+        expect(flagBytes).toBe(26);
+
+        const fitted = fitRowsToResultBudget(rows, measure, skeleton + 500);
+
+        expect(fitted).toEqual({
+            rows: [
+                {
+                    title: 'A',
+                    url: 'https://example.com/a',
+                    snippet: 'x'.repeat(474),
+                    snippetTruncated: true
+                }
+            ],
+            truncated: true,
+            clipped: true
+        });
+        // Exactly the budget, and one character more would exceed it: the clip is the
+        // largest fitting prefix, not a guess.
+        expect(measure(fitted.rows)).toBe(skeleton + 500);
+        expect(measure([{ ...fitted.rows[0], snippet: `${fitted.rows[0].snippet}x` }])).toBe(
+            skeleton + 501
+        );
+    });
+
+    it('never cuts between the halves of an emoji pair', () => {
+        const rows: Row[] = [
+            {
+                title: 'A',
+                url: 'https://example.com/a',
+                snippet: `${'a'.repeat(499)}\u{1F44D}${'z'.repeat(1_000)}`
+            }
+        ];
+
+        const skeleton = measure([{ ...rows[0], snippet: '' }]);
+
+        expect(skeleton).toBe(70);
+
+        // 526 bytes over the skeleton fits 499 'a' characters plus the 26-byte flag
+        // (595 of 596) but not the pair, which costs 4 bytes on top of the 499. The raw
+        // 500-unit cut would land between the halves, so the prefix comes back 499 long.
+        const fitted = fitRowsToResultBudget(rows, measure, skeleton + 526);
+
+        expect(fitted.rows).toEqual([
+            {
+                title: 'A',
+                url: 'https://example.com/a',
+                snippet: 'a'.repeat(499),
+                snippetTruncated: true
+            }
+        ]);
+        expect(measure(fitted.rows)).toBe(595);
+    });
+
+    it('drops the row when its title and URL alone are over budget', () => {
+        const rows: Row[] = [
+            { title: 'T'.repeat(300), url: 'https://example.com/a', snippet: 'x'.repeat(100) }
+        ];
+
+        const skeleton = measure([{ ...rows[0], snippet: '' }]);
+
+        expect(skeleton).toBe(369);
+
+        // An empty excerpt cannot help: everything that remains is over budget, and an
+        // empty result beats a result the harness refuses.
+        expect(fitRowsToResultBudget(rows, measure, skeleton - 1)).toEqual({
+            rows: [],
+            truncated: true,
+            clipped: true
+        });
+    });
+
+    it('leaves a fitting list untouched', () => {
+        const rows: Row[] = [{ title: 'A', url: 'https://example.com/a', snippet: 'short' }];
+
+        expect(fitRowsToResultBudget(rows, measure, MAX_SEARCH_RESULT_BYTES)).toEqual({
+            rows: [{ title: 'A', url: 'https://example.com/a', snippet: 'short' }],
+            truncated: false,
+            clipped: false
+        });
     });
 });

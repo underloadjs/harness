@@ -55,6 +55,16 @@ export const FLAT_DOCUMENT_SECTIONS = 2;
 // mode: a flat page must cost a window, not a document.
 export const PROXIMITY_WINDOW_CHARS = 6_000;
 
+// How far either edge of that window may move to reach a LINE boundary. Snapping
+// is a readability nicety, not a licence to grow the window: F3 measured a 100,022
+// character page with no newlines at all answer a `query` with a 53,022-character
+// "window", because the old close-edge rule was `indexOf('\n', end) === -1 ?
+// content.length : …` — with nothing to snap to it fell back to the END OF THE
+// DOCUMENT. A boundary further away than this is not snapped to at all, which
+// bounds the delivered excerpt at PROXIMITY_WINDOW_CHARS + 2 * this constant, on
+// every page, newline-free ones included.
+export const PROXIMITY_LINE_SNAP_CHARS = 200;
+
 const FENCE = /^\s*(?:```|~~~|`{4,}|~{4,})/;
 const HEADING = /^(#{1,6})\s+(.*\S)\s*$/;
 
@@ -205,6 +215,11 @@ export const selectSections = (
 // sides; a caller reading a hit wants the sentences around it, not the hit at
 // character zero. The heading label is the nearest preceding markdown heading
 // when one exists, so the block is still self-describing.
+//
+// Its LENGTH is a bound, not an intention: `windowChars` is the ceiling and the
+// line-snap that rounds the edges may add at most 2 * PROXIMITY_LINE_SNAP_CHARS
+// (F3 — the close edge used to fall through to the end of the document on a
+// newline-free page, which turned the window back into the document).
 export const selectProximity = (
     content: string,
     query: string,
@@ -232,13 +247,27 @@ export const selectProximity = (
     const end = Math.min(content.length, start + windowChars);
 
     // Snap to line boundaries so a window never opens or closes mid-word, which
-    // is what makes a returned excerpt readable rather than a puzzle. A page with
-    // no newlines at all (one giant line) has nothing to snap to, so the raw
-    // character window is used there rather than collapsing to an empty block.
+    // is what makes a returned excerpt readable rather than a puzzle — but ONLY
+    // where the boundary is close (F3). Both edges used to snap without limit: the
+    // open edge walked back to the start of its line however long that line was,
+    // and the close edge fell through to `content.length` whenever no newline
+    // followed `end`. On a page with no newlines (one giant line — plain text
+    // pasted into HTML, a minified document, a CSV with CRLF converted away) that
+    // second rule made the "window" the whole rest of the document, which is the
+    // exact cost the mode exists to avoid.
+    //
+    // The rule is now symmetric and bounded: an edge snaps only to a boundary
+    // within PROXIMITY_LINE_SNAP_CHARS, so `to - from` can never exceed
+    // windowChars + 2 * PROXIMITY_LINE_SNAP_CHARS. The match itself is always
+    // inside the window: `start <= at < end`, the open edge only ever moves back
+    // from `start`, and the close edge never moves below `end`.
     const openLine = content.lastIndexOf('\n', start);
-    const from = openLine === -1 ? start : openLine + 1;
+    const from =
+        openLine === -1 || start - openLine > PROXIMITY_LINE_SNAP_CHARS ? start : openLine + 1;
+
     const nextBreak = content.indexOf('\n', end);
-    const to = nextBreak === -1 ? content.length : nextBreak;
+    const to =
+        nextBreak === -1 || nextBreak - end > PROXIMITY_LINE_SNAP_CHARS ? end : nextBreak;
 
     const before = content.slice(0, at);
     const line = before.split('\n').length - 1;

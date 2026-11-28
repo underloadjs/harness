@@ -52,8 +52,19 @@ import {
     THREAD_READ_MATCH_FIELDS,
     THREAD_READ_MAX_CONTENT_LIMIT,
     THREAD_READ_MAX_LIMIT,
-    threadReadMatchBudgetError
+    THREAD_READ_WIRE_SHELLS,
+    threadReadMatchBudgetError,
+    threadReadPageAllowance,
+    threadReadResultOverhead
 } from './threadRead';
+// F8: the byte pins below are derived with the harness's own payload measure, so a change
+// to the escape table moves the pins and the cap together. Tests are not bound by the
+// runtime-entry rule that keeps the SIZE a literal in the module under test.
+import { modelPayloadBytes } from '../../core/payload-bytes';
+// The delivery cap and the bounder that enforces it: the regression test in the page-budget
+// suite hands a finished page to `boundToolResult` and demands it be DELIVERED, which is the
+// guarantee this reader's budget exists to provide.
+import { boundToolResult, MODEL_TOOL_RESULT_BUDGET_BYTES } from '../../core';
 
 // One host thread, with the label the projection is expected to echo.
 const RECORD: HarnessThreadRecord = {
@@ -138,6 +149,110 @@ const TOOL_CALL_REF = {
 const indicesOf = (result: { messages: { index: number }[] }): number[] =>
     result.messages.map((message) => message.index);
 
+// F8 — the page's `bytes` is charged in the DELIVERY currency, so every byte pin in this
+// file is DERIVED from the numbers the reader charges with (the exported
+// `THREAD_READ_WIRE_SHELLS`) plus the escaped width of each displayed string, instead of a
+// hand-typed total the reader could drift from. The shells are the receipts' own scaffolding
+// (keys, flags, counters and the quotes around an empty text field); `wire` is the escaped
+// width the harness cap counts — the TWO escaping layers a value passes through before it is
+// billed, minus the two framing quotes a shell already prices, exactly as
+// `contentWireBytes` does in threadRead.ts. Tests import the same payload measure the
+// cap uses (core/payload-bytes.ts) rather than restating it.
+// ---------------------------------------------------------------------------
+const wire = (value: string): number => modelPayloadBytes(JSON.stringify(value)) - 2;
+const SHELLS = THREAD_READ_WIRE_SHELLS;
+
+// One message receipt, described the way the page shows it. `toolArgsMode` selects the
+// tool-call shell (`reference` is the default, and is the smaller one because no arguments
+// TEXT is displayed); `matchedFields` marks a `regex` page, which prices the widest hit
+// list; `toolIdentity` is a `tool`-role message's two identity strings.
+type ReceiptSpec = {
+    content: string;
+    attachments?: readonly { id: string; kind: string; name: string; mime: string }[];
+    toolCalls?: readonly { id: string; name: string; arguments?: string }[];
+    toolArgsMode?: 'full' | 'reference';
+    reasoning?: string;
+    matchedFields?: boolean;
+    toolIdentity?: { name: string; toolCallId: string };
+};
+
+const receiptBytes = (spec: ReceiptSpec): number => {
+    let bytes = SHELLS.message + wire(spec.content);
+
+    if (spec.matchedFields === true) bytes += SHELLS.matchFields;
+    if (spec.reasoning !== undefined) bytes += SHELLS.reasoning + wire(spec.reasoning);
+
+    if (spec.attachments !== undefined && spec.attachments.length > 0) {
+        bytes += spec.attachments.reduce(
+            (total, attachment) =>
+                total +
+                SHELLS.attachmentItem +
+                wire(attachment.id) +
+                wire(attachment.kind) +
+                wire(attachment.name) +
+                wire(attachment.mime),
+            SHELLS.attachments
+        );
+    }
+
+    if (spec.toolCalls !== undefined && spec.toolCalls.length > 0) {
+        const callShell =
+            spec.toolArgsMode === 'full' ? SHELLS.toolCallFull : SHELLS.toolCallReference;
+
+        // The `toolCalls` KEY is priced once per message, the item shells once per call —
+        // exactly the shape the reader charges (threadRead.ts, shell pass).
+        bytes += SHELLS.toolCalls + spec.toolCalls.reduce((total, call) => {
+            let item = callShell + wire(call.id) + wire(call.name);
+
+            // Only `full` mode displays the arguments text, and only `full` pays for it.
+            if (spec.toolArgsMode === 'full') item += wire(call.arguments ?? '');
+
+            return total + item;
+        }, 0);
+    }
+
+    if (spec.toolIdentity !== undefined) {
+        bytes +=
+            SHELLS.toolIdentity + wire(spec.toolIdentity.name) + wire(spec.toolIdentity.toolCallId);
+    }
+
+    return bytes;
+};
+
+const pageBytes = (...receipts: ReceiptSpec[]): number =>
+    receipts.reduce((total, receipt) => total + receiptBytes(receipt), 0);
+
+// The no-argument read of `MESSAGES` as a receipt list: the system seed is absent (it is
+// not returned), message 1 carries the attachment, message 2 the tool call in `reference`
+// mode (no arguments TEXT, so no charge for one), message 3 is a `tool` result with its
+// identity strings, message 4 is plain. Several tests assert this page's byte total, so it
+// is stated once.
+const DEFAULT_PAGE: ReceiptSpec[] = [
+    { content: 'Summarise the report.', attachments: [ATTACHMENT] },
+    { content: 'Reading it.', toolCalls: [TOOL_CALL], toolArgsMode: 'reference' },
+    { content: 'TODO: two open items', toolIdentity: { name: 'read', toolCallId: 'c1' } },
+    { content: 'Two TODO items remain.' }
+];
+
+// The system seed as a receipt — opt it in and the page pays its shell and its text.
+const SEED_RECEIPT: ReceiptSpec = { content: 'You are careful.' };
+
+// Message 2 as a receipt, which is the page `message: 2` answers with, with or without the
+// reasoning the message carries.
+const ASSISTANT_RECEIPT: ReceiptSpec = {
+    content: 'Reading it.',
+    toolCalls: [TOOL_CALL],
+    toolArgsMode: 'reference'
+};
+
+// The same message in `toolArgs: "full"` mode: the bigger call shell, plus the arguments
+// text quoted in full (it fits `contentLimit`, so nothing is cut).
+const ASSISTANT_FULL_RECEIPT: ReceiptSpec = {
+    content: 'Reading it.',
+    toolCalls: [TOOL_CALL],
+    toolArgsMode: 'full'
+};
+
 describe('published bounds', () => {
     it('keeps the page, text and matching numbers the entry schema quotes', () => {
         // threadRead.tool.ts repeats these as JSON Schema literals (a runtime entry
@@ -148,9 +263,13 @@ describe('published bounds', () => {
         expect(THREAD_READ_DEFAULT_CONTENT_LIMIT).toBe(4000);
         expect(THREAD_READ_MAX_CONTENT_LIMIT).toBe(32_000);
         expect(MAX_THREAD_MATCH_MILLIS).toBe(30_000);
-        // Half the harness result cap (core/result-budget.ts, 64 KiB), which is the
-        // whole point of the smaller number.
-        expect(THREAD_READ_CONTENT_BUDGET_BYTES).toBe(65_536 / 2);
+        // F8: this budget IS the harness delivery cap, measured in the cap's own escaped
+        // currency — not "half the 64 KiB cap", which is what this pin used to assert (both
+        // that sentence and that cap are history: core/result-budget.ts is 32,768 escaped
+        // payload bytes of the WHOLE result, and the reader reserves its own scaffolding
+        // against it). Equality with the imported constant is the pin, so the two numbers
+        // can never drift apart silently again.
+        expect(THREAD_READ_CONTENT_BUDGET_BYTES).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
     });
 
     it('publishes the searchable-field vocabulary in its canonical order', () => {
@@ -211,10 +330,12 @@ describe('readThreadTranscript — full read', () => {
             limit: 20,
             hasMore: false,
             contentBudget: 32768,
-            // 21 + 11 + 20 + 22 characters of content. The system seed costs nothing
-            // (it is not returned) and the tool-call arguments cost nothing either
-            // (reference mode quotes no text); attachments are not text, so 0 too.
-            bytes: 74,
+            // F8: every returned receipt pays its measured shell, the attachment descriptor
+            // pays for its id/kind/name/mime, and the `reference` tool-call row pays its own
+            // (smaller) shell while still quoting no arguments TEXT. The system seed costs
+            // nothing because it is not returned at all. Derived from the exported shells —
+            // see the helper block above — rather than typed as a total.
+            bytes: pageBytes(...DEFAULT_PAGE),
             truncated: false,
             messages: [
                 {
@@ -274,12 +395,13 @@ describe('readThreadTranscript — full read', () => {
             contentHasMore: false
         });
 
-        // I2 is literally a byte fix: the seed was charged to EVERY page. 74 → 90 is
-        // its 16 characters, and `matched` (the filtered count) gains it as well,
-        // while `total` stays 5 either way.
+        // I2 is literally a byte fix: the seed was charged to EVERY page. Under F8 its cost
+        // is a whole receipt — its shell plus its 16 characters — which is what this
+        // comparison measures. `matched` (the filtered count) gains it as well, while
+        // `total` stays 5 either way.
         expect({ without: without.bytes, withSeed: withSeed.bytes }).toEqual({
-            without: 74,
-            withSeed: 90
+            without: pageBytes(...DEFAULT_PAGE),
+            withSeed: pageBytes(SEED_RECEIPT, ...DEFAULT_PAGE)
         });
         expect({
             withoutTotal: without.total,
@@ -337,12 +459,15 @@ describe('readThreadTranscript — full read', () => {
 
     it('never reports reasoning unless it is asked for', () => {
         // Message 2 HAS reasoning; the default page must not carry it, and must not
-        // charge it against the byte budget either. The 11 bytes are its content alone
-        // — the reference tool-call row quotes no text, so it costs nothing either.
+        // charge it against the byte budget either. What the page DOES charge is its own
+        // receipt: shell + the 11 characters + the `reference` call row (F8 — a reference
+        // costs its receipt, just not the arguments text).
         const [message] = readThreadTranscript(PLAIN_RECORD, MESSAGES, { message: 2 }).messages;
 
         expect('reasoning' in message).toBe(false);
-        expect(readThreadTranscript(PLAIN_RECORD, MESSAGES, { message: 2 }).bytes).toBe(11);
+        expect(readThreadTranscript(PLAIN_RECORD, MESSAGES, { message: 2 }).bytes).toBe(
+            receiptBytes(ASSISTANT_RECEIPT)
+        );
     });
 
     it('includes reasoning when asked, and flags a cut one', () => {
@@ -406,7 +531,12 @@ describe('readThreadTranscript — single message', () => {
             limit: 1,
             hasMore: false,
             contentBudget: 32768,
-            bytes: 20,
+            // The tool result's receipt: its shell, its 20 characters, and the `name` /
+            // `toolCallId` identity strings the page quotes (F8 prices those too).
+            bytes: receiptBytes({
+                content: 'TODO: two open items',
+                toolIdentity: { name: 'read', toolCallId: 'c1' }
+            }),
             truncated: false,
             messages: [
                 {
@@ -444,7 +574,10 @@ describe('readThreadTranscript — single message', () => {
             limit: 1,
             hasMore: false,
             contentBudget: 32768,
-            bytes: 5,
+            // Five displayed characters, plus the receipt this page returns — and the
+            // attachment row of that same message, which the page still shows and F8
+            // therefore charges (the old accounting priced it at zero).
+            bytes: receiptBytes({ content: 'the r', attachments: [ATTACHMENT] }),
             truncated: false,
             messages: [
                 {
@@ -782,7 +915,19 @@ describe('readThreadTranscript — regexFields and matchedFields (I4)', () => {
         expect({ total: every.total, matched: every.matched, bytes: every.bytes }).toEqual({
             total: 4,
             matched: 2,
-            bytes: 10
+            // F8: both hits pay their receipt shells, and a `regex` page pays the
+            // `matchedFields` list too (priced at its widest). The self-matched row still
+            // contributes no TEXT — its content is empty and reference mode quotes no
+            // arguments — which is the point the assertions below keep proving.
+            bytes: pageBytes(
+                { content: 'start here', matchedFields: true },
+                {
+                    content: '',
+                    toolCalls: [{ id: 'c1', name: 'threadRead' }],
+                    toolArgsMode: 'reference',
+                    matchedFields: true
+                }
+            )
         });
         expect(every.messages.map((message) => ({ index: message.index, matchedFields: message.matchedFields }))).toEqual([
             { index: 0, matchedFields: ['content'] },
@@ -808,7 +953,7 @@ describe('readThreadTranscript — regexFields and matchedFields (I4)', () => {
 });
 
 describe('readThreadTranscript — toolArgs display modes (I3)', () => {
-    it('shows a reference by default, costing no bytes', () => {
+    it('shows a reference by default, costing no arguments text', () => {
         const [message] = readThreadTranscript(PLAIN_RECORD, MESSAGES, { message: 2 }).messages;
 
         // { id, name, argumentsLength } and nothing else: the payload is named and
@@ -818,8 +963,12 @@ describe('readThreadTranscript — toolArgs display modes (I3)', () => {
         // No truncation flag either — nothing was CUT, the text was omitted by policy,
         // and the absent `arguments` key is what says so.
         expect('argumentsTruncated' in message.toolCalls![0]).toBe(false);
-        // 11 bytes: the content alone. This is the page that used to cost 31.
-        expect(readThreadTranscript(PLAIN_RECORD, MESSAGES, { message: 2 }).bytes).toBe(11);
+        // The page costs its receipt and the smaller call shell, but NOT the 20 characters
+        // of payload the `full` page below quotes — that saving is the whole point of the
+        // mode, and F8 kept it while pricing the receipt the old comment called free.
+        expect(readThreadTranscript(PLAIN_RECORD, MESSAGES, { message: 2 }).bytes).toBe(
+            receiptBytes(ASSISTANT_RECEIPT)
+        );
     });
 
     it('returns the paged arguments text in full mode, exactly as before', () => {
@@ -845,8 +994,11 @@ describe('readThreadTranscript — toolArgs display modes (I3)', () => {
             }
         ]);
 
-        // 10 content + 20 arguments = 30, against the 11 the reference costs.
-        expect(readThreadTranscript(PLAIN_RECORD, MESSAGES, { message: 2, toolArgs: 'full' }).bytes).toBe(31);
+        // The same page in `full` mode: the bigger call shell plus the 20 quoted arguments
+        // characters, against the reference page above — the difference IS the payload.
+        expect(readThreadTranscript(PLAIN_RECORD, MESSAGES, { message: 2, toolArgs: 'full' }).bytes).toBe(
+            receiptBytes(ASSISTANT_FULL_RECEIPT)
+        );
     });
 
     it('searches the raw arguments whichever mode is display', () => {
@@ -887,12 +1039,40 @@ describe('readThreadTranscript — toolArgs display modes (I3)', () => {
             indices: indicesOf(reference)
         }).toEqual({
             matched: 2,
-            // 20000 + 10: the payload contributes nothing.
-            bytes: 20_010,
+            // The 20 000-character payload contributes NOTHING in reference mode — that
+            // saving is the point of the mode, and F8 kept it. What the page does pay is
+            // both receipts and the follow-up's 10 characters.
+            bytes: pageBytes(
+                {
+                    content: 'a'.repeat(20_000),
+                    toolCalls: [{ id: 'c1', name: 'write' }],
+                    toolArgsMode: 'reference'
+                },
+                { content: 'qqqqqqqqqq' }
+            ),
             truncated: false,
             hasMore: false,
             indices: [0, 1]
         });
+
+        // F8 — the cut the `full` page enforces is the ALLOWANCE (`threadReadPageAllowance`:
+        // the delivery budget minus this result's own measured scaffolding), not the raw
+        // 32 768 cap. The arguments text gets whatever the allowance still has once this
+        // message's receipt is paid — its shell, the `full` call shell, the two identity
+        // strings and its 20 000 characters. `p` costs one payload byte each, but every
+        // string value also carries `wire('')` = 2 bytes of double-escaped framing quotes,
+        // so the affordable character count is the room minus that fixed pair.
+        const fullAllowance = threadReadPageAllowance(PLAIN_RECORD);
+        const fullArguments = 'p'.repeat(
+            fullAllowance -
+                (SHELLS.message +
+                    wire('a'.repeat(20_000)) +
+                    SHELLS.toolCalls +
+                    SHELLS.toolCallFull +
+                    wire('c1') +
+                    wire('write')) -
+                wire('')
+        );
 
         const full = readThreadTranscript(PLAIN_RECORD, messages, {
             limit: 5,
@@ -910,10 +1090,12 @@ describe('readThreadTranscript — toolArgs display modes (I3)', () => {
             argumentsRow: full.messages[0].toolCalls
         }).toEqual({
             matched: 2,
-            // The budget is exactly full: 20000 content + 12768 arguments.
-            bytes: 32_768,
+            // The allowance is exactly full, and the WHOLE serialized result — envelope
+            // scaffolding included — still fits the cap that is what the harness enforces.
+            bytes: fullAllowance,
             truncated: true,
-            // The second message is gone, whole — which is what `hasMore` is for.
+            // The second message is gone, whole: its receipt alone would not fit. That is
+            // what `hasMore` is for.
             hasMore: true,
             nextOffset: 1,
             indices: [0],
@@ -921,7 +1103,7 @@ describe('readThreadTranscript — toolArgs display modes (I3)', () => {
                 {
                     id: 'c1',
                     name: 'write',
-                    arguments: 'p'.repeat(12_768),
+                    arguments: fullArguments,
                     argumentsTruncated: true,
                     argumentsLength: 20_000
                 }
@@ -1048,7 +1230,14 @@ describe('readThreadTranscript — text paging', () => {
 
         // A `contentLimit` cut is NOT a budget cut: `truncated` stays false.
         expect(result.truncated).toBe(false);
-        expect(result.bytes).toBe(18);
+        // Both pages' receipts, with the 9+9 displayed characters (F8 — the old pin was the
+        // character count alone, and the attachment row this page shows was free).
+        expect(result.bytes).toBe(
+            pageBytes(
+                { content: 'You are c' },
+                { content: 'Summarise', attachments: [ATTACHMENT] }
+            )
+        );
 
         // Continuing from nextContentOffset returns the rest, with no further flag
         // once the end is reached.
@@ -1151,7 +1340,10 @@ describe('readThreadTranscript — text paging', () => {
             contentHasMore: true,
             nextContentOffset: 4
         });
-        expect(result.bytes).toBe(4);
+        // F8 prices the page as the delivery cap measures it: the receipt shell plus the
+        // glyph's four UTF-8 bytes. A SPLIT pair would cost six escaped bytes (`\udXXX`),
+        // which is one of the reasons the pair rule above exists.
+        expect(result.bytes).toBe(receiptBytes({ content: emoji.slice(2, 4) }));
     });
 
     it('answers an offset past the end of the content as empty text', () => {
@@ -1180,6 +1372,19 @@ describe('readThreadTranscript — page budget', () => {
         });
         const messages: HarnessMessage[] = [big('a'), big('b'), big('c')];
 
+        // F8 — the page fills the ALLOWANCE, not the raw cap. The allowance is the delivery
+        // budget minus this result's own measured scaffolding, and that reservation is
+        // exactly what keeps the serialized document inside the cap the harness enforces.
+        const allowance = threadReadPageAllowance(PLAIN_RECORD);
+        // The second message's text gets whatever the allowance still has once BOTH receipts
+        // are paid — the first message's shell plus its 20 000 characters (charged WITH the
+        // two bytes of double-escaped framing quotes every string value costs), and this
+        // message's own shell. `b` costs one payload byte each, so the affordable count is
+        // the remaining room minus that fixed framing pair; derived, not typed.
+        const secondText = 'b'.repeat(
+            allowance - (SHELLS.message + wire('a'.repeat(20_000))) - SHELLS.message - wire('')
+        );
+
         const result = readThreadTranscript(PLAIN_RECORD, messages, { limit: 3, contentLimit: 32_000 });
 
         expect({
@@ -1203,7 +1408,8 @@ describe('readThreadTranscript — page budget', () => {
             hasMore: true,
             nextOffset: 2,
             contentBudget: 32768,
-            bytes: 32768,
+            // The allowance, spent to the byte (`a` and `b` are one escaped byte each).
+            bytes: allowance,
             truncated: true,
             indices: [0, 1]
         });
@@ -1219,27 +1425,88 @@ describe('readThreadTranscript — page budget', () => {
         expect(result.messages[1]).toEqual({
             index: 1,
             role: 'user',
-            content: 'b'.repeat(12_768),
+            content: secondText,
             contentLength: 20_000,
             contentOffset: 0,
             contentHasMore: true,
-            nextContentOffset: 12_768
+            nextContentOffset: secondText.length
         });
     });
 
-    it('keeps the serialized page under the harness 64 KiB result cap', () => {
+    it('delivers an escaping-heavy page at its ceiling instead of being refused', () => {
+        // F8's regression. The old account charged UTF-8 TEXT bytes and reserved nothing for
+        // the envelope, so a page of escaping-heavy text reached the wire LARGER than the
+        // budget it had already "spent", and `boundToolResult` refused the WHOLE result — the
+        // model received the envelope's truncation stub instead of this structured page.
+        // A quote and a backslash are two escaped bytes each, so this fixture costs exactly
+        // four escaped bytes per two characters: the cut is the budget's, and the arithmetic
+        // below is exact rather than approximate.
+        const unit = '"\\';
+        const content = unit.repeat(15_000);
+
+        // The per-character charge, measured with the cap's own measure instead of asserted:
+        // a quote costs FOUR payload bytes, because the document escapes it as `\"` and the
+        // payload escapes THAT again. `wire('')` = 2 is the fixed cost of the value's framing
+        // quotes, which the message shell prices once.
+        const charCharge = wire('"') - wire('');
+        const room = threadReadPageAllowance(PLAIN_RECORD) - SHELLS.message;
+        // The cut is greedy by CODE UNIT (a slice must never split a surrogate pair), so the
+        // ceiling is the largest whole number of characters the room affords — here that
+        // lands mid-unit, which is exactly what "the budget cut it, not the fixture" proves.
+        const expectedText = content.slice(0, Math.floor((room - wire('')) / charCharge));
+
         const messages: HarnessMessage[] = [
-            { role: 'user', content: 'x'.repeat(30_000) },
-            { role: 'assistant', content: 'y'.repeat(30_000) }
+            { role: 'user', content },
+            { role: 'assistant', content }
         ];
 
         const result = readThreadTranscript(PLAIN_RECORD, messages, { limit: 10, contentLimit: 32_000 });
-        const serialized = new TextEncoder().encode(JSON.stringify(result)).length;
 
-        // The whole point of the 32 KiB internal budget: the harness cap never
-        // replaces this structured result with its truncation envelope.
-        expect(serialized).toBeLessThan(65_536);
+        expect(result.messages[0].content).toBe(expectedText);
+        expect(result.messages.length).toBe(1);
+        expect(result.messages[0].contentHasMore).toBe(true);
         expect(result.truncated).toBe(true);
+        expect(result.hasMore).toBe(true);
+        expect(result.bytes).toBe(SHELLS.message + wire(expectedText));
+        // "At its ceiling" stated exactly: what the allowance leaves unspent is the arithmetic
+        // remainder of the room after the last whole character, so no larger page was
+        // deliverable in this currency (and it is smaller than one character's charge).
+        expect(threadReadPageAllowance(PLAIN_RECORD) - result.bytes).toBe(room - wire(expectedText));
+
+        // And the fact the whole budget exists to guarantee: the serialized result fits the
+        // cap the harness enforces, so it is DELIVERED — not refused, not re-cut.
+        const bounded = boundToolResult(JSON.stringify(result), MODEL_TOOL_RESULT_BUDGET_BYTES, {
+            source: { name: 'threadRead' }
+        });
+
+        expect(bounded.rejected).toBeUndefined();
+        expect(bounded.truncated).toBe(false);
+        expect(JSON.parse(bounded.content)).toEqual(result);
+    });
+
+    it('refuses a thread whose own identity block leaves no room for a receipt', () => {
+        // The one case the allowance cannot page around: the identity block is not text the
+        // reader can cut, so when it eats the budget the call says so instead of answering
+        // with an empty page that reads like an empty thread.
+        const huge: HarnessThreadRecord = { ...PLAIN_RECORD, label: 'L'.repeat(THREAD_READ_CONTENT_BUDGET_BYTES) };
+
+        expect(() => readThreadTranscript(huge, MESSAGES, {})).toThrow(HarnessError);
+
+        // The refusal names the three numbers the caller needs, and the overhead it measures
+        // is the one the allowance arithmetic uses.
+        const message = ((): string => {
+            try {
+                readThreadTranscript(huge, MESSAGES, {});
+            } catch (error) {
+                return (error as Error).message;
+            }
+
+            return '';
+        })();
+
+        expect(message).toContain(`cost ${threadReadResultOverhead(huge)} payload bytes`);
+        expect(message).toContain(`leaving 0 of the ${THREAD_READ_CONTENT_BUDGET_BYTES}-byte delivery budget`);
+        expect(threadReadPageAllowance(huge)).toBe(0);
     });
 });
 

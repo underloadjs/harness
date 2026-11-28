@@ -963,7 +963,21 @@ export const createToolboxHarness = (
         // snapshot's own `discovery.enabled`, so the persisted set is the authority there.
         // The kernel, not this layer, decides WHICH names the seed admits (its switchability
         // rule, the host deny list, and `maxEnabledTools`), so no name list travels here.
-        ...(observer?.enableAllTools === true ? { enableAllTools: true } : {})
+        ...(observer?.enableAllTools === true ? { enableAllTools: true } : {}),
+        // F7: THE SESSION'S DOWNLOADS FOLDER, on the identical top-level rule as `knowledge` and
+        // `knowledgeOwner` above (it is a `HarnessConfiguration` field, ../types
+        // `HarnessConfiguration.downloadsDirectory`). Presence is the ONLY way `download` has a
+        // destination: the engine copies this value onto every `ToolContext`
+        // (../engine/harness.ts:12980 / :18665 / :18786), and with no value the tool refuses before
+        // paying for the transfer (../engine/tools/webdownload/download.tool.ts
+        // `downloadsDirectoryOf`) rather than writing into a folder of its own invention.
+        //
+        // Nothing here DERIVES a path: this layer never learns the database root or the session id,
+        // so a fallback in this factory would put a folder choice in a place that cannot know which
+        // conversation owns the bytes. Absence (a CLI build, a direct preset caller, a host with no
+        // persistence directory) therefore means "no folder", exactly as documented on
+        // `HarnessPresetReport.downloadsDirectory` (./types.ts).
+        ...(observer?.downloadsDirectory === undefined ? {} : { downloadsDirectory: observer.downloadsDirectory })
     };
 
     return harness(liveConfiguration);

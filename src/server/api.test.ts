@@ -39,7 +39,7 @@
 //   - ./api-canonical.test.ts        - the sibling file that pins the same contract at `runtime.api`
 
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { existsSync, readFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { existsSync, readFileSync, mkdtempSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -54,6 +54,12 @@ import {
 } from './harnesses';
 import { PRODUCTION_WITH_FIXTURES } from './harnesses/fixture-presets.test-support';
 import { agent, harness } from '../engine/harness';
+// F8 (../engine/core/payload-bytes.ts + result-budget.ts): a `files` receipt prices each entry in the
+// SAME escaped currency the harness caps results with (`entryWireBytes`,
+// ../engine/tools/files/files.tool.ts:454), and `contentBudget` is the shared model-facing cap. Both
+// are IMPORTED rather than hardcoded so the byte figures asserted below cannot drift from the numbers
+// the tool and the envelope actually measure.
+import { MODEL_TOOL_RESULT_BUDGET_BYTES, modelPayloadBytes } from '../engine/core';
 // T-W8: every recorded `thread` payload now carries the minting process's epoch
 // (../core/agent-limits.ts `HARNESS_PROCESS_EPOCH`, stamped at the run-identity mints in
 // ../harness.ts). These assertions are WHOLE payloads, so the key has to be named; the
@@ -79,7 +85,7 @@ import type { HarnessRuntime } from './runtime';
 import { createHarnessServiceHandler } from './service';
 import type { ServiceEndpointContext, ServiceEndpointParameters, ServiceEndpointResult } from './service';
 import { SessionStore } from './sessions';
-import { HarnessPersistence } from './persistence';
+import { HarnessPersistence, harnessSessionDownloadsDirectoryOf } from './persistence';
 import {
     HARNESS_PAGE_LIMIT,
     HARNESS_ROUTES,
@@ -3135,6 +3141,16 @@ describe('task submit and recorded history', () => {
 // it - `global` runs at `POST /tools/{id}/executions`, `session_required` answers 403 there (a
 // policy refusal, not an absence) and runs at `POST /sessions/{id}/tools/{id}/executions`. A call
 // that executed and failed is 200 `ok:false`; a call the server cannot make is an HTTP status.
+// The two `download` sentences this file quotes EXACTLY (F7). They are model-facing text a transcript
+// stores, so a reworded sentence is a contract change and belongs in
+// ../engine/tools/webdownload/download.test.ts (its `NEEDS_SESSION` and `NOTE_ADDRESSABLE` pins);
+// restating them here by import would couple an HTTP-contract file to a tool module's internals, so
+// both are local constants that name their source.
+const DOWNLOAD_NEEDS_SESSION_MESSAGE =
+    'download needs a session: this harness has no session downloads folder, so there is nowhere to save the file. Run it inside a server session, or build the harness with `downloadsDirectory`.';
+const DOWNLOAD_NOTE_ADDRESSABLE_MESSAGE =
+    'Saved in this session\'s downloads folder. Point read or glob at the absolute `path` above: a path you name explicitly is searched even when a .gitignore above it ignores that folder. grep skips this file (it opens only text files under 1 MiB), so use the bytes in this message or read the file.';
+
 describe('manual tool execution', () => {
     it('runs a catalogue tool globally with its declarative panels', async () => {
         const runtime = createRuntime();
@@ -3188,38 +3204,37 @@ describe('manual tool execution', () => {
         });
     });
 
-    it('unwraps tool media into a descriptor list for a manual download', async () => {
+    it('refuses a sessionless manual download BEFORE the transfer, naming the fix', async () => {
+        // F7 at the HTTP boundary. `download` has no destination on a call that is not inside a
+        // session: the folder is a per-SESSION fact (`HarnessConfiguration.downloadsDirectory`,
+        // supplied only by ../sessions.ts `buildHarness` from a persistence directory), and the tool
+        // refuses rather than choosing a folder nobody owns — the old `.underload/downloads` under
+        // the process cwd is what "choosing one" used to mean, and it leaked binaries into a checkout.
         const runtime = createRuntime();
 
-        // `download` now also saves to disk, resolved against the process working
-        // directory. This test passes an explicit UNIQUE path rather than chdir-ing:
-        // process.chdir() is process-global while vitest runs files concurrently, and
-        // a fixed name would also make the expected path depend on how many times the
-        // suite has already run (the no-clobber rule appends a suffix to a taken name).
         const scratchName = `api-download-${randomUUID()}.png`;
-
-        // A real PNG header so the shared magic-signature check passes, served with an explicit
-        // content-length so the pre-check path is exercised.
         const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
 
-        vi.stubGlobal(
-            'fetch',
-            vi.fn(async () => {
-                const headers = new Headers();
-                headers.set('content-type', 'image/png');
-                headers.set('content-length', String(png.length));
+        // A real PNG header plus an explicit content-length: had the call transferred, these are the
+        // bytes it would have taken. The point of stubbing is to prove it never asked for them.
+        const fetchStub = vi.fn(async () => {
+            const headers = new Headers();
 
-                return new Response(
-                    new ReadableStream<Uint8Array>({
-                        start(controller) {
-                            controller.enqueue(Uint8Array.from(png));
-                            controller.close();
-                        }
-                    }),
-                    { status: 200, headers }
-                );
-            })
-        );
+            headers.set('content-type', 'image/png');
+            headers.set('content-length', String(png.length));
+
+            return new Response(
+                new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(Uint8Array.from(png));
+                        controller.close();
+                    }
+                }),
+                { status: 200, headers }
+            );
+        });
+
+        vi.stubGlobal('fetch', fetchStub);
 
         try {
             const { status, body } = await call(runtime, 'POST', HARNESS_ROUTES.toolsByToolIdExecutions('download'), {
@@ -3228,37 +3243,146 @@ describe('manual tool execution', () => {
                 parameters: { url: 'https://files.test/img/pixel.png', path: scratchName }
             });
 
+            // A tool that answered a failure is a 200 `ok: false` on this route; a call the SERVER
+            // could not make would be an HTTP status, and this one is not (./api.ts:5143).
             expect(status).toBe(200);
-            expect(Object.keys(body).sort()).toEqual(['duration_ms', 'media', 'ok', 'result']);
-            expect(body.result).toEqual({
-                url: 'https://files.test/img/pixel.png',
-                finalUrl: 'https://files.test/img/pixel.png',
-                contentType: 'image/png',
-                kind: 'image',
-                name: 'pixel.png',
-                bytes: 12,
-                declaredBytes: 12,
-                media: 'attached',
-                mediaId: 'dl-1',
-                // The disk copy the file tools can reach, at the requested path.
-                saved: true,
-                path: scratchName,
-                searchable: false
-            });
-            expect(existsSync(join(process.cwd(), scratchName))).toBe(true);
-            expect(body.media).toEqual([{ id: 'dl-1', kind: 'image', name: 'pixel.png', mime: 'image/png', size: 12 }]);
-
-            // The payload itself stays out of the HTTP body: 12 bytes of PNG are `iVBORw0KGgoBAgME`
-            // in canonical base64, and a manual call has no transcript to attach bytes to.
-            expect(JSON.stringify(body)).not.toContain('iVBORw0KGgoBAgME');
+            expect(Object.keys(body).sort()).toEqual(['duration_ms', 'error', 'ok']);
+            expect(body.ok).toBe(false);
+            // The refusal is the tool's own sentence, verbatim — a transcript quotes it, and the
+            // engine pins the same string in ../engine/tools/webdownload/download.test.ts:97.
+            expect(body.error).toEqual({ message: DOWNLOAD_NEEDS_SESSION_MESSAGE });
             expect(typeof body.duration_ms).toBe('number');
-            // The scratch file lives in the working directory; remove it so the run
-            // leaves nothing behind.
-            rmSync(join(process.cwd(), scratchName), { force: true });
+
+            // PRE-FLIGHT: the destination is proven before the transfer is paid for, so not one byte
+            // was requested. A stub that had been called would mean 20 MiB could still be spent on a
+            // call that was always going to be refused.
+            expect(fetchStub).not.toHaveBeenCalled();
+
+            // And nothing was written where the tool used to write: the process working directory.
+            // (No cleanup, because there is nothing to clean — the pin is the absence.)
+            expect(existsSync(join(process.cwd(), scratchName))).toBe(false);
         } finally {
             // This file's afterEach only unstubs envs; a leaked global fetch would break the model
             // and download tests that run after this one.
             vi.unstubAllGlobals();
+        }
+    });
+
+    it('unwraps tool media into a descriptor list for a session download, and deletes the bytes with the session', async () => {
+        // F7's other half, on the SESSION door (`POST /sessions/{id}/tools/{id}/executions`): a real
+        // durable server session DOES own a folder, so the same call that refused above succeeds, the
+        // media unwrap contract still holds, the file lands inside that session's own
+        // `sessions/<id>/downloads`, and DELETE takes it away (./journal.ts `remove()` erases the whole
+        // `sessions/<id>` tree — the session is what owns the bytes).
+        const root = await createFixture('harness-session-download-');
+        const registry = createHarnessRegistry(PRODUCTION_WITH_FIXTURES);
+        // The persistence object is constructed HERE (not left to `createHarnessRuntime`) so the
+        // expected path below is the SAME helper the store builds the folder from, rather than a
+        // hand-joined guess. `HarnessPersistence.directory` is `<root>/harness`.
+        const persistence = new HarnessPersistence(root);
+
+        try {
+            const store = new SessionStore(SETTINGS, registry, undefined, { persistence });
+            const runtime = createHarnessRuntime({
+                settings: SETTINGS,
+                defaults: DEFAULTS,
+                registry,
+                store,
+                loadEnvironment: false,
+                catalogue: createToolCatalogue()
+            });
+
+            const created = await call(runtime, 'POST', HARNESS_ROUTES.sessions(), { harness: 'general' });
+
+            expect(created.status).toBe(201);
+
+            const sessionId = created.body.session.id as string;
+            const downloads = harnessSessionDownloadsDirectoryOf(persistence.directory, sessionId);
+
+            const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+
+            vi.stubGlobal(
+                'fetch',
+                vi.fn(async () => {
+                    const headers = new Headers();
+
+                    headers.set('content-type', 'image/png');
+                    headers.set('content-length', String(png.length));
+
+                    return new Response(
+                        new ReadableStream<Uint8Array>({
+                            start(controller) {
+                                controller.enqueue(Uint8Array.from(png));
+                                controller.close();
+                            }
+                        }),
+                        { status: 200, headers }
+                    );
+                })
+            );
+
+            try {
+                const { status, body } = await call(
+                    runtime,
+                    'POST',
+                    HARNESS_ROUTES.sessionsBySessionIdToolsByToolIdExecutions(sessionId, 'download'),
+                    { parameters: { url: 'https://files.test/img/pixel.png', path: 'pixel.png' } }
+                );
+
+                expect(status).toBe(200);
+                expect(Object.keys(body).sort()).toEqual(['duration_ms', 'media', 'ok', 'result']);
+                expect(body.ok).toBe(true);
+                expect(body.result).toEqual({
+                    url: 'https://files.test/img/pixel.png',
+                    finalUrl: 'https://files.test/img/pixel.png',
+                    contentType: 'image/png',
+                    kind: 'image',
+                    name: 'pixel.png',
+                    bytes: 12,
+                    declaredBytes: 12,
+                    media: 'attached',
+                    mediaId: 'dl-1',
+                    saved: true,
+                    // ABSOLUTE, inside THIS session's folder (../engine/types/index.ts:3873). The
+                    // folder is outside the checkout's working tree, which is why a relative path
+                    // would be useless to paste into `read`/`grep`/`glob`.
+                    path: join(downloads, 'pixel.png'),
+                    searchable: false,
+                    // The honesty sentence for a file grep will not open (a PNG is not text).
+                    note: DOWNLOAD_NOTE_ADDRESSABLE_MESSAGE
+                });
+
+                // The descriptor list is the media contract at an HTTP boundary: the bytes are named,
+                // never inlined. 12 bytes of PNG are `iVBORw0KGgoBAgME` in canonical base64.
+                expect(body.media).toEqual([{ id: 'dl-1', kind: 'image', name: 'pixel.png', mime: 'image/png', size: 12 }]);
+                expect(JSON.stringify(body)).not.toContain('iVBORw0KGgoBAgME');
+                expect(typeof body.duration_ms).toBe('number');
+
+                // The file really is there, inside the session's folder, with the exact bytes.
+                expect(existsSync(join(downloads, 'pixel.png'))).toBe(true);
+                expect(readFileSync(join(downloads, 'pixel.png'))).toEqual(Buffer.from(Uint8Array.from(png)));
+
+                // Deleting the conversation deletes the download: the folder is a child of
+                // `sessions/<id>/`, and the store's removal erases that whole directory.
+                expect(
+                    await call(runtime, 'DELETE', HARNESS_ROUTES.sessionsBySessionId(sessionId))
+                ).toEqual({
+                    status: 200,
+                    body: { deleted: true, session_id: sessionId, aborted_turns: 0, dropped_queued_tasks: 0 }
+                });
+
+                // Gone — the file, the folder, and the session directory that held them. This is the
+                // real teardown path (./sessions.ts `remove()` -> ./journal.ts `remove()`), not a stub
+                // of it, and it holds for a session that never ran a turn (no journal instance), which
+                // is exactly the case that used to leave `downloads/` behind.
+                expect(existsSync(join(downloads, 'pixel.png'))).toBe(false);
+                expect(existsSync(downloads)).toBe(false);
+                expect(existsSync(join(persistence.directory, 'sessions', sessionId))).toBe(false);
+            } finally {
+                vi.unstubAllGlobals();
+            }
+        } finally {
+            await rm(root, { recursive: true, force: true });
         }
     });
 
@@ -3286,7 +3410,15 @@ describe('manual tool execution', () => {
                 `${posix(fixture)}/src/nested/`,
                 `${posix(fixture)}/tasks/b.ts`
             ];
-            const expectedBytes = expectedEntries.reduce((total, entry) => total + Buffer.byteLength(entry, 'utf8'), 0);
+            // F8: the envelope's `bytes` is charged in the PAYLOAD currency the serve-time
+            // bounder measures (../engine/core/result-budget.ts), i.e. each entry costs its
+            // escaping-aware UTF-8 size AS IT APPEARS inside the serialized result, plus the byte
+            // its array position costs — one entry = 2 quote bytes + 2 escaping quotes + 1 comma =
+            // raw + 5. The tool's own producer-side formula is `entryWireBytes`
+            // (../engine/tools/files/files.tool.ts:454: `modelPayloadBytes(JSON.stringify(value)) + 1`);
+            // restating it here with the same two primitives keeps the pin honest if either moves.
+            const entryWireBytes = (value: string) => modelPayloadBytes(JSON.stringify(value)) + 1;
+            const expectedBytes = expectedEntries.reduce((total, entry) => total + entryWireBytes(entry), 0);
 
             expect(listed.body).toEqual({
                 ok: true,
@@ -3304,7 +3436,9 @@ describe('manual tool execution', () => {
                         }
                     ],
                     bytes: expectedBytes,
-                    contentBudget: 64 * 1024
+                    // The cap the WHOLE serialized result is measured against: the shared delivery
+                    // cap, not the obsolete 64 KiB producer-side view (F8).
+                    contentBudget: MODEL_TOOL_RESULT_BUDGET_BYTES
                 },
                 duration_ms: expect.any(Number)
             });
@@ -3327,11 +3461,12 @@ describe('manual tool execution', () => {
                             nextOffset: null,
                             offset: 0,
                             limit: 200,
-                            bytes: Buffer.byteLength(wrappedEntry, 'utf8')
+                            // One entry, one charge: the quoted, escaped name plus its position byte.
+                            bytes: entryWireBytes(wrappedEntry)
                         }
                     ],
-                    bytes: Buffer.byteLength(wrappedEntry, 'utf8'),
-                    contentBudget: 64 * 1024
+                    bytes: entryWireBytes(wrappedEntry),
+                    contentBudget: MODEL_TOOL_RESULT_BUDGET_BYTES
                 },
                 duration_ms: expect.any(Number)
             });

@@ -48,8 +48,10 @@ import { mkdir, mkdtemp, rm, symlink, writeFile as writeTextFile } from 'node:fs
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HarnessError } from '../../util';
+import { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult } from '../../core/result-budget';
+import { modelPayloadBytes } from '../../core/payload-bytes';
 import { MAX_RESULTS_LIMIT, expandBraces, globToRegExp, matchGlob, walkFiles } from './glob';
-import { FILE_GLOB_CONTENT_BUDGET, GLOB_METADATA, glob } from './glob.tool';
+import { FILE_GLOB_CONTENT_BUDGET, GLOB_METADATA, glob, globPageAllowance } from './glob.tool';
 
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
 
@@ -162,7 +164,28 @@ describe('glob', () => {
         // module documents, so a host cannot quietly widen them. The hard cap is 1000,
         // not the 100 that made a 369-file question unanswerable.
         expect(MAX_RESULTS_LIMIT).toBe(1000);
-        expect(FILE_GLOB_CONTENT_BUDGET).toBe(64 * 1024);
+
+        // F8: the budget is the harness delivery cap, NOT a larger private number. The
+        // 64 KiB this used to assert was twice `MODEL_TOOL_RESULT_BUDGET_BYTES`, so a
+        // page that satisfied glob's own accounting was REFUSED by the harness
+        // (`oversized-json`) instead of delivered — which is why the equality and the
+        // inequality are both pinned: equality to the constant the enforcement uses, and
+        // the invariant that no tool may size itself above the cap it is measured against.
+        expect(FILE_GLOB_CONTENT_BUDGET).toBe(32 * 1024);
+        expect(FILE_GLOB_CONTENT_BUDGET).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(FILE_GLOB_CONTENT_BUDGET).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+
+        // The allowance the page loop spends is STRICTLY below the cap: the difference is
+        // what the result's own scaffolding (flags, counters, `patterns`, the longest note)
+        // costs, priced by the module rather than guessed by the caller. Pinned exactly,
+        // because the overhead is a pure function of the result SHAPE: a change to a field,
+        // to `patterns` echoing, or to the longest note moves this number, and moving it
+        // silently is how the page stopped matching the cap.
+        const allowance = globPageAllowance(['**/*']);
+
+        expect(allowance).toBe(31540);
+        expect(MODEL_TOOL_RESULT_BUDGET_BYTES - allowance).toBe(1228);
+        expect(globPageAllowance(['**/*.ts'])).toBe(31540 - 3);
     });
 
     it('lists every file for the default pattern without entering skipped directories', async () => {
@@ -176,8 +199,13 @@ describe('glob', () => {
             offset: 0,
             limit: 100,
             nextOffset: null,
-            bytes: EVERY_FILE.reduce((total, file) => total + file.length, 0),
-            contentBudget: 65536,
+            // F8 — `bytes` is the page's charge in the harness delivery currency (the
+            // escaped cost of each quoted path plus its separating comma), not the sum of
+            // the names' UTF-8 lengths. For these nine plain-ASCII names the old figure was
+            // 102 and the charge is 102 + 5 per entry (2 for the delimiting quotes, 2 more
+            // for escaping them, 1 for the comma) = 147.
+            bytes: 147,
+            contentBudget: 32768,
             stopReason: 'complete',
             partial: false,
             patterns: ['**/*']
@@ -402,6 +430,61 @@ describe('glob', () => {
 
             expect(rest.files.length).toBeGreaterThan(0);
             expect(rest.files[0]).not.toBe(result.files[result.files.length - 1]);
+        } finally {
+            process.chdir(restoredCwd);
+            await rm(fixture, { recursive: true, force: true });
+        }
+    });
+
+    it('delivers a full budget page of escaping names instead of refusing it (F8)', async () => {
+        // The defect this test exists for: `bytes` used to count raw UTF-8, so a page of
+        // names holding a quote and a CJK character charged a THIRD of what the harness
+        // bills, claimed headroom it did not have, and came back as
+        // `Tool result too large to deliver` — the tool had done its work and the model
+        // received a refusal instead of a page.
+        //
+        // 1 000 names of `n"0"-目录.txt`-shaped padding: the same shape the probe measured
+        // at 30 000 raw / 41 416 payload bytes (Temp/t4-files/probe.ts).
+        const fixture = await createFixture('currency', {});
+        const restoredCwd = process.cwd();
+
+        try {
+            for (let index = 0; index < 1000; index++) {
+                await seedUnder(fixture, `n"${index}"-目录.txt${'x'.repeat(30)}`, 'x\n');
+            }
+
+            process.chdir(fixture);
+
+            const result = await glob({ maxResults: 1000 });
+            const text = JSON.stringify(result);
+            const rawBytes = result.files.reduce((total, file) => total + Buffer.byteLength(file, 'utf8'), 0);
+            const wireBytes = modelPayloadBytes(text);
+
+            // The premise, asserted: escaping really does inflate this page, which is the
+            // only reason the old currency could claim headroom the wire did not have.
+            expect(wireBytes).toBeGreaterThan(rawBytes);
+            // And the page really is a full budget: the bound that closed it is the byte
+            // budget, not the 1 000-entry cap.
+            expect(result.stopReason).toBe('contentBudget');
+            expect(result.truncated).toBe(true);
+            expect(result.files.length).toBeLessThan(1000);
+            // The charge the receipt reports never exceeds the allowance the loop was
+            // allowed to spend, and that allowance is below the cap by the measured
+            // scaffolding — the two numbers that make the next assertion true.
+            expect(result.bytes).toBeLessThanOrEqual(globPageAllowance(['**/*']));
+            expect(result.bytes).toBeLessThan(MODEL_TOOL_RESULT_BUDGET_BYTES);
+            expect(wireBytes).toBeLessThan(MODEL_TOOL_RESULT_BUDGET_BYTES);
+
+            // The regression itself: this is the exact call the harness makes with the
+            // exact string it measures (`BoundedToolResult` = content + truncated +
+            // originalBytes, plus `rejected` only when the delivery is refused), and
+            // `rejected` is what this tool used to return on its own best page.
+            const bounded = boundToolResult(text, MODEL_TOOL_RESULT_BUDGET_BYTES, { source: { name: 'glob' } });
+
+            expect(bounded.content).toBe(text);
+            expect(bounded.truncated).toBe(false);
+            expect(bounded.rejected).toBeUndefined();
+            expect(bounded.originalBytes).toBe(Buffer.byteLength(text, 'utf8'));
         } finally {
             process.chdir(restoredCwd);
             await rm(fixture, { recursive: true, force: true });

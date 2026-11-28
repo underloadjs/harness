@@ -1758,6 +1758,17 @@ const sayHello = async (frame: Extract<LaneCommand, { kind: 'hello' }>): Promise
             // like the canonical factory built by a direct `SessionStore` with no plugins
             // option.
             ...(plugins === undefined ? {} : { plugins }),
+            // F7: THE SESSION'S DOWNLOADS FOLDER, on the same one-build rule as the two providers
+            // above. The value is a plain absolute path string the coordinator derived from the
+            // session id (../sessions.ts `blueprintFor` -> ../persistence.ts:2653), so it crosses
+            // `worker_threads` as data and needs no reconstruction here — unlike the providers,
+            // whose closures had to be rebuilt from a name list. Presence makes the replica's
+            // `download` save into the SAME folder the inline conversation owns (one filesystem,
+            // shared by both sides); absence keeps the pre-F7 behaviour byte for byte, a refusal
+            // with no guessed default. The engine puts it on every `ToolContext` this replica builds
+            // (../engine/harness.ts:12980 / :18665 / :18786), and the folder is inside
+            // `sessions/<id>/`, so deleting the session erases the bytes a lane wrote.
+            ...(blueprint.downloadsDirectory === undefined ? {} : { downloadsDirectory: blueprint.downloadsDirectory }),
             // T1.5's last mile, stated rather than left implied: the HOST has a diagnostic sink
             // now (../sessions.ts `notePluginDiagnostic`), and this replica does not forward one,
             // because a report fired inside a hook has no frame to travel on — a closure cannot

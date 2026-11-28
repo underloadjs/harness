@@ -264,14 +264,17 @@ const runJournalOperation = (kind: IoOperationKind, frame: Record<string, unknow
 
     if (kind === 'journal.remove') {
         // The session directory this journal lives in — `journal.remove()` deletes it wholesale
-        // (../journal.ts:505-510), shard files included, so the stamps under it must go with it.
+        // (../journal.ts `HarnessJournal.remove()`, whose `fs.rmSync(this.directory, …)` is the
+        // line doing it), shard files included, so the stamps under it must go with it.
         // This IS the session's shard directory: `HARNESS_SESSION_DIRECTORY` is
-        // `HARNESS_JOURNAL_DIRECTORY` by construction (../persistence.ts:217).
+        // `HARNESS_JOURNAL_DIRECTORY` by construction (../persistence.ts
+        // `HARNESS_SESSION_DIRECTORY`, declared as that alias).
         const sessionDirectory = journal.directory;
 
         journal.remove();
         // A deleted session must not keep a handle the next `append` would resurrect
-        // onto a recreated directory (../sessions.ts:11457 discards the instance too).
+        // onto a recreated directory (../sessions.ts `disposeSession()` closes and clears the
+        // store's own `session.journal` for the same reason).
         journals.delete(ioJournalKey(target));
         // Without this, the next save of that id would find a stamp for a file that no longer
         // exists, skip the write, and leave the shard MISSING behind a digest claiming it is there.

@@ -115,6 +115,8 @@ import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toolParameterKey, validateSchemaValue } from '../../core';
+import { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult } from '../../core/result-budget';
+import { modelPayloadBytes } from '../../core/payload-bytes';
 import { fileLockCount } from './lock';
 import {
     FILES_CONTENT_BUDGET,
@@ -124,6 +126,7 @@ import {
     FILES_MAX_OPS,
     FILES_REFUSAL_CODES,
     files,
+    filesListAllowance,
     metadata,
     registration
 } from './files.tool';
@@ -441,10 +444,12 @@ describe('files metadata', () => {
             'plus `starved: true` and a `note` when an earlier list op of the same call already spent the shared entry budget, or left less of it than one entry costs'
         );
         expect(description).toContain('and the note states the bytes that were left');
-        // F10: `bytes` is ONE unit (list entry text), and a caller that is not told so reads a
-        // copy's payload bytes as if they had been charged against `contentBudget`.
+        // F10 + F8: `bytes` is ONE unit, and that unit is the harness delivery currency —
+        // the escaped cost of the serialized result, not raw UTF-8 — and a caller that is
+        // not told so reads a copy's payload bytes as if they had been charged against
+        // `contentBudget`.
         expect(description).toContain(
-            '`bytes` counts the list entry text this call returned, while mutation receipts carry their own `bytes` and are not summed into it'
+            '`bytes` counts what the returned list entries charged against the 32 KiB delivery budget the WHOLE serialized result is measured against (payload bytes of the serialized JSON, not raw UTF-8), while mutation receipts carry their own `bytes` and are not summed into it'
         );
         expect(description).toContain(
             'a `note` also says when a page stopped early because one long name did not fit the remaining budget, or when an `offset` is past the end of the listing'
@@ -490,7 +495,9 @@ describe('files list', () => {
             nextOffset: null,
             offset: 0,
             limit: 200,
-            bytes: 'listing/a.txt'.length + 'listing/b.txt'.length + 'listing/zeta/'.length
+            // F8 currency: each entry is priced as its quoted, escaped form plus the
+            // separating comma (13 + 13 + 12 raw bytes, +5 each) = 54, not 39.
+            bytes: 54
         });
         // The envelope totals what the call charged against the shared budget.
         expect(result).toEqual({
@@ -558,11 +565,11 @@ describe('files list', () => {
         expect(result.results[0].path).toBe('group-b');
     });
 
-    it('shares one 64 KiB entry-text budget across the list operations of a call', async () => {
-        // Every entry is exactly 1024 UTF-8 bytes: 'shared/a' (8) + eight 100-character
-        // directory names (8 x 101) + '/' + a 207-character name = 1024, so 64 entries are
-        // exactly FILES_CONTENT_BUDGET and the cut point is provable, not approximate. The
-        // length has to come from the prefix because NAME_MAX is 255.
+    it('shares one entry allowance across the list operations of a call', async () => {
+        // Every entry is exactly 1024 UTF-8 BYTES of name: 'shared/a' (8) + eight
+        // 100-character directory names (8 x 101) + '/' + a 207-character name = 1024, so the
+        // cost of one entry is provable rather than approximate. The length has to come from
+        // the prefix because NAME_MAX is 255.
         const chain = [0, 1, 2, 3, 4, 5, 6, 7]
             .map((level) => `d${level}`.padEnd(100, 'z'))
             .join('/');
@@ -573,45 +580,71 @@ describe('files list', () => {
         for (let index = 0; index < 70; index += 1) await seed(`shared/a/${chain}/${leaf(index)}`, 'x');
         for (let index = 0; index < 2; index += 1) await seed(`shared/b/${chain}/${leaf(index)}`, 'y');
 
-        const result = await files([
-            { op: 'list', path: `shared/a/${chain}` },
-            { op: 'list', path: `shared/b/${chain}` }
-        ]);
+        const ops = [{ op: 'list', path: `shared/a/${chain}` }, { op: 'list', path: `shared/b/${chain}` }];
 
-        // The FIRST op fills the CALL's budget exactly and stops before the 65th entry,
-        // which no longer fits in what is left (0 bytes).
+        // F8 — the two numbers the page is cut by, both published by the tool rather than
+        // guessed by the caller:
+        //   - `charge`: one entry priced the way the harness bills it (1024 raw + 2 quotes +
+        //     2 for escaping them + 1 separating comma = 1029). The old `bytes` reported 1024,
+        //     and this same fixture used to fill a 65 536-"byte" page that reached the wire at
+        //     ~1.4x that and was REFUSED;
+        //   - `allowance`: the cap minus what THIS call's receipts, notes and envelope cost
+        //     (`filesListAllowance`), which is the half of the cap the paging loop cannot see.
+        // It prices the RESOLVED directory, so it moves with the per-run Temp path — the same
+        // reason read's `budgetPool` is masked in ../presets.test.ts — which is why the cut
+        // point is derived below instead of written as the 64 this pin used to assert.
+        const charge = 1029;
+        const allowance = filesListAllowance(ops);
+        const fit = Math.floor(allowance / charge);
+
+        // The premises, asserted: the fixture is bigger than one page (otherwise the cut
+        // proves nothing), the allowance is the cap minus a real reserve, and one entry is
+        // priced 5 bytes above the raw text the old currency reported.
+        expect(fit).toBeGreaterThan(10);
+        expect(fit).toBeLessThan(70);
+        expect(allowance).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(MODEL_TOOL_RESULT_BUDGET_BYTES - allowance).toBeGreaterThan(1000);
+        expect(charge).toBe(1024 + 5);
+
+        const result = await files(ops);
+
+        // The FIRST op spends the CALL's allowance and stops before the entry that no longer
+        // fits — not because the sequence ends, which is what the note exists to say.
         //
-        // EXTRA-3 pin (this wave): the cut now EXPLAINS itself. `truncated: true` plus a
-        // cursor could not distinguish "stopped because the sequence ends" from "stopped
-        // because one 1024-byte name did not fit the 0 bytes left", and this fixture is that
-        // exact case: entries sort by code point, so the long names are all the same length
-        // and a caller with 200 entries of `limit` still stopped at 64. The note names the
-        // withheld entry, its size, and the bytes that were left.
+        // EXTRA-3 pin: `truncated: true` plus a cursor cannot distinguish "the sequence ends"
+        // from "one 1029-byte entry did not fit the bytes that were left", and this fixture is
+        // that exact case. The note names the withheld entry, its charge, the remainder, and
+        // the allowance the cut was measured against.
+        //
+        // The quoted name is capped at 200 code points (`+ '...'`): the note is inside the
+        // document the cap measures, so quoting a 1 024-character name would let the
+        // explanation cost more than the entry it explains.
+        const withheld = pageOf('shared/a', fit + 1)[fit];
+
         expect(result.results[0]).toEqual({
             op: 'list',
             path: `shared/a/${chain}`,
-            entries: pageOf('shared/a', 64),
+            entries: pageOf('shared/a', fit),
             truncated: true,
-            nextOffset: 64,
+            nextOffset: fit,
             offset: 0,
             limit: 200,
-            bytes: FILES_CONTENT_BUDGET,
-            note: `This page stopped before "${pageOf('shared/a', 65)[64]}" at offset 64: that entry is 1024 bytes and only 0 of the call's ${
-                FILES_CONTENT_BUDGET
-            }-byte entry budget was left. The listing is sorted by code point, so one long name can strand the budget that remains; pass nextOffset back in a fresh call to resume after it, or list a narrower directory.`
+            bytes: fit * charge,
+            note: `This page stopped before "${withheld.slice(0, 200)}..." at offset ${fit}: that entry costs ${charge} payload bytes and only ${
+                allowance - fit * charge
+            } of the call's ${allowance}-byte entry allowance (the ${FILES_CONTENT_BUDGET}-byte delivery budget minus ${
+                MODEL_TOOL_RESULT_BUDGET_BYTES - allowance
+            } bytes of result scaffolding) was left. The listing is sorted by code point, so one long name can strand the budget that remains; pass nextOffset back in a fresh call to resume after it, or list a narrower directory.`
         });
-        // The SECOND op starts with the budget already spent, so it answers an EMPTY page —
+
+        // The SECOND op starts with the allowance already spent, so it answers an EMPTY page —
         // and still reports `truncated: true` with its own offset, because the entry that
-        // did not fit is the next one. A per-op budget gave it a fresh 64 KiB instead, and
+        // did not fit is the next one. A per-op budget gave it a fresh allowance instead, and
         // an envelope `bytes` above the `contentBudget` printed beside it.
         //
-        // M2 pin (this wave): an empty page that is NOT an answer about this directory is
-        // marked `starved: true`, and the note names the op that spent the allowance, so the
-        // caller does not read "no entries" as "this folder is empty".
-        //
-        // F1 reword (kept pin, same scenario, same `starved: true`): the note now states the
-        // remainder that was ACTUALLY left — 0 here — instead of only claiming "already
-        // spent", because the same sentence has to stay true for the near-miss case below.
+        // M2 pin: an empty page that is NOT an answer about this directory is marked
+        // `starved: true`, and the note names the op that spent the allowance, so the caller
+        // does not read "no entries" as "this folder is empty".
         expect(result.results[1]).toEqual({
             op: 'list',
             path: `shared/b/${chain}`,
@@ -622,12 +655,30 @@ describe('files list', () => {
             limit: 200,
             bytes: 0,
             starved: true,
-            note: `This list op could not take an entry from the call's ${FILES_CONTENT_BUDGET}-byte entry budget: the list at "shared/a/${chain}" (offset 0) had already charged ${FILES_CONTENT_BUDGET} of it, leaving 0 — less than one entry's cost — so no entry here could be returned and nextOffset 0 has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
+            note: `This list op could not take an entry from the call's ${allowance}-byte entry allowance: the list at "shared/a/${chain}" (offset 0) had already charged ${
+                fit * charge
+            } of it, leaving ${allowance - fit * charge} — less than one entry's cost — so no entry here could be returned and nextOffset 0 has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
         });
-        // The envelope is the sum of what the ops charged, and can never exceed the cap.
-        expect(result.bytes).toBe(FILES_CONTENT_BUDGET);
+
+        // The envelope is the sum of what the ops charged, and can never exceed the cap —
+        // `contentBudget` still reports the cap itself, because that is the contract the
+        // description publishes.
+        expect(result.bytes).toBe(fit * charge);
         expect(result.bytes).toBe(result.results.reduce((total, entry) => total + (entry.bytes ?? 0), 0));
         expect(result.contentBudget).toBe(FILES_CONTENT_BUDGET);
+
+        // THE F8 REGRESSION: this whole envelope, serialized, is what the harness measures, and
+        // the page it produces is DELIVERED. Sixty-four 1024-byte entries used to be answered
+        // with `Tool result too large to deliver`.
+        const serialized = JSON.stringify(result);
+
+        expect(modelPayloadBytes(serialized)).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+
+        const bounded = boundToolResult(serialized, MODEL_TOOL_RESULT_BUDGET_BYTES, { source: { name: 'files' } });
+
+        expect(bounded.content).toBe(serialized);
+        expect(bounded.truncated).toBe(false);
+        expect(bounded.rejected).toBeUndefined();
     });
 
     // F1 (this wave): the gate was `remainingAtStart === 0`, which describes only one shape of
@@ -638,10 +689,26 @@ describe('files list', () => {
     // budget could not afford the next entry", and the note states the remainder instead of
     // claiming the budget was fully spent (which was untrue for the near miss).
     it('marks an empty page starved when what is left cannot buy the next entry, not only at zero', async () => {
-        // Provable arithmetic, same construction as the pin above: `near/a` (6) + eight
-        // 100-character levels (8 x 101) + '/' = 815 bytes of prefix, so a 209-character leaf
-        // is exactly a 1024-byte entry, 199 is 1014, and 208 is 1023. 63 x 1024 + 1014 =
-        // 65,526 leaves 10; 63 x 1024 + 1023 = 65,535 leaves 1.
+        // Same construction as the pin above: `near/a` (6) + eight 100-character levels
+        // (8 x 101) + '/' = 815 bytes of prefix, so a leaf of length L is an `815 + L`-byte
+        // entry that charges `820 + L` payload bytes (+2 for the quotes, +2 for escaping
+        // them, +1 for the separating comma): L = 209 is 1024 raw / 1029 charged and
+        // L = 219 is 1034 raw / 1039 charged.
+        //
+        // F8 changed what "the budget could not afford the next entry" costs, so the fixture
+        // sizes ITSELF at run time from the allowance the tool publishes, instead of spelling
+        // out the 65 526 / 65 535 arithmetic this pin used to prove (the allowance prices the
+        // RESOLVED directory, so it moves with the per-run Temp path):
+        //
+        //   - seed k = floor((allowance - 10) / 1029) entries, so the page is guaranteed to
+        //     fit every one of them AND to leave at least 10 bytes behind — the near miss the
+        //     old `remainingAtStart === 0` gate let through;
+        //   - put an entry charging 1039 in the next op's way, which is more than the largest
+        //     leftover this construction can produce (1038), so starvation there is proven
+        //     rather than coincidental;
+        //   - and hand the same leftover an entry it CAN buy (`e/f`: 3 raw / 8 charged), the
+        //     other side of the gate. Ten bytes left is starvation relative to an entry, never
+        //     an absolute "the budget is gone".
         const chain = [0, 1, 2, 3, 4, 5, 6, 7]
             .map((level) => `d${level}`.padEnd(100, 'z'))
             .join('/');
@@ -653,43 +720,53 @@ describe('files list', () => {
             for (const entry of pageOf(side, count, length)) await seed(entry, 'x');
         };
 
-        // The 64th entry of each side is the short one, and code-point order puts `n063`
-        // after `n062`, so it is the LAST entry the first page emits.
-        const shortA = `near/a/${chain}/${leaf(63, 199)}`;
-        const shortC = `near/c/${chain}/${leaf(63, 208)}`;
+        const entryCharge = (length: number): number => 820 + length;
+        const pageEntry = entryCharge(209);
+        const bigEntry = entryCharge(219);
 
-        await seedSide('a', 63, 209);
-        await seed(shortA, 'x');
-        await seedSide('b', 2, 209);
-        await seedSide('c', 63, 209);
-        await seed(shortC, 'x');
-        await seedSide('d', 2, 209);
-        // A short name for the gate's OTHER side: 10 bytes left is starvation only relative to
-        // the entry this op was about to emit, never an absolute "the budget is gone".
+        const nearOps = [{ op: 'list', path: `near/a/${chain}` }, { op: 'list', path: `near/b/${chain}` }];
+        const allowance = filesListAllowance(nearOps);
+        const fit = Math.floor((allowance - 10) / pageEntry);
+        const leftover = allowance - fit * pageEntry;
+
+        // The premises, asserted rather than assumed: the page really does strand a
+        // remainder, that remainder is inside the range the construction promises, the b-side
+        // entry costs more than any remainder can pay, and an `e/f`-sized entry costs less
+        // than any of them.
+        expect(pageEntry).toBe(1029);
+        expect(bigEntry).toBe(1039);
+        expect(leftover).toBeGreaterThanOrEqual(10);
+        expect(leftover).toBeLessThanOrEqual(1038);
+        expect(bigEntry).toBeGreaterThan(leftover);
+        // `e/f` is a 1-character-prefix entry (3 raw bytes -> 8 charged), so the tiny side of
+        // the gate is priced separately from the chain fixture above.
+        expect(entryCharge(3)).toBe(823);
+        expect(8).toBeLessThanOrEqual(leftover);
+
+        await seedSide('a', fit, 209);
+        await seedSide('b', 2, 219);
         await seed('e/f', 'x');
 
-        const charged = 63 * 1024 + 1014;
+        // 1. Ten bytes or more left — the near miss the old gate let through, because the
+        // budget was not literally empty and the op still could not buy its first entry.
+        const near = await files(nearOps);
 
-        expect(charged).toBe(FILES_CONTENT_BUDGET - 10);
-
-        // 1. Ten bytes left — the near miss the old gate let through.
-        const near = await files([
-            { op: 'list', path: `near/a/${chain}` },
-            { op: 'list', path: `near/b/${chain}` }
-        ]);
-
-        // The first page is CLEAN (every entry fit, nothing was withheld), so the remainder it
-        // leaves is the second op's whole story.
+        // The first page is CLEAN (every seeded entry fit, nothing was withheld), so the
+        // remainder it leaves is the second op's whole story.
         expect(near.results[0]).toEqual({
             op: 'list',
             path: `near/a/${chain}`,
-            entries: [...pageOf('a', 63, 209), shortA],
+            entries: pageOf('a', fit, 209),
             truncated: false,
             nextOffset: null,
             offset: 0,
             limit: 200,
-            bytes: charged
+            bytes: fit * pageEntry
         });
+        // F1: the note states the remainder that was ACTUALLY left — derived here from the
+        // same two numbers the caller sees (`contentBudget`-sized allowance minus `bytes`) —
+        // instead of claiming "already spent the whole budget", which was untrue for a
+        // remainder of 10.
         expect(near.results[1]).toEqual({
             op: 'list',
             path: `near/b/${chain}`,
@@ -700,45 +777,28 @@ describe('files list', () => {
             limit: 200,
             bytes: 0,
             starved: true,
-            note: `This list op could not take an entry from the call's ${FILES_CONTENT_BUDGET}-byte entry budget: the list at "near/a/${chain}" (offset 0) had already charged ${charged} of it, leaving 10 — less than one entry's cost — so no entry here could be returned and nextOffset 0 has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
+            note: `This list op could not take an entry from the call's ${allowance}-byte entry allowance: the list at "near/a/${chain}" (offset 0) had already charged ${
+                fit * pageEntry
+            } of it, leaving ${leftover} — less than one entry's cost — so no entry here could be returned and nextOffset 0 has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
         });
-        // The remainder the note quotes is the caller's own arithmetic (`contentBudget -
-        // bytes`), so the sentence can be checked against the envelope it arrived in.
-        expect(near.bytes).toBe(charged);
+        expect(near.results[1].note).not.toContain('the whole');
+        // The remainder the note quotes is the caller's own arithmetic (`allowance - bytes`),
+        // so the sentence can be checked against the envelope it arrived in — and the
+        // envelope still reports the published cap, not the shrunk allowance.
+        expect(near.bytes).toBe(fit * pageEntry);
         expect(near.contentBudget).toBe(FILES_CONTENT_BUDGET);
+        expect(FILES_CONTENT_BUDGET - near.bytes).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES - fit * pageEntry);
 
-        // 2. One byte left — the last entry of the first page DID fit, and the next page is
-        // still stranded. This is the boundary of the widened gate: `remaining < nextEntry`.
-        const last = await files([
-            { op: 'list', path: `near/c/${chain}` },
-            { op: 'list', path: `near/d/${chain}` }
-        ]);
+        // 2. The same stranded remainder, against an entry it can buy: the page is returned
+        // and stays the exact clean receipt shape — no `starved`, no `note`. This is why the
+        // gate compares against THIS op's next entry instead of against zero.
+        const fits = await files([{ op: 'list', path: `near/a/${chain}` }, { op: 'list', path: 'e' }]);
 
-        expect(last.results[0]).toMatchObject({
-            entries: [...pageOf('c', 63, 209), shortC],
+        expect(fits.results[0]).toMatchObject({
+            entries: pageOf('a', fit, 209),
             truncated: false,
-            bytes: FILES_CONTENT_BUDGET - 1
+            bytes: fit * pageEntry
         });
-        expect(last.results[1]).toEqual({
-            op: 'list',
-            path: `near/d/${chain}`,
-            entries: [],
-            truncated: true,
-            nextOffset: 0,
-            offset: 0,
-            limit: 200,
-            bytes: 0,
-            starved: true,
-            note: `This list op could not take an entry from the call's ${FILES_CONTENT_BUDGET}-byte entry budget: the list at "near/c/${chain}" (offset 0) had already charged ${FILES_CONTENT_BUDGET - 1} of it, leaving 1 — less than one entry's cost — so no entry here could be returned and nextOffset 0 has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
-        });
-
-        // 3. The same 10 bytes left, against an entry they can buy: the page is returned, and
-        // stays the exact clean receipt shape — no `starved`, no `note`.
-        const fits = await files([
-            { op: 'list', path: `near/a/${chain}` },
-            { op: 'list', path: 'e' }
-        ]);
-
         expect(fits.results[1]).toEqual({
             op: 'list',
             path: 'e',
@@ -747,9 +807,24 @@ describe('files list', () => {
             nextOffset: null,
             offset: 0,
             limit: 200,
-            bytes: 'e/f'.length
+            // 3 raw bytes of name, 8 payload bytes charged (F8 currency).
+            bytes: 8
         });
-        expect(fits.bytes).toBe(charged + 'e/f'.length);
+        expect(fits.results[1].starved).toBeUndefined();
+        expect(fits.results[1].note).toBeUndefined();
+        expect(fits.bytes).toBe(fit * pageEntry + 8);
+
+        // 3. F8: both envelopes above are delivered whole. Before the fix this fixture filled
+        // 64 KiB of "entry text" and the wire carried ~1.4x that, so the call was refused and
+        // the starvation machinery never even ran.
+        for (const envelope of [near, fits]) {
+            const serialized = JSON.stringify(envelope);
+
+            expect(modelPayloadBytes(serialized)).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+            expect(
+                boundToolResult(serialized, MODEL_TOOL_RESULT_BUDGET_BYTES, { source: { name: 'files' } }).rejected
+            ).toBeUndefined();
+        }
     });
 
     it('keeps the listings it did get when one requested directory cannot be read', async () => {
@@ -771,7 +846,8 @@ describe('files list', () => {
             nextOffset: null,
             offset: 0,
             limit: 200,
-            bytes: 'tolerate-a/one.txt'.length + 'tolerate-b/two.txt'.length,
+            // F8 currency: two 20-byte entries priced as their serialized form (+5 each) = 46.
+            bytes: 46,
             error: {
                 code: 'ENOENT',
                 message: expect.stringContaining(posix(join(workdir, 'tolerate-missing')))
@@ -801,7 +877,7 @@ describe('files list', () => {
             nextOffset: null,
             offset: 0,
             limit: 200,
-            bytes: 'dedupe/one.txt'.length + 'dedupe/two.txt'.length
+            bytes: 38
         });
 
         if (!symlinksAvailable) return;
@@ -821,7 +897,7 @@ describe('files list', () => {
             nextOffset: null,
             offset: 0,
             limit: 200,
-            bytes: 'dedupe-alias/one.txt'.length + 'dedupe-alias/two.txt'.length
+            bytes: 50
         });
     });
 
@@ -855,7 +931,9 @@ describe('files list', () => {
             nextOffset: null,
             offset: 0,
             limit: 200,
-            bytes: 77
+            // F8 currency: five entries (77 raw bytes of path text) priced as their quoted,
+            // escaped form plus the separating comma — +5 each — = 102.
+            bytes: 102
         });
     });
 
@@ -958,7 +1036,7 @@ describe('files list', () => {
         const full = await files([{ op: 'list', path: 'past', limit: 1 }]);
 
         expect(full.results[0].note).toBeUndefined();
-        expect(full.results[0]).toMatchObject({ entries: ['past/a.txt'], truncated: true, nextOffset: 1, bytes: 10 });
+        expect(full.results[0]).toMatchObject({ entries: ['past/a.txt'], truncated: true, nextOffset: 1, bytes: 15 });
     });
 });
 
@@ -1268,11 +1346,12 @@ describe('files move and copy', () => {
             nextOffset: null,
             offset: 0,
             limit: 200,
-            bytes: 'bytesum/copy.txt'.length + 'bytesum/payload.txt'.length
+            // F8 currency: two 18-byte entries priced as their serialized form (+5 each).
+            bytes: 45
         });
-        // 35, not 42: the copy's 7 payload bytes stay out of this total on purpose, which is
+        // 45, not 52: the copy's 7 payload bytes stay out of this total on purpose, which is
         // exactly the sentence the description now carries.
-        expect(mixed.bytes).toBe('bytesum/copy.txt'.length + 'bytesum/payload.txt'.length);
+        expect(mixed.bytes).toBe(45);
         expect(mixed.bytes).toBe((mixed.results[1] as { bytes: number }).bytes);
     });
 

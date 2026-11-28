@@ -508,9 +508,12 @@ const retainedHandleOf = (parsed: unknown): { key: RetainedHandleKey; value: str
 //     arguments (smaller limit, fewer ids, narrower fields) to fetch it." The re-run IS the
 //     recovery, because the delivery was the only copy. This branch is BYTE-IDENTICAL to what
 //     this function shipped before the handle clause existed — the three strings below are
-//     concatenated in the same order with the same spaces — so `read`, `grep`, `knowledge`, a
+//     concatenated in the same order with the same spaces — so `read`, `knowledge`, a
 //     record page, and every fixture in ./result-budget.test.ts, ../harness.budget.test.ts and
-//     src/server/api.test.ts still read the sentence they were pinned against.
+//     src/server/api.test.ts still read the sentence they were pinned against. ONE exception,
+//     added later: F14 swaps only the parenthetical for the five tools whose published schema
+//     declares none of those three arguments (see `NARROWING_ADVICE`), and everything not in
+//     that map — including a refusal with no `source` — keeps the sentence above byte for byte.
 //   - HANDLE (a refused document that carries the id of a record the harness kept): naming a
 //     re-run would send the model back through a whole fork or child run to recover text that
 //     is one paged `agentResult` call away. The clause therefore names the retained id and the
@@ -521,6 +524,49 @@ const retainedHandleOf = (parsed: unknown): { key: RetainedHandleKey; value: str
 // `budgetBytes` is the payload budget that was applied (the aggregate case says so out
 // loud, the way the spill note does, so a turn-level squeeze is not read as a second
 // per-result cap the operator never set).
+// PER-TOOL NARROWING ADVICE (F14, 2026-11-28)
+//
+// The generic clause names `limit`, `ids` and `fields` — three arguments that exist in
+// some tools and in NONE of the five that actually hit this cap in practice. A model
+// reading "smaller limit" from a refused `grep` result sends `limit`, gets "files grep
+// does not accept \"limit\"", and has burned a turn on the recovery of a refusal. The
+// map below keys on the tool's WIRE name (`source.name`, the name the harness passes at
+// ../harness.ts:11618) and states the arguments that tool really declares, in the form
+// that shrinks its payload most.
+//
+// The rule is deliberately conservative, because a wrong argument name here is a new
+// defect of the same kind:
+//   - a name that is absent from this map, and a refusal with NO source at all
+//     (src/server/api.ts:647 re-serialises text without one), keep the historical
+//     sentence BYTE-FOR-BYTE — `read`, `knowledge`, a record page, and every pin in
+//     ./result-budget.test.ts, ../harness.budget.test.ts and src/server/api.test.ts read
+//     the string they were pinned against;
+//   - only arguments that the tool's own published schema declares are named, and only
+//     the cheap ones: paging and filtering arguments, never a change of what the call
+//     means.
+const NARROWING_ADVICE: Readonly<Record<string, string>> = {
+    // fetch: `query` is the only filter, `format: 'text'` drops the markdown scaffolding
+    // (src/engine/tools/webfetch/index.ts `FORMATS`), and `offset` pages the SAME document
+    // instead of re-fetching it.
+    fetch: '(a narrower `query`, `format: "text"`, or an `offset` into the part you have not read)',
+    // search: fewer rows, or a tighter question. `includeDomains`/`excludeDomains` narrow
+    // the row set without changing what is asked (websearch/index.ts:219-220).
+    search: '(a smaller `maxResults`, a narrower `query`, or `includeDomains`)',
+    // grep: `output: "count"` answers most survey questions in a few hundred bytes,
+    // `context: 0` removes the neighbour lines, and narrowing `paths` cuts both the
+    // matches and the walk (tools/files/grep.tool.ts).
+    grep: '(a smaller `maxResults`, `context: 0`, `output: "count"`, or narrower `paths`)',
+    // glob: the page is names only, so fewer names or shorter paths are the whole remedy.
+    glob: '(a smaller `maxResults`, narrower `paths`, or fewer `patterns`)',
+    // files: the budget is shared by the whole call, so the fix is a smaller call — the
+    // receipts of the other operations are what filled it (tools/files/files.tool.ts).
+    files: '(fewer operations in one call, or a smaller list `limit`)'
+};
+
+// The parenthetical for one refusal: the tool's own advice, or the historical phrase.
+const narrowingPhrase = (source: ToolResultSource | undefined): string =>
+    NARROWING_ADVICE[source?.name ?? ''] ?? '(smaller limit, fewer ids, narrower fields)';
+
 const refusalMessage = (
     originalBytes: number,
     budgetBytes: number,
@@ -536,10 +582,12 @@ const refusalMessage = (
 
     // Both clauses end with a trailing space, so the write-safety sentence below joins with
     // no separator and the non-handle path reproduces the historical byte stream exactly.
+    // F14: only the parenthetical varies, and it defaults to the historical text, so an
+    // unlisted tool still gets the byte stream its pins assert.
     const recovery =
         handle === undefined
             ? `Re-run ${sourcePhrase(source)} with narrower arguments ` +
-              '(smaller limit, fewer ids, narrower fields) to fetch it. '
+              `${narrowingPhrase(source)} to fetch it. `
             : `What was discarded is retained under ${handle.key} "${handle.value}": agentResult ` +
               `pages the full text by that id, so read it there instead of re-running ${sourcePhrase(source)}. `;
 

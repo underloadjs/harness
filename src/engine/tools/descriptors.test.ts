@@ -31,6 +31,11 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 // `read` returns a branded envelope (core/tool-text.ts): the machine result the compiled
 // body produces is under `content`, exactly as the harness peels it before delivery.
 import { unwrapToolResult } from '../index';
+// The delivery cap the tool reports as `contentBudget` and the budget `boundToolResult`
+// measures against are THE SAME number (F8): imported, never re-typed, so a cap change
+// lands in this pin without a second edit. `modelPayloadBytes` is the budget currency
+// itself, so the byte pins below are derived with the producer's own measure.
+import { MODEL_TOOL_RESULT_BUDGET_BYTES, modelPayloadBytes } from '../core';
 
 // Every generated-loader label this process resolves, in call order. A source-backed
 // catalogue must keep this empty: the generated loader is a BUILD ARTIFACT.
@@ -476,9 +481,17 @@ describe('live Node descriptor catalogue (T24)', () => {
         const posixFolder = folder.replace(/\\/g, '/');
         const first = `${posixFolder}/alpha.txt`;
         const second = `${posixFolder}/beta.txt`;
-        const pageBytes = Buffer.byteLength(first, 'utf8') + Buffer.byteLength(second, 'utf8');
+        // F8: `bytes` is charged in the PAYLOAD currency `boundToolResult` measures —
+        // the escaping-aware size of each entry AS IT APPEARS inside the serialized result
+        // (quoted by `JSON.stringify`, then quoted again as the JSON string the provider
+        // bills), plus the byte each entry's position in the array costs. This is the
+        // EXACT expression production uses — `entryWireBytes` in files.tool.ts:454 — so the
+        // pin is derived from the contract instead of a hand-typed byte count, and it stays
+        // correct on Windows where a path's separators are escaped on the wire.
+        const entryWireBytes = (value: string) => modelPayloadBytes(JSON.stringify(value)) + 1;
+        const pageBytes = entryWireBytes(first) + entryWireBytes(second);
 
-        // `bytes` is the UTF-8 size of THIS page's entries (the strings above), not
+        // `bytes` is the delivery size of THIS page's entries (the strings above), not
         // of the files they name. The cursor lives inside the `list` entry's receipt,
         // and the envelope's own `bytes` totals what the call charged to the budget.
         expect(listing).toEqual({
@@ -495,7 +508,9 @@ describe('live Node descriptor catalogue (T24)', () => {
                 }
             ],
             bytes: pageBytes,
-            contentBudget: 65536
+            // The cap the WHOLE serialized result is measured against: the shared
+            // delivery cap (core/result-budget.ts:62), not a producer-side 64 KiB view.
+            contentBudget: MODEL_TOOL_RESULT_BUDGET_BYTES
         });
 
         // The generated loader resolved NOTHING: the body came from the entry source.

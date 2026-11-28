@@ -33,12 +33,23 @@ export type ExaFetch = (fetch: {
     url: string;
     maxCharacters: number;
     apiKey: string;
+    // The harness's PER-CALL AbortSignal (F10), handed to `requestSearch` as
+    // `callerSignal`. Optional: a caller that cannot cancel (the plain
+    // `definition(parameters)` callable path) leaves it undefined, and the request
+    // then runs on the timeout alone — exactly as before.
+    callerSignal?: AbortSignal;
 }) => Promise<{ content: string; title?: string }>;
 
-export const fetchExa: ExaFetch = async ({ url, maxCharacters, apiKey }) => {
+export const fetchExa: ExaFetch = async ({ url, maxCharacters, apiKey, callerSignal }) => {
     const payload = await requestSearch({
         label: LABEL,
         endpoint: ENDPOINT,
+        // F10: `toolCancel` aborts a hosted call the same way it aborts a native
+        // GET. `requestSearch` links this into its own timeout controller (strong
+        // signal wins, timeout wording preserved — websearch/request.ts:647-681),
+        // so a cancelled crawl stops transferring instead of finishing and being
+        // thrown away.
+        callerSignal,
         // The key travels in a header on purpose: headers are not logged in the
         // URL and not present in any redirect target (redirects are disabled by
         // requestSearch).

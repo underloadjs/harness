@@ -114,6 +114,13 @@ export type LaneBlueprintSource = Pick<
     // and the replica keeps the historical record-only rebuild.
     | 'presetRebuild'
     | 'plugins'
+    // F7: the session's downloads folder. It joins the list because it is the same KIND of value
+    // as the two above — a per-build harness fact the worker cannot derive for itself. It is NOT a
+    // snapshot of mutable state and NOT a deployment-wide answer: it is `<root>/harness/sessions/<id>/downloads`,
+    // derived from the session id (../persistence.ts:2653), so it is fixed for the session's life and
+    // identical on both sides of the thread boundary. Without it a lane replica's `download` refuses
+    // while the inline session it mirrors succeeds (./lane-worker-loop.ts `sayHello`).
+    | 'downloadsDirectory'
 >;
 
 export type LaneTurnRequest = {

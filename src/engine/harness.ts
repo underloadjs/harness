@@ -1557,6 +1557,49 @@ const knowledgeOwnerOf = (provided: HarnessConfiguration['knowledgeOwner']): str
     return owner;
 };
 
+// `HarnessConfiguration.downloadsDirectory`, read the same way `knowledgeOwnerOf` reads its
+// setting: validate at CONSTRUCTION, hand the tools a value that needs no re-checking.
+//
+// WHAT IT IS: the folder the `download` tool may write fetched bytes into (F7). A host-trusted
+// path, never model input — the model chooses a name and an optional subpath inside it, and the
+// entry refuses anything that escapes (./tools/webdownload/download.tool.ts `pathArgument` and
+// `destinationOf`). The server supplies the harness SESSION's own folder so the downloads are
+// deleted with the session (../server/persistence.ts `harnessSessionDownloadsDirectoryOf`,
+// deleted by ../server/journal.ts `remove()`); a relative value stays relative and is resolved
+// against the process working directory at write time, which is the host's own convention.
+//
+// WHY NO DEFAULT: a folder this layer invents is a folder nobody owns — that is exactly the
+// defect F7 closed (the old `.underload/downloads` under the cwd was invisible to `glob`/`grep`
+// behind a `.gitignore` and littered checkouts). Absent/blank therefore means UNOWNED and the
+// tool refuses, rather than this build silently picking a location for the host.
+//
+// A non-string fails construction loudly: an operator's typo must read as "the field you set is
+// wrong", not as "the download tool is unavailable".
+const downloadsDirectorySettingOf = (provided: HarnessConfiguration['downloadsDirectory']): string | undefined => {
+    if (provided === undefined || provided === null) return undefined;
+
+    if (typeof provided !== 'string') {
+        throw new HarnessError(
+            `HarnessConfiguration.downloadsDirectory must be a directory path string; received ${typeof provided}.`
+        );
+    }
+
+    const directory = provided.trim();
+
+    if (directory.length === 0) return undefined;
+
+    // A path over 4096 characters cannot be a real destination on any supported platform, and
+    // refusing here keeps the entry's `pathArgument` bound (512 for the SUBPATH) honest about
+    // what it is guarding.
+    if (directory.length > 4_096) {
+        throw new HarnessError(
+            `HarnessConfiguration.downloadsDirectory is ${directory.length} characters, over the 4096-character path limit.`
+        );
+    }
+
+    return directory;
+};
+
 export const harness = (configuration: HarnessConfiguration): Harness => {
     // Resolve the loop bound once, before anything is built, so a bad value fails
     // at construction instead of after a long run. The bound applies to every agent
@@ -4716,6 +4759,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // UNOWNED articles — the deliberate library-consumer posture, and what keeps legacy
     // articles out of any harness deletion's reach.
     const knowledgeOwner = knowledgeOwnerOf(configuration.knowledgeOwner);
+
+    // THE downloads folder every tool call of THIS build may write into (F7). Resolved once,
+    // beside `knowledgeOwner`, because it is a property of the build rather than of a call: the
+    // model path builds `ToolContext` deep inside the run loop (see the three `context` sites),
+    // where no HTTP request is in scope to carry one, and a lane replica builds it in another
+    // process from the same blueprint. Absent means unowned, and `download` refuses.
+    const downloadsDirectory = downloadsDirectorySettingOf(configuration.downloadsDirectory);
 
     // Per-harness network closures. They are populated during startup from the
     // `websearch`/`webfetch` configuration and carry the credentials; the compiled
@@ -12923,6 +12973,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // on a lane instead of failing on the refusal (src/harness.ts `refuseNestedRun`
                     // is the door; ./core/nested-runs.ts is the sentence).
                     nestedRuns: nestedRunPolicy,
+                    // F7: the folder this call may save downloaded bytes into, when the build has
+                    // one (the server sets it to the session's own downloads folder). Spread
+                    // conditionally so a library build's context keeps its historical key set —
+                    // `download` reads it as "no owner" and refuses rather than picking a folder.
+                    ...(downloadsDirectory === undefined ? {} : { downloadsDirectory }),
                     // R2/R4: the persistent conversation this call belongs to. The
                     // runtime supplies it (never a tool argument), so threadSend can
                     // attribute the sender honestly.
@@ -18603,6 +18658,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ...(options.toolScope === undefined ? {} : { toolScope: options.toolScope }),
             // T14: the live nested-run policy of THIS instance.
             nestedRuns: nestedRunPolicy,
+            // F7: the session downloads folder for this build, when the host configured one. It
+            // rides the BUILD (not the call) because the model path has no request to carry it and
+            // a lane replica rebuilds the same context in another process; `download` treats its
+            // absence as "no owner for the bytes" and refuses instead of choosing a folder.
+            ...(downloadsDirectory === undefined ? {} : { downloadsDirectory }),
             ...(options.threadId === undefined ? {} : { threadId: options.threadId }),
             run: (agentName: string, input: string, options?: ToolRunOptions) => {
                 // T14: this door carries NO parent run (a manual `executeTool` or a nested
@@ -18719,6 +18779,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // the historical full-catalogue shape (unrestricted = the R2 baseline).
             // T14: the live nested-run policy of THIS instance.
             nestedRuns: nestedRunPolicy,
+            // F7: the session downloads folder (see `ToolContext.downloadsDirectory`). A host
+            // `executeTool` call gets the same folder the model path gets — the bytes a download
+            // writes must not depend on which door asked for them, and both are deleted with the
+            // session.
+            ...(downloadsDirectory === undefined ? {} : { downloadsDirectory }),
             run: (agentName: string, input: string, options?: ToolRunOptions) => {
                 // T14: refuse this door before anything resolves (no parent run reaches
                 // `runAgent`'s lineage guard from here).

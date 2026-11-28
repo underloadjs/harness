@@ -59,17 +59,20 @@ const FILE_READ_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
 const anyPool = expect.any(Number);
 
 // Mirrors FILES_CONTENT_BUDGET / FILES_LIST_DEFAULT_LIMIT in ./files/files.tool.ts
-// for the same lazy-loading reason as above.
-const FILES_CONTENT_BUDGET = 64 * 1024;
+// for the same lazy-loading reason as above. DERIVED from the delivery cap rather than
+// written as a literal: the tool's budget IS `MODEL_TOOL_RESULT_BUDGET_BYTES` (F8), and a
+// mirrored `64 * 1024` here was the exact drift that let a full page of entries be refused
+// by the harness while this file still passed. ./files/files.test.ts pins the equality to
+// the real export.
+const FILES_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
 const FILES_LIST_DEFAULT_LIMIT = 200;
 
-// Mirrors FILE_GREP_CONTENT_BUDGET in ./files/grep.tool for the same reason: grep is
-// the content half of the old fileGlob, and its aggregate budget is part of the
-// result shape a model reads. glob now publishes the same size budget for its path
-// text, so both are mirrored here rather than imported (importing would evaluate the
-// implementation module eagerly and break laziness.test.ts).
-const FILE_GREP_CONTENT_BUDGET = 64 * 1024;
-const FILE_GLOB_CONTENT_BUDGET = 64 * 1024;
+// Mirrors FILE_GREP_CONTENT_BUDGET / FILE_GLOB_CONTENT_BUDGET in ./files/{grep,glob}.tool
+// for the same reason: grep is the content half of the old fileGlob, and its aggregate
+// budget is part of the result shape a model reads. Both are the delivery cap since F8, so
+// both derive from the same number instead of repeating a literal that drifted once already.
+const FILE_GREP_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
+const FILE_GLOB_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
 
 // Repo-root Temp/, so fixtures never land in OS temp.
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../Temp', import.meta.url));
@@ -312,10 +315,11 @@ describe('file tools', () => {
                     nextOffset: null,
                     offset: 0,
                     limit: 200,
-                    bytes: 14
+                    // F8 currency: one entry's quoted, escaped form + comma (14 raw + 5).
+                    bytes: 19
                 }
             ],
-            bytes: 14,
+            bytes: 19,
             contentBudget: FILES_CONTENT_BUDGET
         });
     });
@@ -336,7 +340,8 @@ describe('file tools', () => {
             offset: 0,
             limit: 100,
             nextOffset: null,
-            bytes: 'search-split/a.ts'.length,
+            // F8 currency: the entry's quoted, escaped form + comma (14 raw + 5).
+            bytes: 22,
             contentBudget: FILE_GLOB_CONTENT_BUDGET,
             stopReason: 'complete',
             partial: false,
@@ -377,7 +382,9 @@ describe('file tools', () => {
             offset: 0,
             limit: 100,
             nextOffset: null,
-            bytes: 21,
+            // F8 currency: two `{ path, line, text, textTruncated, bytes }` entries priced as
+            // their serialized form plus the separating comma; their snippets alone were 21.
+            bytes: 217,
             contentBudget: FILE_GREP_CONTENT_BUDGET,
             partial: false,
             stopReason: 'complete',
@@ -526,11 +533,12 @@ describe('file tools', () => {
                     nextOffset: null,
                     offset: 0,
                     limit: FILES_LIST_DEFAULT_LIMIT,
-                    // 'tree/a.txt' (10) + 'tree/sub/' (9) UTF-8 bytes.
-                    bytes: 19
+                    // F8 currency: two entries priced as their quoted, escaped form plus the
+                    // separating comma — 'tree/a.txt' (10) + 'tree/sub/' (9) raw, +5 each = 29.
+                    bytes: 29
                 }
             ],
-            bytes: 19,
+            bytes: 29,
             contentBudget: FILES_CONTENT_BUDGET
         });
     });
@@ -553,11 +561,12 @@ describe('file tools', () => {
                     nextOffset: null,
                     offset: 0,
                     limit: FILES_LIST_DEFAULT_LIMIT,
-                    // 'multi/task/b.ts' (15) + 'multi/src/a.ts' (14) UTF-8 bytes.
-                    bytes: 29
+                    // F8 currency: 'multi/task/b.ts' (15) + 'multi/src/a.ts' (14) raw bytes,
+                    // each priced as its quoted, escaped form plus the comma (+5) = 39.
+                    bytes: 39
                 }
             ],
-            bytes: 29,
+            bytes: 39,
             contentBudget: FILES_CONTENT_BUDGET
         });
     });
@@ -583,10 +592,11 @@ describe('file tools', () => {
                         nextOffset: null,
                         offset: 0,
                         limit: FILES_LIST_DEFAULT_LIMIT,
-                        bytes: 14
+                        // F8 currency: 10 + 4 raw bytes, +5 each = 24.
+                        bytes: 24
                     }
                 ],
-                bytes: 14,
+                bytes: 24,
                 contentBudget: FILES_CONTENT_BUDGET
             };
 
@@ -805,5 +815,84 @@ describe('presets inside a harness', () => {
             'syntax'
         ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
+    });
+});
+
+// The one invariant every result size in the preset is subject to.
+//
+// A tool that caps its own output is optimizing for the same line the harness enforces:
+// `MODEL_TOOL_RESULT_BUDGET_BYTES` (src/engine/core/result-budget.ts) is the payload size
+// above which a tool result is REFUSED rather than delivered (F-CUTTER — a refused result
+// is worse than a truncated one: the model gets a sentence and no data). So a tool budget
+// ABOVE the cap is a bug by construction: it lets the tool build a page it can never send.
+// F8 was exactly that shape in three tools at once (grep/glob/files at 64 KiB of raw text
+// against a 32 KiB escaped cap), and webfetch/websearch carried the same 64 KiB.
+//
+// One test, every budgeted constant a preset entry sizes for itself, so the next tool that
+// sizes itself independently fails here with a named tool rather than in a model's transcript.
+// (The map names each entry `tool.CONSTANT`, which is why adding a budget here is the only way
+// to cover it — an unlisted constant is simply unchecked.)
+describe('result budgets', () => {
+    it('sizes every preset tool at or below the delivery cap the harness measures', async () => {
+        // Imported dynamically on purpose: the mirrors at the top of this file stay literal
+        // free WITHOUT adding a static edge from the preset test entry into the tool modules
+        // (the note there explains why that edge matters for ./laziness.test.ts), and an
+        // unbudgeted or renamed export fails this one test instead of taking the file down at
+        // collection time.
+        const { FILE_READ_WIRE_BUDGET } = await import('./files/read.tool');
+        const { FILE_GREP_CONTENT_BUDGET: grepBudget } = await import('./files/grep.tool');
+        const { FILE_GLOB_CONTENT_BUDGET: globBudget } = await import('./files/glob.tool');
+        const { FILES_CONTENT_BUDGET: filesBudget } = await import('./files/files.tool');
+        const { MAX_RESULT_BYTES, MAX_RESULT_CONTENT_BYTES } = await import('./webfetch/request');
+        const { MAX_SEARCH_RESULT_BYTES } = await import('./websearch/request');
+        // `threadRead` sizes its own content window too, and it was the one budgeted constant
+        // the map did not carry: the leaf module (`./runtime/threadRead`, not the tool entry) is
+        // imported dynamically like every other number here, so the map stays literal-free
+        // without a static edge into a tool body (see the note at the top of this file).
+        const { THREAD_READ_CONTENT_BUDGET_BYTES } = await import('./runtime/threadRead');
+
+        const budgets: Record<string, number> = {
+            'read.FILE_READ_WIRE_BUDGET': FILE_READ_WIRE_BUDGET,
+            'grep.FILE_GREP_CONTENT_BUDGET': grepBudget,
+            'glob.FILE_GLOB_CONTENT_BUDGET': globBudget,
+            'files.FILES_CONTENT_BUDGET': filesBudget,
+            'fetch.MAX_RESULT_BYTES': MAX_RESULT_BYTES,
+            'fetch.MAX_RESULT_CONTENT_BYTES': MAX_RESULT_CONTENT_BYTES,
+            'search.MAX_SEARCH_RESULT_BYTES': MAX_SEARCH_RESULT_BYTES,
+            'threadRead.THREAD_READ_CONTENT_BUDGET_BYTES': THREAD_READ_CONTENT_BUDGET_BYTES
+        };
+
+        // The whole map, asserted as one exact object: a tool that changes its budget changes
+        // this fixture, and a NEW budgeted constant has to be added here to be covered.
+        expect(budgets).toEqual({
+            'read.FILE_READ_WIRE_BUDGET': 32768,
+            'grep.FILE_GREP_CONTENT_BUDGET': 32768,
+            'glob.FILE_GLOB_CONTENT_BUDGET': 32768,
+            'files.FILES_CONTENT_BUDGET': 32768,
+            'fetch.MAX_RESULT_BYTES': 32768,
+            'fetch.MAX_RESULT_CONTENT_BYTES': 30720,
+            'search.MAX_SEARCH_RESULT_BYTES': 32768,
+            'threadRead.THREAD_READ_CONTENT_BUDGET_BYTES': 32768
+        });
+
+        for (const [name, budget] of Object.entries(budgets)) {
+            expect(budget, `${name} must not exceed MODEL_TOOL_RESULT_BUDGET_BYTES`).toBeLessThanOrEqual(
+                MODEL_TOOL_RESULT_BUDGET_BYTES
+            );
+        }
+
+        // The budgets that sit on the cap EXACTLY: the three files-preset tools, each of which
+        // subtracts its own measured scaffolding from the allowance it spends
+        // (`globPageAllowance`, `grepPageAllowance`, `filesListAllowance`), and `threadRead`,
+        // whose content budget IS the cap and whose per-record window subtracts
+        // `threadReadResultOverhead` from it (./runtime/threadRead.ts) — the same shape the
+        // files tools use. webfetch instead reserves a fixed `RESULT_OVERHEAD_BYTES`, which is
+        // why its content figure is the only one strictly below its own cap. Both shapes are
+        // legal under the invariant; drifting ABOVE it is not.
+        expect(globBudget).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(grepBudget).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(filesBudget).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(THREAD_READ_CONTENT_BUDGET_BYTES).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(MAX_RESULT_CONTENT_BYTES).toBeLessThan(MAX_RESULT_BYTES);
     });
 });

@@ -98,12 +98,14 @@ For both web rows a host-registered tool of the same wire name wins, and the
 provider surface (description, tags, and the per-harness `provider` enum)
 replaces the entry's generic literal at registration — credentials and the
 configured provider list never enter editable source. The `download` entry needs
-neither credential nor configuration: it is a `preset`-group row with
-`activation: always` and `visibility: searchable`, so every harness registers it and
+neither credential nor per-tool configuration, but it does need a DESTINATION: it
+is a `preset`-group row with
+`activation: always`, `sessionBound: true` (F7 — its bytes are saved in the
+harness session's own downloads folder, so a call with no session has nowhere to
+write them) and `visibility: searchable`, so every harness registers it and
 opens it through `toolRequest` (order 235, between `gitDiff` 230 and `search` 240) —
 or finds it already open in a harness built with `enableAllTools`, which is what the
-server does for a session it creates (`src/server/sessions.ts:2204`) and for one it resets
-(`:10204`).
+server does for a session it creates (`src/server/sessions.ts`) and for one it resets.
 The two web rows are the opposite: `search.tool.ts` and `fetch.tool.ts` are
 `visibility: core` (R9-R11), so a harness that REGISTERED them declares them on every
 request - the gate is activation, never a discovery round. The server mirrors that
@@ -205,7 +207,10 @@ delegate provider/credential operations to the harness that owns them; startup
 supplies the configured metadata/runtime closure. `download` is different:
 `tools/webdownload/download.tool.ts` is a self-contained preset entry with no
 harness-owned closure (no credential, and its bounds and MIME tables are inline
-literals so a compiled revision keeps `dependencies: []`). A replacement
+literals so a compiled revision keeps `dependencies: []` — that figure counts
+captured LOCAL modules, so the entry's `node:fs/promises`/`node:path` imports and
+the one dynamic `import('node:dns/promises')` behind a literal specifier do not
+change it). A replacement
 registered under those names is an ordinary source revision and
 does not inherit the original harness's configured provider closure. Module-local
 provider state is not migrated between revisions. Credentials remain harness

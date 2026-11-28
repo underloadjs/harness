@@ -20,7 +20,6 @@
 //   - ./request   — requestSearch, normalizeMatches, the shared bounds/errors
 //   - ./index     — dispatch + key resolution
 
-import type { WebSearchMatch } from '../../types';
 import {
     excerpt,
     date,
@@ -28,15 +27,17 @@ import {
     requestSearch,
     resultsArray
 } from './request';
-import type { MatchFields, ProviderSearch } from './request';
+import type { MatchFields, NormalizedResults, ProviderSearch } from './request';
 
 const ENDPOINT = 'https://api.exa.ai/search';
 const LABEL = 'Exa';
 
-export const searchExa = async (search: ProviderSearch): Promise<WebSearchMatch[]> => {
+export const searchExa = async (search: ProviderSearch): Promise<NormalizedResults> => {
     const payload = await requestSearch({
         label: LABEL,
         endpoint: ENDPOINT,
+        // F10: the caller's cancellation signal travels with the request.
+        callerSignal: search.signal,
         // The key travels in a header on purpose: headers are not logged in the
         // URL, not embedded in the body the provider may echo, and not present in
         // any redirect target (redirects are disabled by requestSearch).
@@ -64,6 +65,11 @@ export const searchExa = async (search: ProviderSearch): Promise<WebSearchMatch[
 
     const rows = resultsArray(payload, LABEL);
 
+    // F5: `maxResults` bounds the VALID rows, not the rows scanned, so a provider
+    // row with a `javascript:` or relative URL no longer costs the caller a result.
+    // `numResults` above is still what Exa is asked for: over-fetching to cover junk
+    // rows would spend provider credits the caller did not ask for, and the caller
+    // can now ask for more itself because `dropped` is reported.
     return normalizeMatches(
         rows,
         search.maxResults,

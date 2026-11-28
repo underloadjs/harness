@@ -13,20 +13,27 @@
 // Bounds (S1, same philosophy as websearch): these are constants, not knobs. A
 // tool result must stay small and predictable no matter what the open web
 // returns:
-//   - 100 KiB of response body, enforced while streaming so an oversized page
-//     is never allocated in full, plus a content-length pre-check that rejects
-//     (and cancels) before a single byte is read;
-//   - 24,000 characters of returned content (the character budget is what the
-//     model actually pays; the byte bound is what the process is exposed to);
+//   - 1 MiB of response body (see MAX_RESPONSE_BYTES below for why it was raised
+//     from 100 KiB), enforced while streaming so an oversized page is never
+//     allocated in full, plus a content-length pre-check that rejects (and
+//     cancels) before a single byte is read;
+//   - 240,000 characters of returned CONTENT, across all of a page's windows
+//     (the character budget is what the model actually pays; the byte bound is
+//     what the process is exposed to);
+//   - ONE result sized to the harness's model-facing cap (see MAX_RESULT_BYTES
+//     below), so the tool truncates itself instead of being re-wrapped — and,
+//     since F1, sized in the harness's own ESCAPED-byte currency, because a
+//     result measured in raw UTF-8 was still over the cap and got refused whole;
 //   - 15 s per request, enforced with AbortController and cleaned up in
 //     `finally`; one attempt per user agent, plus a single honest-UA retry when
 //     Cloudflare challenges the browser-impersonating one.
 //
-// 100 KiB (not the 512 KiB the provider requests in ../websearch/request allow)
-// is deliberate: this GET faces arbitrary hosts, and a page that does not fit is
-// a file, not an article. A non-text content type and an oversized body are both
-// refusals, and the tool description points the model at the host's download tool
-// for them instead of raising the bound here.
+// The transfer cap is 1 MiB against the 512 KiB the fixed provider endpoints in
+// ../websearch/request allow (see MAX_RESPONSE_BYTES for the measurement that
+// raised it): this GET faces arbitrary hosts, and a page that does not fit is
+// still a file, not an article. A non-text content type and an oversized body are
+// both refusals, and the tool description points the model at the host's download
+// tool for them instead of raising the bound here.
 //
 // Redirects are FOLLOWED here (up to fetch's implementation default), unlike
 // the fixed-endpoint search requests: a page URL legitimately redirects, and
@@ -72,33 +79,61 @@ export const FETCH_TIMEOUT_MS = 15_000;
 // now; a 20 MiB HTML dump is not).
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
 
-// Returned-content ceiling, in characters (10x the previous 24,000). This is
-// what the model pays; MAX_RESPONSE_BYTES is what the process is exposed to.
+// Returned-content ceiling, in characters (10x the previous 24,000). This is what
+// the model pays ACROSS the windows of one page; one RESULT is capped lower, by
+// MAX_RESULT_BYTES, and a longer page is reached by paging with `offset`.
+// MAX_RESPONSE_BYTES is what the process is exposed to.
 export const MAX_CONTENT_CHARS = 240_000;
 
-// The ceiling on the SERIALIZED tool result. The harness caps every model-facing
-// tool result at MODEL_TOOL_RESULT_BUDGET_BYTES (core/result-budget.ts) and
-// replaces an over-budget value with a generic envelope that DROPS this tool's
-// own metadata (url, title, contentType, characters, truncated, nextOffset).
-// So ./index bounds the content to fit inside that cap itself: the tool does the
-// truncating, keeps its shape, and reports `nextOffset` instead of being
-// silently re-wrapped by the harness. A 240,000-character page is therefore
-// reachable, but never in one result that the harness would flatten.
-export const MAX_RESULT_BYTES = 64 * 1024;
+// The ceiling on the SERIALIZED tool result, in the currency the cap is enforced
+// in: the JSON-ESCAPED bytes of `JSON.stringify(result)` as it sits inside the
+// model message. The harness caps every model-facing tool result at
+// `MODEL_TOOL_RESULT_BUDGET_BYTES` (core/result-budget.ts) and, because a fetch
+// result IS a JSON document, an over-budget value is not sliced — it is REFUSED
+// whole (`reason: 'oversized-json'`) and the delivery site reports the call as
+// FAILED (harness.ts `boundDelivery` → `delivered.rejected ? 'failed'`).
+//
+// F1 is the reason this constant is written in escaped bytes and not in raw UTF-8.
+// The number used to be DOUBLE the harness cap, so a page that filled fetch's own
+// content ceiling was, by construction, over the cap: the tool truncated, reported
+// `nextOffset`, and the harness threw the whole result away — a successful read
+// delivered as a failed tool call.
+//
+// The value is a LITERAL rather than an import from ../../core: a relative VALUE
+// import becomes a captured source dependency of a compiled tool entry (the same
+// rule read.tool.ts:682-693 states for the preset, and the same reason
+// ./index re-declares its byte helpers), so the number is spelled out here and
+// webfetch.test.ts pins it against `MODEL_TOOL_RESULT_BUDGET_BYTES` instead.
+export const MAX_RESULT_BYTES = 32 * 1024;
 
-// The fixed keys of a fetch result (provider, url, contentType, format,
-// characters, truncated, pageCharacters, offset, nextOffset, title) plus JSON
-// punctuation and escaping. Measured well under this; the fit loop is exact
-// regardless, so this only decides where the shrink starts.
+// The MINIMUM room the tool always leaves for the fields that ride beside
+// `content` (provider, url, contentType, format, characters, truncated,
+// pageCharacters, offset, nextOffset, title, query, matches, totalSections,
+// totalMatches, matchMode, stopReason, note, redirects), plus JSON punctuation and
+// escaping. ./index MEASURES the real overhead of the result it is about to return
+// and spends whichever allowance is larger, so this constant is only the floor: a
+// short URL and no title still deliver the full MAX_RESULT_CONTENT_BYTES, while a
+// 2,048-character URL plus a 300-character title shrinks the content instead of
+// the result.
 export const RESULT_OVERHEAD_BYTES = 2_048;
 
-// The content ceiling for ONE result, in UTF-8 BYTES: the harness cap minus the
-// object's own overhead. BYTES and not characters on purpose — the harness budget
-// this protects (core/result-budget.ts) is measured in bytes, so a page full of
-// multi-byte text carries FEWER characters than this number and the tool must not
-// claim otherwise. Exported because a test must assert the real bound rather than
-// re-derive the arithmetic.
+// The MAXIMUM content one result may carry, in the harness's escaped-byte currency:
+// the result cap minus the minimum overhead above. It is the number the tool
+// description quotes, and it is the bound the fit loop starts from. BYTES and not
+// characters on purpose — the budget this protects is measured in bytes, so a page
+// full of multi-byte text carries FEWER characters than this number and the tool
+// must not claim otherwise. Exported because a test must assert the real bound
+// rather than re-derive the arithmetic.
 export const MAX_RESULT_CONTENT_BYTES = MAX_RESULT_BYTES - RESULT_OVERHEAD_BYTES;
+
+// The slack the fit loop keeps on top of the measured overhead, for the two figures
+// whose serialized width depends on the fit itself and therefore cannot be in the
+// skeleton it measures: `characters` (the delivered length) and the digits of a
+// `nextOffset` that only exists because the fit cut. Both placeholders in the
+// skeleton are at their widest possible value, so this is a second belt, not the
+// whole guarantee — 64 bytes covers a `stopReason` key the skeleton already
+// includes optimistically plus the digit spread of every number in the object.
+export const RESULT_FIT_SAFETY_BYTES = 64;
 
 // A <title> is a label, not free text: anything longer is dropped.
 export const MAX_TITLE_CHARS = 300;
@@ -118,8 +153,13 @@ export const MAX_REDIRECTS = 5;
 // almost certainly the model pasting the page back.
 export const MAX_QUERY_CHARS = 200;
 
-// Sections a `query` may return. Bounded so a one-word query against a huge
-// page cannot smuggle the whole document back past the character bound.
+// Sections a HEADING-mode `query` may return — the cap is a heading-mode limit
+// only, because proximity mode returns exactly ONE window (see ./sections). It is
+// exported so ./index compares the real cap when it decides whether anything was
+// withheld, instead of inferring a cap hit from `totalMatches > matches.length`
+// (F4: in proximity mode `totalMatches` counts OCCURRENCES, so that comparison
+// reported a cap that never fired). Bounded so a one-word query against a huge
+// page cannot smuggle the whole document back past the result bound.
 export const MAX_QUERY_BLOCKS = 20;
 
 // The user agents. The first impersonates a browser (many hosts 403 an
@@ -395,15 +435,258 @@ export const binaryExtension = (url: string): string | undefined => {
 // local server on 127.0.0.1 answered a fetch and its 404 was reported, which is
 // both an internal read and a port-open oracle.
 //
-// This validates the address form, not the route: an IP literal is checked
-// against the non-public ranges, and `localhost`/`.localhost` by name. A DNS name
-// that RESOLVES to a private address is not caught here, because the platform
-// fetch exposes no hook between a redirect and the connection — stated plainly
-// rather than oversold. Blocking IP literals plus loopback names closes the two
-// shapes that matter in practice (metadata endpoints and local services reached
-// through a redirect) without adding a DNS dependency to a zero-dependency tool.
+// This validates the address FORM, not the route: an IP literal is checked against
+// the non-public ranges, and `localhost`/`.localhost` by name. A DNS name whose A
+// record is private is NOT caught here — that needs a lookup, which is the second
+// gate below (`resolvePublicHost`), and that gate runs only when a resolver is
+// wired (see `WebFetchConfiguration.dns`). Stated plainly rather than oversold:
+// with no resolver configured — which is the state of a browser/bun runtime, of a
+// host that passes `dns: { off: true }`, and of the offline test suite — the ONLY
+// SSRF protection in force is this address-form check plus the redirect re-check
+// that uses it. Blocking IP literals plus loopback names closes the two shapes
+// that matter in practice without adding a DNS dependency to a zero-dependency
+// tool; closing the rebinding hole is the host's opt-in.
+//
+// WHICH ADDRESS FORMS (the review's security intent, made explicit). A gate that
+// only reads dotted quads is a gate you can walk past by writing the same address
+// differently, and the address a fetch was built from is not always a dotted quad:
+// `new URL()` normalizes the IPv4 notations it recognizes (`http://2130706433/`
+// becomes `127.0.0.1` — measured), but a caller that hands `isPrivateHost` or an
+// injected `dns.lookup` address TEXT gets the text verbatim, and every form the URL
+// parser leaves alone used to be answered "public". So the check now decodes:
+//   - IPv4 in the `inet_aton` notations — bare decimal (`2130706433`), hex
+//     (`0x7f000001`), octal (`017700000001`), and the 1-3-part shorthands whose last
+//     number absorbs the rest (`127.1`, `0x7f.1`);
+//   - IPv6 with an IPv4 embedded in it, whatever the text looks like: mapped
+//     (`::ffff:7f00:1` AND the uncompressed `0:0:0:0:0:ffff:7f00:1`), compatible
+//     (`::7f00:1`), IPv4-translated (`64:ff9b::7f00:1` AND
+//     `64:ff9b:0:0:0:0:7f00:1`), 6to4 (`2002:VVVV:VVVV::`, RFC 3056 §5.1 — the
+//     tunnel's IPv4 is the SECOND AND THIRD groups, NOT inverted, so `2002:7f00:1::`
+//     is 127.0.0.1 and `2002:a9fe:a9fe::` is the metadata address, in compressed,
+//     longhand, zero-padded, uppercase, and trailing-host spellings), and Teredo —
+//     `2001::/32`, where the client IPv4 is stored BITWISE INVERTED in the last 32
+//     bits, so `2001::200:0:ff00:fffe` is 127.0.0.1 without ever containing `7f00:1`.
+// Decoding is ADDITIVE: every rule that refused an address before this pass still
+// refuses it, including the blanket `64:ff9b::` and `::` prefixes, which are wider
+// than /96 and therefore also refuse some PUBLIC addresses. Erring wide is the
+// point; narrowing a working fetch tool is not what a security fix should do.
+//
+// DECIDED AGAINST, so the next reader does not "fix" an omission: prefixes whose
+// text LOOKS like it carries an IPv4 but whose specification puts none at that bit
+// position. The ORCHID family is defined away — RFC 4843 §2 builds the address by
+// prepending "the 28-bit ORCHID prefix" to a 100-bit cryptographic hash, and the
+// registered prefixes are `2001:20::/28` (RFC 7194) and ORCHIDv2 `2001:30::/28`
+// (RFC 7360) — so `2001:10::7f00:1` "decoding" to 127.0.0.1 is a low-32-bit guess,
+// not a documented embedding, and the same holds for the 6VTEL `2620::/27` forms
+// (`2620::7f00:1`, `2620:1000:7f00:1::`). Measured (`Temp/t1-webfetch/probe14.ts`):
+// those texts DO reach the network, so the class is real; what is missing is a cited
+// bit position, and a block without one is a speculative refusal. For 6VTEL that is a
+// MISSING-CITATION caveat rather than a disproof — RFC 3964, the document that discusses
+// embedded-address refusal, is 6to4's security analysis and does not mention `2620`.
+// An IPv6 zone id (`fe80::1%25eth0`) needs no rule at all: `new URL()` refuses that host
+// text, so it never reaches the gate (measured).
+//
+// Still NOT caught, and no decode can catch it: a DNS name whose A/AAAA record is
+// private (the `.nip.io` shape, measured above) while no resolver is wired, and any
+// address reached through a public anycast/Teredo relay whose tunnel endpoint is
+// private but whose address text is public. Both are stated in the description.
 const PRIVATE_IPV4 = /^(?:10\.|127\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.0\.0\.|192\.168\.|198\.1[89]\.|0\.)/;
 const PRIVATE_IPV6 = /^(?:(?:fe80|fc|fd)[0-9a-f:]*|::1?|::ffff:(?:7f00:1|0?0?0?0?0?1)(?::0)?|64:ff9b::)/i;
+
+// CGNAT (RFC 6598) is `100.64.0.0/10`, and a /10 is the SECOND octet 64-127 — not the /16 a
+// `startsWith('100.64.')` prefix test sees. `100.127.255.255` is therefore inside the block
+// and used to be answered public; so was every CGNAT address whose second octet was not `64`.
+// It is its own regular expression rather than an arm of `PRIVATE_IPV4` above: the /10
+// arithmetic (`6[4-9]|[7-9]\d|1[01]\d|12[0-7]`) is unreadable inline in that prefix list, and
+// ../webdownload/download.tool.ts RESTATES this predicate character-for-character, so one
+// named constant per range is what keeps the two copies comparable line by line.
+const PRIVATE_IPV4_CGNAT = /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./;
+
+// The one IPv4 predicate the whole gate shares, so a decoded address is refused by exactly the
+// rule its dotted-quad twin is refused by. EVERY IPv4 verdict comes through here — the dotted
+// quads, the `inet_aton` decodes, the embedded-address decode, and the raw `::ffff:<dotted>`
+// text shortcut in `isPrivateHost` — which is what makes a mapped spelling answer the same as
+// its dotted twin. Widening a range means widening ONE predicate; an earlier pass carried
+// CGNAT as a `100.64.` prefix here while the text shortcut tested `PRIVATE_IPV4` alone, so
+// `100.64.0.1` was refused and `::ffff:100.64.0.1` was not.
+const privateIPv4 = (address: string): boolean =>
+    PRIVATE_IPV4.test(address) || PRIVATE_IPV4_CGNAT.test(address);
+
+// ---------------------------------------------------------------------------
+// Address-form decoding for the SSRF gate (no DNS, no dependencies)
+// ---------------------------------------------------------------------------
+//
+// Everything below is pure text handling, and every helper answers a question the
+// gate already asked — it only asks it about forms the old regular expressions
+// could not see. A helper that is unsure returns `undefined`, and `isPrivateHost`
+// then falls back to the verdict the regular expressions give, so an unexpected
+// address string can never turn a public page into a refusal by failing to parse.
+
+// One number in the grammar `inet_aton` accepts and the WHATWG URL host parser
+// copies: decimal, `0x`-prefixed hex, or a leading-`0` octal. Length-capped before
+// `parseInt` so a 20-digit label cannot quietly round into a valid byte.
+const ipv4Number = (label: string): number | undefined => {
+    if (label.length === 0) return undefined;
+
+    const hex = /^0x([0-9a-f]{1,8})$/.exec(label);
+
+    if (hex !== null) return Number.parseInt(hex[1], 16);
+
+    // `0` on its own is decimal zero, not octal; `08`/`09` are not numbers at all in
+    // this grammar (a stack that cannot parse them treats the host as a name).
+    if (label.length > 1 && label.startsWith('0')) {
+        if (!/^0[0-7]{1,11}$/.test(label)) return undefined;
+
+        return Number.parseInt(label.slice(1), 8);
+    }
+
+    if (!/^\d{1,10}$/.test(label)) return undefined;
+
+    return Number.parseInt(label, 10);
+};
+
+// A host written as 1-4 `inet_aton` numbers — where the LAST number holds the
+// remaining bytes, which is what makes `127.1` and a bare `2130706433` addresses
+// rather than names — as a dotted quad. `undefined` means "not that shape", which is
+// the answer for every ordinary hostname: a single non-numeric label (`example`)
+// stops the decode.
+const atonToIPv4 = (host: string): string | undefined => {
+    // A trailing dot is the root label, not a part: `127.0.0.1.` is the same host.
+    const labels = (host.endsWith('.') ? host.slice(0, -1) : host).split('.');
+    if (labels.length > 4) return undefined;
+
+    const numbers: number[] = [];
+
+    for (const label of labels) {
+        const value = ipv4Number(label);
+        if (value === undefined) return undefined;
+        numbers.push(value);
+    }
+
+    // The leading parts are single bytes; the last one is 1-4 bytes wide and may not
+    // overflow them (`4294967296` is not an address, `4294967295` is 255.255.255.255).
+    const width = 5 - numbers.length;
+    const last = numbers[numbers.length - 1] ?? 0;
+
+    if (last >= 256 ** width) return undefined;
+    if (numbers.slice(0, -1).some((value) => value > 255)) return undefined;
+
+    const bytes = numbers.slice(0, -1);
+
+    // The last number's bytes come out most-significant first, so `shift` steps from
+    // (width-1)*8 down to 0 and the loop runs exactly `width` times (bytes.length
+    // reaches 4 on the shift-0 step). `shift` counts BITS: 2**24 is the 16,777,216 that
+    // extracts the leading 127 of `2130706433`. Writing `256 ** shift` here reads like
+    // the same thing and is not — it floors every byte but the last to zero, turning the
+    // PUBLIC decimal `134744072` (8.8.8.8) into `0.0.0.8` and refusing a public page.
+    for (let shift = (width - 1) * 8; bytes.length < 4; shift -= 8) {
+        bytes.push(Math.floor(last / 2 ** shift) % 256);
+    }
+
+    return bytes.join('.');
+};
+
+// The eight 16-bit groups of an IPv6 text form: one `::` run, 1-4 hex digits per
+// group, and the IPv4 tail (dotted, or in the `inet_aton` notations) that the address
+// grammar allows in place of the last two groups. `undefined` = not IPv6 text.
+const ipv6Groups = (host: string): number[] | undefined => {
+    const halves = host.split('::');
+    if (halves.length > 2) return undefined;
+
+    const readHalf = (text: string, allowIPv4Tail: boolean): number[] | undefined => {
+        if (text.length === 0) return [];
+
+        const labels = text.split(':');
+        const groups: number[] = [];
+
+        for (let index = 0; index < labels.length; index += 1) {
+            const label = labels[index];
+            const isEnd = index === labels.length - 1;
+
+            if (isEnd && allowIPv4Tail && label.includes('.')) {
+                const embedded = atonToIPv4(label);
+                if (embedded === undefined) return undefined;
+
+                const bytes = embedded.split('.').map(Number);
+                groups.push((bytes[0] << 8) | bytes[1], (bytes[2] << 8) | bytes[3]);
+            } else if (/^[0-9a-f]{1,4}$/.test(label)) {
+                groups.push(Number.parseInt(label, 16));
+            } else return undefined;
+        }
+
+        return groups;
+    };
+
+    // An IPv4 tail is only an IPv4 tail at the very END of the address.
+    const head = readHalf(halves[0], halves.length === 2 ? halves[1].length === 0 : true);
+
+    if (head === undefined) return undefined;
+
+    let groups = head;
+
+    if (halves.length === 2) {
+        const tail = readHalf(halves[1], true);
+        if (tail === undefined) return undefined;
+
+        // `::` stands for at least one zero group; accepting the 8-group slop keeps a
+        // legal-looking text from escaping the decode entirely.
+        if (head.length + tail.length > 8) return undefined;
+
+        groups = [...head, ...new Array<number>(8 - head.length - tail.length).fill(0), ...tail];
+    } else if (groups.length !== 8) return undefined;
+
+    return groups;
+};
+
+// The IPv4 addresses an IPv6 address carries inside it, as dotted quads. Each form
+// contributes the embedding its own specification defines, plus the one a sloppy
+// writer may mean, because the question this answers is "could this address end up at
+// a private host?" and a refusal costs a fetch while a miss costs an internal read.
+//   - IPv4-mapped `::ffff:a.b.c.d` (RFC 4291 §2.5.5.2) and IPv4-compatible
+//     `::a.b.c.d` (the deprecated §2.5.5.1): the embedded address, as written;
+//   - IPv4-translated `64:ff9b::a.b.c.d` (RFC 6052 §2.1, well-known /96): likewise;
+//   - 6to4 `2002:VVVV:VVVV::` (RFC 3056 §5.1): the tunnel's IPv4 in bits 16-47, as
+//     written — the destination a fetch to that address is encapsulated toward;
+//   - Teredo `2001::/32` (RFC 4380 §5.1): the CLIENT IPv4 sits in the low 32 bits
+//     bitwise inverted (`ff00:fffe` = 127.0.0.1) and the relay's IPv4 in the 32 bits
+//     above it, also inverted; the non-inverted low half is checked too, because a
+//     compatibility-mode writer puts the embedded address there plain.
+const embeddedIPv4 = (groups: number[]): string[] => {
+    const dotted = (high: number, low: number, invert: boolean): string => {
+        const bytes = [(high >>> 8) & 0xff, high & 0xff, (low >>> 8) & 0xff, low & 0xff];
+
+        return (invert ? bytes.map((byte) => 255 - byte) : bytes).join('.');
+    };
+
+    const zeros = (start: number, end: number): boolean =>
+        groups.slice(start, end).every((group) => group === 0);
+
+    if (groups[5] === 0xffff && zeros(0, 5)) return [dotted(groups[6], groups[7], false)];
+    if (zeros(0, 6)) return [dotted(groups[6], groups[7], false)];
+    // The well-known /96: the 64 groups come first, then SIX zero groups before the
+    // embedded address — a prefix test on the whole string cannot see that when the
+    // text is written out longhand (`64:ff9b:0:0:0:0:7f00:1`).
+    if (groups[0] === 0x0064 && groups[1] === 0xff9b && zeros(2, 6))
+        return [dotted(groups[6], groups[7], false)];
+    // 6to4 `2002:VVVV:VVVV::` (RFC 3056 §5.1, RFC 4291 §2.5.7): the tunnel's IPv4 sits
+    // in bits 16-47 — the SECOND and THIRD groups — and is written as-is, not inverted.
+    // Unlike the other forms this one is not merely an encoding of an IPv4 host: a
+    // packet to `2002:7f00:1::` is ENCAPSULATED and delivered to 127.0.0.1, so the
+    // embedded address is the destination a fetch actually reaches. RFC 3964 §3.1/§3.2
+    // (6to4's own security analysis) tells a 6to4 router and a 6to4 relay to "disallow
+    // traffic that has private, broadcast or certain specific reserved IPv4 addresses
+    // in tunnels, or the matching 6to4 prefixes" — this branch is that check, applied
+    // to a text form the platform parser accepts and hands us verbatim.
+    if (groups[0] === 0x2002) return [dotted(groups[1], groups[2], false)];
+    if (groups[0] === 0x2001 && groups[1] === 0x0000)
+        return [
+            dotted(groups[6], groups[7], false),
+            dotted(groups[6], groups[7], true),
+            dotted(groups[2], groups[3], true),
+        ];
+
+    return [];
+};
 
 export const isPrivateHost = (hostname: string): boolean => {
     const host = hostname.trim().toLowerCase().replace(/^\[(.*)\]$/, '$1');
@@ -412,16 +695,43 @@ export const isPrivateHost = (hostname: string): boolean => {
     if (host === 'localhost' || host.endsWith('.localhost')) return true;
 
     // IPv4 literal (including the dotted form a browser accepts).
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
-        return PRIVATE_IPV4.test(host) || host.startsWith('100.64.');
-    }
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return privateIPv4(host);
+
+    // The same address in the other notations a stack accepts. This runs AFTER the
+    // dotted-quad test above so that check keeps exactly its old behaviour, and it
+    // only ever ADDS a refusal: an address that decodes to a public quad still falls
+    // through to `false`.
+    const shorthand = atonToIPv4(host);
+
+    if (shorthand !== undefined) return privateIPv4(shorthand);
 
     // IPv6 literal: anything with a colon. Also covers the mapped IPv4 forms.
     if (host.includes(':')) {
+        // The dotted-tail mapped text is the ONE branch that already holds a dotted quad, so
+        // it goes through `privateIPv4` rather than testing `PRIVATE_IPV4` directly: routed
+        // that way, `::ffff:100.64.0.1` gets the CGNAT refusal its twin `100.64.0.1` has always
+        // gotten, and `::ffff:8.8.8.8` stays public for the same reason its twin does. Testing
+        // the prefix table alone here was the divergence — a mapped spelling of a range only
+        // `privateIPv4` knew about answered "public".
         const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(host);
-        if (mapped !== null) return PRIVATE_IPV4.test(mapped[1]);
+        if (mapped !== null) return privateIPv4(mapped[1]);
 
-        return PRIVATE_IPV6.test(host);
+        // The blanket rules first, unchanged — they refuse the whole `::` and
+        // `64:ff9b::` families, which is wider than those prefixes but was the
+        // behaviour before this pass and errs on the safe side.
+        if (PRIVATE_IPV6.test(host)) return true;
+
+        // Then the decode, for the text forms those prefixes miss: an uncompressed
+        // mapped/translated address, and Teredo's inverted client address.
+        const groups = ipv6Groups(host);
+
+        if (groups !== undefined) {
+            for (const address of embeddedIPv4(groups)) {
+                if (privateIPv4(address)) return true;
+            }
+        }
+
+        return false;
     }
 
     return false;
@@ -464,6 +774,16 @@ export const safeFetchUrl = (value: unknown): string | undefined => {
 //      un-injected resolver must not turn a green suite red.
 // A host that injects `resolve` closes the rebinding hole; a host that does not
 // keeps today's behaviour and the documented limitation stays honest.
+//
+// WHAT "OPTIONAL" MEANS EXACTLY (F16, honesty only — no behaviour change):
+// `resolve === undefined` returns `{ blocked: false }` as the FIRST statement of
+// `resolvePublicHost`, so with no resolver wired the second gate does not run at
+// all — a private A record is not "checked and passed", it is never checked. That
+// is the state of every `dns: { off: true }` construction (the whole offline
+// suite), of `dns.lookup` failing, and of a runtime where the lazy
+// `node:dns/promises` import in ./index throws. In all of them a public name whose
+// A record is 127.0.0.1 or 169.254.169.254 still reaches the network, and neither
+// the tool description nor these comments may promise more than that.
 export type DnsLookup = (hostname: string) => Promise<string[]>;
 
 // Bound the lookup so a slow or hostile DNS answer cannot consume the fetch
@@ -478,7 +798,16 @@ export const resolvePublicHost = async (
 
     // An IP literal needs no lookup, and looking one up would be a wasted query.
     if (isPrivateHost(hostname)) return { blocked: true };
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) || hostname.includes(':')) return { blocked: false };
+    // Any ADDRESS form is an address, in whichever notation it was written: the
+    // dotted quad, an IPv6 text form, or an `inet_aton` shorthand. Querying DNS for
+    // `134744072` would ask for a name that is not a name, and the answer would not
+    // change the verdict — `isPrivateHost` above already decoded it.
+    if (
+        hostname.includes(':') ||
+        /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) ||
+        atonToIPv4(hostname) !== undefined
+    )
+        return { blocked: false };
 
     let addresses: string[];
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -536,9 +865,15 @@ const cancelBody = (response: Response): void => {
 // host was reached, so the caller's answer is "a retry may help", not the generic
 // sentence. The size error stays its own class — the `HarnessError` passthrough
 // below is what keeps it that way.
+//
+// The return type is `unknown`, not `HarnessError`, because of F10: when the
+// CALLER aborted, `failure` hands back the caller's own abort reason rather than a
+// sentence of this tool's, and rewriting a cancellation into a tool error is what
+// makes the harness report `failed` where `cancelled` is the truth. Everything it
+// produces besides that reason is still a HarnessError.
 const readBody = async (
     response: Response,
-    failure: (error?: unknown) => HarnessError,
+    failure: (error?: unknown) => unknown,
     charset?: string
 ): Promise<string> => {
     const stream = response.body;
@@ -695,6 +1030,15 @@ const redirectTarget = (location: string | null, from: string): string | undefin
 // One bounded GET. `format` only steers the Accept header — the body is
 // returned raw and converted by the caller according to the actual content type.
 //
+// `callerSignal` (F10) is the harness's PER-CALL AbortSignal (`ToolContext.signal`,
+// types/index.ts:3381, whose own doc says a tool SHOULD observe it). It is
+// OPTIONAL because `requestPage` is also called directly by tests and by any host
+// that imports this module outside a run; absent means "timeout only", exactly as
+// before. It is LINKED into the tool's own controller rather than passed to fetch
+// directly, so the one signal the request carries still discriminates our timeout
+// (see `aborted` below) and the caller's cancellation still cancels the transfer
+// rather than only its delivery — the same shape download.tool.ts:637-667 uses.
+//
 // REDIRECTS ARE FOLLOWED BY HAND (D2). The platform default follows them
 // invisibly, which means a public URL can 302 the harness to `http://127.0.0.1/`
 // or to a cloud metadata IP and the body lands in the transcript. Measured: a
@@ -706,7 +1050,9 @@ export const requestPage = async (
     format: 'markdown' | 'text' | 'html',
     // Optional DNS resolver (see resolvePublicHost). Injected by a host that wants
     // the rebinding hole closed; absent means address-form checking only.
-    resolve?: DnsLookup
+    resolve?: DnsLookup,
+    // Optional caller signal (F10, see the note above).
+    callerSignal?: AbortSignal
 ): Promise<PageFetch> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -717,10 +1063,35 @@ export const requestPage = async (
     // not resolve, a host that drops the connection, and a failed TLS handshake
     // are three situations with opposite remedies, and the class — never the
     // Node error text — is what a caller needs in order to pick one.
-    const networkFailure = (error?: unknown): HarnessError =>
-        controller.signal.aborted
+    //
+    // The caller's cancellation outranks BOTH discriminators (F10, mirroring
+    // download.tool.ts:658-667): a signal abort lands as an AbortError, and
+    // reporting it as "fetch timed out after 15000 ms." would be a lie about
+    // what happened. Its reason is rethrown untouched so the harness still
+    // classifies the outcome as cancelled whichever phase the abort landed in.
+    const abortedReasonOf = (error?: unknown): unknown =>
+        callerSignal?.aborted === true ? callerSignal.reason ?? error : undefined;
+
+    const networkFailure = (error?: unknown): unknown => {
+        const aborted = abortedReasonOf(error);
+        if (aborted !== undefined) return aborted;
+
+        return controller.signal.aborted
             ? new HarnessError(`fetch timed out after ${FETCH_TIMEOUT_MS} ms.`)
             : new HarnessError(TRANSPORT_FAILURE_MESSAGES[transportCause(error)]);
+    };
+
+    // Linked, not passed through: `forwardAbort` folds the caller's cancellation
+    // into the controller the request already carries, and `once` means the
+    // listener cannot outlive the one abort it was registered for. An already-
+    // aborted signal is handled synchronously, so a call that arrives cancelled
+    // never opens a connection at all.
+    const forwardAbort = (): void => controller.abort(callerSignal?.reason);
+
+    if (callerSignal !== undefined) {
+        if (callerSignal.aborted) forwardAbort();
+        else callerSignal.addEventListener('abort', forwardAbort, { once: true });
+    }
 
     // A binary extension is a `download` job before a single byte is paid for.
     const extension = binaryExtension(url);

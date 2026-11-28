@@ -87,14 +87,20 @@
 //     surrogate pair is never split). A cut snippet is flagged with `textTruncated:
 //     true` on that match — the omission is explicit, never silent. Context lines go
 //     through the same cap and are flagged with `contextTruncated`.
-//   - AGGREGATE: at most FILE_GREP_CONTENT_BUDGET (64 KiB) of UTF-8 returned text per
-//     call, the same budget read uses. In `content` mode the charge is the snippet
-//     plus its context lines; in `files`/`count` mode it is the path text, so one rule
-//     holds in every mode. When the next unit would cross it the search stops and
-//     `truncated: true` is reported, because a unit that exists was NOT returned.
+//   - AGGREGATE: at most FILE_GREP_CONTENT_BUDGET of returned text per call — the
+//     harness's own per-result DELIVERY cap (32,768 payload bytes, the number
+//     MODEL_TOOL_RESULT_BUDGET_BYTES publishes), measured on the serialized result. The
+//     charge is one entry at a time, in every mode: in `content` mode it is the entry
+//     (path, line, snippet, flags, and any `before`/`after` context) as it appears in the
+//     document; in `files`/`count` mode it is the path entry, so one rule holds in every
+//     mode. When the next unit would cross the allowance the search stops and
+//     `truncated: true` is reported, because a unit that exists was NOT returned. See
+//     THE DELIVERY CURRENCY below for why the charge is escaped payload bytes and not
+//     UTF-8, and for the property the number exists for.
 //
-// `bytes` is the total charged against the budget; an entry's own `bytes` is its
-// snippet only, so with `context` the two differ by the context text. `line` is
+// `bytes` is the total charged against the budget, in that serialized-document currency;
+// an entry's own `bytes` is the UTF-8 size of its snippet only, so the two differ by each
+// entry's JSON framing and, with `context`, by the context text. `line` is
 // always the ORIGINAL 1-based line number, even when the snippet was cut.
 //
 // TWO TIME BOUNDS, TWO HONEST OUTCOMES (the defect this revision fixes)
@@ -156,7 +162,7 @@
 // for T13. ../catalogue projects the same data synchronously for lazy enumeration
 // and a consistency test proves the projection equal.
 
-import { tool } from '../../core';
+import { tool, MODEL_TOOL_RESULT_BUDGET_BYTES, modelPayloadBytes } from '../../core';
 import { HarnessError } from '../../util';
 import type { PresetToolMetadata } from '../catalogue';
 import {
@@ -181,15 +187,129 @@ import type { PatternSet, SearchCandidate } from './search';
 // on a code-point boundary and flagged with `textTruncated: true`.
 export const FILE_GREP_MATCH_TEXT_BYTES = 1024;
 
-// Maximum UTF-8 bytes of returned text across the whole call. Reaching it ends the
-// search with `truncated: true`. The sibling claim used to be "the same 64 KiB budget
-// `read` uses" — `read` budgets 32 KiB of WIRE (FILE_READ_WIRE_BUDGET, 32,768, kept
-// equal to the harness cap by a pin in read.test.ts), so this one is the LARGER of the
-// two. Consequence worth knowing: a grep that fills its own 64 KiB produces a JSON
-// document over the harness's per-result delivery cap (MODEL_TOOL_RESULT_BUDGET_BYTES =
-// 32,768 payload bytes, ../../core/result-budget.ts) and is REFUSED at delivery with a
-// "re-run with narrower arguments" error rather than delivered cut.
-export const FILE_GREP_CONTENT_BUDGET = 64 * 1024;
+// ---------------------------------------------------------------------------
+// THE DELIVERY CURRENCY (F8, 2026-11-28)
+// ---------------------------------------------------------------------------
+// `FILE_GREP_CONTENT_BUDGET` used to be 64 KiB of RAW UTF-8 — twice the per-result cap
+// the harness enforces, counted in the unit that cap does not use. Both halves of that
+// sentence were measurable defects:
+//
+//   1. SIZE. A search that filled its own budget serialized past `MODEL_TOOL_RESULT_
+//      BUDGET_BYTES` (32,768) and was REFUSED at delivery — the whole result discarded
+//      for a "re-run with narrower arguments" error, not delivered cut — because a JSON
+//      document over the cap is refused, never sliced (F-CUTTER,
+//      ../../core/result-budget.ts). Measured before the change (Temp/t4-files/probe.ts):
+//      a quote-heavy page charging 65,380 of its own 65,536 reached the wire at 105,746
+//      payload bytes.
+//   2. CURRENCY. The old charge was `Buffer.byteLength` of the match text. The harness
+//      charges the bytes the result occupies AFTER JSON escaping (`modelPayloadBytes`),
+//      and escaping is where `"` and `\` double, every control character becomes
+//      `\u00XX` (6 bytes) and a non-ASCII name costs its 2-4 UTF-8 bytes plus the
+//      escaped quotes around it. A page of source lines is exactly the content that
+//      escapes worst, so the tool's own `bytes` was the least trustworthy number in it.
+//
+// So the budget is now the harness's cap, and the two charges add up to the serialized
+// result exactly:
+//
+//   - `entryWireBytes(unit)` — the cost of ONE match entry as it appears in the
+//     document (its `path`, `line`, `text`, `bytes`, and any `before`/`after` context),
+//     plus the comma that separates it. `JSON.stringify` composes additively at the
+//     default separators and escaping is per character, so a sum of entry costs IS the
+//     document's cost — and each entry is priced slightly HIGH on purpose: measuring
+//     an entry's own serialized form charges the quotes around every string 2 bytes
+//     each (`\"`), which the array does not pay, so a match is over-priced by 2 bytes
+//     per quote in its form. An over-price can only end the page one entry earlier,
+//     which is `truncated: true` with a cursor; an under-price is what used to produce
+//     a refusal (see the 41 416-byte measurement above);
+//   - `grepResultOverhead(patterns)` — the cost of every field that is NOT `matches`,
+//     with the caller's own `patterns` at their real size (the result echoes them) and
+//     every counter priced at the widest value it can print and the longest note the
+//     call can emit.
+//
+// The page allowance is the cap minus that overhead, so the guarantee holds for the
+// WHOLE result, not just for the match text: `modelPayloadBytes(JSON.stringify(result))
+// <= FILE_GREP_CONTENT_BUDGET`, i.e. a grep that fills its own page always survives
+// `boundToolResult` byte for byte. The same property `FILE_READ_WIRE_BUDGET` exists for
+// (read.tool.ts), reached by measurement instead of by a constant kept equal by a test.
+// ---------------------------------------------------------------------------
+const entryWireBytes = (value: unknown): number => modelPayloadBytes(JSON.stringify(value)) + 1;
+
+// Every numeric field priced at the widest value it can hold: counts cannot exceed
+// `Number.MAX_SAFE_INTEGER`, so this is an upper bound on each of them and the overhead
+// below is a bound rather than an average (it over-reserves a few hundred bytes).
+const MAX_FIELD_VALUE = Number.MAX_SAFE_INTEGER;
+
+// The longest note this call can print: `buildNote` pushes one clause per condition, so
+// the worst case is every condition true with every number at its widest. It quotes no
+// path and no pattern, which is what keeps the caller's roots out of the overhead.
+const worstGrepNote = (): string =>
+    buildNote(
+        'searchBudget',
+        MAX_FIELD_VALUE,
+        MAX_FIELD_VALUE,
+        MAX_FIELD_VALUE,
+        { tooLarge: MAX_FIELD_VALUE, binary: MAX_FIELD_VALUE, unreadable: MAX_FIELD_VALUE },
+        {
+            ignoredFiles: MAX_FIELD_VALUE,
+            prunedDirectories: MAX_FIELD_VALUE,
+            skippedDirectories: MAX_FIELD_VALUE,
+            unreadableDirectories: MAX_FIELD_VALUE,
+            symlinks: MAX_FIELD_VALUE,
+            ignoreFilesParsed: MAX_FIELD_VALUE,
+            ignoreRulesTruncated: true
+        }
+    ) ?? '';
+
+// The serialized cost of everything the result carries BESIDES `matches`. Key names and
+// key order are the real result's (`matches: []` keeps the array's brackets in the
+// skeleton, so appending entries costs exactly what `entryWireBytes` charges) and every
+// value is the widest that field can print, except `patterns`, which the result echoes
+// at its real size.
+const grepResultOverhead = (patterns: readonly string[]): number =>
+    modelPayloadBytes(
+        JSON.stringify({
+            // The longest of the three mode names ('content').
+            output: 'content',
+            truncated: true,
+            offset: MAX_FIELD_VALUE,
+            limit: MAX_FIELD_VALUE,
+            nextOffset: MAX_FIELD_VALUE,
+            bytes: MAX_FIELD_VALUE,
+            contentBudget: FILE_GREP_CONTENT_BUDGET,
+            partial: true,
+            // The longest of the four verdicts ('contentBudget').
+            stopReason: 'contentBudget',
+            searched: { inScope: MAX_FIELD_VALUE, scanned: MAX_FIELD_VALUE, roots: MAX_FIELD_VALUE },
+            skipped: { tooLarge: MAX_FIELD_VALUE, binary: MAX_FIELD_VALUE, unreadable: MAX_FIELD_VALUE },
+            excluded: {
+                ignoredFiles: MAX_FIELD_VALUE,
+                prunedDirectories: MAX_FIELD_VALUE,
+                skippedDirectories: MAX_FIELD_VALUE,
+                unreadableDirectories: MAX_FIELD_VALUE,
+                symlinks: MAX_FIELD_VALUE,
+                ignoreFilesParsed: MAX_FIELD_VALUE,
+                ignoreRulesTruncated: true
+            },
+            patterns: [...patterns],
+            note: worstGrepNote(),
+            matches: []
+        })
+    );
+
+// The allowance the search charges match text against: the delivery cap minus the
+// result's own scaffolding. Exported so a test or a document quotes the number the
+// implementation enforces instead of re-deriving it.
+export const grepPageAllowance = (patterns: readonly string[]): number =>
+    Math.max(0, FILE_GREP_CONTENT_BUDGET - grepResultOverhead(patterns));
+
+// The most returned text one grep call may charge, in the harness's delivery currency:
+// `MODEL_TOOL_RESULT_BUDGET_BYTES`, the same per-result cap `read` sizes itself against
+// (`FILE_READ_WIRE_BUDGET`, read.tool.ts:693) and the cap `boundToolResult` enforces.
+// It is imported from ../../core rather than written as a literal because `../../core`
+// resolves to the LIVE framework namespace for a compiled preset entry
+// (core/tool-source.ts `LIVE_MODULE_KEYS`), so it adds no captured dependency to the
+// compiled tool — unlike the deep `../../core/result-budget` path read avoids.
+export const FILE_GREP_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
 
 // Wall-clock bound on one whole search — walk, reads and matching together. This is
 // the bound a LARGE TREE hits, and it produces a partial result rather than an error
@@ -224,8 +344,10 @@ export type FileGrepLine = {
     // True when the line was longer than the snippet cap, so `text` is a PREFIX and
     // the rest of that line was not returned. Explicit, never a silent omission.
     textTruncated: boolean;
-    // UTF-8 bytes of `text` (the snippet). The aggregate `bytes` also charges context
-    // lines, so the two differ when `context` is set.
+    // UTF-8 bytes of `text` (the snippet). This is the text's own size, NOT the amount
+    // the call charged against its budget: `bytes` on the RESULT is the serialized cost
+    // of every entry, so the two differ by each entry's JSON framing and, when `context`
+    // is set, by the context lines.
     bytes: number;
     // Up to `context` lines before and after the hit. Present ONLY when the caller
     // asked for context, so the default entry shape is unchanged. Each line is cut to
@@ -290,10 +412,14 @@ export type FileGrepResult = {
     limit: number;
     // Pass as `offset` for the next page, or null when this is the last page.
     nextOffset: number | null;
-    // Total UTF-8 bytes charged against the budget (snippets, context lines, and path
-    // text in files/count modes).
+    // Payload bytes charged against the budget: every returned entry priced at what it
+    // adds to the SERIALIZED result (`entryWireBytes`), which is the currency the
+    // delivery cap is spent in. An entry's own `bytes` is still the UTF-8 length of its
+    // `text`, so the two differ by the entry's JSON framing as well as by context lines.
     bytes: number;
-    // The fixed aggregate content budget this call was subject to. Metadata only.
+    // The fixed aggregate content budget this call was subject to. Metadata only: the
+    // page allowance is this cap minus the result's own scaffolding (`grepPageAllowance`),
+    // measured before the search, because the cap covers the WHOLE serialized result.
     contentBudget: number;
     // True when the scope was NOT fully covered: the search budget ran out, or a
     // directory or file could not be read. Distinct from `truncated`, which only says
@@ -437,11 +563,12 @@ export const normalizeGrepRequest = (parameters: unknown): FileGrepRequest => {
     };
 };
 
-// One result unit plus the bytes it charges against the aggregate budget.
-//
-// The charge is decided with the unit rather than at push time, because in `content`
-// mode with `context` the amount to charge is the snippet PLUS its context lines, and
-// only the code that built the entry knows that.
+// One result unit plus the bytes it charges against the aggregate budget. The charge is
+// the unit's cost IN THE SERIALIZED DOCUMENT (`entryWireBytes`) — the only currency the
+// delivery cap is spent in: `path`, `line`, the snippet, the flags, and any
+// `before`/`after` context are all billed, not just the text. It is decided WITH the
+// unit rather than at push time, because only the code that built the entry knows what
+// the entry contains.
 type GrepUnit = { unit: FileGrepMatch; bytes: number };
 
 // What one file contributes, and whether MORE exists beyond that.
@@ -460,7 +587,10 @@ type FileVerdict = {
 const NO_MATCH: FileVerdict = { units: [], more: false };
 
 // A verdict whose one and only unit is already built (files/count modes: one per file).
-const oneUnit = (unit: GrepUnit): FileVerdict => ({ units: [() => unit], more: false });
+// The charge is computed from the built unit, exactly as content mode does, so one rule
+// prices every mode.
+const wireUnit = (unit: FileGrepMatch): GrepUnit => ({ unit, bytes: entryWireBytes(unit) });
+const oneUnit = (unit: FileGrepMatch): FileVerdict => ({ units: [() => wireUnit(unit)], more: false });
 
 // How many of a file's units the caller can still use, and whether any of them will
 // actually be returned.
@@ -485,8 +615,6 @@ const verdictFor = (
     window: VerdictWindow,
     matcher: ReturnType<typeof createBoundedLineMatcher>
 ): FileVerdict => {
-    const pathBytes = Buffer.byteLength(candidate.display, 'utf8');
-
     // Split on both terminators so a CRLF file reports clean line text.
     const lines = content.split(/\r?\n/);
 
@@ -498,22 +626,20 @@ const verdictFor = (
         // by the cap or by the offset counter.
         if (window.window === 0 || window.skip > 0) {
             return matcher.testLines(lines, 1).length > 0
-                ? oneUnit({ unit: { path: candidate.display, matchCount: null }, bytes: pathBytes })
+                ? oneUnit({ path: candidate.display, matchCount: null })
                 : NO_MATCH;
         }
 
         const count = matcher.countLines(lines);
 
-        return count === 0
-            ? NO_MATCH
-            : oneUnit({ unit: { path: candidate.display, matchCount: count }, bytes: pathBytes });
+        return count === 0 ? NO_MATCH : oneUnit({ path: candidate.display, matchCount: count });
     }
 
     if (output === 'files') {
         // One index is the whole question. Scanning the rest of the file would spend
         // matching time on information the caller did not ask for.
         return matcher.testLines(lines, 1).length > 0
-            ? oneUnit({ unit: { path: candidate.display, matchCount: null }, bytes: pathBytes })
+            ? oneUnit({ path: candidate.display, matchCount: null })
             : NO_MATCH;
     }
 
@@ -529,10 +655,11 @@ const verdictFor = (
             line: index + 1,
             text: snippet.text,
             textTruncated: snippet.textTruncated,
+            // The entry's own number stays the UTF-8 length of its `text` — the question
+            // a caller reads it for ("how much of this line did I get"). The AGGREGATE
+            // `bytes` is a different unit (what the document costs); see FileGrepResult.
             bytes: snippet.bytes
         };
-
-        let bytes = snippet.bytes;
 
         // Context is opt-in, so the default entry keeps its exact published shape.
         if (context > 0) {
@@ -541,11 +668,12 @@ const verdictFor = (
             // Each neighbour line goes through the SAME snippet cap as the hit itself.
             // `truncateSnippet` returns the original string instance when the line
             // already fits, so an ordinary file pays nothing but the byteLength call.
+            // The context text needs no separate charge here: it is inside the entry, and
+            // `entryWireBytes` prices the whole entry (F8).
             const cut = (line: string): string => {
                 const neighbour = truncateSnippet(line, FILE_GREP_MATCH_TEXT_BYTES);
 
                 if (neighbour.textTruncated) contextTruncated = true;
-                bytes += neighbour.bytes;
 
                 return neighbour.text;
             };
@@ -556,7 +684,7 @@ const verdictFor = (
             if (contextTruncated) entry.contextTruncated = true;
         }
 
-        return { unit: entry, bytes };
+        return wireUnit(entry);
     };
 
     // Each thunk carries its own line index, so ascending order and the deterministic
@@ -659,6 +787,24 @@ export const searchContents = async (
 
     const stats = createSearchStats();
     const startedAt = nowMs();
+
+    // F8 — the search charges match text against the delivery cap MINUS this call's own
+    // scaffolding, measured before the walk, so the stop test compares against the
+    // number `boundToolResult` enforces. `patterns` is the only caller-controlled part of
+    // that scaffolding (the result echoes the compiled set); a request whose fixed half
+    // already fills the cap is refused by name instead of answered by an empty page whose
+    // cursor can never advance — the same reasoning as glob's oversized-entry guard.
+    const overhead = grepResultOverhead(set.effective);
+    const allowance = Math.max(0, FILE_GREP_CONTENT_BUDGET - overhead);
+
+    if (allowance === 0) {
+        throw new HarnessError(
+            `grep cannot answer this call: its own result scaffolding — ${set.effective.length} compiled pattern(s), ${Buffer.byteLength(
+                JSON.stringify(set.effective),
+                'utf8'
+            )} bytes of pattern text the result echoes — fills the whole ${FILE_GREP_CONTENT_BUDGET}-byte delivery budget, leaving no room for a match. Pass fewer or shorter "patterns".`
+        );
+    }
 
     const matches: FileGrepMatch[] = [];
     let bytes = 0;
@@ -765,7 +911,25 @@ export const searchContents = async (
                 // entry knows its own size. This is the one unit built and then withheld,
                 // and it is at most one per call — which is what makes `truncated` a
                 // proven fact rather than a guess. An exact fit is NOT truncation.
-                if (bytes + unitBytes > FILE_GREP_CONTENT_BUDGET) {
+                if (bytes + unitBytes > allowance) {
+                    // GUARD against a cursor that can never advance. A unit bigger than
+                    // the WHOLE allowance (a `context: 10` page of control-character-heavy
+                    // lines escapes past it) is refused by every page too, so returning an
+                    // empty page with `nextOffset === offset` would trap a caller paging
+                    // this sequence — the same reasoning glob's oversized-entry guard and
+                    // the `contextTruncated` cap exist for. It is a refusal with the
+                    // remedy in it, not a `truncated` page.
+                    if (returned === 0) {
+                        const where =
+                            'line' in unit ? `"${unit.path}" at line ${unit.line}` : `"${unit.path}"`;
+
+                        throw new HarnessError(
+                            `grep cannot return ${where}: it costs ${unitBytes} payload bytes, more than the ${allowance}-byte page allowance (the ${
+                                FILE_GREP_CONTENT_BUDGET
+                            }-byte delivery budget minus ${overhead} bytes of result scaffolding). Ask for fewer "context" lines, "output": "count"/"files", or read the file directly.`
+                        );
+                    }
+
                     more = true;
                     budgetStopped = true;
                     break;
@@ -817,13 +981,14 @@ export const searchContents = async (
 
     const note = buildNote(stopReason, iterations, matcher.elapsed(), limits.searchBudgetMs, skipped, excluded);
 
-    // KEY ORDER IS NOT COSMETIC. The harness caps a serialized tool result at 64 KiB of
-    // text (core/result-budget.ts) and keeps the BEGINNING when it has to cut, and this
-    // call's own budget is the same 64 KiB — of match TEXT, not of JSON. A full page of
-    // 1 KiB snippets therefore serializes past the wire cap (per-entry `{path, line,
-    // ...}` overhead is real), and whatever sits after `matches` would be what gets cut.
-    // `matches` goes LAST so an envelope truncation costs the tail of the result list and
-    // never the explanation of why the list is short.
+    // KEY ORDER IS NOT COSMETIC. The harness caps a serialized tool result at
+    // MODEL_TOOL_RESULT_BUDGET_BYTES payload bytes and keeps the BEGINNING when it has to
+    // cut, so the explanation of why a list is short has to sit before the list. Since F8
+    // this call is also built to fit that cap on its own — the page allowance is the cap
+    // minus this skeleton, measured up front — so a full page is delivered whole and the
+    // order is what makes a cut (a search that stopped for another reason, or an envelope
+    // from the per-turn aggregate) cost the tail of the match list rather than the
+    // coverage fields a caller needs to read a short answer correctly.
     return {
         output: request.output,
         truncated: more,
@@ -853,7 +1018,7 @@ export const searchContents = async (
 export const GREP_METADATA: PresetToolMetadata = {
     name: 'grep',
     description:
-        'Search file CONTENTS with a regular expression and return the matching lines. `pattern` (required) is JavaScript regular-expression SOURCE with no delimiters and no inline flags - pass flags in `flags` (flag letters, "i" for case-insensitive), because `(?i)foo` is a JavaScript "Invalid group"; invalid source is an error naming the parser message, never "no matches". `patterns` (default ["**/*"]) filters which files to read - same matcher as glob: *, ?, **, [abc] classes, {a,b} alternatives, a leading ! to exclude, a slashless pattern also matching file names at any depth, and paths matched RELATIVE TO THE ROOT that found them. `paths` (default ["."]) lists roots in order and accepts a FILE to search just that file; overlapping roots are deduplicated by real file identity, so each file is searched once under the first root that reached it. `output` picks the verdict: "content" (default) one entry per matching line, "files" one entry per matching file, "count" the exact number of matching lines per file - the last two answer a survey question in one call. `context` (0-10) adds `before`/`after` neighbour lines so a hit needs no follow-up read. Each hit is { path, line, text, textTruncated, bytes }: `line` is the 1-based line number and `text` is at most a 1024-byte UTF-8 snippet (`textTruncated` says when it was cut). The result is { "matches": [...], "truncated": boolean, "bytes": number, "contentBudget": number } plus output, offset, limit, nextOffset, partial, stopReason, searched, skipped, excluded, patterns, note. `truncated` is true only when a result that exists was withheld by the cap (maxResults, default 100, clamped to 1-1000) or the 64 KiB budget, and `nextOffset` resumes the same deterministic sequence as `offset`; `partial` means the SCOPE was not fully covered; `stopReason` says which bound closed the window ("resultCap", "contentBudget", "searchBudget", "complete"). Nothing is silently dropped: `skipped` counts files not searched (over 1 MiB, binary, unreadable), `excluded` counts what the walk did not yield (ignored files, pruned and unreadable directories, symlinks, .gitignore cap), `searched` reports { inScope, scanned, roots }, and `note` explains what is worth acting on. Time is bounded twice and never confused: 30s of regex execution throws (only a pattern can exhaust it), 30s of wall clock returns a partial result with stopReason "searchBudget" (only a big tree can). Matching is per line - a pattern cannot span lines, so use `context` for neighbours. Skips .git, symlinks, binary files, and files larger than 1 MiB, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is never opened - while a root you name explicitly is searched even when an enclosing .gitignore ignores it. Search root and .gitignore: rules are read only at or below the root, so naming a subdirectory as the root deliberately bypasses the ignores above it (a `dist/` under it is searched) and `excluded.ignoreFilesParsed` reports how many rule files were parsed - search from the directory that owns the .gitignore to prune build output. Does not list file names (use glob for that).',
+        'Search file CONTENTS with a regular expression and return the matching lines. `pattern` (required) is JavaScript regular-expression SOURCE with no delimiters and no inline flags - pass flags in `flags` (flag letters, "i" for case-insensitive), because `(?i)foo` is a JavaScript "Invalid group"; invalid source is an error naming the parser message, never "no matches". `patterns` (default ["**/*"]) filters which files to read - same matcher as glob: *, ?, **, [abc] classes, {a,b} alternatives, a leading ! to exclude, a slashless pattern also matching file names at any depth, and paths matched RELATIVE TO THE ROOT that found them. `paths` (default ["."]) lists roots in order and accepts a FILE to search just that file; overlapping roots are deduplicated by real file identity, so each file is searched once under the first root that reached it. `output` picks the verdict: "content" (default) one entry per matching line, "files" one entry per matching file, "count" the exact number of matching lines per file - the last two answer a survey question in one call. `context` (0-10) adds `before`/`after` neighbour lines so a hit needs no follow-up read. Each hit is { path, line, text, textTruncated, bytes }: `line` is the 1-based line number and `text` is at most a 1024-byte UTF-8 snippet (`textTruncated` says when it was cut). The result is { "matches": [...], "truncated": boolean, "bytes": number, "contentBudget": number } plus output, offset, limit, nextOffset, partial, stopReason, searched, skipped, excluded, patterns, note. `truncated` is true only when a result that exists was withheld by the cap (maxResults, default 100, clamped to 1-1000) or the 32 KiB delivery budget the WHOLE serialized result is measured against (`bytes` reports what the matches charged in that currency, while each hit\'s own `bytes` stays the UTF-8 size of its snippet), and `nextOffset` resumes the same deterministic sequence as `offset`; `partial` means the SCOPE was not fully covered; `stopReason` says which bound closed the window ("resultCap", "contentBudget", "searchBudget", "complete"). Nothing is silently dropped: `skipped` counts files not searched (over 1 MiB, binary, unreadable), `excluded` counts what the walk did not yield (ignored files, pruned and unreadable directories, symlinks, .gitignore cap), `searched` reports { inScope, scanned, roots }, and `note` explains what is worth acting on. Time is bounded twice and never confused: 30s of regex execution throws (only a pattern can exhaust it), 30s of wall clock returns a partial result with stopReason "searchBudget" (only a big tree can). Matching is per line - a pattern cannot span lines, so use `context` for neighbours. Skips .git, symlinks, binary files, and files larger than 1 MiB, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is never opened - while a root you name explicitly is searched even when an enclosing .gitignore ignores it. Search root and .gitignore: rules are read only at or below the root, so naming a subdirectory as the root deliberately bypasses the ignores above it (a `dist/` under it is searched) and `excluded.ignoreFilesParsed` reports how many rule files were parsed - search from the directory that owns the .gitignore to prune build output. Does not list file names (use glob for that).',
     tags: ['files', 'grep', 'search', 'content', 'regex', 'filesystem'],
     // R18: grep is core because content search is the single most common way a coding
     // agent locates code. It replaces fileGlob's `content` mode; that property no

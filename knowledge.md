@@ -702,8 +702,10 @@ src/
       webfetch.test.ts  native + both hosted providers, env injected, fetch stubbed
     webdownload/
       index.ts          type-only barrel (no value import, keeps the entry lazy)
-      download.tool.ts  the `download` preset: 20 MiB cap, toolMedia() envelope
-      download.test.ts  caps, streaming, names, kinds, cancellation
+      download.tool.ts  the `download` preset: 20 MiB cap, toolMedia() envelope,
+                        SSRF gates, bytes saved in the SESSION downloads folder
+      download.test.ts  caps, streaming, names, kinds, cancellation, ssrf gates,
+                        content-disposition names, the session folder
     presets.test.ts     covers every preset, standalone and in a harness
   plugin/               the programmatic extension host (four parts, one folder)
     index.ts            barrel: runPlugins, resolvePluginList, createHookBus, the two
@@ -1168,7 +1170,7 @@ reach into `src/`.
 - [Preset tools](#preset-tools-1) - the ten lazy presets, executable on their own
 - [Web search](#web-search) — opt-in per-harness `search` over Exa/Tavily/Linkup
 - [Web fetch](#web-fetch) — opt-in `fetch`: keyless `native` default, hosted `exa`/`linkup`
-- [Web download](#web-download) — always-registered `download`: 20 MiB bytes as model media
+- [Web download](#web-download) — always-registered `download`: 20 MiB bytes as model media, saved in the session's folder, saved in the session folder
 
 ### Harness
 - [harness](#harness-1) — Callable execution loop
@@ -1705,15 +1707,22 @@ core when `forks.enabled` (the
 default). Both are registered as standalone definitions whose `execute` refuses a
 direct call, because the runtime handles them with the owning run.
 
-**Core is not session-bound.** The five core file tools, `download`, `search`,
-and `fetch` have real implementations, so the server's direct-call path runs them
-without a `sessionId`.
+**Core is not session-bound — `download` is the one preset that is.** The five
+core file tools, `search`, and `fetch` have real implementations, so the server's
+direct-call path runs them without a `sessionId`.
 Only the harness-owned set mutates a session's harness and therefore carries
 `sessionBound: true`. `knowledge` carries the flag for that reason alone, and NOT because what
 it writes belongs to the session: the flag says the CALL needs a session's harness — that is
 where its `harness.knowledge` seam lives — while the articles it writes land beside
 `harness/sessions/`, outside every session folder
-([Cross-session knowledge](#cross-session-knowledge)). There is no `fileSearch` tool and no mode switch either:
+([Cross-session knowledge](#cross-session-knowledge)). `download` carries the flag for the
+opposite reason, and it is a USER decision (F7): its bytes are written into the SESSION's own
+downloads folder (`harness/sessions/<id>/downloads`, deleted with the session), so a call with no
+session has nowhere to save them and the entry refuses rather than picking a folder for the host.
+The flag is the row stating that dependency; it is NOT yet a door for a preset row (the server's
+403 gate reads the flag off a `CatalogueEntry`, and only the harness-owned rows carry one —
+`server/harnesses/core.ts:87` vs `server/harnesses/index.ts:195`), so a sessionless call still
+runs and gets the refusal as a tool error. There is no `fileSearch` tool and no mode switch either:
 `glob` lists names and `grep` searches contents, both under their own name, and both
 are core.
 
@@ -3552,12 +3561,12 @@ list (`enableAllTools`, see [Tool discovery](#tool-discovery)).
 | `read` | `(paths: (string \| { path, startLine?, startColumn?, startByte?, maxLines?, maxBytes?, lossy?, numbered? })[])` — non-empty, ≤100 | a `toolText()` **envelope**, not a plain value: `{ content: { files: [{ path, content, startLine, endLine, truncated, limit, startByteAligned, nextLine, nextColumn, nextByte, bytes, sizeBytes, lineCount?, lossy?, budgetGranted?, error? }], truncated, bytes, wireBytes, contentBudget, budgetPool, modelBytes, skipped, note? }, __toolText: <projection> }` — `unwrapToolResult` hands the object to a programmatic caller (the server's manual-execute answer included) and the prose to the transcript. Per-file defaults `startLine 1`, `startColumn 0`, `startByte null`, **`maxLines 2000`, `maxBytes 16384`** — deliberately SMALL, because a read feeds a context window; ceilings 20000 lines / 262144 bytes, and an explicit value outside them is refused, never clamped. `maxBytes` is charged in **escaped wire bytes** — the unit `wireBytes` counts, not the raw bytes `bytes` reports — so a newline-heavy window stops with `bytes` well under the allowance and `limit: 'maxBytes'`. `limit` names WHICH governor cut a window (`'maxLines'` / `'maxBytes'` / `'budget'` / `null` for EOF), `budgetPool` (always present) is what the batch had left to split once the result's and every entry's scaffolding and the note reserve were taken, `budgetGranted` names the allowance an entry was actually scanned against and appears only when that batch share was smaller than its own `maxBytes`, and `lineCount` (the `wc -l` figure) appears only once EVERY line has been counted to a PROVEN end — a window stopped mid-file carries none, and a size-less pseudo-file publishes a count only after a walk actually reached its end. A truncated entry's `nextByte` is always STRICTLY PAST the offset its own window started at, so paging terminates, and `nextColumn` is counted from the PHYSICAL start of `nextLine` (never from a seek), so `{ startLine: nextLine, startColumn: nextColumn }` resumes exactly — including through a line longer than `maxBytes`. A `startColumn` past the end of `startLine` lands on the NEXT line and the entry reports the line it actually returned. The off-the-end axes answer differently: `startByte` at or past EOF is `ERANGE` (exactly AT EOF included), `startLine === lineCount + 1` is a legal empty window ONLY when the last line is terminated — the newline is what creates the position past it, so `'a\nb\n'` accepts `startLine: 3` and `'a\nb'` refuses it — `startLine` past that is `ERANGE`, and a 0-byte file answers ANY `startLine` with the empty window and `lineCount: 0`. `sizeBytes` is `number \| null`, and `null` means the size is not a filesystem fact — a FIFO, socket or device, or a regular file whose `st_size === 0` a read contradicts (`/proc`, `/sys`) — and neither `0` nor `null` is ever treated as EOF: such a target resumes from its own `nextByte` instead of answering `ERANGE`, and its `startLine` is settled against a real EOF rather than answered from byte 0. `numbered: true` is PER FILE — the `123: ` gutter lands on that file's model copy only and is charged against that file's `maxBytes` at the padded width the projection pads to. The 32 KiB call envelope (`FILE_READ_WIRE_BUDGET`) is measured on the **serialized** result and water-filled by demand, so `modelBytes <= wireBytes <= contentBudget` always holds and the continuation fields survive the harness cap — the `note`'s own size is reserved before the split, and it appears only for a file of `65536` bytes or more whose window was cut (up to 2 paths named, the rest counted). A missing path, directory, permission denial, or **binary content** keeps its own ordered entry with `error: { code: 'ENOENT' \| 'EISDIR' \| 'EACCES' \| 'EPERM' \| 'EBINARY' \| 'ERANGE' \| 'EAGAIN' \| 'ENOTDIR' \| 'ELOOP' \| 'ENAMETOOLONG' \| 'ESPIPE' \| 'ETIMEDOUT' \| 'ECANCELED' \| 'EIO', rawCode?, message }` — a CLOSED 14, so an errno the tool does not promise is folded onto `EIO` with its untouched name in `rawCode` — and consumes no budget: ENOENT names up to 3 near-miss siblings (`FILE_READ_SUGGESTION_MAX`) or the nearest existing ancestor, EISDIR previews up to 12 entries (`FILE_READ_PREVIEW_MAX`), an `ERANGE` seek past EOF names the file's size or line count, `EAGAIN` is a FIFO with no writer (every FIFO is opened `O_NONBLOCK`, which is what replaced the kernel-level hang), `ESPIPE` is a `startByte` on a target with no file offset, and `ETIMEDOUT` is this tool's own per-file 10 000 ms I/O deadline (`FILE_READ_IO_DEADLINE_MS`, injectable through `FileReadLimits` / `DEFAULT_FILE_READ_LIMITS`) — one unresponsive mount costs one entry, never the batch; a CANCELLED call is the opposite and rejects the whole CALL with `ECANCELED` (the 14th code, and the only one of the 14 that never lands on an entry), because the caller's signal is checked before every syscall; that rejection carries `details: { rawCode, path }` with the reason the host passed to `abort()` as `rawCode` (the published rule: present because it differs from `code`) and the same object as its `cause`, and it is authored by `tools/files/cancellation.ts`, which replaced the old answer of "whatever the signal happened to carry" (measured: a `DOMException` named `AbortError` whose `code` is the NUMBER 20, not a string errno and not a member of this set); `lossy: true` substitutes U+FFFD for undecodable bytes instead of reporting EBINARY (the entry then says `lossy: true`; a NUL is still binary). Only a malformed request or a cancelled call (`ECANCELED`, see the cancellation clause above) rejects the call. The NUL check is WINDOW-scoped and the invalid-UTF-8 check CHUNK-scoped; neither is whole-file validation. A `startByte` inside a run of UTF-8 continuation bytes longer than any code point is `EBINARY` naming that offset — the alignment probe stays bounded and used to report EOF on giving up, which read as "the file ends here" over a file with readable bytes before the run. A readable file whose share of the envelope was consumed by the per-entry reserves gets the smallest window the floor allows — ONE code point, `limit: 'budget'`, `budgetGranted: 0`, and a cursor that still advances — never `EIO` |
 | `write` | `(files: { path, content }[])` — non-empty, ≤100 (`FILE_WRITE_MAX_TARGETS`) | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected by file identity, NUL content rejected (read would refuse it). Serialized per file against a concurrent `edit` on the same path. Each file is PUBLISHED ATOMICALLY (`publishAtomically`, shared with `edit`): the payload goes into a staging file created next to the RESOLVED target (`realWriteTarget`, so the rename stays on one device), the existing file's mode is copied onto it (`existingMode` + `chmod`), and a same-directory rename swaps the directory ENTRY — so a reader sees the whole previous content or the whole new content, never a prefix, and a failure before the rename leaves the target exactly as it was with the staging file removed. What that trade buys, stated plainly: the target gets a NEW inode, so an already-open handle, a hard link, `uid`/`gid` and xattrs keep describing the OLD file (the mode travels, ownership does not); a read-only FILE is now overwritable, because only the DIRECTORY's permissions gate the rename; a DANGLING symlink is still HONORED, exactly as the in-place write honored it — the link survives and its missing end is created, so `path` names the link and not a new regular file (the parent directory and mode are the link's own, not the resolved directory's); a NON-REGULAR target is now refused with a stated error (`EISDIR` for a directory, `EOPNOTSUPP` for a FIFO/socket/device) instead of having the rename clobber it — and the same is true of a non-regular link TARGET, which an in-place write would have happily followed; and no `fsync` was added, so the power-loss durability boundary is the one in-place writing already had |
 | `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty, ≤100 (`FILE_EDIT_MAX_TARGETS`, and the same `maxItems: 100` is published in the schema) | ordered `{ path, replacements, bytes, match? }[]`; exact-first matching (typographic and trailing-whitespace fallbacks), all preflighted before the first write, each file written once. `match` names a fallback tier and can ONLY be `'typographic'` or `'trailing-whitespace'` — there is no ending-related value; the trailing-whitespace tier matches WHOLE LINES, so an edit that came through it replaces those whole lines and the trailing whitespace inside the region goes with them. Line endings: an LF-only `newString` adopts the endings of the matched region, while a `newString` containing `\r` is ENDING-EXPLICIT and is written VERBATIM, byte for byte (`edit.tool.ts` `verbatim`), so an explicit `\r\n` is never rewritten into the file's endings — converting endings is an `oldString`/`newString` pair that differs only in `\r`, which matches exact bytes. A target whose bytes are not valid UTF-8, or that holds a NUL, is refused with `EBINARY` naming the byte offset during the preflight (`decodeEditSource` / `firstInvalidUtf8Byte`), rewriting nothing — it used to round-trip a Latin-1 file as U+FFFD and report success. The result is PUBLISHED EXACTLY LIKE `write` does (`publishAtomically('edit', ...)`): staged beside the resolved target, mode copied, renamed over the directory ENTRY — so the inode and its mode do NOT survive, an already-open handle or hard link keeps describing the OLD bytes, and a failure before the rename leaves the previous bytes exactly as they were with the stage removed. A target over `FILE_EDIT_MAX_BYTES` (8 MiB) is refused DURING THE PREFLIGHT with `EFBIG` and its `details.limit`, naming the entry — the ceiling is what keeps N fallback scans linear — and it is checked BEFORE the empty-array check, so `edits: []` can only ever mean an empty file and the tool can never report a vacuous success. A malformed entry — non-array/empty array, non-string field, or an UNKNOWN property — is refused with `EINVSTATE` plus the dotted `details.field` (`edits[0].replaceAl`), before any filesystem change, instead of reaching `undefined.replaceAll` as an unhandled TypeError; note the refusal is an unknown FIELD, not an unknown ERROR code — an invented `code` in an op is a different bug and still lands on the closed published set. A file whose current bytes already equal the result is reported `changed: false` and is NOT republished: no stage, no rename, no new inode, so a no-op does not churn a hot file's identity. That flag is the only `false` `changed` can ever hold — when a fallback tier produced byte-identical output the call still errors, because that means the model reproduced the region without changing it. Read-match-write is one per-file critical section (`./tools/files/lock.ts`), so a concurrent call re-reads the winner's bytes and fails with "no match" instead of clobbering the other's change — unless the winner happened to produce exactly what the loser wanted, which is the `changed: false` no-op above |
-| `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` - non-empty, ≤100 (`FILES_MAX_OPS`) | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` → `{ path, entries, truncated, nextOffset, offset, limit, bytes, starved?, note?, error? }` (ONE page of `dir/entry`, directories end with `/` — including a symlink that resolves to one, since "walkable" is what the slash means — non-recursive; `limit` defaults to 200 and is CLAMPED into 1..1000, `offset` is clamped to ≥0, and neither is ever rejected, which is why the published schema carries NO `minimum`/`maximum` on those two fields — a schema bound would be enforced before `execute` and turn the runtime clamp into a dead branch; the 64 KiB `FILES_CONTENT_BUDGET` of entry text is ONE mutable allowance threaded through every list op in the CALL, so an op whose turn arrives after it is spent answers `entries: []` with `truncated: true` and `nextOffset` naming its own offset while entries remain past it, and `nextOffset` is `null` when nothing was withheld); duplicate or aliased spellings of one directory in a `path` array are walked ONCE, first spelling wins (`dedupePaths` by `fileIdentity`); `move`/`copy` → `{ path, to, kind, bytes, replaced? }` — `replaced: { path, kind, entries }` shows up ONLY when an existing destination was removed to make room, and it is the receipt's account of what that cost: `kind` names what stood there, `entries` counts the IMMEDIATE entries of a replaced directory or is `null` when the listing itself failed, so "unknown" is never read as "empty" (a file or a symlink costs no tree and reports 0) — an existing destination is refused unless `overwrite`, a real DIRECTORY destination additionally needs `replaceDirectory: true` (a symlink destination does not: replacing it costs the link alone), and a destination that IS the source or lies INSIDE it is refused BEFORE any filesystem change (`selfOrContained`: resolved text first, then real identity, so a symlinked alias is caught) — that guard is what stops `copy X → X` with `overwrite: true` from deleting the tree and reporting success, and `copyDirectory` additionally stops at `FILES_COPY_MAX_DEPTH` (64) levels; a symlink inside a copied tree is copied AS a symlink (target string verbatim, 0 bytes) while a symlinked directory used as the SOURCE is still followed at the top level; `delete` → `{ path, removed, recursive }` (a NON-EMPTY directory needs `recursive`, an EMPTY directory is removed without it, a DANGLING symlink is deletable because the path is examined with `lstat` before anything follows it, and a missing path needs `force` and is then reported `removed: false, skipped: true`; a NON-EMPTY directory without `recursive` is a `files-delete-non-empty` refusal that counts what is in there); `mkdir` → `{ path, created }`, creating parents, reporting an existing directory as `created: false`, and REFUSING whatever else stands there — `files-mkdir-not-a-directory` for a plain file or a symlink that resolves to a non-directory (its `details` carry `kind` and `targetExists`), `files-mkdir-dangling-link` for a symlink whose target is gone — because `mkdir` never replaces anything: `replaceDirectory` is a move/copy permission and nothing else. A failed list entry carries its own `error: { code, message, details? }` and does NOT void the directories that could be read — the surviving entries stay in the receipt, the `code` comes from the closed set `ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`EIO`/`EXDEV` (the exported `FILES_ERROR_CODES` carries a 7th member, `ECANCELED`, and it is the CALL-level cancellation answer, never an entry's) (`filesFailureOf` folds every other raw Node errno — `ENAMETOOLONG`, `ELOOP`, `ERR_FS_EISDIR`, `ENOTEMPTY` — onto `EIO`, because a caller switches on `code` and cannot switch on a set the tool never promises) while the raw errno stays in `rawCode` — the message alone is not an interface, and it gets re-prefixed when the receipt travels through an MCP boundary; a failed mutation rejects the call and names the operations already applied (there is no rollback), with machine-readable `details`: `{ op, path, applied, appliedCount, rollback: false, failure: { code, details } }`, so an `EXDEV` rename and an `EACCES` on the same operand are distinguishable, and the batch-level `code` is the refusal's OWN code when it has one (`files-source-missing`, `files-source-is-destination`, `files-destination-inside-source`, `files-destination-contains-source`, `files-destination-exists`, `files-destination-directory`, `files-delete-missing`, `files-delete-non-empty`, `files-mkdir-not-a-directory`, `files-mkdir-dangling-link`) and only otherwise the generic `files-operation-failed`. Operations run in array order against the state each one finds, and mutations hold the same per-file locks as `write`/`edit` (`./tools/files/lock.ts`) |
+| `files` | `(ops: ({ op: 'list' \| 'move' \| 'copy' \| 'delete' \| 'mkdir', path? \| from+to, overwrite?, recursive?, force?, offset?, limit? })[])` - non-empty, ≤100 (`FILES_MAX_OPS`) | `{ results, bytes, contentBudget }` with ONE ordered receipt per operation: `list` → `{ path, entries, truncated, nextOffset, offset, limit, bytes, starved?, note?, error? }` (ONE page of `dir/entry`, directories end with `/` — including a symlink that resolves to one, since "walkable" is what the slash means — non-recursive; `limit` defaults to 200 and is CLAMPED into 1..1000, `offset` is clamped to ≥0, and neither is ever rejected, which is why the published schema carries NO `minimum`/`maximum` on those two fields — a schema bound would be enforced before `execute` and turn the runtime clamp into a dead branch; the 32 KiB `FILES_CONTENT_BUDGET` is the harness DELIVERY budget in the currency that cap is enforced in — escaped payload bytes of the WHOLE serialized result (`MODEL_TOOL_RESULT_BUDGET_BYTES`, `core/result-budget.ts`) — less the measured scaffolding of this call's own receipts (`filesResultOverhead`); what is left is ONE mutable page allowance (`filesListAllowance`) threaded through every list op in the CALL, charged per entry in that same currency (`entryWireBytes`), so an op whose turn arrives after it is spent answers `entries: []` with `truncated: true` and `nextOffset` naming its own offset while entries remain past it, and `nextOffset` is `null` when nothing was withheld; a call with so many ops that the result's static prose cannot fit the cap is REFUSED whole, before any operation mutates the filesystem); duplicate or aliased spellings of one directory in a `path` array are walked ONCE, first spelling wins (`dedupePaths` by `fileIdentity`); `move`/`copy` → `{ path, to, kind, bytes, replaced? }` — `replaced: { path, kind, entries }` shows up ONLY when an existing destination was removed to make room, and it is the receipt's account of what that cost: `kind` names what stood there, `entries` counts the IMMEDIATE entries of a replaced directory or is `null` when the listing itself failed, so "unknown" is never read as "empty" (a file or a symlink costs no tree and reports 0) — an existing destination is refused unless `overwrite`, a real DIRECTORY destination additionally needs `replaceDirectory: true` (a symlink destination does not: replacing it costs the link alone), and a destination that IS the source or lies INSIDE it is refused BEFORE any filesystem change (`selfOrContained`: resolved text first, then real identity, so a symlinked alias is caught) — that guard is what stops `copy X → X` with `overwrite: true` from deleting the tree and reporting success, and `copyDirectory` additionally stops at `FILES_COPY_MAX_DEPTH` (64) levels; a symlink inside a copied tree is copied AS a symlink (target string verbatim, 0 bytes) while a symlinked directory used as the SOURCE is still followed at the top level; `delete` → `{ path, removed, recursive }` (a NON-EMPTY directory needs `recursive`, an EMPTY directory is removed without it, a DANGLING symlink is deletable because the path is examined with `lstat` before anything follows it, and a missing path needs `force` and is then reported `removed: false, skipped: true`; a NON-EMPTY directory without `recursive` is a `files-delete-non-empty` refusal that counts what is in there); `mkdir` → `{ path, created }`, creating parents, reporting an existing directory as `created: false`, and REFUSING whatever else stands there — `files-mkdir-not-a-directory` for a plain file or a symlink that resolves to a non-directory (its `details` carry `kind` and `targetExists`), `files-mkdir-dangling-link` for a symlink whose target is gone — because `mkdir` never replaces anything: `replaceDirectory` is a move/copy permission and nothing else. A failed list entry carries its own `error: { code, message, details? }` and does NOT void the directories that could be read — the surviving entries stay in the receipt, the `code` comes from the closed set `ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`EIO`/`EXDEV` (the exported `FILES_ERROR_CODES` carries a 7th member, `ECANCELED`, and it is the CALL-level cancellation answer, never an entry's) (`filesFailureOf` folds every other raw Node errno — `ENAMETOOLONG`, `ELOOP`, `ERR_FS_EISDIR`, `ENOTEMPTY` — onto `EIO`, because a caller switches on `code` and cannot switch on a set the tool never promises) while the raw errno stays in `rawCode` — the message alone is not an interface, and it gets re-prefixed when the receipt travels through an MCP boundary; a failed mutation rejects the call and names the operations already applied (there is no rollback), with machine-readable `details`: `{ op, path, applied, appliedCount, rollback: false, failure: { code, details } }`, so an `EXDEV` rename and an `EACCES` on the same operand are distinguishable, and the batch-level `code` is the refusal's OWN code when it has one (`files-source-missing`, `files-source-is-destination`, `files-destination-inside-source`, `files-destination-contains-source`, `files-destination-exists`, `files-destination-directory`, `files-delete-missing`, `files-delete-non-empty`, `files-mkdir-not-a-directory`, `files-mkdir-dangling-link`) and only otherwise the generic `files-operation-failed`. Operations run in array order against the state each one finds, and mutations hold the same per-file locks as `write`/`edit` (`./tools/files/lock.ts`) |
 | `glob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` — names only; the old `content` property is gone and the schema rejects it |
-| `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }` (required `pattern`; 1 KiB snippet per line, 64 KiB aggregate) |
+| `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }` (required `pattern`; 1 KiB snippet per line; the WHOLE result is bounded by the shared 32 KiB delivery budget — escaped payload bytes of the serialized result, `MODEL_TOOL_RESULT_BUDGET_BYTES` — spent from a page allowance left after the result's measured scaffolding (`grepResultOverhead` / `grepPageAllowance`), and `contentBudget` reports that cap) |
 | `shell` | `({ command, cwd?, timeoutMs?, input?, saveOutput? })` | `{ exitCode, stdout, stderr, truncated, stdoutTruncated, stderrTruncated, stdoutBytes, stderrBytes, stdoutDroppedBytes, stderrDroppedBytes, outputPath, timedOut, aborted, exitSignal, durationMs, linesChained }`; stdout 128 KiB / stderr 16 KiB **head+tail** with an in-band `[... N bytes omitted ...]` marker (`./boundedOutput`, because build and test output is read from the end) and the full stream teed to `outputPath` when either was cut; timeout 1..600000 ms (default 120000), process tree killed best-effort (`taskkill /T` cannot reach detached/reparented descendants), and a run that finished on its own is never reported `timedOut`; stdin is closed by default and `input` feeds it; on Windows a multi-line `command` is chained with `&&` because cmd.exe otherwise executes only its first line; `exitCode` is normalised to the signed convention |
 | `gitDiff` | `({ ref?, staged?, paths?, cwd? })` | `{ exitCode, stdout, stderr, truncated, timedOut, stderrTruncated, aborted }`; `paths` is one path or a non-empty array |
-| `download` | `({ url, name? })` — absolute `http(s)`, no userinfo, URL ≤2 048 chars | a `toolMedia()` **envelope**, not a plain value: `{ content: { url, finalUrl, contentType, kind, name, bytes, declaredBytes?, media: 'attached', mediaId }, __toolMedia: [attachment] }` — the summary text is what the model reads, the bytes ride on the tool message (20 MiB cap, 60 s, one attempt, nothing written to disk) |
+| `download` | `({ url, name?, path? })` — absolute `http(s)`, no userinfo, URL ≤2 048 chars, and a **public** address on the first hop and on every redirect hop; `path` is relative to the session downloads folder (absolute, a drive colon or any `..` is refused) | a `toolMedia()` **envelope**, not a plain value: `{ content: { url, finalUrl, contentType, kind, name, bytes, declaredBytes?, media: 'attached', mediaId, saved, path?, saveError?, searchable, note }, __toolMedia: [attachment] }` — the summary text is what the model reads, the bytes ride on the tool message, AND the same bytes are written into the harness session's own `downloads/` folder (20 MiB cap, 60 s, one attempt, ≤5 hand-followed redirects, no folder ⇒ the call refuses) |
 
 Implementation notes worth keeping:
 
@@ -3890,9 +3899,13 @@ Implementation notes worth keeping:
   names. Paging state lives INSIDE the list receipt (`{ entries, truncated, nextOffset,`
   `offset, limit, bytes, starved?, note? }`), which is what lets `files` declare ONE array property (`ops`)
   where `fileList` needed three - the catalogue's last exception to the batching rule is
-  gone. The 64 KiB entry-text budget (`FILES_CONTENT_BUDGET`) is ONE mutable `{ remaining }`
-  allowance threaded through every list op in the CALL, so it means "64 KiB across the whole
-  call", not per op: the second list op starts where the first stopped, a page stops BEFORE the
+  gone. The 32 KiB entry budget (`FILES_CONTENT_BUDGET`) IS the harness delivery budget, in
+  the currency that cap is enforced in — escaped payload bytes of the WHOLE serialized
+  result (`MODEL_TOOL_RESULT_BUDGET_BYTES`, `core/result-budget.ts`) — less the measured
+  scaffolding of this call's own receipts (`filesResultOverhead`). What is left
+  (`filesListAllowance`) is ONE mutable `{ remaining }` cell threaded through every list op
+  in the CALL, so it means "one page across the whole call", not per op, and an entry is
+  charged what it costs on the wire (`entryWireBytes`), not its raw name length: the second list op starts where the first stopped, a page stops BEFORE the
   entry that would cross it (no entry is ever split), and an op whose turn arrives to a spent
   budget answers `entries: []`, `truncated: true`, `nextOffset: <its own offset>` — a cursor at
   the entry that did not fit, never one that silently walks past it. The receipt tells the two
@@ -3900,9 +3913,11 @@ Implementation notes worth keeping:
   allowance says `truncated: true` with no `starved`, while an op whose turn arrives to a pool
   that was ALREADY spent says `starved: true` and repeats the reason verbatim in `note` — that
   op never ran, which is a different fact from having spent its share. `starved`/`note` are
-  absent, never `false`, when the pool had room. An entry whose OWN UTF-8
-  size exceeds the whole budget is a refusal naming it and its offset, because its cursor could
-  never advance. Unlike `fileList`, a directory that cannot be read is that entry's own `error`
+  absent, never `false`, when the pool had room. An entry whose OWN payload
+  charge (the escaped width of the name AS IT APPEARS inside the serialized result, plus the byte
+  its array position costs) exceeds that page allowance is a refusal naming it and its offset, because
+  its cursor could never advance. A call with so many ops that the receipts' static prose alone
+  cannot fit the cap is refused outright — no operation runs, and nothing is mutated. Unlike `fileList`, a directory that cannot be read is that entry's own `error`
   (`ENOENT`/`ENOTDIR`/`EACCES`/`EPERM`/`ECANCELED`/`EIO`/`EXDEV` — a CLOSED set exported as
   `FILES_ERROR_CODES` so a caller can type the switch; `filesFailureOf` folds every other raw Node
   errno — `ENAMETOOLONG`, `ELOOP`, `ERR_FS_EISDIR`, `ENOTEMPTY` — onto `EIO` and puts the real name
@@ -4030,8 +4045,9 @@ Implementation notes worth keeping:
   above a root reaches into it. `grep` additionally skips binaries and files over 1 MiB,
   caps its result at 100
   matches (clamped 1-100), cuts each match to a 1 KiB snippet on a code-point boundary
-  with `textTruncated`, and stops the whole call at a 64 KiB aggregate with
-  `truncated`; `.git/info/exclude` and the global `core.excludesFile` are not read.
+  with `textTruncated`, and stops the whole call at the shared 32 KiB delivery budget — escaped
+  payload bytes of the serialized result, with the result's own scaffolding reserved first
+  (`grepResultOverhead` / `grepPageAllowance`) — reporting `truncated` and `contentBudget`; `.git/info/exclude` and the global `core.excludesFile` are not read.
 - **Content matching is time-bounded.** grep's `pattern` is a JavaScript regex, and
   JavaScript regexes backtrack: `(a+)+$` blocks the process for seconds on a 31-byte
   line. `tools/files/bounded-regex.ts` therefore runs the match loop inside
@@ -4299,30 +4315,96 @@ guidance instead (see [Slash commands](#slash-commands)).
 
 `download` (`tools/webdownload/download.tool.ts`) is the byte path. `fetch`
 answers bounded text and refuses a binary; `download` accepts **any** content
-type, caps the transfer, and hands the real bytes to the model as multimodal
-input. It is a plain **preset** — in `presetTools`, exported by name, listed and
-callable in the server catalogue — with `registration: { group: 'preset',
-activation: 'always', mode: 'sync', order: 235 }` and `visibility: 'core'`, so
-every harness registers and declares it without a key, a configuration field, or a
-discovery round. `presets: false` is the only way to keep it out.
+type, caps the transfer, hands the real bytes to the model as multimodal
+input, **and** saves the same bytes into the harness session's own downloads
+folder so `glob`/`grep`/`read` can reach the file afterwards. It is a plain
+**preset** — in `presetTools`, exported by name, listed and callable in the
+server catalogue — with `registration: { group: 'preset', activation: 'always',
+mode: 'sync', order: 235, sessionBound: true }` and `visibility: 'searchable'`
+(R9-R11): every harness registers it without a key or a configuration field, and
+`toolRequest` opens it on demand. `presets: false` is the only way to keep it out.
 
 **Caps (all enforced before allocation, all module-local literals).**
 `MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024` decoded bytes, checked twice — against
 `content-length` before any byte is paid for, then per streamed chunk for a host
 that declares nothing or lies. `DOWNLOAD_TIMEOUT_MS = 60_000` for the whole
 transfer (a 20 MiB file on a slow link is normal; `fetch`'s 15 s is not), one
-attempt, redirects followed, `context.signal` LINKED to the timeout controller so
+attempt, `context.signal` LINKED to the timeout controller so
 `toolCancel`/run abort stops the socket rather than only its delivery. URL must be
-absolute `http(s)` without userinfo, ≤2,048 characters. **Nothing is written to
-disk** — there is no output path argument; a host that wants a file uses `write`.
+absolute `http(s)` without userinfo, ≤2,048 characters.
+
+**Three address gates (the same policy `fetch` enforces — parity is a user
+decision).** (1) the address FORM, before a socket opens: loopback,
+`.localhost`, RFC1918, CGNAT, link-local and the metadata IP `169.254.169.254`,
+IPv6 loopback/ULA, and the mapped forms; (2) the RESOLVED address, so a public
+name whose A record is private (`127.0.0.1.nip.io`) is refused too; (3) EVERY
+redirect hop — which is only possible because redirects are followed BY HAND
+(`redirect: 'manual'`, cap 5 = `MAX_REDIRECTS` in `tools/webfetch/request.ts`):
+the platform default resolves `Location` and connects before this entry regains
+control, and one 302 into loopback used to deliver internal bytes to the model
+AND to disk. The resolver (`node:dns/promises`, lazy) has its own 2 s watchdog and
+FAILS OPEN: no `node:dns`, a lookup error, or a lookup past the deadline means
+gate 2 cannot answer and only the address form is checked — a resolver problem is
+not a security verdict, and the tool description states that limitation instead
+of pretending gate 2 is unconditional. Because `fetch` and `download` restate
+these predicates rather than share them (a captured source revision may not
+value-import a sibling entry — `core/tool-source.ts:141`), the focused test
+compares the two predicate sets over an address corpus.
+
+**The destination is the session's folder, not the working directory.** The
+folder comes from `ToolContext.downloadsDirectory`, a HOST value the model can
+never move: the server supplies the harness session's own
+`harness/sessions/<id>/downloads` (`server/persistence.ts`
+`harnessSessionDownloadsDirectoryOf`), which journal `remove()` deletes with the
+session; a library build supplies its own through
+`HarnessConfiguration.downloadsDirectory`, and BOTH build the context from the
+harness build (`harness.ts` `downloadsDirectorySettingOf` + the three context
+sites), because the model path constructs `ToolContext` inside the run loop where
+no request is in scope to carry one. With no folder there is no owner for the
+bytes, so the call refuses BEFORE the transfer instead of inventing a location —
+which is why `registration.sessionBound` is now `true`. That flag is the ROW
+stating the dependency, and it is honest but NOT yet a gate for this tool: the
+server's only consumer of `sessionBound` (`server/api.ts:2911`) reads it off a
+`CatalogueEntry`, and only the harness-owned rows carry it
+(`server/harnesses/core.ts:87`); a package-preset row is built by
+`server/harnesses/index.ts:195`, which copies metadata only. So a sessionless
+`POST /v1/harness/tools/download/executions` still runs the entry and answers
+200 `ok:false` with the refusal sentence, and gating it at the door (403, plus
+`execution.scope: 'session_required'` on the detail read) is a server/contract
+change for its own pass. `path` is a subpath INSIDE
+that folder: absolute, a drive colon, or any `..` segment is refused rather than
+normalized — also before the transfer, so 20 MiB is never paid for a wrong
+argument — while `raw/report.csv` is fine and `writeUnique` mkdirs the leaf's
+parent so the subfolder exists. The name is sanitized (no separators, no
+`<>:"|?*`, no control characters, percent-decoded, ≤200 chars);
+`content-disposition` is parsed as a QUOTED-STRING first, so a `;` inside a
+filename survives instead of cutting the name, and RFC 5987 `filename*` wins over
+`filename` (an unterminated quote keeps the legacy bare-token behaviour). The
+default name is the URL basename plus the MIME-derived extension.
+`path` in the result is ABSOLUTE — a relative path was only ever meaningful
+inside whatever directory the process happened to start in. Writing never breaks
+a download that already succeeded: an errno lands in `saveError` with
+`saved: false`, the bytes stay in the message, and `note` tells the model plainly
+that no file tool can reach them.
 
 The value a caller gets is a `toolMedia()` **envelope**
 (`{ __toolMedia: [attachment], content: summary }`), and the two halves are
 deliberately different sizes:
 
-- `content` is the small JSON summary (`url`, `finalUrl`, `contentType`, `kind`,
-  `name`, `bytes`, `declaredBytes?`, `media: 'attached'`, `mediaId`) — a few
-  hundred bytes, so the 64 KiB model-facing result budget never touches it;
+- `content` is the small JSON summary the tool itself describes — the saved ABSOLUTE
+  `path`, whether the file is `searchable` by grep (text and under 1 MiB) or only
+  addressable, and the counts (`url`, `finalUrl`, `contentType`, `kind`, `name`,
+  `bytes`, `declaredBytes?`, `media: 'attached'`, `mediaId`, `saved`, `path?`,
+  `saveError?`, `note`) — a few hundred bytes, and still bounded as a small result
+  by the STANDARD tool-result cap (./core `MODEL_TOOL_RESULT_BUDGET_BYTES`, 32 KiB
+  of escaped payload bytes — the retired per-tool 64 KiB figure no longer exists),
+  so the budget never bites a successful download; the payload itself never rides
+  this text at all — it goes as attachments under the download profile's limits
+  (20 MiB per attachment, at most 4, 80 MiB total; ./shared/attachments.ts
+  `DOWNLOAD_ATTACHMENT_LIMITS`); `note` is the sentence that tells the model how to
+  point `glob`/`grep`/`read` at the saved file (a root named EXPLICITLY is walked
+  even when an enclosing `.gitignore` ignores that folder, which is what makes a
+  session download reachable);
 - the bytes go on the committed `tool` message's `attachments`
   (`HarnessMessage` tool branch), which is what makes them survive history,
   snapshot restore, and forks;
@@ -4368,11 +4450,19 @@ attachment payloads) therefore still applies and can block a fork of a
 download-heavy session until it is raised. There is no UI preview of downloaded
 files.
 
-**Packaging contract.** The entry is compiled as editable source, so its only
-value imports are the `../../core` barrel and `../../util`; the bounds and MIME
-tables are literals to keep the captured source revision at `dependencies: []`. The
-focused test (`download.test.ts`) asserts those literals equal the authoritative
-numbers in `shared/attachments.ts`, so the two cannot drift. The folder barrel is
+**Packaging contract.** The entry is compiled as editable source, so its value
+imports are the `../../core` barrel, `../../util`, and the node built-ins it needs
+to write a file (`node:fs/promises`, `node:path`) plus ONE dynamic import of
+`node:dns/promises` behind a literal specifier — the literal is what
+`core/tool-source.ts` requires inside a tool entry, and keeping the import dynamic
+is what stops a browser bundle from evaluating `node:dns`. The bounds and MIME
+tables are literals so the numbers this entry advertises are the ones it enforces;
+the focused test (`download.test.ts`) asserts those literals equal the authoritative
+numbers in `shared/attachments.ts`. The SSRF predicates are the one place a copy
+exists twice in the package: a captured source revision may not VALUE-import a
+sibling entry (`core/tool-source.ts:141` refuses `../webfetch/request`), so the
+private-address tests are restated here and the focused test compares the two
+predicate sets over an address corpus instead of sharing them. The folder barrel is
 type-only for the same reason a value re-export anywhere else would eagerly
 evaluate the entry.
 
@@ -8243,14 +8333,27 @@ a live scan on Node, falling back to the generated `src/core/tool-manifest.ts` o
 browser or scanner-less build (`src/tools/descriptors.ts`) —
 so a descriptor cannot advertise a schema the runtime does not use.
 
-**R18: core file/search/download tools are NOT session-bound.** `read`, `write`,
-`edit`, `glob`, `grep`, `download`, and a configured `search` have
+**R18: core file and search tools are NOT session-bound; `download` is.** `read`,
+`write`, `edit`, `glob`, `grep`, and a configured `search` have
 `visibility: 'core'` but
 keep their real `tool` implementation and appear in the direct-call catalogue
 (groups `Package presets` / `Web search`), so
-`POST /v1/harness/tools/read/executions` works with no session at all;
-`POST /v1/harness/tools/download/executions` returns the summary plus
-`media` **descriptors**, never the base64. `sessionBound: true` remains exclusive to the eight
+`POST /v1/harness/tools/read/executions` works with no session at all.
+`download` is the exception, and it is a USER decision (F7): its bytes go into the
+harness SESSION's own `downloads/` folder, which is deleted with the session, so a
+call with no session has nowhere to save them. Its row now declares
+`sessionBound: true` (and `visibility: 'searchable'`, R9-R11 — it is
+demand-discovered, not declared). What that flag does NOT do is gate this tool:
+`POST /v1/harness/tools/download/executions` still reaches the entry, because the
+server's 403 gate (`src/server/api.ts:2911`) reads `sessionBound` off a
+`CatalogueEntry`, and only the harness-owned rows built by
+`src/server/harnesses/core.ts:87` carry one — a package-preset row is built by
+`src/server/harnesses/index.ts:195`, which copies metadata only. A sessionless call
+therefore answers 200 `ok:false` with the tool's own refusal
+("download needs a session…") instead of running a transfer that can only fail, and
+moving that refusal to the door (403 plus `execution.scope: 'session_required'` on
+the detail read) is a server/contract change for its own pass. `sessionBound: true`
+is consequently no longer exclusive to the eight
 harness-owned entries above plus `delegate`, `actionRequest`, and `threadFork`
 (the last two are still refused by the manual call path because they need the
 owning run). The UI's core dropdown reads

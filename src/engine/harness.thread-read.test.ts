@@ -13,8 +13,10 @@
 //   R2  The default `agent:<name>` conversation and an independent host thread are
 //       both readable; the calling run's own thread comes from the runtime, so a
 //       model that passes no `thread` reads the conversation it is in.
-//   R3  Attachment bytes never reach the result, and the 64 KiB model-facing result
-//       cap is never what truncates a page â€” the tool's own budget reports the cut.
+//   R3  Attachment BYTES never reach the result — only their descriptors, which ARE
+//       charged — and the reader's own 32 KiB budget is spent in the same escaped
+//       payload currency as the model-facing result cap (F8), so the result cap is
+//       never what truncates a page — the tool's own budget reports the cut.
 //   R4  An unknown thread id and a malformed pattern come back as honest errors, a manual
 //       host call has no thread to default to, and a SOFT-DELETED thread is not an error for
 //       the doors a soft delete keeps: the host view and the releasing lineage read it through
@@ -33,6 +35,11 @@
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness } from './index';
+// F8: the byte pins in this suite are derived with the cap's own payload measure and the
+// reader's exported receipt shells, so a change to either moves the pins and the contract
+// together.
+import { modelPayloadBytes } from './core/payload-bytes';
+import { THREAD_READ_WIRE_SHELLS } from './tools/runtime/threadRead';
 import type {
     HarnessMessage,
     HarnessStream,
@@ -91,6 +98,66 @@ type Page = {
 // accepted here rather than at every call site.
 const pageOf = (value: unknown): Page =>
     typeof value === 'string' ? (JSON.parse(value) as Page) : (value as Page);
+
+// F8 — the page's `bytes` is charged in the harness DELIVERY currency: escaped payload
+// bytes (core/payload-bytes.ts), with every receipt paying its measured shell
+// (`THREAD_READ_WIRE_SHELLS`, the same constants the reader charges with). Rather than
+// freeze a hand-typed total per fixture, these integration pins RECOMPUTE the charge from
+// the rows the live page actually returned — an independent recomputation of the tool's own
+// accounting, not a restatement of it. The byte-for-byte values of those shells are pinned
+// against fixed fixtures in tools/runtime/threadRead.test.ts; what this suite proves is that
+// a page produced through the real harness obeys the same arithmetic.
+const wire = (value: string): number => modelPayloadBytes(JSON.stringify(value)) - 2;
+const SHELLS = THREAD_READ_WIRE_SHELLS;
+
+const receiptCharge = (message: Record<string, any>): number => {
+    let bytes = SHELLS.message + wire(String(message.content ?? ''));
+
+    // A `regex` page prices the widest `matchedFields` list on every row it returns; the key
+    // is present exactly when the regex ran (threadRead.ts, shell pass).
+    if (message.matchedFields !== undefined) bytes += SHELLS.matchFields;
+    if (typeof message.reasoning === 'string') bytes += SHELLS.reasoning + wire(message.reasoning);
+
+    if (Array.isArray(message.attachments) && message.attachments.length > 0) {
+        bytes += message.attachments.reduce(
+            (total: number, item: Record<string, any>) =>
+                total +
+                SHELLS.attachmentItem +
+                wire(item.id) +
+                wire(item.kind) +
+                wire(item.name) +
+                wire(item.mime),
+            SHELLS.attachments
+        );
+    }
+
+    if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) {
+        bytes += message.toolCalls.reduce((total: number, call: Record<string, any>) => {
+            // A call that DISPLAYS its `arguments` pays the wider shell and the text;
+            // `reference` mode pays the smaller shell and no text (F8 — a reference is
+            // cheaper, it is not free).
+            const shell =
+                typeof call.arguments === 'string' ? SHELLS.toolCallFull : SHELLS.toolCallReference;
+
+            let item = shell + wire(call.id) + wire(call.name);
+
+            if (typeof call.arguments === 'string') item += wire(call.arguments);
+
+            return total + item;
+        }, SHELLS.toolCalls);
+    }
+
+    if (message.role === 'tool') {
+        bytes += SHELLS.toolIdentity + wire(String(message.name ?? '')) + wire(String(message.toolCallId ?? ''));
+    }
+
+    return bytes;
+};
+
+const chargeOfRows = (rows: Record<string, any>[]): number =>
+    rows.reduce((total, message) => total + receiptCharge(message), 0);
+
+const chargeOf = (page: Page): number => chargeOfRows(page.messages);
 
 // A transcript attachment the shared validator accepts: `data` must agree with the
 // declared MIME and with `size` (src/shared/attachments.ts), which is what
@@ -234,7 +301,9 @@ describe('threadRead through a model tool call (R2)', () => {
 
         // The result is the LIVE record of this run's conversation: a host thread,
         // owned by this agent, and 'running' because the read happened mid-run.
-        expect(pageOf(toolResultOf(writer.threadMessages(thread.id), 'threadRead'))).toEqual({
+        const toolPage = pageOf(toolResultOf(writer.threadMessages(thread.id), 'threadRead'));
+
+        expect(toolPage).toEqual({
             thread: {
                 id: thread.id,
                 agent: 'writer',
@@ -255,9 +324,11 @@ describe('threadRead through a model tool call (R2)', () => {
             limit: 20,
             hasMore: false,
             contentBudget: 32768,
-            // 10 characters of the seed message. The 22-character raw arguments string of
-            // the threadRead call itself is SEARCHED but not returned, so it costs nothing.
-            bytes: 10,
+            // F8: 10 characters of the seed message, charged as the delivery cap measures
+            // them — that row's shell plus its escaped text. The 22-character raw arguments
+            // string of the threadRead call itself is SEARCHED but not displayed, so only
+            // the (smaller) reference call shell around it costs anything.
+            bytes: chargeOf(toolPage),
             truncated: false,
             messages: [
                 {
@@ -374,9 +445,11 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
             limit: 20,
             hasMore: false,
             contentBudget: 32768,
-            // 30 + 22 + 20 content characters. The seed costs nothing (not returned)
-            // and the tool-call arguments cost nothing (reference mode quotes no text).
-            bytes: 72,
+            // F8: the page's charge in the delivery currency — every row's measured shell
+            // (the seed contributes nothing because it is not returned) plus the escaped
+            // width of the displayed text. A `reference` tool call pays its smaller shell and
+            // no arguments text; the attachment descriptor pays for its four strings.
+            bytes: chargeOf(page),
             truncated: false,
             messages: [
                 {
@@ -411,13 +484,15 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
             ]
         });
 
-        // 30 + 22 + 20 content characters = 72. `bytes` counts UTF-8 BYTES of the text
-        // the page returns, which is the same unit the harness 64 KiB result cap measures.
-        expect(page.bytes).toBe(72);
+        // The same charge, restated on its own so the currency claim is asserted, not just
+        // implied by the object above: `bytes` is the page's cost in the unit the harness cap
+        // counts (escaped payload bytes, core/payload-bytes.ts), receipts included — and the
+        // page as a whole therefore fits the cap without the envelope ever cutting it.
+        expect(page.bytes).toBe(chargeOf(page));
 
         // The opt-in is a schema-accepted parameter, and it restores exactly what the
-        // default withholds: index 0 on the page, `matched` 4, and the seed's own 15
-        // bytes charged to the page (72 + 15).
+        // default withholds: index 0 on the page, `matched` 4, and the seed's own cost
+        // charged to the page — its shell plus its text, which is the whole delta (F8).
         const seeded = pageOf(
             await writer.executeTool('threadRead', { thread: target.id, includeSystem: true })
         );
@@ -427,7 +502,8 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
             matched: seeded.matched,
             bytes: seeded.bytes,
             indices: seeded.messages.map((message) => message.index)
-        }).toEqual({ total: 4, matched: 4, bytes: 87, indices: [0, 1, 2, 3] });
+        }).toEqual({ total: 4, matched: 4, bytes: chargeOf(seeded), indices: [0, 1, 2, 3] });
+        expect(seeded.bytes - page.bytes).toBe(SHELLS.message + wire('You keep notes.'));
         expect(seeded.messages[0]).toEqual({
             index: 0,
             role: 'system',
@@ -437,8 +513,10 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
             contentHasMore: false
         });
 
-        // `toolArgs: "full"` is the other half of the same contract: the payload comes
-        // back quoted, and the page pays 20 bytes for it.
+        // `toolArgs: "full"` is the other half of the same contract: the payload comes back
+        // quoted, and the page pays the wider call shell PLUS the arguments text — measured
+        // against the reference page above, so the delta is exactly the payload and nothing
+        // else moved (F8 keeps the reference mode's saving honest by pricing both shells).
         const quoted = pageOf(
             await writer.executeTool('threadRead', { thread: target.id, toolArgs: 'full' })
         );
@@ -446,7 +524,9 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
         expect(quoted.messages[1].toolCalls).toEqual([
             { id: 't1', name: 'read', arguments: '{"path":"report.md"}' }
         ]);
-        expect(quoted.bytes).toBe(92);
+        expect(quoted.bytes - page.bytes).toBe(
+            SHELLS.toolCallFull - SHELLS.toolCallReference + wire('{"path":"report.md"}')
+        );
     });
 
     it('reports attachment descriptors and never the base64 payload', async () => {
@@ -536,7 +616,10 @@ describe('threadRead as a host-callable tool (R2/R3/R4)', () => {
         }).toEqual({
             total: 4,
             matched: 1,
-            bytes: 22,
+            // F8: the row's measured shell plus its escaped text — recomputed from the row
+            // the page returned, which is what makes this an accounting check rather than a
+            // character count.
+            bytes: chargeOf(hidden),
             messages: [
                 {
                     index: 2,
@@ -854,26 +937,11 @@ describe('threadRead of a released conversation follows the read door (R1, 2026-
     // is a roster fact, not a transcript edit. `status` stays 'idle' on the record, and the page
     // has no `inactive` key to leak the difference; the doors that must REFUSE a released
     // conversation (`threadSend`, `threadDelete`) refuse it by name.
-    const releasedPage = (thread: { id: string; label?: string; sequence: number }, ownerThreadId: string) => ({
-        thread: {
-            id: thread.id,
-            agent: 'writer',
-            origin: 'host',
-            status: 'idle',
-            sequence: thread.sequence,
-            ownerThreadId,
-            label: thread.label
-        },
-        // 22 + 24 characters of text, no filter, no paging, and nothing cut.
-        total: 2,
-        matched: 2,
-        offset: 0,
-        limit: 20,
-        hasMore: false,
-        contentBudget: 32768,
-        bytes: 46,
-        truncated: false,
-        messages: [
+    const releasedPage = (thread: { id: string; label?: string; sequence: number }, ownerThreadId: string) => {
+        // The two rows, named so the byte figure below can be DERIVED from them (F8: every
+        // row pays its measured shell plus its escaped text) instead of being typed as a
+        // character count that no longer matches any measure the harness uses.
+        const rows = [
             {
                 index: 0,
                 role: 'user',
@@ -890,8 +958,31 @@ describe('threadRead of a released conversation follows the read door (R1, 2026-
                 contentOffset: 0,
                 contentHasMore: false
             }
-        ]
-    });
+        ];
+
+        return {
+            thread: {
+                id: thread.id,
+                agent: 'writer',
+                origin: 'host',
+                status: 'idle',
+                sequence: thread.sequence,
+                ownerThreadId,
+                label: thread.label
+            },
+            // No filter, no paging, and nothing cut — the only thing this page pays is its
+            // two receipts, in the delivery currency.
+            total: 2,
+            matched: 2,
+            offset: 0,
+            limit: 20,
+            hasMore: false,
+            contentBudget: 32768,
+            bytes: chargeOfRows(rows),
+            truncated: false,
+            messages: rows
+        };
+    };
 
     it('serves the retained rows to the lineage that released it, through the tool', async () => {
         const { writer, parent, child } = releasedFixture((childId) => [

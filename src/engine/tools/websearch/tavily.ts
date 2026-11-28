@@ -19,7 +19,6 @@
 //   - ./request   — requestSearch, normalizeMatches, the shared bounds/errors
 //   - ./index     — dispatch + key resolution
 
-import type { WebSearchMatch } from '../../types';
 import {
     excerpt,
     date,
@@ -27,15 +26,17 @@ import {
     requestSearch,
     resultsArray
 } from './request';
-import type { MatchFields, ProviderSearch } from './request';
+import type { MatchFields, NormalizedResults, ProviderSearch } from './request';
 
 const ENDPOINT = 'https://api.tavily.com/search';
 const LABEL = 'Tavily';
 
-export const searchTavily = async (search: ProviderSearch): Promise<WebSearchMatch[]> => {
+export const searchTavily = async (search: ProviderSearch): Promise<NormalizedResults> => {
     const payload = await requestSearch({
         label: LABEL,
         endpoint: ENDPOINT,
+        // F10: the caller's cancellation signal travels with the request.
+        callerSignal: search.signal,
         headers: { authorization: `Bearer ${search.apiKey}` },
         body: {
             query: search.query,
@@ -52,11 +53,18 @@ export const searchTavily = async (search: ProviderSearch): Promise<WebSearchMat
             ...(search.excludeDomains ? { exclude_domains: search.excludeDomains } : {}),
             ...(search.since ? { start_date: search.since } : {}),
             ...(search.until ? { end_date: search.until } : {})
+            // `category` is deliberately absent: Tavily's search endpoint has no
+            // category field, so the argument is dropped here rather than refused
+            // (F11 — the combination rules that make `category` + a date filter an
+            // error are Exa's rules, and this provider honours the date filter). The
+            // result echoes `category` because the CALLER asked for it; see ./index.
         }
     });
 
     const rows = resultsArray(payload, LABEL);
 
+    // F5: valid rows fill the request, junk rows are counted, not silently charged
+    // against it (see ./request `normalizeMatches`).
     return normalizeMatches(
         rows,
         search.maxResults,

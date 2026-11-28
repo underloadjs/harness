@@ -280,6 +280,27 @@ export type LaneBlueprint = {
     // B6: the deployment's complete plugin set, as data. Absent means "the host never
     // configured plugins"; `none` is a configured empty set. See `LanePluginPosture`.
     plugins?: LanePluginPosture;
+    // F7 (the SESSION DOWNLOADS FOLDER): the directory this conversation's `download` writes into,
+    // as an ABSOLUTE PATH STRING — the one harness-build fact that is per session and still
+    // structured-clone-safe, which is why it can ride the blueprint where `knowledge` cannot
+    // (a `HarnessKnowledge` object is a live reference, ./protocol.ts notes above).
+    //
+    // WHY A LANE NEEDS IT AT ALL: the replica is built by `preset.create(...)` in
+    // ./lane-worker-loop.ts `sayHello`, and a report that never carries the folder produces a
+    // replica whose `download` refuses with "download needs a session" WHILE the inline session
+    // serves the same call — the same widened/narrowed-harness gap `presetRebuild` and
+    // `disabledTools` exist to close, in the other direction. The worker thread shares the
+    // coordinator's filesystem, so the coordinator's path is the worker's path; nothing here is
+    // resolved or rewritten on the way.
+    //
+    // A LANE-CREATION SNAPSHOT like every other field: the path is derived from the session id
+    // (../persistence.ts `harnessSessionDownloadsDirectoryOf`), so it cannot change during the
+    // session's life, and deleting the session removes the folder on BOTH sides at once.
+    //
+    // ADDITIVE and OPTIONAL: `undefined` means the coordinator shipped no folder (an ephemeral
+    // store with no persistence directory, or an older bundle), and the replica behaves exactly as
+    // it did before — a refusal, not a guessed default.
+    downloadsDirectory?: string;
 };
 
 // What the worker could actually do once built. A non-empty `unsupported` list makes

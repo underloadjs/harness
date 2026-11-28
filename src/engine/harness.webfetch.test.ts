@@ -305,7 +305,15 @@ describe('fetch error classes and query fields through the tool envelope', () =>
         expect(cut.stopReason).toBe('contentBudget');
         expect(cut.truncated).toBe(true);
         expect(typeof cut.nextOffset).toBe('number');
-        expect(cut.content).not.toContain('END-05');
+        // THE TIGHTEST HONEST NEGATIVE, re-derived at T6: call 1 delivers 29 184 characters
+        // (resuming at 29 138), the END-02 marker sits at page position 30 056, so the withheld
+        // END-02 is exactly 872 characters past the delivered window — this pin bites if the
+        // window grows by as much as 873 characters. The `END-05` it replaced was 45 968
+        // characters away from this window and could not fail for any fit change short of
+        // delivering the whole page (it stays pinned where it means something: the resumed
+        // window arithmetic below). Measured with `Temp/t6-integration/probe-webfetch-cut.ts`,
+        // which reads the delivered content itself, not the page slice.
+        expect(cut.content).not.toContain('END-02');
 
         const resumed = (await webfetch().executeTool('fetch', {
             url: 'https://example.com/long',
@@ -313,6 +321,20 @@ describe('fetch error classes and query fields through the tool envelope', () =>
         })) as WebFetchResult;
 
         expect(resumed.offset).toBe(cut.nextOffset);
-        expect(resumed.content).toContain('END-05');
+        // The resumed window, by arithmetic rather than by observation. The envelope the
+        // fit prices is the WHOLE result (`index.ts` `fitResult` measures
+        // `JSON.stringify({ ...fields, content: '' })` and shrinks content in the nested
+        // currency, under the `MAX_RESULT_BYTES - RESULT_FIT_SAFETY_BYTES` = 32 704
+        // ceiling), so this page's newline escaping (22 of them, 3 bytes each once nested)
+        // costs ~44 bytes that used to be free: call 1 delivers 29 184 characters and
+        // resumes at 29 138, and call 2 delivers 29 184 more, ending at 58 322.
+        // Marker positions in the page are 15 024 / 30 056 / 45 088 / 60 120 / 75 152, so
+        // the resume covers END-02 and END-03 and stops 1 798 characters BEFORE END-04 —
+        // one section earlier than the pre-fit envelope reached. `END-05` is outside the
+        // window by 16 830 characters, which is why this pin moved.
+        // Measured with `Temp/t1-webfetch/probe17.ts`; it goes through the harness
+        // `executeTool` door, so both the tool's fit and the harness result binding are on
+        // the path, and it is stable at 3 repeats.
+        expect(resumed.content).toContain('END-03');
     });
 });

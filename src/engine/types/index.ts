@@ -3427,6 +3427,20 @@ export type ToolContext<TParameters = any> = {
     // policy, or catch the named refusal — never assume `run` exists just because
     // this harness does.
     nestedRuns?: NestedRunPolicy;
+    // THE FOLDER THIS CALL MAY SAVE DOWNLOADED BYTES INTO (F7). Supplied by the engine from
+    // `HarnessConfiguration.downloadsDirectory`, which the server sets to the session's own
+    // downloads folder (`<databaseRoot>/harness/sessions/<id>/downloads`, see
+    // ../server/persistence.ts `harnessSessionDownloadsDirectoryOf`).
+    //
+    // It is per-BUILD, not per-call, for the same reason `pluginSettings`/`knowledgeOwner` are:
+    // the model path builds this object inside the run loop (./harness.ts:12885), where no HTTP
+    // request is in scope, and the lane replica builds it in another process. A tool may therefore
+    // treat the folder as a property of the session that owns the run, never of one call.
+    //
+    // Optional: a bare library harness has no session, and `download` REFUSES in that case rather
+    // than inventing a folder nobody chose (./tools/webdownload/download.tool.ts
+    // `downloadsDirectoryOf`). A tool never writes here without being asked by the model.
+    downloadsDirectory?: string;
 };
 
 // WHEN a finished call of this tool is allowed to start the next agent turn
@@ -3617,6 +3631,20 @@ export type WebSearchResult = {
     until?: string;
     category?: string;
     speed?: 'balanced' | 'fast';
+    // ---- the fit report (additive; absent unless the answer needed a correction) --
+    // ROWS REMOVED FOR SIZE (F2). The harness REFUSES a tool result whose JSON-escaped
+    // payload exceeds its per-result budget rather than slicing a JSON document in half,
+    // so a full answer that is 1 byte too large is a FAILED call. The search tool trims
+    // itself first, and this flag is how a caller knows the list it sees is a prefix of
+    // what the provider returned.
+    resultsTruncated?: boolean;
+    // PROVIDER ROWS THAT COULD NOT BE USED (F5): rows with no valid http(s) URL, or
+    // whose redacted URL no longer fits. A DIFFERENT cause from `resultsTruncated`
+    // above, deliberately a different field: one is "the answer was too big", the other
+    // is "the provider sent junk".
+    droppedResults?: number;
+    // The one sentence that says which of the two happened, and what to do.
+    note?: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -3735,9 +3763,15 @@ export type WebFetchResult = {
     // Echoed back when the call used section selection, so a transcript reader
     // can tell a filtered answer from a whole page.
     query?: string;
-    // Sections returned / sections the page has / sections that matched in total
-    // (the last one exceeds `matches` when the block cap dropped some). Present
-    // only in query mode.
+    // Sections returned / sections the page has / matches the page has in total.
+    // Present only in query mode. What `totalMatches` counts depends on `matchMode`
+    // (F4): in HEADING mode it is the number of matching sections, so it exceeds
+    // `matches` when the block cap withheld some; in PROXIMITY mode it counts
+    // OCCURRENCES of the phrase while the answer is always exactly one window, so it
+    // can exceed `matches.length` with nothing withheld. Only the heading-mode
+    // excess means "the cap dropped some" — which is why `stopReason` is decided
+    // against `MAX_QUERY_BLOCKS` in heading mode only
+    // (tools/webfetch/index.ts:1043-1053).
     matches?: number;
     totalSections?: number;
     totalMatches?: number;
@@ -3798,11 +3832,11 @@ export type DownloadParameters = {
     // way (no path separators, no drive colon, at most 200 characters), so a
     // model-supplied value can never smuggle a path.
     name?: string;
-    // Optional destination for the saved copy, relative to the working directory.
-    // Absolute paths and `..` are REFUSED rather than normalized: the tool
-    // documents a session folder, and silently writing to /etc because a model
-    // guessed an absolute path is worse than an error. Omitted = the default
-    // .underload/downloads/ folder, where glob, grep and read can reach the file.
+    // Optional destination INSIDE the session's downloads folder (F7), e.g. `raw/report.csv` or
+    // just `report.csv`. Absolute paths, a drive colon and any `..` segment are REFUSED rather
+    // than normalized: the folder is the one deleted with the session, and silently writing to
+    // /etc because a model guessed an absolute path is worse than an error. Omitted = the
+    // sanitized file name directly under that folder, where glob, grep and read can reach it.
     path?: string;
 };
 
@@ -3836,8 +3870,10 @@ export type DownloadResult = {
     // the file. False on a host with no writable filesystem — the download itself
     // still succeeded and the bytes are still attached.
     saved?: boolean;
-    // Where it was saved, RELATIVE to the working directory (what the file tools
-    // resolve against). Present only when `saved` is true.
+    // Where it was saved, ABSOLUTE (F7). The folder is the harness session's own downloads
+    // directory, which is usually OUTSIDE the working directory, so a relative path would be
+    // meaningless to paste into `read`/`grep`/`glob` — all three accept an absolute root. Present
+    // only when `saved` is true, and it is the value the file tools want.
     path?: string;
     // Why the disk copy failed, when it did. A short reason, never a stack.
     saveError?: string;
@@ -3846,6 +3882,12 @@ export type DownloadResult = {
     // path but a grep over it returns nothing — the model should use `read` on a
     // text file or treat a media file as attached input instead.
     searchable?: boolean;
+    // HOW TO REACH THE FILE (the honesty half of the disk story). One sentence naming the folder
+    // kind (session vs working directory), whether `.gitignore` hides it, and what `searchable`
+    // means in practice — so a model never burns a turn on a `grep` the folder layout was always
+    // going to answer empty. Absent only when nothing was written and nothing failed (a bare
+    // library call refuses before this point, so in practice every successful call carries it).
+    note?: string;
     // The id the attachment travels under on this tool message. The progress
     // event's `media` descriptor and the tool message agree on it; only the
     // transport may re-suffix it (deterministically) when one tool block
@@ -5527,6 +5569,21 @@ export type HarnessConfiguration = {
     // `KnowledgeArticle.harness`, which survives copy/snapshot/persistence and is what the
     // cleanup filters on. This member is only the carrier that tells the engine who is writing.
     knowledgeOwner?: string;
+    // THE FOLDER THE `download` TOOL SAVES FETCHED BYTES INTO (F7) — an absolute directory, or one
+    // resolved against the process working directory at call time.
+    //
+    // WHY IT IS A BUILD FIELD: a downloaded file has to be deleted with whatever owns it. The old
+    // contract wrote to `.underload/downloads` under the process cwd, which (a) is invisible to
+    // `glob`/`grep` wherever a `.gitignore` ignores `.underload/` — this package's own
+    // `.gitignore` does — and (b) leaves untracked binaries in a checkout for the life of the
+    // repository. A session owns its bytes, so the server supplies the session's own folder
+    // (`../server/persistence.ts` `harnessSessionDownloadsDirectoryOf`), and removing the session
+    // removes the downloads (`../server/journal.ts:788-797` deletes the whole session directory).
+    //
+    // Absent means UNOWNED, and `download` then refuses instead of picking a folder for the host.
+    // A per-call override is not offered: the value must hold for every call of the build, because
+    // the model path has no request to carry one (see `ToolContext.downloadsDirectory`).
+    downloadsDirectory?: string;
 };
 
 // The callable harness. `await writer('...')` runs the entry agent to

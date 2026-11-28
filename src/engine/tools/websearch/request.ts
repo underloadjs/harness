@@ -19,15 +19,36 @@
 //     being truncated into a different link);
 //   - 512 KiB of response body, enforced while streaming so an oversized body is
 //     never allocated in full, plus a content-length pre-check. This is the
-//     *provider* budget and deliberately not the fetch tool's native page budget
-//     (../webfetch/request caps a page GET at 100 KiB): a search API returns a
-//     JSON list whose size it controls, while a native GET faces the open web;
-//   - 15 s per request, enforced with AbortController and cleaned up in `finally`.
+//     *provider transfer* budget and deliberately not the fetch tool's native page
+//     budget (../webfetch/request caps a page GET at 1 MiB — `MAX_RESPONSE_BYTES`
+//     there, 1,048,576): a search API returns a JSON list whose size it controls,
+//     while a native GET faces the open web;
+//   - 32 KiB (32,768 bytes) of DELIVERED result, enforced by ./index after
+//     normalization (MAX_SEARCH_RESULT_BYTES + fitRowsToResultBudget below). The
+//     transfer budget is 16x this number on purpose, and the ratio is the whole
+//     point of the fit: a provider may hand back far more than the harness is
+//     willing to put in front of a model, and READING it is not the same as being
+//     able to DELIVER it. Without the fit, measured against the real core helpers:
+//     20 rows with 1,000-character snippets and 1,000-character URLs serialize at
+//     41,650 payload bytes, and 20 rows at every per-row cap at once (300-char
+//     title, 2,048-char URL, 1,000-char snippet) at 67,970 — both over 32,768, so
+//     the harness REFUSED the call outright (an oversized JSON document is never
+//     slice-cut: core/result-budget.ts `boundToolResult` marks it
+//     `rejected: { reason: 'oversized-json' }` and the run reports the call as
+//     failed) — 16x the transfer cap looked safe and was not;
+//   - 15 s per request, enforced with AbortController and cleaned up in `finally`,
+//     and LINKED to the caller's per-call `ToolContext.signal` (F10) so a
+//     `toolCancel` stops the request rather than only its delivery.
 //
 // Redaction order is a security property, not a style choice: every field is
 // redacted FIRST and bounded second. Bounding first (the old behaviour) could cut
 // a configured credential in half, leaving a prefix of the secret in the result at
-// the truncation boundary.
+// the truncation boundary. The delivery fit (fitRowsToResultBudget) preserves that
+// property by construction: it runs LAST, on a result whose every field has already
+// been redacted, and it removes content in only two ways — a row leaves WHOLE, or
+// the last row's snippet is cut at a CODE-UNIT boundary. Either way the secret is
+// long gone, replaced by `[redacted]`; at worst the marker itself is cut, which is
+// the same property the per-field bounds already state (a marker is not a secret).
 //
 // Errors are sanitized on purpose: a provider status is reported, a provider
 // body never is (it could echo the key or an unrelated secret), and a network
@@ -42,13 +63,25 @@
 //   - ./exa        — Exa request body and result mapping
 //   - ./tavily     — Tavily request body and result mapping
 //   - ./linkup     — Linkup request body and result mapping
-//   - ./index      — createWebsearchTool: key resolution, validation, dispatch
-//   - ../webfetch/request — the fetch tool's own (100 KiB) page budget
+//   - ./index      — createWebsearchTool: key resolution, validation, dispatch,
+//                    and the delivery fit that spends MAX_SEARCH_RESULT_BYTES
+//   - ../webfetch/request — the fetch tool's own (1 MiB) page budget
+//   - ../../core/result-budget.ts — MODEL_TOOL_RESULT_BUDGET_BYTES, the 32,768-byte
+//                    cap this file's MAX_SEARCH_RESULT_BYTES is kept equal to, and
+//                    boundToolResult, which REFUSES an oversized JSON document
+//   - ../../core/payload-bytes.ts — modelPayloadBytes, the escaped-byte currency BOTH
+//                    budgets are counted in (imported here rather than re-declared:
+//                    this file is not a compiled tool entry, so the standalone-source
+//                    rule that makes ../files/read.tool.ts write its literal does not
+//                    apply, and one currency measured by one function cannot drift)
+//   - ../tools/webdownload/download.tool.ts — the caller-signal linking pattern
+//                    requestSearch copies for F10
 //   - ../../util   — HarnessError (the message the model ends up reading)
 
 // `clipPrefix` is the pair-safe bound every text field here passes through (T3, the
 // lone-surrogate defect): the caps below are code-unit counts, so a plain `slice` could
 // end a title or snippet on half of an emoji.
+import { modelPayloadBytes } from '../../core';
 import { clipPrefix, HarnessError } from '../../util';
 import type { WebSearchMatch } from '../../types';
 
@@ -65,7 +98,33 @@ export const SEARCH_TIMEOUT_MS = 15_000;
 // Response ceiling, in bytes (512 KiB). The body is read through a stream and the
 // budget is checked per chunk, so a provider cannot force a full allocation first.
 // Content-length is checked too, when the provider sends it.
+//
+// This is what is READ off the provider. It is NOT what can be delivered: that is
+// MAX_SEARCH_RESULT_BYTES below, 16x smaller. The two numbers answer different
+// questions (how much may this process ingest vs how much may a model read), and
+// keeping only the big one is exactly what left the F2 defect latent: every shape
+// the per-row caps allow could pass the transfer check and still be refused at
+// delivery.
 export const MAX_RESPONSE_BYTES = 512 * 1024;
+
+// F2 — the DELIVERABLE ceiling, in model-facing (JSON-escaped) bytes.
+//
+// KEEP THIS EQUAL to `MODEL_TOOL_RESULT_BUDGET_BYTES` in ../../core/result-budget.ts
+// (32,768): that is the cap the harness enforces on every tool result at delivery,
+// and it measures an oversized JSON document by REFUSING it whole — no envelope, no
+// slice, and the call reported as `isError`. A search result that exceeds it is
+// therefore not "cut down", it is LOST, so ./index spends this budget itself and
+// hands the harness something it cannot refuse.
+//
+// The value is written out rather than imported on purpose, following the
+// ../files/read.tool.ts precedent (`FILE_READ_WIRE_BUDGET`): the number is a
+// decision the tool must be able to state on its own, and websearch.test.ts pins the
+// two constants equal (the same drift pin read.test.ts uses) instead of letting the
+// equality rest on an import that a future refactor could drop. The CURRENCY, by
+// contrast, is imported (`modelPayloadBytes` above): a re-declared byte table could
+// drift silently, and a fit measured in the wrong unit is a fit that either wastes
+// rows or still gets refused.
+export const MAX_SEARCH_RESULT_BYTES = 32 * 1024;
 
 export const MAX_TITLE_CHARS = 300;
 export const MAX_SNIPPET_CHARS = 1_000;
@@ -90,6 +149,12 @@ export type ProviderSearch = {
     maxResults: number;
     apiKey: string;
     redact: (text: string) => string;
+    // F10 — the CALLER's per-call cancellation signal (`ToolContext.signal`, the
+    // controller a `toolCancel` or a run abort fires). Optional because a direct
+    // `search({ query })` call has none; an adapter passes it straight to
+    // `requestSearch`, which links it into its own timeout controller. An adapter
+    // that ignored it would keep a cancelled search running, and paying for it.
+    signal?: AbortSignal;
     // Filters the caller asked for. Every adapter receives them; an adapter whose
     // provider has no equivalent sends what it can and ignores the rest, so one
     // argument surface works across providers rather than leaking one vendor's
@@ -110,6 +175,12 @@ type SearchRequest = {
     endpoint: string;
     headers: Record<string, string>;
     body: Record<string, unknown>;
+    // F10 — the caller's signal, linked into the request's own AbortController.
+    // Named `callerSignal` (not `signal`) so it can never be mistaken for the
+    // controller's signal in the fetch call below: the two are different objects,
+    // and which one fired decides whether the caller sees a cancellation, a
+    // timeout, or a network failure.
+    callerSignal?: AbortSignal;
 };
 
 // A provider row mapped to our stable field names, still unvalidated. Adapters
@@ -240,32 +311,73 @@ const validUrl = (value: unknown): string | undefined => {
     }
 };
 
-// Turn provider rows into the stable result shape: slice to the requested count,
-// drop rows without a valid URL, bound every field, and redact every string.
+// What one provider call produced: the rows that survived validation, and the
+// count of rows that did not.
+//
+// The count is not decoration (F5). Before this, a provider row with no usable URL
+// was skipped AFTER the requested count had been sliced off, so an invalid row
+// silently consumed a slot a valid row could have used, and a call that returned
+// `results: []` looked identical to "the web has nothing". `dropped` is the number
+// the caller needs to tell those two sentences apart, and ./index surfaces it as
+// `droppedResults` plus a `note` when nothing usable is left.
+export type NormalizedResults = {
+    matches: WebSearchMatch[];
+    dropped: number;
+};
+
+// Turn provider rows into the stable result shape: VALIDATE THEN COUNT, dropping
+// rows without a valid URL, bounding every field, and redacting every string.
 // Invalid rows are skipped rather than failing the whole search: one bad row is
 // not a reason to lose the good ones.
 //
+// F5 — the iteration deliberately does NOT slice to `maxResults` first. Slicing
+// first let the provider's junk decide how much of the request was filled: five
+// `ftp://` rows ahead of fifteen valid ones and `maxResults: 5` produced ZERO
+// results, and the caller had no way to know the provider had actually answered.
+// Now every row is examined and the loop stops as soon as `maxResults` VALID rows
+// are collected, so the count the caller asked for is the count it gets whenever
+// the provider can supply it. The scan is still bounded by the response cap
+// (MAX_RESPONSE_BYTES) — 512 KiB of JSON is a few thousand rows, so validating the
+// whole list costs nothing the transfer check has not already paid for.
+//
 // Order per field: validate raw -> redact -> bound. Redaction happens on the raw
-// string so a credential can never be cut at a truncation boundary.
+// string so a credential can never be cut at a truncation boundary. A row is
+// dropped WHOLE, never half, which is what keeps that property true for the
+// delivery fit that runs after this.
 export const normalizeMatches = (
     rows: readonly unknown[],
     maxResults: number,
     redact: (text: string) => string,
     read: MatchReader
-): WebSearchMatch[] => {
+): NormalizedResults => {
     const matches: WebSearchMatch[] = [];
+    let dropped = 0;
 
-    for (const row of rows.slice(0, maxResults)) {
-        if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
+    for (const row of rows) {
+        // Stopping at the requested count keeps the promise intact in both
+        // directions: the caller gets `maxResults` usable rows, and a provider that
+        // sends 500 of them cannot make this loop walk all 500.
+        if (matches.length >= maxResults) break;
+
+        if (!row || typeof row !== 'object' || Array.isArray(row)) {
+            dropped += 1;
+            continue;
+        }
 
         const fields = read(row as Record<string, unknown>);
         const url = validUrl(fields.url);
-        if (url === undefined) continue;
+        if (url === undefined) {
+            dropped += 1;
+            continue;
+        }
 
         // Redaction can lengthen a URL (`[redacted]` is longer than a short key).
         // If the safe form no longer fits, drop the row rather than truncate it.
         const safeUrl = redact(url);
-        if (safeUrl.length > MAX_URL_CHARS) continue;
+        if (safeUrl.length > MAX_URL_CHARS) {
+            dropped += 1;
+            continue;
+        }
 
         const snippet = boundedFlagged(fields.snippet, MAX_SNIPPET_CHARS, redact);
 
@@ -284,7 +396,99 @@ export const normalizeMatches = (
         matches.push(match);
     }
 
-    return matches;
+    return { matches, dropped };
+};
+
+// ---------------------------------------------------------------------------
+// F2 — the delivery fit
+// ---------------------------------------------------------------------------
+//
+// WHY THIS LIVES HERE AND IS GIVEN A `measure` CALLBACK
+// ----------------------------------------------------
+// The number that matters is the size of the WHOLE result the tool returns: the
+// rows, plus the echoed query, provider, maxResults and filters, plus whatever
+// `resultsTruncated`/`droppedResults`/`note` the fit itself adds. Only ./index holds
+// that object, so ./index supplies the measurement and this file owns the rule — one
+// place decides "what to drop", one function decides "what it costs", and the
+// currency is core's `modelPayloadBytes` on both sides.
+//
+// WHY DROPPING TRAILING ROWS IS THE RIGHT CUT
+// -------------------------------------------
+// The provider's order is its ranking, so a prefix keeps the rows the caller was
+// most likely to cite. Cutting a snippet in every row instead would leave twenty
+// rows each too thin to act on and would still need a flag; dropping rows is
+// reversible by the caller (lower `maxResults`, or narrow the query) in a way that a
+// uniformly shredded list is not.
+//
+// INVARIANT: the returned rows always satisfy `measure(rows) <= budget`, or the rows
+// are empty. A result the harness would refuse is never handed back.
+export const fitRowsToResultBudget = <TRow extends { snippet: string; snippetTruncated?: boolean }>(
+    rows: readonly TRow[],
+    measure: (candidate: readonly TRow[]) => number,
+    budget: number = MAX_SEARCH_RESULT_BYTES
+): { rows: TRow[]; truncated: boolean; clipped: boolean } => {
+    const fitted = [...rows];
+
+    // The common path: a default 5-row search is ~1.6 KiB, nowhere near the budget,
+    // so it returns untouched and the caller adds no flag and no note at all.
+    if (fitted.length === 0 || measure(fitted) <= budget) {
+        return { rows: fitted, truncated: false, clipped: false };
+    }
+
+    // Drop from the end until the serialized result fits, keeping at least one row
+    // for the clip step below to work on.
+    while (fitted.length > 1 && measure(fitted) > budget) fitted.pop();
+
+    let clipped = false;
+
+    // One row still over the budget is clipped rather than thrown away: a single
+    // short excerpt with a real URL beats "no results".
+    if (fitted.length === 1 && measure(fitted) > budget) {
+        const original = fitted[0];
+
+        // A clipped row is a row whose excerpt no longer reaches the source's own
+        // end, which is exactly what `snippetTruncated` declares — and the flag is
+        // payload as well, so the bisection measures the row WITH it. Bisection
+        // without the flag lands ~23 bytes over the cap and the row then gets thrown
+        // away for nothing.
+        const clipTo = (units: number): TRow => {
+            // `clipPrefix` is pair-safe, so the cut cannot end on half of an emoji
+            // (the same T3 rule every other bound in this file follows).
+            const clippedRow = { ...original, snippet: clipPrefix(original.snippet, units) };
+
+            if (clippedRow.snippet.length > 0) clippedRow.snippetTruncated = true;
+
+            return clippedRow;
+        };
+
+        // Escaping is per character, so `measure` is monotone in the snippet and the
+        // largest fitting prefix falls out of a bisection over code units (at most
+        // ~10 measures for a 1,000-character snippet). Guessing a character count
+        // instead would be wrong by the escaped width of every quote, control
+        // character and non-ASCII letter in the excerpt.
+        let low = 0;
+        let high = original.snippet.length;
+
+        while (low < high) {
+            // Upper midpoint: `mid` is always > `low`, so the loop cannot stall when
+            // the answer is `low + 1`.
+            const mid = (low + high + 1) >>> 1;
+
+            if (measure([clipTo(mid)]) <= budget) low = mid;
+            else high = mid - 1;
+        }
+
+        fitted[0] = clipTo(low);
+        clipped = true;
+
+        // Safety net rather than the normal path: `low` is only the answer while
+        // `measure` is monotone, and a row whose title and URL ALONE exceed the
+        // budget cannot be rescued by clipping its excerpt. Dropping it is still
+        // better than a result the harness refuses.
+        if (measure(fitted) > budget) fitted.length = 0;
+    }
+
+    return { rows: fitted, truncated: true, clipped };
 };
 
 // One fixed sentence per failure class. Provider bodies are deliberately absent:
@@ -343,10 +547,16 @@ const cancelBody = (response: Response): void => {
 // budget is checked on content-length before this is called, and again on the
 // no-stream fallback so a runtime without `body` is not exempt.
 //
-// `failure` is the caller's network/timeout classifier: a read that rejects is
-// either the request signal aborting or a broken transport, and the caller is the
-// only place that can tell them apart.
-const readBody = async (response: Response, label: string, failure: () => HarnessError): Promise<string> => {
+// `failure` is the caller's request-phase classifier: a read that rejects is
+// either the caller aborting, our own deadline, or a broken transport, and the
+// caller is the only place that can tell them apart. It returns the value to throw
+// (`unknown`, not HarnessError) precisely so a caller abort can be rethrown as the
+// caller's own reason instead of being rewritten into a provider message.
+const readBody = async (
+    response: Response,
+    label: string,
+    failure: (error: unknown) => unknown
+): Promise<string> => {
     const stream = response.body;
 
     if (!stream || typeof stream.getReader !== 'function') {
@@ -354,8 +564,8 @@ const readBody = async (response: Response, label: string, failure: () => Harnes
 
         try {
             body = await response.text();
-        } catch {
-            throw failure();
+        } catch (error) {
+            throw failure(error);
         }
 
         if (new TextEncoder().encode(body).byteLength > MAX_RESPONSE_BYTES) throw oversizedResponse(label);
@@ -401,7 +611,7 @@ const readBody = async (response: Response, label: string, failure: () => Harnes
         // A HarnessError here is our own size error: keep it.
         if (error instanceof HarnessError) throw error;
 
-        throw failure();
+        throw failure(error);
     } finally {
         // Releasing the lock is best-effort: cancel() in the limit path already
         // closes the reader, and a release on a closed reader is a no-op we do not
@@ -417,16 +627,63 @@ const readBody = async (response: Response, label: string, failure: () => Harnes
 // The one place a network request is made. Resolves the parsed JSON body; throws
 // a HarnessError with a sanitized message for every failure. The AbortController
 // and its timer are always cleaned up, including when JSON parsing throws.
+//
+// F10 — TWO signals, one controller. The request owns a deadline controller; the
+// caller's `ToolContext.signal` (F10) is LINKED into it exactly the way
+// ../tools/webdownload/download.tool.ts:663-677 links its own, so `toolCancel` or a
+// run abort stops the transfer instead of only its delivery. Linking (rather than
+// passing the caller's signal to fetch directly) keeps the 15 s deadline working
+// when there is no caller signal at all, and keeps one abort path.
+//
+// The three failure classes stay distinct, because a caller that cancelled must not
+// be told the provider timed out:
+//   - the caller's signal fired  -> rethrow ITS reason, so the harness still
+//     classifies the outcome as cancelled whatever phase the throw landed in
+//     (same reasoning as download.tool.ts `abortOf`);
+//   - our own deadline fired     -> the explicit timeout sentence;
+//   - anything else              -> the one fixed network sentence.
+// `timedOut` is why the deadline needs its own flag: `controller.signal.aborted` is
+// now true for BOTH the timer and a caller abort, so it can no longer tell them apart.
 export const requestSearch = async (request: SearchRequest): Promise<unknown> => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS);
+    let timedOut = false;
 
-    // `aborted` is the only way to tell our timeout from a network refusal, since
-    // fetch rejects with an AbortError for both a signal and some transports.
+    const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+    }, SEARCH_TIMEOUT_MS);
+
+    const callerSignal = request.callerSignal;
+    const forwardAbort = (): void => controller.abort(callerSignal?.reason);
+
+    if (callerSignal !== undefined) {
+        // `{ once: true }`, and no listener when the signal has already fired: a
+        // listener added to an aborted signal never runs, so the abort is forwarded
+        // by hand and `fetch` rejects with the caller's reason instead of hanging.
+        if (callerSignal.aborted) forwardAbort();
+        else callerSignal.addEventListener('abort', forwardAbort, { once: true });
+    }
+
     const networkFailure = (): HarnessError =>
-        controller.signal.aborted
+        timedOut
             ? new HarnessError(`${request.label} search timed out after ${SEARCH_TIMEOUT_MS} ms.`)
             : new HarnessError(`${request.label} search could not be reached (network error).`);
+
+    // ONE mapping from "this request threw" to the error the caller gets, used by
+    // the fetch phase AND by the streamed body (`failureOf`). Two cases are not
+    // failures of the provider at all and must not be rewritten into one — the same
+    // two `download.tool.ts:655-666` keeps apart:
+    //   - the caller aborted (toolCancel, a run abort, or a host cancelling a direct
+    //     `search(...)` call): rethrow ITS reason, so the harness still classifies
+    //     the outcome as `cancelled` whatever phase the throw landed in;
+    //   - anything else: the caller keeps the classifier's own message.
+    const abortOf = (error: unknown): unknown => {
+        if (callerSignal?.aborted === true) return callerSignal.reason ?? error;
+
+        return undefined;
+    };
+
+    const failureOf = (error: unknown): unknown => abortOf(error) ?? networkFailure();
 
     try {
         let response: Response;
@@ -441,8 +698,8 @@ export const requestSearch = async (request: SearchRequest): Promise<unknown> =>
                 // fixed endpoint policy did not choose.
                 redirect: 'error'
             });
-        } catch {
-            throw networkFailure();
+        } catch (error) {
+            throw failureOf(error);
         }
 
         if (!response.ok) {
@@ -464,7 +721,7 @@ export const requestSearch = async (request: SearchRequest): Promise<unknown> =>
             throw oversizedResponse(request.label);
         }
 
-        const body = await readBody(response, request.label, networkFailure);
+        const body = await readBody(response, request.label, failureOf);
 
         try {
             return JSON.parse(body) as unknown;

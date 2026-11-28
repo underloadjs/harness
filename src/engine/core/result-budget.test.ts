@@ -257,6 +257,77 @@ describe('boundToolResult', () => {
         expect(plain.content).not.toContain('agentResult');
     });
 
+    it('names the arguments the refused tool actually declares (F14)', () => {
+        // The generic clause offers `limit`, `ids` and `fields` — three arguments that NONE of
+        // the five tools which reach this cap in practice declares. A model that sends `limit`
+        // to `grep` gets "files grep does not accept \"limit\"" and has burned a turn on the
+        // recovery of a refusal. The advice half of the sentence therefore names arguments the
+        // refused tool publishes; the rest of the sentence is untouched, which is why the
+        // pins above this test still read byte for byte.
+        //
+        // Pinned as WHOLE messages, because the message is what a model reads, and pinned
+        // exact so a reword is a deliberate edit rather than a drift.
+        const advised: [string, string][] = [
+            ['fetch', '(a narrower `query`, `format: "text"`, or an `offset` into the part you have not read)'],
+            ['search', '(a smaller `maxResults`, a narrower `query`, or `includeDomains`)'],
+            ['grep', '(a smaller `maxResults`, `context: 0`, `output: "count"`, or narrower `paths`)'],
+            ['glob', '(a smaller `maxResults`, narrower `paths`, or fewer `patterns`)'],
+            ['files', '(fewer operations in one call, or a smaller list `limit`)']
+        ];
+
+        for (const [name, advice] of advised) {
+            const source = JSON.stringify({ id: 'thing-1', body: 'z'.repeat(80) });
+            const bounded = boundToolResult(source, 40, { source: { name, callId: 'c1' } });
+
+            expect(bounded.content).toBe(
+                `Tool result too large to deliver: ${utf8ByteLength(
+                    source
+                )} bytes against a 40-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool '${name}' (call c1) with narrower arguments ${advice} to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying.`
+            );
+            // The generic phrase is GONE for these five — keeping both sentences would make the
+            // refusal longer without making it truer.
+            expect(bounded.content).not.toContain('(smaller limit, fewer ids, narrower fields)');
+        }
+
+        // A tool OUTSIDE the map keeps the historical bytes, exactly. This is the assertion that
+        // keeps F14 from being a breaking change to `read`, `knowledge`, `agent`, a custom host
+        // tool, or anything else that has never been measured against this cap.
+        for (const name of ['read', 'write', 'edit', 'shell', 'agent', 'knowledge', 'store', 'threadFork', 'custom']) {
+            const source = JSON.stringify({ id: 'thing-1', body: 'z'.repeat(80) });
+            const bounded = boundToolResult(source, 40, { source: { name, callId: 'c1' } });
+
+            expect(bounded.content).toBe(
+                `Tool result too large to deliver: ${utf8ByteLength(
+                    source
+                )} bytes against a 40-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run tool '${name}' (call c1) with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying.`
+            );
+        }
+
+        // And with NO source at all — the manual-execute route in src/server/api.ts, which
+        // re-serialises a result it holds no call identity for — the fallback stays byte for
+        // byte, because a refusal whose advice is invented is worse than one that is generic.
+        const sourceless = JSON.stringify({ id: 'thing-1', body: 'z'.repeat(80) });
+
+        expect(boundToolResult(sourceless, 40, {}).content).toBe(
+            `Tool result too large to deliver: ${utf8ByteLength(
+                sourceless
+            )} bytes against a 40-byte budget. The result was discarded, not truncated: no part of it reached this transcript. Re-run the tool call with narrower arguments (smaller limit, fewer ids, narrower fields) to fetch it. If this call could have written anything, that write may already be applied — re-read before retrying.`
+        );
+
+        // The HANDLE branch outranks the advice for a mapped tool too: when the harness kept the
+        // document, naming the retained id beats naming any argument. Asserted on a tool that
+        // HAS advice, so the two clauses cannot both appear.
+        const retained = boundToolResult(
+            JSON.stringify({ branchId: 'branch-9', matches: 'x'.repeat(80) }),
+            40,
+            { source: { name: 'grep', callId: 'c2' } }
+        );
+
+        expect(retained.content).toContain('agentResult pages the full text by that id');
+        expect(retained.content).not.toContain('narrower arguments');
+        expect(retained.content).not.toContain('maxResults');
+    });
+
     it('refuses an over-budget JSON document instead of handing over two broken halves', () => {
         // F-CUTTER. This fixture is the one the head/tail envelope used to be praised
         // for: a `read` page whose opening structure AND trailing `nextLine` were said to

@@ -343,7 +343,15 @@ describe('turn.before interception', () => {
         // Temp/coding/probe-catalogue-ab.ts shape D: its pristine-HEAD leg reproduces 35,820 B /
         // 8,955 tokens EXACTLY, which is what makes +1,029 a measurement and not arithmetic — and
         // the estimator itself moved not one line, so nothing but this constant moved.
-        expect(hooks[0].estimatedTokens).toBe(9215);
+        // T6 (2026-11-28, the budget-currency alignment wave): +324 B / +81 tokens, and exactly TWO of
+        // these seven declarations moved — `glob` +141 and `grep` +183 (their result-budget clauses now
+        // name the 32 KiB delivery budget and the escaped-payload currency, ../tools/files/*.tool.ts);
+        // the wave's other text moves (`files`, `download`, `threadRead`, `webfetch`, `websearch`) are
+        // not in this 7-row roster. The catalogue is 37,173 B (still 1 mod 4 like 36,849, the same
+        // rounding shape: ceil((8 + 37,173) / 4) = 9,296) and the estimator again moved not one line —
+        // measured per entry on a live request with `Temp/t6-integration/probe-floor.ts`, sums agreeing
+        // to the byte.
+        expect(hooks[0].estimatedTokens).toBe(9296);
         expect(hooks[0].iteration).toBe(1);
         expect(hooks[0].agent).toBe('writer');
         // The callable root runs in the entry agent's DEFAULT conversation.

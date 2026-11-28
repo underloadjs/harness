@@ -303,7 +303,13 @@ import type {
 import { openHarnessIoClient } from './workers';
 import type { HarnessIoClient, IoCloseSummary } from './workers';
 import { HarnessPersistenceError } from './persistence';
-import { HARNESS_DATABASE_VERSION, repairInterruptedToolCalls } from './persistence';
+// F7: THE ONE PLACE a session's downloads folder is spelled. `create` and `restoreSession` hand it
+// to `buildHarness`, `blueprintFor` hands the SAME value to a lane replica, and the tool's
+// destination is whatever the engine echoes back from `HarnessConfiguration.downloadsDirectory`
+// (../engine/harness.ts:12980 / :18665 / :18786). Deleting the session deletes the folder because
+// the folder is INSIDE `sessions/<id>/`, which ./journal.ts `remove()` erases recursively — no
+// second cleanup path exists, so no second path can leak.
+import { HARNESS_DATABASE_VERSION, harnessSessionDownloadsDirectoryOf, repairInterruptedToolCalls } from './persistence';
 import type {
     HarnessDatabase,
     HarnessGlobalSettingsRecord,
@@ -2815,6 +2821,20 @@ export class SessionStore {
         // session inline (./workers/capability.ts states why).
         this.assertWorkerCapable(preset);
 
+        // F7: THE ID IS MINTED BEFORE THE HARNESS IS BUILT, and its position IS the change. The
+        // session's downloads folder is named BY the id (`harnessSessionDownloadsDirectoryOf`,
+        // ../persistence.ts:2653), and that folder has to be in `HarnessConfiguration` before the
+        // build: `download` reads its destination off the `ToolContext` the engine assembles per
+        // call (../engine/harness.ts:12980 / :18665 / :18786), so an id minted AFTER the build —
+        // where this value used to live, inside the `session` literal below — could not reach a
+        // build option at all, and every session of a durable server got the tool's pre-flight
+        // refusal ("download needs a session…") even though it WAS a session.
+        //
+        // Nothing between here and the literal reads the id, and this is the SAME
+        // `randomUUID()` the literal used to mint: `session.id`, the shard path, the journal
+        // directory and the 201 body are byte-identical to before.
+        const id = randomUUID();
+
         let harness: Harness;
 
         // R4 — THE COPY-DOWN, before the harness exists. A new session gets its OWN plugin
@@ -2837,7 +2857,13 @@ export class SessionStore {
             // still the only pair that ever disagrees about nothing: `definition` below is
             // described from the same preset, and the snapshot at the bottom of this method
             // captures the seeded enabled set exactly as the live harness states it.
-            harness = this.buildHarness(preset, settings, () => session, plugins, { enableAllTools: true });
+            harness = this.buildHarness(preset, settings, () => session, plugins, {
+                enableAllTools: true,
+                // F7: the folder this conversation owns, keyed by the id minted above. Absent only
+                // when the store has no persistence directory (an ephemeral store has nothing to
+                // delete the bytes with), which is exactly when `download` should refuse.
+                downloadsDirectory: this.downloadsDirectoryFor(id)
+            });
         } catch (error) {
             // T27: a build failure that ALREADY carries an HTTP status is propagated, not
             // re-numbered. The case that matters is a retired agent profile: `agent-state`
@@ -2859,7 +2885,9 @@ export class SessionStore {
 
         const now = Date.now();
         session = {
-            id: randomUUID(),
+            // The id minted BEFORE the build, so the harness and the Session object name the SAME
+            // downloads folder (`buildHarness` received it as a build option).
+            id,
             preset,
             // Frozen metadata for this session. Built once, from the preset the
             // harness above was constructed from, so the pair can never disagree.
@@ -2949,6 +2977,25 @@ export class SessionStore {
         return this.snapshot(session);
     }
 
+    // F7: THE SESSION'S DOWNLOADS FOLDER, or `undefined` when this store has nowhere to put one.
+    //
+    // The rule is one line and it has no exception: the folder exists exactly when the session
+    // directory exists, because the folder IS a child of it (`<root>/harness/sessions/<id>/downloads`,
+    // ../persistence.ts:2653). A store built without a `persistence` option keeps sessions in memory
+    // only — nothing deletes their directory, so promising a folder would strand bytes in a
+    // location the operator never chose, which is the defect F7 closed. Those stores state no
+    // folder and `download` says so BEFORE transferring:
+    // "../server session" plus the `downloadsDirectory` build option are the two ways to get one.
+    //
+    // `undefined` (rather than a throw) is deliberate: an ephemeral store is a supported
+    // deployment, and refusing a session because it cannot download would be a wider contract
+    // change than the feature asks for.
+    private downloadsDirectoryFor(sessionId: string): string | undefined {
+        if (this.persistence === undefined) return undefined;
+
+        return harnessSessionDownloadsDirectoryOf(this.persistence.directory, sessionId);
+    }
+
     // Build one harness with the store's two host hooks attached: progress goes to
     // whichever turn is currently streaming, and every core state change becomes a
     // durable save. The callbacks read `session` lazily because the harness is
@@ -2989,12 +3036,22 @@ export class SessionStore {
     // (src/server/harnesses/toolbox.ts forwards it; src/server/cli/index.ts never passes a report).
     // Nothing here names a tool: the kernel's own switchability rule, the host deny list, and
     // `maxEnabledTools` decide the seeded set (src/types/index.ts `HarnessConfiguration.enableAllTools`).
+    //
+    // `options.downloadsDirectory` (F7) is the OTHER per-build fact, and it is per-build for a
+    // harsher reason than the seed: the value names a DIRECTORY that only the caller knows, because
+    // only the caller knows the session id (`create` mints it, `restoreSession` reads it from the
+    // record). It rides the report into `HarnessConfiguration.downloadsDirectory`
+    // (./harnesses/toolbox.ts), which is where the engine picks it up for every `ToolContext`
+    // (../engine/harness.ts:12980 / :18665 / :18786). Both store build paths pass it when the store
+    // has a persistence directory (`downloadsDirectoryFor`), and a build that passes nothing leaves
+    // `download` refusing rather than guessing — so this method never invents a path, and no preset
+    // factory has to know that the feature exists.
     private buildHarness(
         preset: HarnessPreset,
         settings: RunnerSettings,
         current: () => Session | undefined,
         plugins: HarnessPluginSettingsStore,
-        options: { enableAllTools?: boolean } = {}
+        options: { enableAllTools?: boolean; downloadsDirectory?: string } = {}
     ): Harness {
         // Progress routing (R1-R6). The runtime has ONE progress hook per harness,
         // so two concurrent root thread runs would otherwise be indistinguishable
@@ -3116,7 +3173,17 @@ export class SessionStore {
             // R1: the per-build toolbox seed, forwarded verbatim so a preset factory never has
             // to guess whether ITS session is new. Absent (every restore, and every caller that
             // does not ask) means the library default: an empty enabled set.
-            ...(options.enableAllTools === true ? { enableAllTools: true } : {})
+            ...(options.enableAllTools === true ? { enableAllTools: true } : {}),
+            // F7: THE SESSION'S DOWNLOADS FOLDER, forwarded on the identical per-build rule (it is
+            // a `HarnessConfiguration` field, ../engine/types/index.ts:5586, and the shared toolbox
+            // factory passes it through unchanged — ./harnesses/toolbox.ts). Presence is the whole
+            // feature: `download` refuses before a byte moves when its `ToolContext` has no
+            // directory (../engine/tools/webdownload/download.tool.ts `downloadsDirectoryOf`), so
+            // these lines are what make a download work inside a server session, and the folder
+            // being under `sessions/<id>/` is what makes `journal.remove()` take it away with the
+            // conversation (./journal.ts:788-797). Absent means an ephemeral store
+            // (`downloadsDirectoryFor`), whose refusal is the honest answer.
+            ...(options.downloadsDirectory === undefined ? {} : { downloadsDirectory: options.downloadsDirectory })
         });
 
         // T4 (data plane): the record store's live signal.
@@ -3428,6 +3495,10 @@ export class SessionStore {
             );
         }
 
+        // F7: read the folder ONCE, so the presence test below and the value it ships can never
+        // disagree (the same one-build rule ./lane-worker-loop.ts applies to its two providers).
+        const downloadsDirectory = this.downloadsDirectoryFor(session.id);
+
         return {
             record: presetToRecord(session.preset),
             settings: session.settings,
@@ -3445,6 +3516,19 @@ export class SessionStore {
             // array that is really this live handle's own state.
             withheldTools: [...session.harness.withheldTools],
             pluginSettings: session.plugins.snapshot(),
+            // F7: THE CONVERSATION'S DOWNLOADS FOLDER, by the same one-line rule the inline build uses
+            // (`downloadsDirectoryFor`, the id-derived path in ../persistence.ts:2653). This is the
+            // parity line: without it a replica built by ./lane-worker-loop.ts `sayHello` has no
+            // `HarnessConfiguration.downloadsDirectory`, so its `download` refuses with "download
+            // needs a session" while the SAME call inline succeeds — a lane that answers its model
+            // something the conversation itself could do. The value is an absolute path string, so
+            // unlike `knowledge` (a live object) it crosses `worker_threads` as data, and the worker
+            // resolves nothing: one filesystem, one folder, deleted with the session on both sides.
+            //
+            // Spread CONDITIONALLY on purpose, exactly like `presetRebuild`/`plugins` below: an
+            // ephemeral store states no folder, and an absent key is what makes the replica behave
+            // byte-for-byte as it did before this field existed.
+            ...(downloadsDirectory === undefined ? {} : { downloadsDirectory }),
             // B6: the serializable boot posture. Both fields are ALREADY structured-clone
             // safe by construction (paths, booleans, numbers, names — never a closure),
             // and both are omitted when there is nothing to state:
@@ -4897,7 +4981,17 @@ export class SessionStore {
             //
             // Pinned by src/server/restore-enabled-tool-prune.test.ts and
             // src/server/session-reset-toolbox.test.ts ("a restart alone never refills…").
-            const harness = this.buildHarness(preset, settings, () => session, plugins, { enableAllTools: true });
+            const harness = this.buildHarness(preset, settings, () => session, plugins, {
+                enableAllTools: true,
+                // F7: THE SAME FOLDER THE SESSION ALREADY OWNS. The id comes from the record
+                // (`id: record.id` below), so a download committed before the restart sits in the
+                // folder this build points at afterwards — the bytes are found again, and
+                // `journal.remove()` still erases them with the session because the path is derived
+                // from the id, not remembered. `load()` has already refused any id that is not one
+                // safe path segment (../persistence.ts:3196), so the join below cannot be a
+                // traversal and the folder it names is inside `sessions/<id>/`.
+                downloadsDirectory: this.downloadsDirectoryFor(record.id)
+            });
 
             session = {
                 id: record.id,
@@ -13456,6 +13550,35 @@ export class SessionStore {
         return this.snapshot(session);
     }
 
+    // F7: erase ONE SESSION'S OWN DIRECTORY (`<root>/harness/sessions/<id>/`) when no journal
+    // instance exists to do it — see the third branch of `remove()` for the case that needs it.
+    //
+    // WHY A JOURNAL OBJECT AND NOT A PLAIN `rmSync`: the journal already owns this exact footprint
+    // (`HARNESS_JOURNAL_DIRECTORY` is `HARNESS_SESSION_DIRECTORY` by construction — the log lives IN
+    // the session directory, and `journal.remove()` deletes the directory, ./journal.ts:788-797).
+    // Building one for the id is therefore the same primitive the journaled branch calls, with one
+    // path derivation instead of two, and `force: true` makes a directory that was never created a
+    // no-op. It is also what the IO worker does for the identical case
+    // (./workers/io-worker-loop.ts:265-281), so inline and worker mode cannot disagree about what a
+    // deleted session leaves behind — which for F7 means: nothing.
+    //
+    // Best-effort, on the store's own journal channel: the header has ALREADY dropped this session
+    // by the time this runs, so a directory that refuses to die costs disk, not correctness
+    // (the same policy `HarnessPersistence.eraseVanishedShards` states, ./persistence.ts:3455-3458)
+    // — but it is reported, because an operator comparing a DELETE's 204 with a surviving folder is
+    // entitled to the reason.
+    private eraseSessionDirectory(sessionId: string): void {
+        if (this.persistence === undefined) return;
+
+        const journal = new HarnessJournal(this.persistence.directory, sessionId);
+
+        journal.remove();
+
+        if (journal.error === undefined) return;
+
+        this.reportJournalFailure(`Session ${sessionId}: could not remove its directory: ${journal.error}`);
+    }
+
     // Deleting a session never waits for an in-flight operation: an active run is
     // aborted, pending queue turns are discarded, and attached /events watchers
     // are closed. A manual call is detached but allowed to settle against the
@@ -13502,8 +13625,26 @@ export class SessionStore {
             // D4: same order as inline (close, then remove), because the worker's `remove` also
             // drops its cached handle - and in worker mode the coordinator may never have held one
             // at all, so the queue op is issued by session id, not by handle.
-            if (this.io === undefined) journal?.remove();
-            else this.io.queueJournalRemove(id);
+            //
+            // F7 CONTAINMENT — the THIRD branch is the case that used to leak: it did not exist, so
+            // a session with no journal object was simply left on disk. A session that never ran a
+            // turn has NO `HarnessJournal` instance (`attachJournal` creates one lazily, only when
+            // something is appended), so `journal?.remove()` was a no-op and the session's own
+            // DIRECTORY survived its DELETE. Before F7 that directory could only ever hold
+            // `events.jsonl` (which the journaled branch removes anyway) or nothing; the `download`
+            // tool gave it real bytes to leave behind — `<root>/harness/sessions/<id>/downloads/`
+            // after a conversation that created a session, downloaded something, and was deleted
+            // without a model turn. The manual
+            // `POST /sessions/{id}/tools/download/executions` door is exactly that shape, and it is
+            // the door this feature is for.
+            //
+            // Worker IO mode already answers this correctly: its `journal.remove` op opens a journal
+            // BY ID when the coordinator never held a handle and deletes the whole session directory
+            // (./workers/io-worker-loop.ts:265-281 — "journal.remove() deletes it wholesale"). The
+            // third branch is that parity, inline, through the SAME primitive.
+            if (this.io !== undefined) this.io.queueJournalRemove(id);
+            else if (journal !== undefined) journal.remove();
+            else this.eraseSessionDirectory(id);
 
             return true;
         } finally {

@@ -7,11 +7,13 @@
 //   - RETENTION: how many completed invocation results the harness keeps
 //     (active runs are always retained regardless of this cap);
 //   - PAGE / PAGE_MAX: the default and maximum characters agentResult returns
-//     per page. The page cap is deliberately far below the 256 KiB serialized
-//     tool-result bound (`MODEL_TOOL_RESULT_BUDGET_BYTES`, ./result-budget.ts) even
-//     with JSON escaping, so a long result is paged explicitly instead of being
-//     silently truncated by boundToolResult. (The "64 KiB" this line used to name
-//     was that constant's value before the read budget was raised 4x.)
+//     per page. The page cap is deliberately a small fraction of the serialized
+//     tool-result delivery bound (`MODEL_TOOL_RESULT_BUDGET_BYTES`,
+//     ./result-budget.ts) even with JSON escaping, so a long result is paged
+//     explicitly instead of being silently truncated by boundToolResult. The
+//     number is stated HERE rather than spelled out in prose, because every
+//     earlier draft of this line quoted a fixed figure ("64 KiB", then "256 KiB")
+//     that drifted the moment the constant moved; the constant is the contract.
 //
 // T13 note: agentManage.tool.ts / agentResult.tool.ts write these same numbers as
 // LITERALS inside their schemas. A runtime entry must keep zero captured local

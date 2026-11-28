@@ -50,7 +50,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile as writeTextFile } from 'node:fs
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HarnessError } from '../../util';
-import { boundToolResult } from '../../core/result-budget';
+import { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult } from '../../core/result-budget';
 import {
     DEFAULT_GREP_LIMITS,
     FILE_GREP_CONTENT_BUDGET,
@@ -60,6 +60,7 @@ import {
     MAX_GREP_CONTEXT_LINES,
     MAX_SEARCH_MILLIS,
     grep,
+    grepPageAllowance,
     searchContents
 } from './grep.tool';
 import { compilePatterns } from './search';
@@ -252,7 +253,27 @@ describe('grep', () => {
         // The numbers a caller reads in the result must be the numbers the module
         // documents, so a host cannot quietly widen them.
         expect(FILE_GREP_MATCH_TEXT_BYTES).toBe(1024);
-        expect(FILE_GREP_CONTENT_BUDGET).toBe(65536);
+
+        // F8: the aggregate budget IS the harness delivery cap. The 65536 this used to
+        // assert was twice `MODEL_TOOL_RESULT_BUDGET_BYTES`, so a full page of matches was
+        // refused as `oversized-json` (measured: 65 380 charged → 105 746 payload bytes,
+        // Temp/t4-files/probe.ts) while grep's own accounting reported a page that fit.
+        expect(FILE_GREP_CONTENT_BUDGET).toBe(32 * 1024);
+        expect(FILE_GREP_CONTENT_BUDGET).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(FILE_GREP_CONTENT_BUDGET).toBeLessThanOrEqual(MODEL_TOOL_RESULT_BUDGET_BYTES);
+
+        // The match loop spends the cap MINUS the measured cost of everything that is not
+        // `matches` (flags, counters, the echoed `patterns`, the longest note). Pinned as
+        // exact numbers: they are pure functions of the result shape, so a new field, a
+        // reworded note, or a wider counter moves them — and that is the moment the page
+        // stops matching the cap.
+        expect(grepPageAllowance(['**/*'])).toBe(31193);
+        expect(MODEL_TOOL_RESULT_BUDGET_BYTES - grepPageAllowance(['**/*'])).toBe(1575);
+        // The patterns are echoed in the result, so a wider pattern is priced wider too:
+        // `lines.txt` costs 5 payload bytes more than `**/*`.
+        expect(grepPageAllowance(['lines.txt'])).toBe(31188);
+        expect(grepPageAllowance(['a', 'b'])).toBeLessThan(grepPageAllowance(['a']));
+
         expect(MAX_SEARCH_MILLIS).toBe(30_000);
     });
 
@@ -274,8 +295,13 @@ describe('grep', () => {
             offset: 0,
             limit: 100,
             nextOffset: null,
-            bytes: 67,
-            contentBudget: 65536,
+            // F8 — the delivery currency. Six matches charged 67 raw bytes of snippet text;
+            // what the harness bills for the same page is the serialized form of each entry
+            // (keys, quotes, line numbers, the two flags) plus its separating comma, priced
+            // by the harness's own escaper: 596. The entry's own `bytes` above stays the
+            // snippet's UTF-8 size, which is a different number on purpose.
+            bytes: 596,
+            contentBudget: 32768,
             partial: false,
             stopReason: 'complete',
             patterns: ['**/*']
@@ -322,7 +348,7 @@ describe('grep', () => {
             { path: 'src/b.ts', line: 1, text: '// TODO: two', textTruncated: false, bytes: 12 },
             { path: 'task/e.ts', line: 1, text: '// TODO: five', textTruncated: false, bytes: 13 }
         ]);
-        expect(windowOf(result)).toMatchObject({ bytes: 37, truncated: false, patterns: ['*.ts'] });
+        expect(windowOf(result)).toMatchObject({ bytes: 296, truncated: false, patterns: ['*.ts'] });
     });
 
     it('treats pattern as a JavaScript regular expression', async () => {
@@ -343,7 +369,8 @@ describe('grep', () => {
             truncated: true,
             limit: 2,
             nextOffset: 2,
-            bytes: 19,
+            // F8 currency: two entries priced as their serialized form, not their snippets.
+            bytes: 196,
             stopReason: 'resultCap'
         });
     });
@@ -681,13 +708,17 @@ describe('grep', () => {
             { path: 'src/nested/c.js', matchCount: null },
             { path: 'task/e.ts', matchCount: null }
         ]);
-        // 14+8+8+8+15+9 bytes of path text.
-        expect(windowOf(files)).toMatchObject({ output: 'files', bytes: 62, truncated: false });
+        // F8 currency: six `{ path, matchCount: null }` entries priced as their serialized
+        // form (the `files` mode drops the snippet fields, which is why this page is much
+        // smaller than the content-mode one above). The path text alone was 62 bytes.
+        expect(windowOf(files)).toMatchObject({ output: 'files', bytes: 278, truncated: false });
 
         const counted = await grep({ pattern: 'REPEAT', paths: ['many'], output: 'count' });
 
         expect(counted.matches).toEqual([{ path: 'many/repeats.ts', matchCount: 3 }]);
-        expect(counted.bytes).toBe('many/repeats.ts'.length);
+        // F8 currency: one `{ path, matchCount }` entry priced as its serialized form
+        // (keys, quotes, the count) plus its separating comma. The path text alone was 15.
+        expect(counted.bytes).toBe(48);
 
         // `null` in files mode is deliberate: the scan stopped at the first match, so the
         // number was not counted and must not look like 1.
@@ -721,9 +752,12 @@ describe('grep', () => {
             }
         ]);
 
-        // Context is charged against the aggregate budget, so `bytes` is the snippet PLUS
-        // the context text — and the entry's own `bytes` stays the snippet alone.
-        expect(result.bytes).toBe(13 + 'first line'.length + 'last line'.length);
+        // Context is charged against the aggregate budget, so the page charge covers the
+        // snippet PLUS the context text — in the harness delivery currency (F8), i.e. the
+        // serialized form of the one entry: its five keys, the `before`/`after` arrays, the
+        // path, the line number, the two numbers, plus the separating comma. The entry's own
+        // `bytes` stays the snippet alone, which is the number the model reasons about.
+        expect(result.bytes).toBe(158);
         expect((result.matches[0] as { bytes: number }).bytes).toBe(13);
 
         // No context, no extra keys: the shape every existing caller already reads.
@@ -926,12 +960,18 @@ describe('grep', () => {
         ]);
     });
 
-    it('stops at the aggregate 64 KiB budget and reports truncation instead of dropping matches silently', async () => {
-        // budget/lines.txt has 70 matching lines of exactly 1024 bytes. 64 matches
-        // charge 64 * 1024 = 65536 bytes — the budget EXACTLY — so all 64 are
-        // returned; the 65th match is the one that cannot fit, which is what makes
-        // `truncated: true` a proven fact rather than a guess.
-        const expectedBudgetMatches = Array.from({ length: 64 }, (_unused, index) => ({
+    it('stops at the 32 KiB delivery budget and reports truncation instead of dropping matches silently', async () => {
+        // budget/lines.txt has 70 matching lines of exactly 1024 bytes. The loop spends
+        // `grepPageAllowance(['lines.txt'])` = 31 188 — the 32 768-byte cap minus the
+        // 1 580 bytes this call's own scaffolding costs (flags, counters, the echoed
+        // pattern, the longest note). One match entry costs its serialized form measured by
+        // the harness escaper: 1 120 payload bytes for lines 1-9 and 1 121 from line 10 on
+        // (the extra digit), so 9 x 1 120 + 18 x 1 121 = 30 258 fits and the 28th match
+        // (31 379) does not. That is what makes `truncated: true` a proven fact rather than
+        // a guess — and it is the F8 fix: at 64 KiB of raw snippet text this same fixture
+        // charged 65 536 "bytes" and reached the wire at 105 746 payload bytes, so the page
+        // was REFUSED.
+        const expectedBudgetMatches = Array.from({ length: 27 }, (_unused, index) => ({
             path: 'budget/lines.txt',
             line: index + 1,
             text: 'Q'.repeat(1024),
@@ -947,29 +987,60 @@ describe('grep', () => {
             truncated: true,
             offset: 0,
             limit: 100,
-            nextOffset: 64,
-            bytes: 65536,
-            contentBudget: 65536,
+            nextOffset: 27,
+            bytes: 30258,
+            contentBudget: 32768,
             partial: false,
             stopReason: 'contentBudget',
             patterns: ['lines.txt']
         });
 
-        // And the page resumes exactly where the budget stopped: 6 more lines exist.
-        const rest = await grep({ pattern: 'Q', patterns: ['lines.txt'], offset: 64 });
+        // The charge never crosses the allowance the loop was given, and the whole
+        // serialized document — envelope, counters and note included — stays inside the
+        // cap the harness measures. This is the assertion the old currency could not make:
+        // the receipt and the wire used to disagree.
+        expect(result.bytes).toBeLessThanOrEqual(grepPageAllowance(['lines.txt']));
 
-        expect(rest.matches).toHaveLength(6);
-        expect(rest.offset).toBe(64);
-        expect(rest.nextOffset).toBeNull();
-        expect(rest.stopReason).toBe('complete');
+        // The regression itself, asserted the way the harness measures it.
+        const serializedResult = JSON.stringify(result);
+        const boundedPage = boundToolResult(serializedResult, MODEL_TOOL_RESULT_BUDGET_BYTES, {
+            source: { name: 'grep' }
+        });
+
+        expect(boundedPage.content).toBe(serializedResult);
+        expect(boundedPage.truncated).toBe(false);
+        expect(boundedPage.rejected).toBeUndefined();
+
+        // And the page resumes exactly where the budget stopped. The resumed page is bound
+        // by the SAME allowance, so it carries 27 matches of its own (lines 28-54, every one
+        // with a two-digit line number at 1 121 bytes: 30 267 fits, the 28th does not) and
+        // only the third page is complete. Paging therefore walks the whole listing without
+        // either repeating or dropping an entry — which is what `nextOffset` is for.
+        const rest = await grep({ pattern: 'Q', patterns: ['lines.txt'], offset: 27 });
+
+        expect(rest.matches).toHaveLength(27);
+        expect(rest.matches[0]).toMatchObject({ line: 28 });
+        expect(rest.offset).toBe(27);
+        expect(rest.nextOffset).toBe(54);
+        expect(rest.stopReason).toBe('contentBudget');
+
+        const tail = await grep({ pattern: 'Q', patterns: ['lines.txt'], offset: 54 });
+
+        expect(tail.matches).toHaveLength(16);
+        expect(tail.matches[0]).toMatchObject({ line: 55 });
+        expect(tail.matches[15]).toMatchObject({ line: 70 });
+        expect(tail.nextOffset).toBeNull();
+        expect(tail.stopReason).toBe('complete');
     });
 
     it('reports the cap independently of the byte budget', async () => {
-        // 40 matches of 1024 bytes charge 40960 bytes, well inside the 64 KiB budget,
-        // so `truncated: true` here can only come from the maxResults cap, and
-        // `stopReason` says which one did it. The flag means "a match that exists was
-        // withheld", whichever limit did it.
-        const expectedCappedMatches = Array.from({ length: 40 }, (_unused, index) => ({
+        // 20 matches charge 22 431 payload bytes, well inside the 31 188-byte allowance, so
+        // `truncated: true` here can only come from the maxResults cap, and `stopReason`
+        // says which one did it. The flag means "a match that exists was withheld",
+        // whichever limit did it. (Under the old 64 KiB budget this test asked for 40
+        // matches; 40 no longer fits the delivery budget, so the cap has to be set below
+        // the byte bound for the premise to hold.)
+        const expectedCappedMatches = Array.from({ length: 20 }, (_unused, index) => ({
             path: 'budget/lines.txt',
             line: index + 1,
             text: 'Q'.repeat(1024),
@@ -977,14 +1048,15 @@ describe('grep', () => {
             bytes: 1024
         }));
 
-        const capped = await grep({ pattern: 'Q', patterns: ['lines.txt'], maxResults: 40 });
+        const capped = await grep({ pattern: 'Q', patterns: ['lines.txt'], maxResults: 20 });
 
         expect(capped.matches).toEqual(expectedCappedMatches);
         expect(windowOf(capped)).toMatchObject({
             truncated: true,
-            bytes: 40960,
+            limit: 20,
+            bytes: 22411,
             stopReason: 'resultCap',
-            nextOffset: 40
+            nextOffset: 20
         });
 
         // A result that is genuinely complete says so: one 1 KiB snippet, nothing
@@ -1005,27 +1077,38 @@ describe('grep', () => {
 
     it('keeps the honesty fields ahead of the result list in the serialized form', async () => {
         // Whatever caps a serialized tool result must keep the BEGINNING usable
-        // (core/result-budget.ts). grep's own budget is 64 KiB of MATCH TEXT, not of
-        // JSON, so a full page of 1 KiB snippets serializes past that — every entry also
-        // carries its path, line number, flags and braces. If `matches` came first, a cut
-        // would destroy exactly the fields that explain the cut: `truncated`,
-        // `stopReason`, `skipped`, `excluded`, `note`.
+        // (core/result-budget.ts). A full page of 1 KiB snippets is the shape that used to
+        // make this matter: grep's budget was 64 KiB of MATCH TEXT rather than of the JSON
+        // that carries it, so the document ran past the harness cap and the fields that
+        // explain the answer sat behind 64 KiB of list. If `matches` came first, a cut —
+        // or a refusal that quotes the head of the document — would destroy exactly
+        // `truncated`, `stopReason`, `skipped`, `excluded`, `note`.
         //
-        // Since F-CUTTER the harness itself never delivers a cut JSON DOCUMENT (it
-        // refuses one), so this pin tests the ordering of the serialized form and the
-        // refusal the cap now produces; the ordering is still what protects a caller who
-        // truncates the page themselves. The cap that bites is supplied below rather than
-        // inherited, so the premise stays asserted instead of degrading into a truncation
-        // that never happens.
+        // F8 closed the delivery half of that: the page now sizes itself against the cap
+        // minus its own scaffolding, so the harness never refuses grep's own best page, and
+        // the first assertion below pins exactly that. What remains, and what this pin is
+        // for, is the ORDER of the serialized form — load-bearing for any caller that has to
+        // cut the page itself. Since the tool no longer overflows the delivery cap, the cap
+        // that bites here is SUPPLIED (the 16 KiB squeeze below), so the premise stays
+        // asserted instead of degrading into a truncation that never happens.
         const result = await grep({ pattern: 'Q', patterns: ['lines.txt'] });
 
         expect(result.truncated).toBe(true);
 
         const serialized = JSON.stringify(result);
 
-        // The premise, asserted rather than assumed: this result really does exceed the
-        // cap being applied, so the ordering is load-bearing and not decorative.
-        const appliedBudget = FILE_GREP_CONTENT_BUDGET;
+        // F8: at the cap the harness actually applies to a `grep` result, this page is
+        // delivered whole. Before the fix the same fixture produced a 65 536-"byte" page
+        // that measured 105 746 payload bytes and came back as a refusal.
+        expect(
+            boundToolResult(serialized, MODEL_TOOL_RESULT_BUDGET_BYTES, { source: { name: 'grep' } }).rejected
+        ).toBeUndefined();
+
+        // The premise for the ordering pin, asserted rather than assumed: this result really
+        // does exceed the cap being applied, so the ordering is load-bearing and not
+        // decorative.
+        const appliedBudget = 16 * 1024;
+
         expect(Buffer.byteLength(serialized, 'utf8')).toBeGreaterThan(appliedBudget);
 
         const bounded = boundToolResult(serialized, appliedBudget);
@@ -1060,16 +1143,19 @@ describe('grep', () => {
 
         // THE BLOCK THAT EXPLAINS THE ANSWER, pinned as an exact byte figure: grep's fixed
         // prose plus the counts and flags, with `skipped`/`excluded`/`patterns` all fixed by
-        // this fixture. UTF-8 bytes, because that is the unit every cap in this file spends
-        // (`appliedBudget` above, and `budgetBytes` in the envelope the cutter emits).
+        // this fixture (the note is the part that names the allowance the loop spent, which
+        // is what makes the truncation checkable from the receipt alone). UTF-8 bytes,
+        // because that is the unit every cap in this file spends (`appliedBudget` above, and
+        // `budgetBytes` in the envelope the cutter emits).
         const explanationBytes = Buffer.byteLength(serialized.slice(0, matchesAt), 'utf8');
 
         expect(explanationBytes).toBe(579);
 
-        // The cap sits INSIDE the list, which is why the ordering is load-bearing rather than
-        // decorative: the explanation is ~1% of the budget, and the document runs a full cap
-        // past it, so the bytes a tight reader loses are entries and nothing else.
-        expect(explanationBytes).toBeLessThan(appliedBudget / 100);
+        // The cap sits INSIDE the list, which is why the ordering is load-bearing rather
+        // than decorative: the explanation is a small fraction of the squeeze applied above
+        // (~4% of 16 KiB, under 2% of the real delivery cap), and the document runs a full
+        // cap past it, so the bytes a tight reader loses are entries and nothing else.
+        expect(explanationBytes * 25).toBeLessThan(appliedBudget);
         expect(Buffer.byteLength(serialized, 'utf8')).toBeGreaterThan(appliedBudget + explanationBytes);
 
         // Every honesty field is inside that block — asserted by its OWN byte offset, so a
@@ -1149,7 +1235,9 @@ describe('grep - .gitignore scoping', () => {
             { path: 'notes.ts', line: 1, text: 'MARK source', textTruncated: false, bytes: 11 }
         ]);
         expect(result.truncated).toBe(false);
-        expect(result.bytes).toBe(24);
+        // F8 currency: two entries priced as their serialized form; the snippets alone were
+        // 13 + 11 = 24 bytes.
+        expect(result.bytes).toBe(196);
 
         // The counts are the other half of this assertion: what is missing from the list
         // is missing because of a RULE, and the result says how many of each kind.

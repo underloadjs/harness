@@ -125,14 +125,19 @@
 //     (../../core/schema-validation.ts), so bounds written in the schema would reject
 //     the oversized value first and turn the clamp below into a dead branch — the
 //     promise would only hold for a host calling the tool object directly;
-//   - FILES_CONTENT_BUDGET (64 KiB) of UTF-8 entry text is an AGGREGATE budget
-//     shared by every list op in the CALL (`bytes` reports the entry text the call
-//     returned, `contentBudget` the fixed cap). A mutation receipt's own `bytes` counts
+//   - FILES_CONTENT_BUDGET (32 KiB, measured in the harness delivery currency — the
+//     escaped-JSON byte cost of the serialized result, not raw UTF-8) is an AGGREGATE
+//     budget
+//     shared by every list op in the CALL (`bytes` reports what the entries the call
+//     returned charged in that currency, `contentBudget` the fixed cap). A mutation receipt's own `bytes` counts
 //     FILE payload, a different unit, so it is never summed into that total — the
 //     published description says the same, because the envelope otherwise reads as
 //     though a copy had charged the listing budget. It is threaded through the ops as
-//     one mutable `{ remaining }`, so the second op in a call starts where the first one
-//     stopped.
+//     one mutable `{ remaining, allowance, overhead, consumer }`, so the second op in a call starts where the first one
+//     stopped, and every op spends the SAME allowance: the cap minus the measured byte
+//     cost of this call's own scaffolding (one receipt per op, every note and error, the
+//     envelope — see resultOverhead), which is what makes the cap a promise rather than
+//     a probability.
 //     A page stops BEFORE the entry that would cross it, so no entry is ever split,
 //     and an op whose turn arrives with too little of the budget left to buy even the
 //     next entry — all of it spent, or a handful of bytes left behind one long name —
@@ -144,11 +149,11 @@
 //     op could not afford a single entry, and `note` names the op that charged it (its
 //     path, offset and charge), states the remainder actually left, and says how to get a
 //     real answer — the budget stays call-wide ON PURPOSE (it is the published contract,
-//     and per-op budgets let N list ops charge N x 64 KiB), so the fix is visibility, not
+//     and per-op budgets let N list ops charge N x the cap), so the fix is visibility, not
 //     a new cap;
 //   - `truncated` is true when entries exist beyond this page and `nextOffset`
 //     locates them; pass it back as that entry's `offset`. An entry whose own
-//     UTF-8 size exceeds the whole budget can never be paged, so the call is
+//     payload charge exceeds the whole allowance can never be paged, so the call is
 //     refused with a message naming it rather than returning a cursor that never
 //     advances.
 //   - `note` is the "why is this page short/empty" field, present in exactly three
@@ -394,18 +399,108 @@
 import { copyFile, lstat, mkdir, readdir, readlink, rename, rmdir, rm, stat, symlink, unlink } from 'node:fs/promises';
 import type { Dirent, Stats } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
-import { tool } from '../../core';
+import { tool, MODEL_TOOL_RESULT_BUDGET_BYTES, modelPayloadBytes } from '../../core';
 import { HarnessError } from '../../util';
 import type { PresetToolMetadata } from '../catalogue';
 import { fileCancelledError, throwIfFileCancelled } from './cancellation';
 import { fileIdentity } from './identity';
 import { withFileLocks } from './lock';
 
+// ---------------------------------------------------------------------------
+// THE DELIVERY CURRENCY (F8, 2026-11-28)
+// ---------------------------------------------------------------------------
+// `FILES_CONTENT_BUDGET` used to be 64 KiB of RAW UTF-8 entry text. Two independent
+// defects hid in that one number:
+//
+//   1. SIZE. The harness caps one serialized tool result at MODEL_TOOL_RESULT_BUDGET_
+//      BYTES (32,768) and REFUSES a JSON document over the line rather than slicing it
+//      (F-CUTTER, ../../core/result-budget.ts). 64 KiB of entry text is double that cap,
+//      so a full page of `list` was answered with a "re-run with narrower arguments"
+//      error instead of with the page.
+//   2. CURRENCY. The charge was `Buffer.byteLength(entry)`. The harness bills the bytes
+//      the result occupies AFTER JSON escaping (`modelPayloadBytes`), and a directory
+//      listing is full of characters that cost more escaped than raw — a name with a
+//      quote or a backslash doubles, a CJK name costs 3 raw bytes plus the escaped quotes
+//      around it, a control character costs 6. Measured before the change
+//      (Temp/t4-files/probe.ts): a 1 000-entry page of `n"0"-目录.txt` names charged
+//      30 000 raw bytes, a THIRD under the cap, and still reached the wire at 41 189
+//      payload bytes: refused while the receipt claimed it had room.
+//
+// And neither number covered the half of the result that is NOT entry text: the envelope,
+// one receipt per operation, every `note` and `error` — a full 100-operation call carries
+// 30 KiB of receipts before one entry is read.
+//
+// The fix is arithmetic the harness itself performs. `JSON.stringify` composes additively
+// at the default separators (`[a,b]` is `[` + a + `,` + b + `]`) and escaping is per
+// character, so:
+//
+//     cost(serialized result) == scaffolding + sum(entry charges)
+//
+// exactly. `entryWireBytes` prices one entry as the document sees it — measured high by
+// a few bytes on purpose, because pricing an entry's own serialized form charges the
+// quotes around every string 2 bytes each (`\"`) while the array pays 1, and a
+// page that stops one entry early is `truncated: true` with a cursor while a page
+// that stopped late is a refusal; `resultOverhead`
+// prices the scaffolding — the envelope plus one receipt per op, each at the widest shape
+// that op's receipt can take, with the caller's own paths priced exactly and every note
+// and error priced at its longest printable form. The list allowance is the cap minus the
+// overhead, so `modelPayloadBytes(JSON.stringify(result)) <= FILES_CONTENT_BUDGET` for
+// every call that is not refused by the guards, which is the property
+// FILE_READ_WIRE_BUDGET exists for in read.tool.ts.
+// ---------------------------------------------------------------------------
+
+// One entry's cost IN THE DOCUMENT, plus the comma that separates it from its neighbour.
+// For `list` that is the quoted, escaped name — not the name's UTF-8 length.
+const entryWireBytes = (value: unknown): number => modelPayloadBytes(JSON.stringify(value)) + 1;
+
+// A whole object's cost as it appears inside the serialized result.
+const documentWireBytes = (value: unknown): number => modelPayloadBytes(JSON.stringify(value));
+
+// The cost of a string's CONTENT inside quotes the receipt shell already prices.
+const contentWireBytes = (value: string): number => modelPayloadBytes(JSON.stringify(value)) - 2;
+
+// Every numeric field priced at the widest value it can print. Counts cannot exceed
+// `Number.MAX_SAFE_INTEGER`, so the overhead is an upper bound rather than an average;
+// the over-reserve is a few hundred bytes against a 32 KiB cap.
+const MAX_FIELD_VALUE = Number.MAX_SAFE_INTEGER;
+
+// The longest kind name a move/copy receipt can report (`'directory'`), priced once so
+// the shells below do not have to guess.
+const LONGEST_KIND = 'directory';
+
+// The most of a withheld entry's name the note quotes. That name is the longest string a
+// receipt's `note` can carry (a 1 024-byte prefixed name is ordinary in a deep tree) and
+// the note is inside the bounded result, so the quote is capped — the same bound glob
+// puts on the path it names in glob.tool.ts's oversized-entry error.
+const NOTE_ENTRY_NAME_QUOTE_CHARS = 200;
+
+// The text of a list op's `error` beyond the path it quotes: `filesFailureOf` renders
+// `${CODE}[ (raw)] on <resolved path>: <errno prose>. <remedy>` and Node's prose repeats
+// the path, so the resolved path is priced twice — and the remedy sentence
+// (`listRemedy`) is the longest fixed prose in that line. Prose grows with the errno, not
+// with the request, so it is a constant reserve; 900 is that line's fixed half rounded up
+// well past the longest remedy this file ships, and files.test.ts proves the whole
+// overhead bound end to end by handing a full-budget page back to `boundToolResult`.
+const LIST_ERROR_PROSE_BYTES = 900;
+
 // Page-size and byte bounds, exported so docs/tests quote the numbers the
 // implementation enforces (same convention ./fileList used).
 export const FILES_LIST_DEFAULT_LIMIT = 200;
 export const FILES_LIST_MAX_LIMIT = 1000;
-export const FILES_CONTENT_BUDGET = 64 * 1024;
+
+// The most ENTRY TEXT one `files` call may charge, in the harness's delivery currency:
+// `MODEL_TOOL_RESULT_BUDGET_BYTES`, the per-result cap `boundToolResult` enforces and the
+// number `read` sizes itself against (FILE_READ_WIRE_BUDGET). Imported from ../../core
+// rather than written as a literal because `../../core` resolves to the LIVE framework
+// namespace for a compiled preset entry (core/tool-source.ts `LIVE_MODULE_KEYS`), so it
+// adds no captured dependency — the deep `../../core/result-budget` path read avoids
+// would. It replaced a 64 KiB raw-UTF-8 figure that was twice the cap and counted in the
+// wrong unit; see THE DELIVERY CURRENCY above.
+//
+// The cap covers the WHOLE serialized result, so the entry-text allowance the list ops
+// spend is this minus the call's own scaffolding (`filesResultOverhead`), and
+// `contentBudget` in the result keeps reporting the cap.
+export const FILES_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
 
 // How deep `copy` will follow a directory tree. The walk starts at depth 0 = the source
 // root itself, so the deepest directory it will CREATE is 64 levels below that root and
@@ -532,8 +627,9 @@ export type FilesOperationResult = {
     // mkdir: the directory did not exist and was created.
     created?: boolean;
     // move/copy: bytes moved (file size, walked sum for a copied directory, 0 for a
-    // renamed one and for a 'symlink' receipt, which holds no payload). list: UTF-8 bytes
-    // of this page's entry text.
+    // renamed one and for a 'symlink' receipt, which holds no payload). list: the PAYLOAD
+    // bytes of this page's entries — what they charged the call's entry allowance in the
+    // harness delivery currency (escaped JSON), not the UTF-8 size of the names (F8).
     bytes?: number;
     // move/copy ONLY, and only when an existing destination was removed to make room:
     // exactly what that removal cost (see ./FilesReplacedEntry).
@@ -814,6 +910,162 @@ const prepareOperations = async (ops: FilesParameters): Promise<PreparedOperatio
 
     return prepared;
 };
+
+// ---------------------------------------------------------------------------
+// THE CALL'S OWN SCAFFOLDING (F8) — see THE DELIVERY CURRENCY at the top of this file
+// ---------------------------------------------------------------------------
+
+// The receipt each op kind reports, priced with EVERY optional field present, every
+// numeric field at its widest printable value, and the path strings empty (they are
+// priced separately, at their real size, because the request decides them). `entries: []`
+// and `results: []` keep their array brackets inside the shell, so entry text and receipts
+// add exactly what `entryWireBytes` charges them.
+const RECEIPT_SHELLS: Record<FilesOperationKind, number> = {
+    // A list receipt can carry three optional extras at once — `starved`, `note`, and one
+    // `error` — so the shell prices all three; a page that needs one can then afford it.
+    list: documentWireBytes({
+        op: 'list',
+        path: '',
+        entries: [],
+        truncated: true,
+        nextOffset: MAX_FIELD_VALUE,
+        offset: MAX_FIELD_VALUE,
+        limit: MAX_FIELD_VALUE,
+        bytes: MAX_FIELD_VALUE,
+        starved: true,
+        note: '',
+        error: { code: 'ENOTDIR', rawCode: 'ERR_FS_EISDIR', message: '' }
+    }),
+    // `replaced` appears only when the call removed an existing destination, and its
+    // `entries` count is as wide as any other number here.
+    move: documentWireBytes({
+        op: 'move',
+        path: '',
+        to: '',
+        kind: LONGEST_KIND,
+        bytes: MAX_FIELD_VALUE,
+        replaced: { path: '', kind: LONGEST_KIND, entries: MAX_FIELD_VALUE }
+    }),
+    copy: documentWireBytes({
+        op: 'copy',
+        path: '',
+        to: '',
+        kind: LONGEST_KIND,
+        bytes: MAX_FIELD_VALUE,
+        replaced: { path: '', kind: LONGEST_KIND, entries: MAX_FIELD_VALUE }
+    }),
+    delete: documentWireBytes({ op: 'delete', path: '', removed: true, recursive: true, skipped: true }),
+    mkdir: documentWireBytes({ op: 'mkdir', path: '', created: true })
+};
+
+// The longest `note` a list op can print. `listNote` has three branches and only one
+// fires per receipt, so the bound is the longer of its two prose-heavy sentences: the
+// starvation sentence (which quotes ANOTHER op's path — hence `longestListPath`) and the
+// withheld-entry sentence (which quotes a name, capped at NOTE_ENTRY_NAME_QUOTE_CHARS).
+// Every number is priced at its widest.
+const worstListNoteBytes = (longestListPath: number): number => {
+    const maxima = {
+        offset: MAX_FIELD_VALUE,
+        pageLength: MAX_FIELD_VALUE,
+        windowLength: MAX_FIELD_VALUE,
+        total: MAX_FIELD_VALUE,
+        allowance: MAX_FIELD_VALUE,
+        overhead: MAX_FIELD_VALUE,
+        remainingAtStart: MAX_FIELD_VALUE,
+        remainingAtCut: MAX_FIELD_VALUE
+    };
+
+    const starved =
+        listNote({
+            ...maxima,
+            starved: true,
+            consumer: { path: '', offset: MAX_FIELD_VALUE, bytes: MAX_FIELD_VALUE }
+        }) ?? '';
+
+    // The real quote is the entry name sliced to `NOTE_ENTRY_NAME_QUOTE_CHARS` code units
+    // plus the three dots. `y` is one payload byte, and no code unit costs more than six
+    // (`\u00XX`), so the extra reserve covers a name that is entirely the worst character
+    // in the language — the case a fixture of ASCII names would otherwise hide.
+    const quoted = 'y'.repeat(NOTE_ENTRY_NAME_QUOTE_CHARS + 3);
+    const quoteEscapeSlack = (NOTE_ENTRY_NAME_QUOTE_CHARS + 3) * 5;
+
+    const cut =
+        listNote({
+            ...maxima,
+            starved: false,
+            withheld: { entry: quoted, size: MAX_FIELD_VALUE }
+        }) ?? '';
+
+    // The empty consumer path in the shell is what `longestListPath` adds on top: exactly
+    // how much a real starvation note can grow over the measured form.
+    return Math.max(modelPayloadBytes(starved), modelPayloadBytes(cut) + quoteEscapeSlack) + longestListPath;
+};
+
+// The overhead of one receipt beyond the entry text it carries: the strings it echoes, and
+// — for a list op — the longest note and the one `error` object it can print. A list
+// failure quotes the RESOLVED directory, and Node's own prose repeats it, so that path is
+// priced twice; `listFailure` reports only the FIRST unreadable directory, so one error
+// object per list op is the true bound.
+const receiptOverheadBytes = (operation: PreparedOperation, longestListPath: number): number => {
+    const echoed = [operation.path, ...(operation.to === undefined ? [] : [operation.to])];
+
+    let bytes = RECEIPT_SHELLS[operation.op];
+
+    for (const value of echoed) bytes += contentWireBytes(toPosixPath(value));
+
+    // A `replaced` receipt quotes the destination it removed.
+    if (operation.op === 'move' || operation.op === 'copy') {
+        bytes += contentWireBytes(toPosixPath(operation.to ?? operation.path));
+    }
+
+    if (operation.op !== 'list') return bytes;
+
+    let worstResolvedPath = 0;
+
+    for (const directory of operation.paths) {
+        const size = contentWireBytes(toPosixPath(resolve(directory)));
+        if (size > worstResolvedPath) worstResolvedPath = size;
+    }
+
+    return bytes + worstListNoteBytes(longestListPath) + LIST_ERROR_PROSE_BYTES + 2 * worstResolvedPath;
+};
+
+// Everything a call's result carries that is NOT list entry text, priced the way the
+// harness bills it. This is the half of the cap the paging loop cannot see and the caller
+// cannot shrink.
+const resultOverhead = (operations: readonly PreparedOperation[]): number => {
+    // The envelope. Adding n receipts costs n entry charges minus one separating comma,
+    // and `entryWireBytes` over-counts every entry by one byte, so the two errors cancel
+    // out in the safe direction: the reserve is never an under-count.
+    let overhead = documentWireBytes({ results: [], bytes: MAX_FIELD_VALUE, contentBudget: FILES_CONTENT_BUDGET });
+
+    // The path a starvation note quotes belongs to another op, so the call's longest list
+    // path is the worst case for every one of them.
+    let longestListPath = 0;
+
+    for (const operation of operations) {
+        if (operation.op !== 'list') continue;
+
+        const size = contentWireBytes(toPosixPath(operation.path));
+        if (size > longestListPath) longestListPath = size;
+    }
+
+    for (const operation of operations) overhead += receiptOverheadBytes(operation, longestListPath);
+
+    return overhead;
+};
+
+// The scaffolding of a call as a caller can ask for it: the same preparation `execute`
+// runs, so a test or a document quotes the number the implementation charges instead of
+// re-deriving it. It validates, so a malformed entry is the same error `files` would raise.
+export const filesResultOverhead = (operations: readonly unknown[]): number =>
+    resultOverhead(operations.map((entry, index) => prepareOperation(entry, index)));
+
+// The entry-text allowance one call actually spends: the delivery cap minus its own
+// scaffolding. A call whose receipts alone fill the cap is refused by name in ./execute
+// rather than answered with an empty page whose cursor can never advance.
+export const filesListAllowance = (operations: readonly unknown[]): number =>
+    Math.max(0, FILES_CONTENT_BUDGET - filesResultOverhead(operations));
 
 // The path the FAILING syscall actually named (D10). Node puts it on `error.path` — the
 // same string its message quotes (`scandir '<dir>'`) — so a failure deep inside a walked
@@ -1167,6 +1419,11 @@ const listNote = (args: {
     windowLength: number;
     total: number;
     starved: boolean;
+    // The allowance this call actually spends (the delivery cap minus its own
+    // scaffolding), and that scaffolding's size — the two numbers that make the byte
+    // figures in these sentences reconcilable against `contentBudget` (F8).
+    allowance: number;
+    overhead: number;
     remainingAtStart: number;
     remainingAtCut: number;
     withheld?: { entry: string; size: number };
@@ -1184,20 +1441,32 @@ const listNote = (args: {
     // could disprove from the envelope it was handed.
     if (args.starved) {
         return args.consumer === undefined
-            ? `The call's ${FILES_CONTENT_BUDGET}-byte entry budget had only ${args.remainingAtStart} left when this list op ran — less than one entry's cost — so no entry of this listing could be returned and nextOffset ${args.offset} has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
-            : `This list op could not take an entry from the call's ${FILES_CONTENT_BUDGET}-byte entry budget: the list at "${args.consumer.path}" (offset ${args.consumer.offset}) had already charged ${args.consumer.bytes} of it, leaving ${args.remainingAtStart} — less than one entry's cost — so no entry here could be returned and nextOffset ${args.offset} has not advanced. Ask for this listing in a separate call, or list a narrower directory.`;
+            ? `The call's ${args.allowance}-byte entry allowance had only ${args.remainingAtStart} left when this list op ran — less than one entry's cost — so no entry of this listing could be returned and nextOffset ${args.offset} has not advanced. Ask for this listing in a separate call, or list a narrower directory.`
+            : `This list op could not take an entry from the call's ${args.allowance}-byte entry allowance: the list at "${args.consumer.path}" (offset ${args.consumer.offset}) had already charged ${args.consumer.bytes} of it, leaving ${args.remainingAtStart} — less than one entry's cost — so no entry here could be returned and nextOffset ${args.offset} has not advanced. Ask for this listing in a separate call, or list a narrower directory.`;
     }
 
     // EXTRA-3 — the page stopped at an entry that no longer fits. Paging itself is kept
     // exactly as published (stop before the entry, never split it); only the cause of the
     // cut is disclosed, because the sequence is code-point SORTED and one long name strands
     // every usable byte behind it.
+    //
+    // The name is quoted up to `NOTE_ENTRY_NAME_QUOTE_CHARS`: the note is inside the result
+    // the tool bounds, and a 1 KiB prefixed name in every page would be a 1 KiB charge the
+    // scaffolding reserve could not have priced (same cap glob's oversized-entry error
+    // puts on the path it names).
     if (args.withheld !== undefined) {
-        return `This page stopped before "${args.withheld.entry}" at offset ${
+        const quoted =
+            args.withheld.entry.length > NOTE_ENTRY_NAME_QUOTE_CHARS
+                ? `${args.withheld.entry.slice(0, NOTE_ENTRY_NAME_QUOTE_CHARS)}...`
+                : args.withheld.entry;
+
+        return `This page stopped before "${quoted}" at offset ${
             args.offset + args.pageLength
-        }: that entry is ${args.withheld.size} bytes and only ${args.remainingAtCut} of the call's ${
-            FILES_CONTENT_BUDGET
-        }-byte entry budget was left. The listing is sorted by code point, so one long name can strand the budget that remains; pass nextOffset back in a fresh call to resume after it, or list a narrower directory.`;
+        }: that entry costs ${args.withheld.size} payload bytes and only ${args.remainingAtCut} of the call's ${
+            args.allowance
+        }-byte entry allowance (the ${FILES_CONTENT_BUDGET}-byte delivery budget minus ${
+            args.overhead
+        } bytes of result scaffolding) was left. The listing is sorted by code point, so one long name can strand the budget that remains; pass nextOffset back in a fresh call to resume after it, or list a narrower directory.`;
     }
 
     // L8 — an offset at or past the end slices to `[]` and looked exactly like a listing that
@@ -1212,10 +1481,14 @@ const listNote = (args: {
 };
 
 // The CALL's shared entry-text allowance, threaded through its list ops as one mutable cell
-// (see LIST PAGING). `consumer` is the last op that charged it, which is what a later
-// starved op has to name (M2).
+// (see LIST PAGING). `allowance` is the delivery cap minus this call's own scaffolding
+// (`resultOverhead`): the cap covers the WHOLE serialized result, so the receipts and notes
+// are charged before a single entry is read (F8). `consumer` is the last op that charged it,
+// which is what a later starved op has to name (M2).
 type ListBudget = {
     remaining: number;
+    allowance: number;
+    overhead: number;
     consumer?: { path: string; offset: number; bytes: number };
 };
 
@@ -1226,10 +1499,11 @@ type ListBudget = {
 // than silently absent — and a directory that CANNOT be read stays a visible error
 // without voiding the directories that could be.
 //
-// `budget` is the CALL's shared UTF-8 allowance (one mutable cell created in ./execute
-// and handed to every list op in order), so FILES_CONTENT_BUDGET means "64 KiB across
-// the whole call", which is what the description promises. Charging it per op instead
-// let a call of N list ops return N x 64 KiB of entry text and report a `bytes` total
+// `budget` is the CALL's shared allowance in the harness delivery currency (one mutable
+// cell created in ./execute and handed to every list op in order), so
+// FILES_CONTENT_BUDGET means "32 KiB across the whole call", which is what the
+// description promises. Charging it per op instead
+// let a call of N list ops return N x the cap of entry text and report a `bytes` total
 // above the `contentBudget` printed beside it — the cap stays call-wide ON PURPOSE, so
 // what a spent budget costs an unlucky op is a MARKER (`starved` + `note`), not a fresh
 // allowance.
@@ -1311,11 +1585,16 @@ const runList = (
             let withheld: { entry: string; size: number } | undefined;
 
             for (const entry of window) {
-                const size = Buffer.byteLength(entry, 'utf8');
+                // F8 — the charge is the entry's cost IN THE DOCUMENT (quoted and escaped),
+                // not the name's UTF-8 length: that is the unit the delivery cap is spent
+                // in, and the unit every byte figure in this receipt quotes.
+                const size = entryWireBytes(entry);
 
-                if (size > FILES_CONTENT_BUDGET) {
+                if (size > budget.allowance) {
                     throw new HarnessError(
-                        `files list entry at offset ${request.offset + page.length} is ${size} UTF-8 bytes, larger than the ${FILES_CONTENT_BUDGET}-byte budget, so it can never be returned. List a deeper directory so the entry prefix is shorter, or shorten the entry's name.`
+                        `files list entry at offset ${request.offset + page.length} costs ${size} payload bytes, more than the ${budget.allowance}-byte entry allowance (the ${
+                            FILES_CONTENT_BUDGET
+                        }-byte delivery budget minus ${budget.overhead} bytes of result scaffolding), so it can never be returned. List a deeper directory so the entry prefix is shorter, or shorten the entry's name.`
                     );
                 }
 
@@ -1355,7 +1634,10 @@ const runList = (
             // whole window would be a WEAKER gate here — the sequence is code-point sorted,
             // not size sorted, so a cheap entry can hide behind the expensive one the loop
             // stopped at, and the page would still be empty for a budget reason.
-            const firstEntryBytes = window.length === 0 ? 0 : Buffer.byteLength(window[0], 'utf8');
+            // Same currency as the loop above: the gate asks "could this page have afforded
+            // its own first entry", so it has to compare the CHARGE, not the name's UTF-8
+            // length (F8).
+            const firstEntryBytes = window.length === 0 ? 0 : entryWireBytes(window[0]);
             const starved = page.length === 0 && window.length > 0 && remainingAtStart < firstEntryBytes;
 
             const consumed = request.offset + page.length;
@@ -1365,6 +1647,8 @@ const runList = (
                 pageLength: page.length,
                 windowLength: window.length,
                 total: entries.length,
+                allowance: budget.allowance,
+                overhead: budget.overhead,
                 starved,
                 remainingAtStart,
                 remainingAtCut: budget.remaining,
@@ -2132,7 +2416,7 @@ const copyFileWithSize = async (fromPath: string, toPath: string, progress: Copy
 export const FILES_METADATA: PresetToolMetadata = {
     name: 'files',
     description:
-        'Manage files and folders: list, move, copy, delete, and mkdir in ONE call, applied in the order given. Pass an array of operations, each `{ op, ... }`: list takes `path` (one directory or several, default the working directory) plus `offset`/`limit`; move and copy take `from` and `to` plus `overwrite` (default false, so an existing destination is an EEXIST error, not a silent replace) and `replaceDirectory` (default false, move/copy only; REQUIRED whenever replacing the destination would delete a TREE - a file moved or copied onto a directory name, or a directory onto a NOT-EMPTY directory - because `overwrite` permits removing the NAME at `to`, not the contents under it, and a call that omits it is refused with the number of entries at stake and changes nothing; an EMPTY destination directory with a directory source needs only `overwrite`, and a destination that is a symlink needs only `overwrite` because the link, never anything under its target, is what goes); a destination that is the source, inside it, or an ancestor of it is refused before anything moves, and a copy stops at a depth of 64 directory levels; delete takes `path` plus `recursive` (a non-empty directory without it is refused; for a symlink it removes the link only, never the target or its contents, and a symlink to a NON-EMPTY directory is refused without it too - `recursive` then removes the LINK and leaves that tree exactly as it was) and `force` (a missing path becomes `removed: false, skipped: true` instead of an error); mkdir takes `path` and creates missing parents, reporting an existing directory (or a symlink that reaches one) as `created: false`, and refusing a name held by a DANGLING symlink with the remedy for that shape. Returns `{ results, bytes, contentBudget }` - `bytes` counts the list entry text this call returned, while mutation receipts carry their own `bytes` and are not summed into it - with ONE ordered receipt per op: list gives `{ entries, truncated, nextOffset, offset, limit, bytes }`, plus `starved: true` and a `note` when an earlier list op of the same call already spent the shared entry budget, or left less of it than one entry costs (an empty page that is NOT an answer about the directory, and the note states the bytes that were left), move/copy give `{ path, to, kind, bytes }` where `kind` is what stands at the DESTINATION afterwards - `file`, `directory`, or `symlink`: a moved link stays a link and reports 0 bytes, while a copy of a live link writes the payload under it, and a copy of a dangling one writes the link - plus `replaced: { path, kind, entries }` whenever the call removed an existing destination, so the tree it deleted is visible in the receipt rather than only in the message; delete gives `{ path, removed, recursive }`, and mkdir gives `{ path, created }`. Entry names are prefixed with the directory they came from, directories end with "/", and listings are sorted by code point, so paging is deterministic; a `note` also says when a page stopped early because one long name did not fit the remaining budget, or when an `offset` is past the end of the listing. Every entry is validated before anything runs, so a malformed call changes nothing; a failing mutation rejects the call, names the ops already applied AND states what this op left behind (a half-copied tree with its top-level entries, or a destination its own `overwrite` had already removed while the source stayed), and there is NO rollback, while a failing list entry reports its own `error: { code, rawCode?, message }` without failing the batch. A cancelled call rejects the same way with `ECANCELED`, naming the operation it stopped on and the ops already applied. Cross-device moves report `EXDEV` rather than copying behind your back, and the message names the two calls to send instead ({ "op": "copy" }, then { "op": "delete" }). Symlinks are handled differently per verb, on purpose: move renames the link, top-level copy dereferences a live link and preserves a dangling one, links inside a copied tree are preserved, delete removes the link only, and each result says which happened. Use read/write/edit for content and glob/grep for searching.',
+        'Manage files and folders: list, move, copy, delete, and mkdir in ONE call, applied in the order given. Pass an array of operations, each `{ op, ... }`: list takes `path` (one directory or several, default the working directory) plus `offset`/`limit`; move and copy take `from` and `to` plus `overwrite` (default false, so an existing destination is an EEXIST error, not a silent replace) and `replaceDirectory` (default false, move/copy only; REQUIRED whenever replacing the destination would delete a TREE - a file moved or copied onto a directory name, or a directory onto a NOT-EMPTY directory - because `overwrite` permits removing the NAME at `to`, not the contents under it, and a call that omits it is refused with the number of entries at stake and changes nothing; an EMPTY destination directory with a directory source needs only `overwrite`, and a destination that is a symlink needs only `overwrite` because the link, never anything under its target, is what goes); a destination that is the source, inside it, or an ancestor of it is refused before anything moves, and a copy stops at a depth of 64 directory levels; delete takes `path` plus `recursive` (a non-empty directory without it is refused; for a symlink it removes the link only, never the target or its contents, and a symlink to a NON-EMPTY directory is refused without it too - `recursive` then removes the LINK and leaves that tree exactly as it was) and `force` (a missing path becomes `removed: false, skipped: true` instead of an error); mkdir takes `path` and creates missing parents, reporting an existing directory (or a symlink that reaches one) as `created: false`, and refusing a name held by a DANGLING symlink with the remedy for that shape. Returns `{ results, bytes, contentBudget }` - `bytes` counts what the returned list entries charged against the 32 KiB delivery budget the WHOLE serialized result is measured against (payload bytes of the serialized JSON, not raw UTF-8), while mutation receipts carry their own `bytes` and are not summed into it - with ONE ordered receipt per op: list gives `{ entries, truncated, nextOffset, offset, limit, bytes }`, plus `starved: true` and a `note` when an earlier list op of the same call already spent the shared entry budget, or left less of it than one entry costs (an empty page that is NOT an answer about the directory, and the note states the bytes that were left), move/copy give `{ path, to, kind, bytes }` where `kind` is what stands at the DESTINATION afterwards - `file`, `directory`, or `symlink`: a moved link stays a link and reports 0 bytes, while a copy of a live link writes the payload under it, and a copy of a dangling one writes the link - plus `replaced: { path, kind, entries }` whenever the call removed an existing destination, so the tree it deleted is visible in the receipt rather than only in the message; delete gives `{ path, removed, recursive }`, and mkdir gives `{ path, created }`. Entry names are prefixed with the directory they came from, directories end with "/", and listings are sorted by code point, so paging is deterministic; a `note` also says when a page stopped early because one long name did not fit the remaining budget, or when an `offset` is past the end of the listing. Every entry is validated before anything runs, so a malformed call changes nothing; a failing mutation rejects the call, names the ops already applied AND states what this op left behind (a half-copied tree with its top-level entries, or a destination its own `overwrite` had already removed while the source stayed), and there is NO rollback, while a failing list entry reports its own `error: { code, rawCode?, message }` without failing the batch. A cancelled call rejects the same way with `ECANCELED`, naming the operation it stopped on and the ops already applied. Cross-device moves report `EXDEV` rather than copying behind your back, and the message names the two calls to send instead ({ "op": "copy" }, then { "op": "delete" }). Symlinks are handled differently per verb, on purpose: move renames the link, top-level copy dereferences a live link and preserves a dangling one, links inside a copied tree are preserved, delete removes the link only, and each result says which happened. Use read/write/edit for content and glob/grep for searching.',
     tags: [
         'files',
         'list',
@@ -2342,11 +2626,32 @@ export const files = tool<FilesParameters, FilesResult>({
 
             // ONE allowance for the WHOLE call, handed to every list op in order and
             // decremented as each page fills (see LIST PAGING). A per-op budget let N list
-            // ops charge N x 64 KiB while the envelope still printed `contentBudget: 65536`
+            // ops charge N x the cap while the envelope still printed `contentBudget`
             // beside a larger `bytes`, which is the promise the description does not make.
             // `consumer` (see ./ListBudget) is what lets a LATER op name the earlier one that
             // starved it instead of answering `entries: []` and leaving the caller to guess.
-            const budget: ListBudget = { remaining: FILES_CONTENT_BUDGET };
+            //
+            // F8: the allowance is the cap MINUS this call's measured scaffolding, because
+            // the harness measures the whole serialized document — an allowance of the full
+            // cap would spend every byte on entries and then be refused for the receipts,
+            // notes and envelope printed around them. The overhead cannot change while ops
+            // run (it depends only on their count and kind), so the ceiling the page holds
+            // to is known exactly here, before the first op moves.
+            // A page cannot exist in this call: the receipts it must print fill the cap.
+            // Failing is right because a silently empty page would be a LIE about the
+            // directory. Only a call that actually asked for a listing owes that answer:
+            // a call of pure mutations has no page to withhold, and refusing it would turn
+            // a working move/delete batch into an error over a budget it never spent.
+            const overhead = resultOverhead(prepared);
+            const allowance = Math.max(0, FILES_CONTENT_BUDGET - overhead);
+
+            if (allowance === 0 && prepared.some((operation) => operation.op === 'list')) {
+                throw new HarnessError(
+                    `files: this ${prepared.length}-operation call needs at least ${overhead} bytes of the ${FILES_CONTENT_BUDGET}-byte result budget for its receipts, notes and envelope, leaving no room for a list page. Ask for the listing in its own call, or put these operations in a call with fewer operations.`
+                );
+            }
+
+            const budget: ListBudget = { remaining: allowance, allowance, overhead };
 
             for (const operation of prepared) {
                 // CANCELLATION is checked before EVERY op — a `list` included, because an

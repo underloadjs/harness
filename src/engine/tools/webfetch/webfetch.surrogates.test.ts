@@ -10,17 +10,18 @@
 // character '\ud83d' in position 643: surrogates not allowed` in the live stress run (295 tool
 // calls, ~9.85M chars), on every retry of every request that replayed the transcript.
 //
-// The trailing direction was already handled (`trimBrokenSurrogate`, index.ts:390-401, runs on
-// the byte-budget shrink); the LEAD direction had no guard at all, because that helper only
-// looks at the last code unit. Pinned here:
+// The trailing direction was already handled (`trimBrokenSurrogate`, index.ts:579, which runs
+// on every candidate the result fit (`fitResult`) considers); the LEAD direction had no guard
+// at all, because that helper only looks at the last code unit. Pinned here:
 //
 //   1. an offset on the LOW half of a pair: the emitted page carries no orphan half, and
 //      `offset` / `truncated` / `nextOffset` keep their exact existing values — the repair
 //      trims TEXT, it does not move the window;
 //   2. an offset on the HIGH half, and an offset between whole characters: byte-for-byte what
 //      they always returned, so the guard costs nothing on the paths that never needed it;
-//   3. a byte-budget-bound page chain: no emitted page carries an orphan half, and the
-//      documented 5 % shrink arithmetic still lands on the character count it always did.
+//   3. a budget-bound page chain: no emitted page carries an orphan half, and the documented
+//      5 % shrink arithmetic still lands exactly where it says — on a pair boundary, with the
+//      two windows meeting at a whole character.
 //
 // Offline and deterministic, exactly like its sibling suite: `fetch` is a stub, the resolved-
 // address SSRF gate is switched off, and no key or network is read.
@@ -136,34 +137,38 @@ describe('the fetch window never emits a lone surrogate', () => {
         expect(whole.truncated).toBe(false);
     });
 
-    it('pages a byte-budget-bound page with no orphan half on any emitted page', async () => {
-        // The path a long document actually takes: the RESULT byte budget (63,488 bytes) binds
-        // long before the 240,000-character page bound, and the shrink steps back 5 % at a
-        // time until the encoded form fits. Derived from that documented arithmetic, not read
-        // back from a run: the first candidate is `keep = 63,488` units, which encodes to
-        // 63,490 bytes, so one step fires — 63,488 - floor(63,488 × 0.05) = 60,314 units — and
-        // that cut lands BETWEEN the halves of the pair at 60,313/60,314, so the trailing trim
-        // drops the orphan high half and the page ends at 60,313 characters.
-        stubFetch(`${'x'.repeat(60_313)}${PAIR}${'y'.repeat(4_000)}`);
+    it('pages a budget-bound page with no orphan half on any emitted page', async () => {
+        // The path a long document actually takes: the RESULT budget (32 KiB of ESCAPED
+        // payload, of which MAX_RESULT_CONTENT_BYTES = 30,720 is the share left for
+        // `content`) binds long before the 240,000-character page bound, and the shrink
+        // steps back 5 % at a time until the encoded form fits. Derived from that
+        // documented arithmetic, not read back from a run: the first candidate is
+        // `keep = 30,720` units, which encodes to 30,722 bytes (the pair inside it costs
+        // 4 escaped bytes for 2 units), so one step fires — 30,720 - floor(30,720 × 0.05)
+        // = 29,184 units — and that cut lands BETWEEN the halves of the pair at
+        // 29,183/29,184, so the trailing trim drops the orphan high half and the page ends
+        // at 29,183 characters.
+        stubFetch(`${'x'.repeat(29_183)}${PAIR}${'y'.repeat(4_000)}`);
 
         const first = await call(keyless(), { url: 'https://example.com/long' });
 
-        expect(MAX_RESULT_CONTENT_BYTES).toBe(63_488);
+        // 32 KiB cap minus the RESULT_OVERHEAD_BYTES envelope the fields need.
+        expect(MAX_RESULT_CONTENT_BYTES).toBe(30_720);
         expect(MAX_CONTENT_CHARS).toBeGreaterThan(MAX_RESULT_CONTENT_BYTES);
-        expect(first.characters).toBe(60_313);
-        expect(first.content).toBe('x'.repeat(60_313));
+        expect(first.characters).toBe(29_183);
+        expect(first.content).toBe('x'.repeat(29_183));
         expect(countLoneSurrogates(first.content)).toBe(0);
         expect(first.truncated).toBe(true);
-        expect(first.nextOffset).toBe(60_313);
+        expect(first.nextOffset).toBe(29_183);
 
         // The resume: the pair is now the first WHOLE character of the second window — the two
         // windows split the document at a pair boundary instead of through the middle of one,
         // and nothing between them is lost or repeated.
-        const second = await call(keyless(), { url: 'https://example.com/long', offset: 60_313 });
+        const second = await call(keyless(), { url: 'https://example.com/long', offset: 29_183 });
 
         expect(second.content).toBe(`${PAIR}${'y'.repeat(4_000)}`);
         expect(countLoneSurrogates(second.content)).toBe(0);
-        expect(second.offset).toBe(60_313);
+        expect(second.offset).toBe(29_183);
         expect(second.characters).toBe(4_002);
         expect(second.truncated).toBe(false);
         expect(second.nextOffset).toBeUndefined();

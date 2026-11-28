@@ -65,25 +65,45 @@
 // the whole transcript. An exhausted budget throws a HarnessError naming the tool
 // and the likely cause instead of returning a silently partial answer.
 //
-// RESULT BUDGET (R3, restated 2026-11-13):
-// the harness caps any model-facing tool result at 256 KiB of serialized text
-// (core/result-budget.ts, MODEL_TOOL_RESULT_BUDGET_BYTES — the "64 KiB" this header
-// used to cite was that constant's value before the read budget was raised 4x). A
+// RESULT BUDGET (R3, restated 2026-11-13, currency corrected 2026-11-28 and ENFORCED the
+// same day — the F8 fix this reader owed when the files-preset tools were fixed):
+// the harness caps any model-facing tool result at
+// `MODEL_TOOL_RESULT_BUDGET_BYTES` of SERIALIZED text — escaped payload bytes of
+// the whole JSON document (core/result-budget.ts, core/payload-bytes.ts). The
+// "256 KiB" and "64 KiB" this header used to quote were earlier values of that
+// constant; the constant is the contract, so the number is not repeated here. A
 // page of 20 × 4000 characters would still be a wall of text the envelope has to
-// police, so this reader applies its OWN, much smaller 32 KiB budget to the text it
-// returns — an EIGHTH of the model-facing cap, which is what leaves the envelope, the
-// per-field JSON overhead and any escaping inflation room to stay inside it — as
-// `contentBudget`, and reports exactly what was cut: per-message
+// police, so this reader applies its OWN budget of the SAME size to the page it
+// returns — and that budget is now spent in the cap's currency, not next to it:
+//   - `threadReadResultOverhead` measures the result's own scaffolding (the thread
+//     identity block priced from the record, every counter, the flags, the empty
+//     `messages` array) OUT of the budget, and `threadReadPageAllowance` is what the
+//     page's text may then spend;
+//   - every message receipt, tool-call receipt, attachment descriptor and displayed
+//     character is charged in `modelPayloadBytes` — the escaped measure the cap uses —
+//     and the byte cap is applied AFTER the character caps, with the same measure, so
+//     no field can overrun the room it was granted;
+//   - the guarantee: a page this reader returns is DELIVERED, never refused by the
+//     envelope, whatever its text contains (CJK, quotes, backslashes, control bytes).
+//     The old UTF-8 accounting could not promise that: escaping adds up to six bytes
+//     per character AFTER the budget was already spent, and the receipts and
+//     descriptors around the text were counted as free.
+// The budget is still what keeps the answer structured — it is reported as
+// `contentBudget`, and this reader states exactly what was cut: per-message
 // `contentHasMore`/`nextContentOffset`, `argumentsTruncated`,
-// `reasoningTruncated`, plus top-level `truncated`/`hasMore`/`nextOffset`. The
-// number is a literal because a runtime entry (and the helper it captures) must
-// not value-import `../../core` — that closes a cycle through core/metadata.ts.
+// `reasoningTruncated`, plus top-level `truncated`/`hasMore`/`nextOffset`. The SIZE is
+// a literal because a runtime entry (and the helper it captures) must not value-import
+// the `../../core` BARREL — that closes a cycle through core/metadata.ts. The byte
+// MEASURE is imported from core/payload-bytes.ts, which imports nothing and therefore
+// cannot close one.
 //
 // TOOL-CALL ARGUMENTS (I3):
 // a tool call's raw JSON `arguments` is the largest text a transcript page carries,
 // and reading ONE'S OWN thread re-bills the very arguments the caller just sent. The
-// default display is therefore a REFERENCE — `{ id, name, argumentsLength }`, no
-// arguments text and no byte cost; `toolArgs: "full"` opts back into the paged text.
+// default display is therefore a REFERENCE — `{ id, name, argumentsLength }`: no
+// arguments TEXT (the receipt itself and its two identity strings still cost bytes, which
+// the shell pass charges — F8 removed the old "a reference is free" claim); `toolArgs:
+// "full"` opts back into the paged text.
 // Because nothing is CUT in reference mode, `argumentsTruncated` is deliberately not
 // reported there: the absent `arguments` key is the signal, and `argumentsLength` is
 // the exact raw length the follow-up `full` read pages from. `tool`-role message
@@ -97,26 +117,49 @@
 //   - ./threadRead.tool.ts            — the scanned entry (identity + schema + fetch)
 //   - ../files/bounded-regex.ts       — the node:vm timeout technique this mirrors
 //   - ../../harness.ts `resultPageOf` (~2620) — the surrogate-pair-safe slicing rule
-//   - ../../core/result-budget.ts     — the 256 KiB model-facing cap this stays under
+//   - ../../core/result-budget.ts     — the model-facing delivery cap this is sized
+//                                        against (equal to it today, not under it)
 //   - ../../types `HarnessMessage` / `HarnessThreadRecord` — the shapes read here
 //   - ./threadList.tool.ts            — where a model observes the thread ids
 
 import { createContext, Script } from 'node:vm';
 import { HarnessError } from '../../util';
 import type { HarnessAttachment, HarnessMessage, HarnessThreadRecord } from '../../types';
+// F8 — THE byte measure, from the one module that owns it, so this reader budgets in
+// exactly the currency `boundToolResult` enforces (core/result-budget.ts). This import
+// is NOT the cycle the header warns about: that cycle closes through the ../../core
+// BARREL (core/index.ts -> core/metadata.ts -> the entry -> the barrel). ./payload-bytes
+// has ZERO imports of its own, so `threadRead -> payload-bytes` is a leaf edge and cannot
+// close any cycle. Budget the SIZE as a literal; never duplicate the MEASURE.
+import { modelPayloadBytes } from '../../core/payload-bytes';
 
 // ---------------------------------------------------------------------------
-// Bounds. Inlined literals (see the header for why this module may not reach
-// into ../../core for them); the entry's JSON schema states the same numbers.
+// Bounds. The SIZES are inlined literals (see the header for why this module may not
+// value-import the ../../core barrel for them); the entry's JSON schema states the
+// same numbers. The byte CURRENCY is imported (see above), which is the whole point of
+// the accounting below: a page is now cut by the bytes the provider is billed, not by
+// the bytes of the text before it was serialized.
 // ---------------------------------------------------------------------------
 
-// UTF-8 bytes of returned TEXT one `threadRead` page may carry. An EIGHTH of the
-// harness's serialized tool-result bound (`MODEL_TOOL_RESULT_BUDGET_BYTES` is 256 KiB
-// in ../../core/result-budget.ts — this used to say "half the 64 KiB cap", which was
-// true of that smaller constant and is false of the current one), which leaves room
-// for the envelope, per-field JSON overhead and any
-// escaping inflation, so the model always gets the structured pagination metadata
-// instead of a truncated-JSON wrapper.
+// The delivery budget one `threadRead` page may consume, in the SAME currency the
+// harness cap is enforced in: ESCAPED payload bytes of the WHOLE serialized result
+// (`MODEL_TOOL_RESULT_BUDGET_BYTES`, ../../core/result-budget.ts — this literal is that
+// constant's value, which the runtime-boundary rule above forbids importing).
+//
+// The guarantee, as of the F8 fix (the currency was UTF-8 TEXT bytes before, and this
+// budget was "a fraction of the cap" in even older drafts — both claims are gone):
+//   a page this reader returns is NEVER refused by `boundToolResult`, because
+//   `threadReadResultOverhead` measures the result's own scaffolding (identity block,
+//   counters, flags, one message shell) out of this budget first, and every byte the
+//   page then spends — every message receipt, tool-call receipt, attachment descriptor
+//   and displayed character — is charged in `modelPayloadBytes`, the escaped measure the
+//   cap uses. What remains of the budget is the TEXT allowance (`threadReadPageAllowance`).
+//
+// Within that allowance the reader still answers with its own structured pagination
+// metadata rather than leaving the envelope to truncate a wall of text — the reason the
+// budget exists at all. `contentBudget` in the result reports THIS number (the cap the
+// whole document is measured against) and `bytes` reports what the page charged against
+// it, both in this currency.
 export const THREAD_READ_CONTENT_BUDGET_BYTES = 32 * 1024;
 
 // Messages per page (default and hard maximum).
@@ -252,8 +295,13 @@ export type ThreadReadResult = {
     hasMore: boolean;
     // Pass back as `offset` to continue.
     nextOffset?: number;
-    // The text budget this page was built under, and the bytes it used. A tool call
-    // displayed as a `reference` contributes nothing to `bytes`: only text does.
+    // The delivery budget the WHOLE serialized result is measured against — the cap,
+    // exactly as grep.tool.ts, glob.tool.ts and files.tool.ts report it. `bytes` is what
+    // this page CHARGED against it in the same escaped currency: every receipt shell
+    // (message, tool call, attachment descriptor — a `reference` call is smaller than a
+    // `full` one but never free) plus every displayed character (F8). The text allowance
+    // the cut actually enforced is `threadReadPageAllowance(record)`, and `bytes` never
+    // exceeds it, which is what makes the page deliverable.
     contentBudget: number;
     bytes: number;
     // True when the page BUDGET cut text or dropped messages (a `contentLimit`
@@ -272,12 +320,132 @@ export type ThreadReadOptions = {
 // Text helpers
 // ---------------------------------------------------------------------------
 
-// UTF-8 byte length. Copied from core/result-budget.ts, which documents why bytes
-// (not code units) are the right unit; the fallback over-counts never under-counts.
-const encoder = typeof TextEncoder === 'undefined' ? undefined : new TextEncoder();
+// F8 — THE page's byte currency. `modelPayloadBytes` (imported at the top) is the
+// escaped width a string occupies inside the serialized result, i.e. exactly what the
+// delivery cap counts. The UTF-8 measure this file used to keep (`byteLengthOf`, now
+// gone) under-counted every quote, backslash, newline and control byte — a control byte
+// is SIX escaped bytes — which is how a page that "fit" its own budget came back REFUSED
+// by the envelope. There is deliberately no UTF-8 measure left here to reach back for.
+//
+// The `- 2` is NOT slop: a string inside a JSON document is escaped TWICE before it is
+// billed — once by the document's own serialization, and again by the serialization of
+// that document into `HarnessMessage.content` — so the measure must run on the
+// `JSON.stringify` form to see the second layer (`\"` becoming `\\\"` is where a
+// quote-heavy transcript escapes a raw-byte budget). `modelPayloadBytes(JSON.stringify(v))`
+// is that double-escaped width INCLUDING the value's two framing quotes; the shells in
+// `THREAD_READ_WIRE_SHELLS` already price those quotes (they carry the empty-value `""`),
+// so the charge for the CONTENT is that measure minus 2. This is the same arithmetic as
+// `contentWireBytes` in ../files/files.tool.ts:458 — one measure, two call sites.
+const contentWireBytes = (value: string): number => modelPayloadBytes(JSON.stringify(value)) - 2;
 
-const byteLengthOf = (value: string): number =>
-    encoder === undefined ? Math.max(value.length, 0) : encoder.encode(value).length;
+// The cost of one JSON document AS IT APPEARS inside the serialized result: its
+// `JSON.stringify` form, escaped. It over-counts by the two quotes of the string literal
+// the enclosing document adds (that framing is the enclosing key's cost, per
+// core/payload-bytes.ts) — over-reserving is the only safe direction for a budget.
+const documentWireBytes = (value: unknown): number => modelPayloadBytes(JSON.stringify(value));
+
+// Every numeric field of a receipt is priced at the widest value it can print, so the
+// measured shells below are UPPER bounds rather than averages. A count cannot exceed
+// `Number.MAX_SAFE_INTEGER`, so this is a ceiling, not a guess.
+const MAX_FIELD_VALUE = Number.MAX_SAFE_INTEGER;
+
+// THE MEASURED SCAFFOLDING (F8). Each constant is the serialized cost of one receipt
+// shape with its text fields EMPTY — the part that exists whatever the text turns out to
+// be. Text is charged separately (`contentWireBytes`), so nothing is counted twice, and
+// the page's allowance is the cap minus `threadReadResultOverhead`. Exported as one
+// frozen record so tests and docs quote the numbers the implementation charges instead of
+// re-measuring them — the same convention as the files tools' exported allowances.
+export const THREAD_READ_WIRE_SHELLS: Readonly<{
+    message: number;
+    matchFields: number;
+    attachments: number;
+    attachmentItem: number;
+    toolCalls: number;
+    toolCallFull: number;
+    toolCallReference: number;
+    reasoning: number;
+    toolIdentity: number;
+}> = Object.freeze({
+    // One message receipt: the always-present keys, the four counters at their ceiling,
+    // `contentHasMore` true, and `nextContentOffset` present (the widest case, since the
+    // key is absent when the text ran out on its own).
+    message: documentWireBytes({
+        index: MAX_FIELD_VALUE,
+        role: 'assistant',            // the widest of the four roles
+        content: '',
+        contentLength: MAX_FIELD_VALUE,
+        contentOffset: MAX_FIELD_VALUE,
+        contentHasMore: true,
+        nextContentOffset: MAX_FIELD_VALUE
+    }),
+    // `matchedFields` worst case: every name in the searchable-field vocabulary, which is
+    // what a `regex` hit in all four fields prints. Charged only when `regex` is given,
+    // because the key is absent otherwise (and in `message` mode).
+    matchFields: documentWireBytes({ matchedFields: [...THREAD_READ_MATCH_FIELDS] }),
+    attachments: documentWireBytes({ attachments: [] }),
+    // One attachment descriptor. `kind` is an empty string here: the value comes from a
+    // closed five-member union (src/engine/types/index.ts:47, longest 5 characters) and is
+    // charged per item, so the shell does not have to assume the widest one.
+    attachmentItem: documentWireBytes({ id: '', kind: '', name: '', mime: '', size: MAX_FIELD_VALUE }) + 1,
+    toolCalls: documentWireBytes({ toolCalls: [] }),
+    // `toolArgs: "full"` — the widest call receipt (arguments present and flagged).
+    toolCallFull: documentWireBytes({
+        id: '',
+        name: '',
+        arguments: '',
+        argumentsTruncated: true,
+        argumentsLength: MAX_FIELD_VALUE
+    }) + 1,
+    // `toolArgs: "reference"` (the default) — the smaller receipt, priced separately
+    // because reference mode is what most pages carry and charging it the `full` shape
+    // would tax every call by the cost of a text field it never displays.
+    toolCallReference: documentWireBytes({ id: '', name: '', argumentsLength: MAX_FIELD_VALUE }) + 1,
+    reasoning: documentWireBytes({
+        reasoning: '',
+        reasoningTruncated: true,
+        reasoningLength: MAX_FIELD_VALUE
+    }),
+    // `tool`-role identity: the two small strings a tool result message always names.
+    toolIdentity: documentWireBytes({ name: '', toolCallId: '' })
+});
+
+// The measured cost of the result ENVELOPE carrying no messages: the thread identity
+// block priced from the ACTUAL record (its id/agent/origin/status/sequence and the
+// optional `ownerThreadId`/`label` are in the delivered document, so they are real
+// bytes of this call), every counter at its ceiling, `hasMore`/`truncated` true, and an
+// empty `messages` array. threadRead has no prose field — errors THROW outside the
+// delivered JSON and `contentBudget`/`bytes` are numbers — so nothing else needs a
+// reserve. Exported because the allowance, the starvation refusal and the tests all quote
+// the same measurement.
+export const threadReadResultOverhead = (record: HarnessThreadRecord): number =>
+    documentWireBytes({
+        thread: {
+            id: record.id,
+            agent: record.agent,
+            origin: record.origin,
+            status: record.status,
+            sequence: MAX_FIELD_VALUE,
+            ...(record.ownerThreadId === undefined ? {} : { ownerThreadId: record.ownerThreadId }),
+            ...(record.label === undefined ? {} : { label: record.label })
+        },
+        total: MAX_FIELD_VALUE,
+        matched: MAX_FIELD_VALUE,
+        offset: MAX_FIELD_VALUE,
+        limit: MAX_FIELD_VALUE,
+        hasMore: true,
+        nextOffset: MAX_FIELD_VALUE,
+        contentBudget: MAX_FIELD_VALUE,
+        bytes: MAX_FIELD_VALUE,
+        truncated: true,
+        messages: []
+    });
+
+// What the TEXT of a page may spend: the delivery budget minus the envelope's own
+// scaffolding. Every message shell is charged from here inside the reader, so a page at
+// this ceiling is inside the cap `boundToolResult` enforces — which is the guarantee this
+// reader did not have before F8 (it counted raw UTF-8 and reserved nothing).
+export const threadReadPageAllowance = (record: HarnessThreadRecord): number =>
+    Math.max(0, THREAD_READ_CONTENT_BUDGET_BYTES - threadReadResultOverhead(record));
 
 const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
 const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
@@ -315,6 +483,43 @@ const sliceSafe = (
     }
 
     return { text: text.slice(start, end), offset: start, end, hasMore: end < total };
+};
+
+// F8 — the page budget is a BYTE budget in the delivery currency, while `contentLimit`
+// is a CHARACTER budget, so the two caps have to be applied in order: characters first
+// (`sliceSafe`, the parameter's own contract), then bytes here. The cut is measured with
+// `modelPayloadBytes` itself rather than a duplicated escape table, so the reader cannot
+// drift from the cap it is sizing against.
+//
+// Why a ratio guess and not a unit walk: the escaped width of a slice is O(n) to measure
+// and the fields here are up to 32 000 characters, so walking unit-by-unit from 0 would
+// re-measure the whole prefix per unit. Scaling the length by the escaped/raw ratio lands
+// within the escaping spread of the tail, and the loop below trims from there — a handful
+// of units for ordinary text, never a pass over the whole field.
+const fitWithinPayload = (text: string, limitBytes: number): string => {
+    if (limitBytes <= 0) return '';
+
+    const total = contentWireBytes(text);
+
+    if (total <= limitBytes) return text;
+
+    let end = Math.max(0, Math.min(text.length, Math.floor((text.length * limitBytes) / total)));
+
+    while (end > 0 && contentWireBytes(text.slice(0, end)) > limitBytes) end -= 1;
+
+    // A slice must never end on the HIGH half of a surrogate pair: `JSON.stringify`
+    // writes the orphan as a six-byte `\udXXX` escape, which both changes the measure the
+    // cut is being made against and corrupts the text the model gets back.
+    if (
+        end > 0 &&
+        end < text.length &&
+        isHighSurrogate(text.charCodeAt(end - 1)) &&
+        isLowSurrogate(text.charCodeAt(end))
+    ) {
+        end -= 1;
+    }
+
+    return text.slice(0, end);
 };
 
 // ---------------------------------------------------------------------------
@@ -675,7 +880,25 @@ export const readThreadTranscript = (
     const searchable = new Set(regexFields);
     const regex = stringOf(parameters, 'regex');
     const flags = stringOf(parameters, 'flags', true);
-    const budget = THREAD_READ_CONTENT_BUDGET_BYTES;
+    // F8 — the page's TEXT allowance is the delivery budget minus this result's own
+    // measured scaffolding (`threadReadResultOverhead`), and every byte the page then
+    // spends is charged in the same escaped currency the harness cap uses. A page that
+    // fills this allowance is therefore inside the cap `boundToolResult` enforces instead
+    // of merely inside a budget counted in a currency the cap does not measure. The cap
+    // itself is still what `contentBudget` reports.
+    const overhead = threadReadResultOverhead(record);
+    const budget = threadReadPageAllowance(record);
+
+    // A thread whose identity block alone leaves less than one message shell cannot be
+    // delivered at all — the result would be refused whatever the reader put in it — so it
+    // is REFUSED here, naming the three numbers, rather than answering with an empty page
+    // that reads like "this thread has nothing to show". In practice only a thread whose
+    // stored `label`/identity fields run to tens of kilobytes gets here.
+    if (budget < THREAD_READ_WIRE_SHELLS.message) {
+        throw new HarnessError(
+            `threadRead cannot deliver a page for thread "${record.id}": the thread's identity block and this result's counters cost ${overhead} payload bytes, leaving ${budget} of the ${THREAD_READ_CONTENT_BUDGET_BYTES}-byte delivery budget — less than the ${THREAD_READ_WIRE_SHELLS.message}-byte shell one message receipt costs, so no message could be returned. Shorten the thread's stored label, or read a narrower thread.`
+        );
+    }
     const total = messages.length;
 
     // --- selection ---------------------------------------------------------
@@ -802,18 +1025,78 @@ export const readThreadTranscript = (
     const views: ThreadReadMessage[] = [];
 
     for (const index of page) {
-        // Nothing left for this message or any later one: the budget drops them
-        // whole, and `hasMore`/`nextOffset` tell the caller where to continue.
-        if (used >= budget) {
-            truncated = true;
-            break;
-        }
-
         // The union's four discriminants are exactly `ThreadReadRole`, so the role
         // is reported without a cast; every role-specific field below is reached by
         // narrowing on that discriminant instead of casting the message.
         const message = messages[index];
         const content = message.content ?? '';
+
+        // F8 — a message costs its RECEIPT SHELL before any text is cut. A shell is the
+        // JSON that exists whatever the text turns out to be: keys, flags, counters and the
+        // quotes around an empty text field, measured in `THREAD_READ_WIRE_SHELLS`. The old
+        // accounting charged none of it (it counted displayed characters only) and called
+        // attachment descriptors and tool-call receipts free, which is the same under-count
+        // that let a page "inside its own budget" come back refused.
+        const attachments =
+            message.role === 'user' || message.role === 'tool' ? message.attachments : undefined;
+        const toolCalls = message.role === 'assistant' ? message.toolCalls : undefined;
+        const reasonText =
+            includeReasoning && message.role === 'assistant' ? message.reasoning : undefined;
+
+        let shell = THREAD_READ_WIRE_SHELLS.message;
+
+        // `matchedFields` is priced at its widest (all four field names) and only when a
+        // `regex` was given, because the key is absent with no regex and in `message` mode.
+        if (regex !== undefined) shell += THREAD_READ_WIRE_SHELLS.matchFields;
+        if (typeof reasonText === 'string') shell += THREAD_READ_WIRE_SHELLS.reasoning;
+
+        if (attachments !== undefined && attachments.length > 0) {
+            shell += attachments.reduce(
+                (total, attachment) =>
+                    total +
+                    THREAD_READ_WIRE_SHELLS.attachmentItem +
+                    contentWireBytes(attachment.id) +
+                    contentWireBytes(attachment.kind) +
+                    contentWireBytes(attachment.name) +
+                    contentWireBytes(attachment.mime),
+                THREAD_READ_WIRE_SHELLS.attachments
+            );
+        }
+
+        if (toolCalls !== undefined && toolCalls.length > 0) {
+            // Reference mode still emits `{ id, name, argumentsLength }`, so it costs a
+            // receipt — the smaller one — and the two identity strings cost their escaped
+            // bytes either way. The `arguments` TEXT is charged where it is displayed.
+            const callShell =
+                toolArgs === 'full'
+                    ? THREAD_READ_WIRE_SHELLS.toolCallFull
+                    : THREAD_READ_WIRE_SHELLS.toolCallReference;
+
+            shell += toolCalls.reduce(
+                (total, call) =>
+                    total + callShell + contentWireBytes(call.id) + contentWireBytes(call.name),
+                THREAD_READ_WIRE_SHELLS.toolCalls
+            );
+        }
+
+        if (message.role === 'tool') {
+            shell +=
+                THREAD_READ_WIRE_SHELLS.toolIdentity +
+                contentWireBytes(message.name) +
+                contentWireBytes(message.toolCallId);
+        }
+
+        // Nothing left for this message's own scaffolding, so nothing is left for any later
+        // message either: the budget drops them whole and `hasMore`/`nextOffset` tell the
+        // caller where to continue. (This subsumes the old `used >= budget` test: a shell is
+        // never zero bytes.)
+        if (used + shell > budget) {
+            truncated = true;
+            break;
+        }
+
+        used += shell;
+
         // Required fields first, then the optional ones by narrowing below.
         const view: ThreadReadMessage = {
             index,
@@ -824,107 +1107,118 @@ export const readThreadTranscript = (
             contentHasMore: false
         };
 
-        // 1. content — paged by `contentOffset`, capped by `contentLimit`, then by
-        //    whatever the page budget still allows.
+        // 1. content — paged by `contentOffset` and capped by `contentLimit`, BOTH of which
+        //    are character bounds (the parameter's published contract), and then capped by
+        //    the delivery budget, which is a byte bound in the escaped currency. The two
+        //    caps are applied in that order, and the byte cap is what keeps the serialized
+        //    result inside the harness cap (F8) — the old code spent `room` bytes as if they
+        //    were characters, which let one page emit up to 6x the bytes it was granted.
         const room = budget - used;
-        const take = Math.min(contentLimit, room);
-        const contentPage = sliceSafe(content, contentOffset, take);
+        const byChars = sliceSafe(content, contentOffset, contentLimit);
+        const budgetCut = contentWireBytes(byChars.text) > room;
+        const text = budgetCut ? fitWithinPayload(byChars.text, room) : byChars.text;
 
-        view.content = contentPage.text;
+        view.content = text;
         view.contentLength = content.length;
-        view.contentOffset = contentPage.offset;
-        view.contentHasMore = contentPage.hasMore;
+        view.contentOffset = byChars.offset;
+        // More content exists when EITHER cap stopped short of the end of the text: a
+        // `contentLimit` cut the caller can re-page, or the budget's own cut.
+        view.contentHasMore = byChars.hasMore || budgetCut;
 
-        if (contentPage.hasMore) {
-            view.nextContentOffset = contentPage.end;
+        if (view.contentHasMore) {
+            // The resume offset addresses the ORIGINAL string, and the byte cap can only
+            // have removed a SUFFIX of the char slice, so the end of the text the caller
+            // actually received is the offset to hand back (pair-safe on both cuts).
+            view.nextContentOffset = byChars.offset + text.length;
 
-            // `take` was below `contentLimit`, so the cut is the budget's doing.
-            if (take < contentLimit) truncated = true;
+            // Only the BUDGET's cut belongs to the top-level `truncated`; a `contentLimit`
+            // cut is reported per message, exactly as it always was.
+            if (budgetCut) truncated = true;
         }
 
-        used += byteLengthOf(contentPage.text);
+        used += contentWireBytes(text);
 
-        // 2. attachments — descriptors, no bytes, no budget cost. Only `user` and
-        //    `tool` messages can carry them (src/types/index.ts `HarnessMessage`).
-        if (message.role === 'user' || message.role === 'tool') {
-            const attachments = message.attachments;
-
-            if (attachments !== undefined && attachments.length > 0) {
-                view.attachments = attachments.map((attachment) => ({
-                    id: attachment.id,
-                    kind: attachment.kind,
-                    name: attachment.name,
-                    mime: attachment.mime,
-                    size: attachment.size
-                }));
-            }
+        // 2. attachments — descriptors only (the base64 `data` never travels), but they are
+        //    NOT free: F8 charges each one its shell plus the escaped bytes of its
+        //    id/kind/name/mime in the shell pass above. Only `user` and `tool` messages can
+        //    carry them (src/engine/types/index.ts `HarnessMessage`).
+        if (attachments !== undefined && attachments.length > 0) {
+            view.attachments = attachments.map((attachment) => ({
+                id: attachment.id,
+                kind: attachment.kind,
+                name: attachment.name,
+                mime: attachment.mime,
+                size: attachment.size
+            }));
         }
 
         // 3. tool calls — kept structurally in full either way (a model needs the
         //    call id/name pairing to act on a call), but the raw JSON `arguments`
         //    payload is DISPLAYED two ways (I3):
-        //      `reference` (default): { id, name, argumentsLength } — no text, no byte
-        //        cost, and NO truncation flag, because nothing was cut; the caller
-        //        asks for the text with `toolArgs: "full"` and pages it from there;
-        //      `full`: the arguments string, paged by `contentLimit` and then by the
-        //    remaining page budget, flagged when either cut it.
+        //      `reference` (default): { id, name, argumentsLength } — no arguments TEXT,
+        //        and NO truncation flag, because nothing was cut; the caller asks for the
+        //        text with `toolArgs: "full"` and pages it from there. The receipt and the
+        //        two identity strings still cost bytes, charged in the shell pass (F8);
+        //      `full`: the arguments string, capped by `contentLimit` (characters) and then
+        //        by the remaining delivery budget (escaped bytes), flagged when either cut.
         //    `regex` SEARCHES the raw arguments regardless of either mode.
-        if (message.role === 'assistant') {
-            const toolCalls = message.toolCalls;
+        if (toolCalls !== undefined && toolCalls.length > 0) {
+            view.toolCalls = toolCalls.map((call) => {
+                const raw = call.arguments ?? '';
 
-            if (toolCalls !== undefined && toolCalls.length > 0) {
-                view.toolCalls = toolCalls.map((call) => {
-                    const raw = call.arguments ?? '';
+                if (toolArgs === 'reference') {
+                    return { id: call.id, name: call.name, argumentsLength: raw.length };
+                }
 
-                    if (toolArgs === 'reference') {
-                        return { id: call.id, name: call.name, argumentsLength: raw.length };
-                    }
+                const callRoom = Math.max(0, budget - used);
+                const byCallChars = sliceSafe(raw, 0, contentLimit);
+                const callCut = contentWireBytes(byCallChars.text) > callRoom;
+                const callText = callCut ? fitWithinPayload(byCallChars.text, callRoom) : byCallChars.text;
+                const entry: ThreadReadToolCall = {
+                    id: call.id,
+                    name: call.name,
+                    arguments: callText
+                };
 
-                    const callRoom = Math.max(0, budget - used);
-                    const callTake = Math.min(contentLimit, callRoom);
-                    const callPage = sliceSafe(raw, 0, callTake);
-                    const entry: ThreadReadToolCall = {
-                        id: call.id,
-                        name: call.name,
-                        arguments: callPage.text
-                    };
+                used += contentWireBytes(callText);
 
-                    used += byteLengthOf(callPage.text);
+                if (byCallChars.hasMore || callCut) {
+                    entry.argumentsTruncated = true;
+                    entry.argumentsLength = raw.length;
 
-                    if (callPage.hasMore) {
-                        entry.argumentsTruncated = true;
-                        entry.argumentsLength = raw.length;
+                    // Only the budget's cut belongs to the top-level `truncated`.
+                    if (callCut) truncated = true;
+                }
 
-                        // `callTake` was below `contentLimit`, so the budget did it.
-                        if (callTake < contentLimit) truncated = true;
-                    }
-
-                    return entry;
-                });
-            }
+                return entry;
+            });
         }
 
         // 4. reasoning — opt-in, capped by `contentLimit` like the rest, reported
         //    with a truncation flag rather than an offset (it is not the text the
-        //    model is usually navigating).
-        if (includeReasoning && message.role === 'assistant' && typeof message.reasoning === 'string') {
-            const reasoning = message.reasoning;
+        //    model is usually navigating). `reasonText` already carries the
+        //    `includeReasoning` + assistant-role decision the shell pass charged.
+        if (typeof reasonText === 'string') {
             const reasoningRoom = Math.max(0, budget - used);
-            const reasoningTake = Math.min(contentLimit, reasoningRoom);
-            const reasoningPage = sliceSafe(reasoning, 0, reasoningTake);
+            const byReasonChars = sliceSafe(reasonText, 0, contentLimit);
+            const reasoningCut = contentWireBytes(byReasonChars.text) > reasoningRoom;
+            const reasoningText = reasoningCut
+                ? fitWithinPayload(byReasonChars.text, reasoningRoom)
+                : byReasonChars.text;
 
-            view.reasoning = reasoningPage.text;
-            used += byteLengthOf(reasoningPage.text);
+            view.reasoning = reasoningText;
+            used += contentWireBytes(reasoningText);
 
-            if (reasoningPage.hasMore) {
+            if (byReasonChars.hasMore || reasoningCut) {
                 view.reasoningTruncated = true;
-                view.reasoningLength = reasoning.length;
+                view.reasoningLength = reasonText.length;
 
-                if (reasoningTake < contentLimit) truncated = true;
+                if (reasoningCut) truncated = true;
             }
         }
 
-        // 5. tool identity — small, never paged.
+        // 5. tool identity — small, never paged, and charged in the shell pass above
+        //    (`THREAD_READ_WIRE_SHELLS.toolIdentity` plus both escaped strings).
         if (message.role === 'tool') {
             view.name = message.name;
             view.toolCallId = message.toolCallId;
@@ -965,7 +1259,12 @@ export const readThreadTranscript = (
         limit: selected !== undefined && selected !== null ? 1 : limit,
         hasMore,
         ...(hasMore ? { nextOffset: offset + views.length } : {}),
-        contentBudget: budget,
+        // `contentBudget` reports the CAP the WHOLE serialized result is measured against
+        // (the delivery budget, same convention as grep/glob/files), and `bytes` reports
+        // what this page CHARGED against it in that same currency — envelope shells excepted,
+        // since the caller cannot re-measure the identity block it was handed. The text
+        // allowance the cut actually enforced is `bytes <= threadReadPageAllowance(record)`.
+        contentBudget: THREAD_READ_CONTENT_BUDGET_BYTES,
         bytes: used,
         truncated,
         messages: views

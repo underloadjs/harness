@@ -134,8 +134,10 @@ const COMMENTS = /<!--[\s\S]*?(?:-->|$)/g;
 // Measured: a Wikipedia article returned its entire 321-entry interlanguage list
 // (`Аԥсшәа / Acèh / Адыгабзэ / Afrikaans …`) plus the sidebar menu before the
 // lead paragraph, and a footer-only offset window came back as nothing but
-// "Privacy policy / About Wikipedia / Disclaimers". That is a third of a 64 KiB
-// budget spent on links.
+// "Privacy policy / About Wikipedia / Disclaimers". Measured against the one result
+// a call gets — 32 KiB of escaped payload (core's model-facing budget, which is what
+// ./request's MAX_RESULT_BYTES mirrors) — links of that size eat most of the answer
+// before the article text starts.
 //
 // A SEPARATE regex from NON_CONTENT, not another name in its alternation: that
 // pattern's lazy body stops at the first closing tag of ANY of its elements, so
@@ -469,14 +471,18 @@ export type NativeFetch = (
     format: 'markdown' | 'text' | 'html',
     // Optional DNS resolver forwarded to requestPage for the resolved-address SSRF
     // gate (see ./request). Absent means address-form checking only.
-    resolve?: DnsLookup
+    resolve?: DnsLookup,
+    // Optional per-caller AbortSignal, forwarded to requestPage so a cancelled tool
+    // call stops the transfer and not merely its delivery (F10; ./index passes
+    // `ToolContext.signal`).
+    callerSignal?: AbortSignal
 ) => Promise<{ page: PageFetch; converted: ConvertedPage }>;
 
 // Fetch and convert. The decision of WHAT to return is driven by the response's
 // actual content type, not the requested format: a markdown request against a
 // JSON API returns the JSON, not a conversion of it.
-export const fetchNative: NativeFetch = async (url, format, resolve?) => {
-    const page = await requestPage(url, format, resolve);
+export const fetchNative: NativeFetch = async (url, format, resolve?, callerSignal?) => {
+    const page = await requestPage(url, format, resolve, callerSignal);
 
     const isHtml = page.contentType.includes('text/html') || page.contentType.includes('application/xhtml+xml');
 

@@ -11,6 +11,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createWebFetchTool, WEB_FETCH_METADATA } from '../../index';
 import type { Tool, WebFetchParameters, WebFetchResult } from '../../index';
+// The delivery contract is core's, so the fit is tested against the SAME helpers
+// the delivery site uses: `boundToolResult` is what actually decides whether a
+// result reaches the transcript, and `modelPayloadBytes` is the currency it counts
+// (escaped JSON bytes, not UTF-8 text bytes — see core/payload-bytes.ts). Tests are
+// allowed to import values from core; the compiled tool entry may not (its result is
+// captured with the dependency closed).
+import { MODEL_TOOL_RESULT_BUDGET_BYTES, boundToolResult, modelPayloadBytes } from '../../core';
 // The native page budget lives here (1 MiB); the hosted providers answer
 // through ../websearch/request's own JSON budget (512 KiB). Importing both under
 // distinct names pins the fact that they are two different policies.
@@ -24,12 +31,31 @@ import {
     MAX_RESPONSE_BYTES,
     MAX_RESULT_BYTES,
     MAX_RESULT_CONTENT_BYTES,
+    MAX_TITLE_CHARS,
+    MAX_URL_CHARS,
+    RESULT_FIT_SAFETY_BYTES,
+    RESULT_OVERHEAD_BYTES,
     binaryExtension,
     charsetFrom,
     isPrivateHost,
+    resolvePublicHost,
     safeFetchUrl,
     transportFailureMessage
 } from './request';
+// The two measuring helpers and the two proximity sentences, pinned from the module
+// that owns them (the tools directory is internal — none of this reaches the package
+// surface). The helpers must agree with core's table byte for byte (F1), and the
+// sentences are exact model-facing text (F9), so both belong in an assertion.
+import {
+    CONTENT_QUOTES_BYTES,
+    PROXIMITY_NOTE_CUT,
+    PROXIMITY_NOTE_WHOLE,
+    jsonTextBytes,
+    resultStringBytes,
+} from './index';
+// The window bound (F3): the excerpt may never exceed the window plus the two
+// bounded line-snaps.
+import { PROXIMITY_LINE_SNAP_CHARS, PROXIMITY_WINDOW_CHARS } from './sections';
 
 // The oversized-response sentence, pinned WHOLE. The two existing oversize tests
 // asserted only the first clause, which let the ADVICE drift back to remedies that
@@ -44,10 +70,16 @@ const OVERSIZED_MESSAGE =
 // can be pinned without depending on the envelope that turns it into a `note`.
 import { MATH_FLATTENED_NOTE, fetchNative } from './native';
 
+// The tool's own parameter contract accepts a bare URL string as well as the object
+// (`readInvocation`, ./index.ts:273-279 — "direct callers may pass the bare URL"), and
+// one test below pins that shorthand. `Tool<P, R>`'s CALL signature (types/index.ts
+// :3513) declares only `(parameters: P)`, so the union has to be narrowed at the call
+// site; the cast states the gap rather than hiding a wrong assumption.
 const call = async (
     definition: Tool<WebFetchParameters, WebFetchResult>,
     parameters: WebFetchParameters | string
-): Promise<WebFetchResult> => (await definition(parameters)) as WebFetchResult;
+): Promise<WebFetchResult> =>
+    (await definition(parameters as WebFetchParameters)) as WebFetchResult;
 
 const response = (
     body: BodyInit | null,
@@ -67,7 +99,14 @@ const response = (
     return created;
 };
 
-const html = (markup: string, init?: { status?: number; url?: string }): Response =>
+// `headers` belongs to this init type as much as it belongs to `response`'s: callers
+// below add a content type on top of the html default, and without the field the
+// spread had no type to spread (the package tsconfig excludes `**/*.test.ts`, so only
+// an explicit `tsc -p` over the suites can see either of these two errors).
+const html = (
+    markup: string,
+    init?: { status?: number; headers?: Record<string, string>; url?: string }
+): Response =>
     response(markup, {
         ...init,
         headers: { 'content-type': 'text/html; charset=utf-8', ...(init?.headers ?? {}) }
@@ -191,11 +230,16 @@ describe('factory and schema', () => {
     });
 
     it('keeps one result inside the harness model-facing cap', async () => {
-        // The harness caps every tool result at 64 KiB and replaces an over-budget
-        // value with a generic envelope that drops url/title/truncated/nextOffset.
-        // fetch bounds itself to that cap so it keeps its own shape and stays
-        // resumable; MAX_CONTENT_CHARS is the per-PAGE bound, reached by paging.
-        expect(MAX_RESULT_BYTES).toBe(64 * 1024);
+        // The harness caps every tool result at the model-facing budget — 32 KiB of
+        // ESCAPED payload bytes — and for a JSON document it does not shrink the
+        // value, it REFUSES the whole thing (`reason: 'oversized-json'`) and the call
+        // is reported as failed, which drops the url/title/truncated/nextOffset a
+        // model needs in order to resume (core/result-budget.ts:642-745). fetch sizes
+        // itself to that cap in the cap's own currency so it keeps its own shape and
+        // stays resumable; MAX_CONTENT_CHARS is the per-PAGE bound, reached by paging.
+        expect(MAX_RESULT_BYTES).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+        expect(MAX_RESULT_BYTES).toBe(32 * 1024);
+        expect(MAX_RESULT_CONTENT_BYTES).toBe(MAX_RESULT_BYTES - RESULT_OVERHEAD_BYTES);
         expect(MAX_RESULT_CONTENT_BYTES).toBeLessThan(MAX_CONTENT_CHARS);
 
         stubFetch(() =>
@@ -816,10 +860,11 @@ describe('linkup provider', () => {
         const prefix = '[redacted] then [redacted] ';
 
         expect(result.truncated).toBe(true);
-        // One RESULT is capped by the harness model-facing budget, not by
-        // MAX_CONTENT_CHARS: the page is bounded at 240,000 characters and reached
-        // by paging with `offset`, while a single return stays inside 64 KiB so the
-        // harness never replaces this tool's envelope with its generic one.
+        // One RESULT is capped by the harness model-facing budget (32 KiB of escaped
+        // payload), not by MAX_CONTENT_CHARS: the page is bounded at 240,000 characters
+        // and reached by paging with `offset`, while a single return stays inside the
+        // cap so the harness never REFUSES the call outright (for a JSON document an
+        // over-budget result is discarded whole, not wrapped in another envelope).
         expect(result.characters).toBe(MAX_RESULT_CONTENT_BYTES);
         expect(result.content).toBe(prefix + 'x'.repeat(MAX_RESULT_CONTENT_BYTES - prefix.length));
         expect(result.pageCharacters).toBe(MAX_CONTENT_CHARS + prefix.length);
@@ -868,7 +913,11 @@ describe('fetch: content shape and safety (defect fixes)', () => {
             'http://localhost/x',
             'http://169.254.169.254/latest/meta-data/',
             'http://10.0.0.5/x',
-            'http://[::1]/x'
+            'http://[::1]/x',
+            // The top of the CGNAT block, as a raw quad and as a mapped literal: before the
+            // /10 fix both were fetched, and the second is the same address written twice.
+            'http://100.127.255.255/x',
+            'http://[::ffff:100.127.0.1]/x'
         ]) {
             await expect(call(keyless(), { url })).rejects.toThrow(/not a public absolute http\(s\) address/);
         }
@@ -1779,16 +1828,18 @@ describe('fetch: query-mode truncation causes and ordering (issue 0016)', () => 
     });
 
     it('reports a resumable nextOffset when the byte budget cuts the answer', async () => {
-        // Six sections of ~15,000 characters each: the joined answer is 90,331
-        // characters, so the content byte budget (MAX_RESULT_CONTENT_BYTES, 63,488)
-        // cuts it inside section 05. Every section ends with its own marker, so
-        // "resumed correctly" is a fact rather than a claim.
+        // Six sections of ~7,000 characters each: the joined answer is ~42,239
+        // characters (each block is its 23-24-character line label plus its 7,015-character
+        // body), so the content budget cuts it inside section 05. (The budget is
+        // 30,720 ESCAPED bytes, not 30,720 characters, so the cut lands at 29,184
+        // characters — see the size-currency expectations below.) Every section ends
+        // with its own marker, so "resumed correctly" is a fact rather than a claim.
         const page = Array.from(
             { length: 6 },
             (_, index) => {
                 const label = String(index + 1).padStart(2, '0');
 
-                return `## Section ${label}\n\nquantum ${'x'.repeat(15_000)} END-${label}`;
+                return `## Section ${label}\n\nquantum ${'x'.repeat(7_000)} END-${label}`;
             }
         ).join('\n\n');
 
@@ -1801,21 +1852,25 @@ describe('fetch: query-mode truncation causes and ordering (issue 0016)', () => 
         expect(result.truncated).toBe(true);
         expect(result.matches).toBe(6);
         expect(result.totalMatches).toBe(6);
-        // Exact: an all-ASCII answer lands precisely on the byte budget.
-        expect(result.characters).toBe(MAX_RESULT_CONTENT_BYTES);
+        // Exact: the answer's newlines cost one escaped byte each, so the FIRST
+        // candidate (the whole 30,720-byte budget) overshoots and one 5 % step fires:
+        // 30,720 − floor(30,720 × 0.05) = 29,184 characters. Pinning the figure rather
+        // than `MAX_RESULT_CONTENT_BYTES` is the point — characters and bytes are
+        // different units (F13), and this is the tool's own arithmetic.
+        expect(result.characters).toBe(29_184);
         // The cut landed inside section 05: 04 came through whole, 05 did not.
         expect(result.content).toContain('END-04');
         expect(result.content).not.toContain('END-05');
 
         const nextOffset = result.nextOffset as number;
 
-        // The offset is the exact continuation. Layout arithmetic, from the fixture:
-        // each section block occupies 4 lines, so the heading labels are 1, 5, 9, 13,
-        // 17, 21 — 23-character labels for sections 01-03 (one digit) and 24 for the
-        // rest; every section text is 15,030 characters; blocks are joined by "\n\n".
-        // That puts section 05's text at 60,245 in the joined answer, and the budget
-        // keeps 63,488 - 60,245 = 3,243 characters of it.
-        expect(nextOffset).toBe(page.indexOf('## Section 05') + 3_243);
+        // The offset is the exact continuation. From the fixture: each page block is
+        // 7,030 characters (13-character heading, blank line, 7,015-character text)
+        // joined by "\n\n", so section 05 starts at 28,128 and its text at 28,143;
+        // 939 of those characters are the 15 the heading and blank line occupy plus the
+        // 924 the answer delivered of the body.
+        expect(nextOffset).toBe(28_128 + 939);
+        expect(page.indexOf('## Section 05')).toBe(28_128);
         // Which is also, character for character, where the answer stopped.
         expect(page.slice(nextOffset - 24, nextOffset)).toBe(result.content.slice(-24));
 
@@ -1827,6 +1882,9 @@ describe('fetch: query-mode truncation causes and ordering (issue 0016)', () => 
         expect(resumed.content.startsWith(page.slice(nextOffset, nextOffset + 40))).toBe(true);
         expect(resumed.content).toContain('END-05');
         expect(resumed.content).toContain('END-06');
+        // The whole remainder fits in one window, so the resume is not itself cut.
+        expect(resumed.characters).toBe(13_123);
+        expect(resumed.truncated).toBe(false);
     });
 
     it('orders a query answer by hits per character instead of by document position', async () => {
@@ -1898,9 +1956,10 @@ describe('fetch: query-mode truncation causes and ordering (issue 0016)', () => 
 
     it('reports the withheld occurrences of a proximity answer without promising a resume', async () => {
         // A heading-less page answers with one window around the FIRST occurrence.
-        // The other 300 occurrences are the withheld matches, and paging the page
-        // cannot recover them as a section — so the cause is named and no `nextOffset`
-        // is offered.
+        // The other 300 occurrences are counted and reported, but they are NOT a
+        // withheld part of the answer: the window itself arrived whole, and the
+        // `MAX_QUERY_BLOCKS` section cap this cause names never applied (F4). Claiming
+        // `resultCap` here told the caller its answer had been trimmed when it had not.
         const page = `${'alpha needle beta '.repeat(300)}\ngamma needle delta`;
 
         stubFetch(plainPage(page));
@@ -1910,10 +1969,18 @@ describe('fetch: query-mode truncation causes and ordering (issue 0016)', () => 
         expect(result.matchMode).toBe('proximity');
         expect(result.matches).toBe(1);
         expect(result.totalMatches).toBe(301);
-        expect(result.truncated).toBe(true);
-        expect(result.stopReason).toBe('resultCap');
+        // The window is what it is: whole, with no cause and nothing to resume.
+        expect(result.truncated).toBe(false);
+        expect(result.stopReason).toBeUndefined();
         expect(result.nextOffset).toBeUndefined();
-        expect(result.note).toContain('no heading structure');
+        // Exact sentence, from the module that owns it (F9): it no longer advises
+        // `offset`, which `query` ignores, and it says plainly that there is no
+        // `nextOffset` to pass back.
+        expect(result.note).toBe(PROXIMITY_NOTE_WHOLE);
+        expect(result.note).not.toContain('Use `offset` to read further');
+        // The 301 occurrences do not become a cause, and they do not become a page:
+        // a `query` answer never carries an `offset`, cut or whole.
+        expect(result.offset).toBeUndefined();
     });
 
     it('states the offset/query rule where the caller reads it', () => {
@@ -1925,5 +1992,892 @@ describe('fetch: query-mode truncation causes and ordering (issue 0016)', () => 
         expect(properties.offset.description).toContain('IGNORED when "query" is set');
         expect(properties.offset.description).toContain('"stopReason": "resultCap"');
         expect(properties.query.description).toContain('Up to 20 sections.');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F1 — the one bound that decides whether the result ARRIVES
+// ---------------------------------------------------------------------------
+//
+// The delivery site measures `JSON.stringify(result)` with `modelPayloadBytes`
+// (core/payload-bytes.ts) — ESCAPED bytes, not UTF-8 text bytes — and for a JSON
+// document it does not shrink an over-budget value: it refuses the whole thing and
+// the call is reported as failed (core/result-budget.ts:690 `boundWithReason`,
+// `reason: 'oversized-json'`, reached from :789 `boundToolResult`). A character-count
+// fit therefore shipped "30,720
+// characters" and lost the entire answer — url, title, contentType and the
+// `nextOffset` a resume needs — on exactly the pages whose text escapes widest.
+//
+// These tests call the tool and measure the result with core's OWN helpers, so the
+// contract under test is delivery, not an internal constant.
+describe('fetch: one result inside the cap, counted in the cap\'s currency', () => {
+    // Measures a delivered result exactly as the delivery site does. It takes the
+    // serialized value rather than a WebFetchResult because one case below measures the
+    // shape the OLD fit produced, which is no longer a type this tool returns.
+    // (The local `response`/`html` helpers above carry two type errors that
+    // `check-package-types.ts` cannot see: the package tsconfig excludes
+    // `**/*.test.ts`. They predate this pass, and `yarn tsc -p` over the two webfetch
+    // suites reports exactly those two and nothing else added by it.)
+    const measure = (result: unknown) => {
+        const json = JSON.stringify(result);
+
+        return {
+            payload: modelPayloadBytes(json),
+            // `undefined` means the result reaches the transcript; anything else is
+            // the refusal that turns a successful fetch into a failed call.
+            rejected: boundToolResult(json, MODEL_TOOL_RESULT_BUDGET_BYTES, {
+                source: { name: 'fetch' }
+            }).rejected,
+        };
+    };
+
+    // The widest field envelope the result can carry: a url at MAX_URL_CHARS, a
+    // title at MAX_TITLE_CHARS, and a declared content type. Every one of them is
+    // inside the same envelope as `content`, which is the point of F1.
+    const longUrl = `https://example.com/${'a'.repeat(MAX_URL_CHARS - 20)}`;
+    const wideTitle = '中'.repeat(MAX_TITLE_CHARS);
+    const wideHtml = (body: string) =>
+        `<!doctype html><html><head><title>${wideTitle}</title></head><body>${body}</body></html>`;
+
+    const stubWideHtml = (body: string) =>
+        stubFetch(() =>
+            response(wideHtml(body), { headers: { 'content-type': 'text/html; charset=utf-8' } })
+        );
+
+    it('ships the widest ASCII result at the exact budget its own fields leave', async () => {
+        // 'x' has no escape cost, so the delivered count IS the budget the fields
+        // leave: the cap minus the measured envelope of the skeleton, minus the
+        // safety allowance. Pinned exactly, because the envelope is fixed here (the
+        // url and title are fixed above) and the arithmetic is the tool's.
+        expect(longUrl.length).toBe(MAX_URL_CHARS);
+        stubWideHtml('x'.repeat(MAX_RESULT_CONTENT_BYTES));
+
+        const result = await call(keyless(), { url: longUrl, format: 'text' });
+        const { payload, rejected } = measure(result);
+
+        // The envelope this result carries — a 2,048-character url, a 300-character CJK
+        // title (900 bytes, because core charges the UTF-8 width of a non-ASCII
+        // character), the content type, the keys, and the 4 bytes of `content` quotes —
+        // is 3,183 bytes. 'x' costs one escaped byte each, so the fit ships exactly
+        // 32,768 − 3,183 − 64 = 29,521 of it, and the document lands on the ceiling the
+        // module promises.
+        expect(result.title).toBe(wideTitle);
+        expect(result.characters).toBe(29_521);
+        expect(result.content).toBe('x'.repeat(29_521));
+        expect(result.nextOffset).toBe(29_521);
+        expect(result.truncated).toBe(true);
+        expect(rejected).toBeUndefined();
+        // The guarantee the fit documents: the whole result stays this far inside the
+        // cap, whatever the fields cost.
+        expect(payload).toBeLessThanOrEqual(MAX_RESULT_BYTES - RESULT_FIT_SAFETY_BYTES);
+        expect(payload).toBe(32_703);
+    });
+
+    it('shrinks text that escapes wider than it is, instead of shipping a refusal', async () => {
+        // Each case is the SAME 30,720 characters of page text, in shapes whose
+        // escaped widths differ by more than 7x. A character-count fit would ship all
+        // four at the full 30,720; only the first one delivers.
+        // The delivered counts are the fit's own arithmetic, not the page length: the
+        // first candidate is the byte budget, and while the escaped form is over it the
+        // loop steps back 5 % at a time (./index, `fitResult`). With the same envelope as
+        // the test above the budget starts at 29,521 bytes, and each shape stops at the
+        // first candidate whose ESCAPED cost fits: 7,028 / 4,211 / 9,557 / 14,402
+        // characters. Every one is a fraction of the 30,720 a character-count fit would
+        // ship, and that gap is the defect: the pages that lose the most text are the
+        // ones the old arithmetic refused outright.
+        const cases: Array<[string, string, number]> = [
+            ['quotes and backslashes', '\\"'.repeat(MAX_RESULT_CONTENT_BYTES / 2), 7_028],
+            ['control characters', '\u0001'.repeat(MAX_RESULT_CONTENT_BYTES), 4_211],
+            ['CJK', '中'.repeat(MAX_RESULT_CONTENT_BYTES), 9_557],
+            ['astral pairs', '\ud83c\udf89'.repeat(MAX_RESULT_CONTENT_BYTES / 2), 14_402],
+        ];
+
+        for (const [label, body, expectedCharacters] of cases) {
+            stubWideHtml(body);
+
+            const result = await call(keyless(), { url: longUrl, format: 'text' });
+            const { payload, rejected } = measure(result);
+
+            expect([label, result.characters]).toEqual([label, expectedCharacters]);
+            // The text really was cut — these pages are the ones the old fit lost.
+            expect([label, result.content.length]).toEqual([label, expectedCharacters]);
+            expect([label, result.truncated]).toEqual([label, true]);
+            expect([label, rejected]).toEqual([label, undefined]);
+            expect([label, payload <= MAX_RESULT_BYTES - RESULT_FIT_SAFETY_BYTES]).toEqual([label, true]);
+        }
+    });
+
+    it('loses the whole result when the fit counts characters and the cap counts bytes', async () => {
+        // The failure mode F1 fixes, pinned as a fact: one result at the old ceiling,
+        // with the same fields as above, measured by the helper that decides delivery.
+        const naive = {
+            url: longUrl,
+            contentType: 'text/html',
+            title: wideTitle,
+            characters: MAX_RESULT_CONTENT_BYTES,
+            truncated: true,
+            nextOffset: MAX_RESULT_CONTENT_BYTES,
+            content: '中'.repeat(MAX_RESULT_CONTENT_BYTES),
+        };
+
+        expect(measure(naive).rejected?.reason).toBe('oversized-json');
+    });
+
+    it('counts bytes in exactly the currency core counts them in', async () => {
+        // The local table must agree with core's, byte for byte, in both directions:
+        // the raw JSON text (what the cap measures) and a string nested inside that
+        // text (what the content budget measures). A silent drift here re-opens F1.
+        expect(MAX_RESULT_BYTES).toBe(MODEL_TOOL_RESULT_BUDGET_BYTES);
+
+        const samples = [
+            '',
+            'plain ascii',
+            '"quote" \\ backslash',
+            'tab\tnl\ncr\rbs\bff\f',
+            '\u0001\u001f',
+            'café 中文 \ud83c\udf89',
+            '\ud83d',
+            '<h1>&amp;</h1>',
+        ];
+
+        for (const sample of samples) {
+            const jsonText = JSON.stringify(sample);
+
+            expect([sample, jsonTextBytes(jsonText)]).toEqual([sample, modelPayloadBytes(jsonText)]);
+            // The nested measure costs the same text less the value's own quotes: the
+            // 4 bytes that sit inside the priced envelope (`CONTENT_QUOTES_BYTES`),
+            // which is why the budget is the cap minus the WHOLE envelope.
+            expect(CONTENT_QUOTES_BYTES).toBe(jsonTextBytes('""'));
+            expect([sample, resultStringBytes(sample)]).toEqual([sample, modelPayloadBytes(jsonText) - CONTENT_QUOTES_BYTES]);
+        }
+    });
+
+    it('prices the envelope and the content so the two add up to the document', () => {
+        // The budget formula is only honest because escaping is per-character and
+        // context-free: the cost of the document with `content` in it is the cost of the
+        // priced skeleton PLUS the cost of the content in the nested currency, with no
+        // interaction between the two. Pinned across the shapes that escape widest — an
+        // interaction there would turn the guarantee back into "close enough", which is
+        // how the 3-byte gap that this test closes got away in the first place.
+        const fields = {
+            provider: 'native',
+            url: longUrl,
+            contentType: 'text/html; charset=utf-8',
+            format: 'text',
+            characters: MAX_RESULT_CONTENT_BYTES,
+            truncated: false,
+            nextOffset: MAX_RESULT_CONTENT_BYTES,
+        };
+
+        const contents = [
+            'x'.repeat(1_000),
+            '\\"'.repeat(500),
+            '\u0001'.repeat(300),
+            '中'.repeat(400),
+            '\ud83c\udf89'.repeat(300),
+            'a\n"b\\c\u0001d',
+        ];
+
+        for (const content of contents) {
+            const envelope = jsonTextBytes(JSON.stringify({ ...fields, content: '' }));
+            const whole = jsonTextBytes(JSON.stringify({ ...fields, content }));
+
+            expect([content.slice(0, 6), whole]).toEqual([
+                content.slice(0, 6),
+                envelope + resultStringBytes(content),
+            ]);
+        }
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F3 — the proximity window stays a window
+// ---------------------------------------------------------------------------
+describe('fetch: a proximity window is bounded even on a page with no newlines', () => {
+    // A heading-less answer is ONE window around the first match. Both edges used to
+    // snap to a line boundary without limit, and the close edge fell through to the
+    // end of the document whenever no newline followed it — so on a page that is one
+    // long line (minified HTML, pasted plain text, a CSV with its CRLFs converted
+    // away) the "window" was the rest of the document: the exact cost the mode exists
+    // to avoid.
+    const flat = `${'A'.repeat(40_000)}needle at the middle${'B'.repeat(40_000)}`;
+
+    it('cuts the window at its bound instead of at the end of the line', async () => {
+        stubFetch(
+            () => response(flat, { headers: { 'content-type': 'text/plain' } })
+        );
+
+        const result = await call(keyless(), { url: 'https://example.com/flat', query: 'needle' });
+
+        // Exact: the label line, then the window — 3,000 characters of context on each
+        // side of the match, no more. Before the fix this answer was ~43,000 characters.
+        expect(result.content).toBe(
+            `## (no heading) [line 1]\n${'A'.repeat(3_000)}needle at the middle${'B'.repeat(2_980)}`
+        );
+        expect(result.characters).toBe(25 + PROXIMITY_WINDOW_CHARS);
+        expect(result.truncated).toBe(false);
+        // The documented ceiling: the window plus one bounded snap on each edge.
+        expect(result.characters).toBeLessThanOrEqual(
+            25 + PROXIMITY_WINDOW_CHARS + 2 * PROXIMITY_LINE_SNAP_CHARS
+        );
+    });
+
+    it('still snaps to line boundaries where the boundary is close', async () => {
+        // The other half of the rule: snapping is a readability feature and must
+        // survive, so a page of short lines still opens and closes on whole lines.
+        const lines = `${'A'.repeat(50)}\n`.repeat(1_000) + 'needle here\n' + `${'B'.repeat(50)}\n`.repeat(1_000);
+
+        stubFetch(() => response(lines, { headers: { 'content-type': 'text/plain' } }));
+
+        const result = await call(keyless(), { url: 'https://example.com/lines', query: 'needle' });
+
+        expect(result.characters).toBe(6_057);
+        expect(result.content.split('\n')[1]).toBe('A'.repeat(50));
+        expect(result.content.endsWith('B'.repeat(50))).toBe(true);
+        expect(result.characters).toBeLessThanOrEqual(
+            25 + PROXIMITY_WINDOW_CHARS + 2 * PROXIMITY_LINE_SNAP_CHARS
+        );
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F9 — what a proximity answer promises
+// ---------------------------------------------------------------------------
+describe('fetch: a proximity note only promises what the tool can honour', () => {
+    it('points at the reported nextOffset when the window really was cut', async () => {
+        // A 6,000-character window of control characters escapes to ~36,000 bytes, so
+        // the result budget cuts it and a resume pointer exists. The sentence that
+        // names that pointer must be the one that ships — and it has to say which
+        // argument to drop, because `offset` does nothing while `query` is set.
+        // (The url is fixed because the delivered count depends on the result
+        // envelope: these figures are the fit's arithmetic, not a bound.)
+        const page = `${'\u0001'.repeat(40_000)}needle${'\u0001'.repeat(40_000)}`;
+
+        stubFetch(() => response(page, { headers: { 'content-type': 'text/plain' } }));
+
+        const result = await call(keyless(), { url: 'https://example.com/dense', query: 'needle' });
+
+        expect(result.note).toBe(PROXIMITY_NOTE_CUT);
+        expect(result.stopReason).toBe('contentBudget');
+        expect(result.truncated).toBe(true);
+        expect(result.characters).toBe(4_210);
+        expect(result.nextOffset).toBe(41_185);
+        // The pointer is the exact continuation, character for character.
+        expect(page.slice((result.nextOffset as number) - 10, result.nextOffset as number)).toBe(
+            result.content.slice(-10)
+        );
+        // The cut window still delivers: the whole result stays inside the cap.
+        expect(modelPayloadBytes(JSON.stringify(result))).toBeLessThanOrEqual(
+            MAX_RESULT_BYTES - RESULT_FIT_SAFETY_BYTES
+        );
+
+        // And following it — WITHOUT `query`, which is the whole advice — reads on.
+        stubFetch(() => response(page, { headers: { 'content-type': 'text/plain' } }));
+
+        const resumed = await call(keyless(), { url: 'https://example.com/dense', offset: result.nextOffset });
+
+        expect(resumed.offset).toBe(41_185);
+        expect(resumed.characters).toBe(4_384);
+        expect(resumed.content.startsWith(page.slice(41_185, 41_225))).toBe(true);
+        // A plain windowed read is not a proximity answer, so it carries no such note.
+        expect(resumed.note).toBeUndefined();
+    });
+
+    it('promises no resume when the window arrived whole', async () => {
+        // The pair of the case above: the same mode with nothing withheld. The old
+        // sentence told every headingless caller to "Use `offset` to read further",
+        // which is an instruction this tool ignores while `query` is set — a model
+        // that followed it re-fetched and got the identical window.
+        const page = `${'alpha needle beta '.repeat(300)}\ngamma needle delta`;
+
+        stubFetch(() => response(page, { headers: { 'content-type': 'text/plain' } }));
+
+        const result = await call(keyless(), { url: 'https://example.com/flat', query: 'needle' });
+
+        expect(result.note).toBe(PROXIMITY_NOTE_WHOLE);
+        expect(result.note).not.toContain('Use `offset` to read further');
+        expect(result.note).toContain('No "nextOffset" is reported');
+        expect(result.nextOffset).toBeUndefined();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F10 — the caller's signal stops the transfer on every provider
+// ---------------------------------------------------------------------------
+describe('fetch: the caller signal cancels the request in flight', () => {
+    // `ToolContext.signal` (types/index.ts:3381) says a tool SHOULD observe it. The
+    // GET is the only part of this tool with a side effect worth stopping, and
+    // rethrowing the caller's own reason (rather than one of this tool's sentences)
+    // is what lets the harness report `cancelled` instead of `failed`.
+    const reason = new Error('cancelled by toolCancel');
+
+    // A stub that behaves like a real transport: it rejects with the abort reason
+    // when the request's own signal fires, and never resolves otherwise.
+    const stubHang = () =>
+        stubFetch((_url, init) => {
+            const signal = init.signal as AbortSignal;
+
+            return new Promise<Response>((_resolve, reject) => {
+                if (signal.aborted) reject(signal.reason ?? reason);
+                else signal.addEventListener('abort', () => reject(signal.reason ?? reason), { once: true });
+            });
+        });
+
+    it('rethrows the caller reason for a native GET', async () => {
+        stubHang();
+
+        const controller = new AbortController();
+        const pending = keyless().execute({
+            parameters: { url: 'https://example.com/slow' },
+            signal: controller.signal
+        });
+
+        pending.catch(() => undefined);
+        controller.abort(reason);
+
+        await expect(pending).rejects.toBe(reason);
+    });
+
+    it('rethrows the caller reason when the abort lands while the body is arriving', async () => {
+        // The phase that used to be rewritten: a cancellation mid-stream is caught by
+        // the body reader, and a body read error would otherwise become "could not
+        // read the response body." — a failure, not a cancellation.
+        let pullCount = 0;
+        let body: ReadableStreamDefaultController<Uint8Array> | undefined;
+        // The CALLER's controller — the one handed to `execute`. The stream below
+        // aborts it from its third pull, so the cancellation lands while a read is in
+        // flight, which is the phase that used to be rewritten.
+        const caller = new AbortController();
+
+        stubFetch((_url, init) => {
+            const signal = init.signal as AbortSignal;
+
+            const stream = new ReadableStream<Uint8Array>(
+                {
+                    start(streamController) {
+                        body = streamController;
+                    },
+                    pull(streamController) {
+                        pullCount += 1;
+
+                        if (pullCount === 3) {
+                            // Two whole chunks delivered, and the third is where the
+                            // caller pulls the plug. Nothing is enqueued: the abort below
+                            // errors this stream, exactly as a real transport would.
+                            caller.abort(reason);
+
+                            return;
+                        }
+
+                        streamController.enqueue(new Uint8Array(1024));
+                    }
+                },
+                { highWaterMark: 0 }
+            );
+
+            // A real transport errors the body when its signal fires; the stub does the
+            // same, which is what puts the throw inside `readBody`. `signal.reason` is
+            // the caller's reason because `requestPage` folds one into the other.
+            signal.addEventListener('abort', () => body?.error(signal.reason ?? reason), { once: true });
+
+            return Promise.resolve(
+                new Response(stream, { status: 200, headers: { 'content-type': 'text/plain' } })
+            );
+        });
+
+        const pending = keyless().execute({
+            parameters: { url: 'https://example.com/stream' },
+            signal: caller.signal
+        });
+
+        await expect(pending).rejects.toBe(reason);
+        // Proof the request really got into the body before being cut: exactly two
+        // chunks were delivered, and the third pull is where the abort fired.
+        expect(pullCount).toBe(3);
+    });
+
+    it('rethrows the caller reason when the signal is already aborted', async () => {
+        // A listener added to an aborted signal never fires, so the abort has to be
+        // forwarded by hand or the call would wait for the timeout.
+        stubHang();
+
+        const controller = new AbortController();
+        controller.abort(reason);
+
+        await expect(
+            keyless().execute({
+                parameters: { url: 'https://example.com/too-late' },
+                signal: controller.signal
+            })
+        ).rejects.toBe(reason);
+    });
+
+    it('cancels a hosted exa call with the caller reason', async () => {
+        stubHang();
+
+        const controller = new AbortController();
+        const pending = withExa().execute({
+            parameters: { url: 'https://example.com/slow', provider: 'exa' },
+            signal: controller.signal
+        });
+
+        pending.catch(() => undefined);
+        controller.abort(reason);
+
+        // The reason reaches the caller through ./exa, which hands the signal to
+        // requestSearch as `callerSignal` (websearch/request.ts maps an aborted caller
+        // signal back to its reason rather than to a provider error).
+        await expect(pending).rejects.toBe(reason);
+    });
+
+    it('cancels a hosted linkup call with the caller reason', async () => {
+        stubHang();
+
+        const controller = new AbortController();
+        const pending = withLinkup().execute({
+            parameters: { url: 'https://example.com/slow', provider: 'linkup' },
+            signal: controller.signal
+        });
+
+        pending.catch(() => undefined);
+        controller.abort(reason);
+
+        await expect(pending).rejects.toBe(reason);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// F13 / F16 — the description states the bounds the tool actually enforces
+// ---------------------------------------------------------------------------
+describe('fetch: the description matches the enforced bounds', () => {
+    it('names the byte cap it enforces, and the unit difference it depends on', () => {
+        const definition = keyless();
+
+        // The figures a model reads must be the figures the code enforces: the byte
+        // cap is 1 MiB (not 100 KiB) and the page ceiling is 240,000 characters (not
+        // 100,000), and the content bound is quoted in the unit it is actually
+        // measured in — escaped bytes, not characters.
+        expect(definition.description).toContain(`bounded to ${MAX_RESPONSE_BYTES} bytes of body`);
+        expect(definition.description).toContain(`${MAX_CONTENT_CHARS} characters`);
+        expect(definition.description).toContain(`${MAX_RESULT_CONTENT_BYTES} escaped bytes`);
+        expect(definition.description).toContain('DIFFERENT UNITS');
+        expect(definition.description).not.toContain('100 KiB');
+        expect(definition.description).not.toContain('100,000 characters');
+        // And it names the one case the SSRF wording used to overstate: the resolved
+        // address gate only runs where names can actually be resolved.
+        expect(definition.description).toContain('whenever names can be resolved here');
+    });
+});
+
+
+
+// ---------------------------------------------------------------------------
+// SSRF address forms — every notation of a private address is refused
+// ---------------------------------------------------------------------------
+//
+// `isPrivateHost` is the ONLY SSRF protection in force when no resolver is wired
+// (`dns: { off: true }`, a browser/bun runtime, and the whole offline suite), so a
+// gate that reads only dotted quads and compressed IPv6 text is a gate you walk past
+// by writing the same address differently. Measured before this pass:
+//   - `http://[2001::200:0:ff00:fffe]/` (Teredo, client 127.0.0.1) reached the
+//     network — `new URL` leaves that text alone, so the gate never saw `127.0.0.1`;
+//   - the uncompressed IPv6 spellings (`64:ff9b:0:0:0:0:7f00:1`,
+//     `0:0:0:0:0:ffff:7f00:1`) answered "public" from the helper, which is also what
+//     an injected resolver's answer is checked with;
+//   - `http://[2002:7f00:1::]/` (6to4, tunnel endpoint 127.0.0.1) and
+//     `http://[2002:a9fe:a9fe::]/` (6to4, tunnel endpoint 169.254.169.254) reached the
+//     network in every spelling tried, and an injected lookup ANSWERING a 6to4 loopback
+//     was waved through by the second gate as well;
+//   - a single-label decimal was answered "public" by the helper too, although
+//     `new URL()` itself rewrites `http://2130706433/` to `127.0.0.1` — the URL path
+//     was covered by the parser, the helper surface was not.
+//
+// The oracle for "which address is this really?" is the platform's own host parser, so
+// each row below pins BOTH facts: what `new URL()` says the host is, and what the gate
+// answers about it. That is what makes a wrong decode visible rather than merely green.
+describe('fetch: the address-form gate refuses every notation of a private address', () => {
+    // [notation, host text, the address the platform parser says it is]
+    const privateIPv4Forms: Array<[string, string, string]> = [
+        ['decimal single', '2130706433', '127.0.0.1'],
+        ['decimal single, second loopback', '2130706434', '127.0.0.2'],
+        ['hex single', '0x7f000001', '127.0.0.1'],
+        ['octal single', '017700000001', '127.0.0.1'],
+        ['a.b shorthand', '127.1', '127.0.0.1'],
+        ['a.b.c shorthand', '127.0.1', '127.0.0.1'],
+        ['hex label, decimal tail', '0x7f.1', '127.0.0.1'],
+        ['octal label, decimal tail', '0177.1', '127.0.0.1'],
+        ['every label hex', '0x7f.0x0.0x0.0x1', '127.0.0.1'],
+        ['root label', '127.0.0.1.', '127.0.0.1'],
+        ['decimal 10.0.0.1', '167772161', '10.0.0.1'],
+        ['decimal metadata ip', '2852039166', '169.254.169.254'],
+        ['decimal 172.16.0.1', '2886729729', '172.16.0.1'],
+        ['decimal 192.168.1.1', '3232235777', '192.168.1.1'],
+        ['decimal 100.64.0.1 (cgnat)', '1681915905', '100.64.0.1'],
+        // CGNAT is `100.64.0.0/10`, so the TOP of the block is 100.127.255.255 — a notation the
+        // old `startsWith('100.64.')` test answered public, in every spelling. Pinned as a
+        // notation row because the platform parser, not the reader, decides it is an address.
+        ['decimal 100.127.255.255 (cgnat /10 top edge)', '1686110207', '100.127.255.255'],
+        ['a.b.c shorthand 192.0.0.1', '192.0.1', '192.0.0.1'],
+    ];
+
+    it('refuses every inet_aton notation of a private address', async () => {
+        for (const [notation, host, address] of privateIPv4Forms) {
+            // The platform parser is the ground truth for the address; the gate must
+            // refuse THAT address, not a guess at the notation.
+            expect([notation, new URL(`http://${host}/`).hostname]).toEqual([notation, address]);
+            expect([notation, isPrivateHost(host)]).toEqual([notation, true]);
+            // The dotted twin is refused by the same rule (./request's `privateIPv4`),
+            // which is the whole point of decoding rather than pattern-matching.
+            expect([notation, isPrivateHost(address)]).toEqual([notation, true]);
+        }
+
+        // And the fetch path refuses them end to end: no request is made for a target
+        // the gate can name.
+        const fetchMock = stubFetch(() => response('<p>internal</p>'));
+
+        for (const host of ['2130706433', '0x7f000001', '017700000001', '127.1', '2852039166']) {
+            expect([host, safeFetchUrl(`http://${host}/`)]).toEqual([host, undefined]);
+            await expect(call(keyless(), { url: `http://${host}/` })).rejects.toThrow(
+                /not a public absolute http\(s\) address/
+            );
+        }
+
+        expect(fetchMock).toHaveBeenCalledTimes(0);
+    });
+
+    it('still fetches every notation of a public address', async () => {
+        // The false-positive guard, which is the part a deny-list widening gets wrong:
+        // `134744072` is 8.8.8.8, and an early version of the decoder produced
+        // `0.0.0.8` for it (a `256 ** shift` where the shift is in bits), i.e. a public
+        // page refused as loopback. Pinned against the parser, not against the reader.
+        const publicIPv4Forms: Array<[string, string, string]> = [
+            ['decimal single', '134744072', '8.8.8.8'],
+            ['hex single', '0x8080808', '8.8.8.8'],
+            ['a.b shorthand fills from the right', '172.20', '172.0.0.20'],
+            ['a.b.c shorthand', '8.8.1', '8.8.0.1'],
+            ['max single', '4294967295', '255.255.255.255'],
+            ['public dotted', '93.184.216.34', '93.184.216.34'],
+        ];
+
+        stubFetch(() => response('<p>public</p>', { url: 'http://example.com/' }));
+
+        for (const [notation, host, address] of publicIPv4Forms) {
+            expect([notation, new URL(`http://${host}/`).hostname]).toEqual([notation, address]);
+            expect([notation, isPrivateHost(host)]).toEqual([notation, false]);
+            expect([notation, safeFetchUrl(`http://${host}/`) !== undefined]).toEqual([notation, true]);
+        }
+
+        // `172.20` is the row worth reading twice: the shorthand puts the last number in
+        // the LOW bytes, so it is 172.0.0.20 (public) and not 172.20.0.0 (private). The
+        // decode follows the parser, which is also what the connection follows.
+        expect(isPrivateHost('172.20.0.0')).toBe(true);
+
+        // A number too big to be an address is a name, not an address: the URL itself is
+        // unparseable, so the tool refuses it for that reason rather than as private.
+        expect(isPrivateHost('4294967296')).toBe(false);
+        expect(safeFetchUrl('http://4294967296/')).toBeUndefined();
+
+        // Names that merely contain digits stay names.
+        for (const name of ['example.com', '1a2b.example', '169-254-169-254.nip.io', '1.2.3.4.example']) {
+            expect([name, isPrivateHost(name)]).toEqual([name, false]);
+        }
+    });
+
+    it('refuses an IPv4 embedded in IPv6 text, in either spelling', () => {
+        // The prefix rules could only see the COMPRESSED spelling, and `new URL`
+        // compresses what it parses — so the forms that matter are the ones that reach
+        // the helper or an injected resolver's answer as text: an AAAA record written
+        // longhand, or a host the caller hands to the gate directly.
+        const embedded: Array<[string, string, string]> = [
+            ['mapped compressed', '::ffff:7f00:1', '127.0.0.1'],
+            ['mapped uncompressed', '0:0:0:0:0:ffff:7f00:1', '127.0.0.1'],
+            ['mapped uncompressed, dotted tail', '0:0:0:0:0:ffff:127.0.0.1', '127.0.0.1'],
+            ['mapped, inet_aton tail', '::ffff:0x7f.1', '127.0.0.1'],
+            ['compatible', '::7f00:1', '127.0.0.1'],
+            ['compatible uncompressed', '0:0:0:0:0:0:7f00:1', '127.0.0.1'],
+            ['translated (64:ff9b::/96)', '64:ff9b::7f00:1', '127.0.0.1'],
+            ['translated, uncompressed', '64:ff9b:0:0:0:0:7f00:1', '127.0.0.1'],
+            ['translated, metadata ip', '64:ff9b::a9fe:a9fe', '169.254.169.254'],
+            ['translated, metadata uncompressed', '64:ff9b:0:0:0:0:a9fe:a9fe', '169.254.169.254'],
+            // CGNAT in a mapped literal, in BOTH spellings of the tail. The dotted-tail text is
+            // the row that used to be answered public: that branch tested the prefix table
+            // directly and CGNAT lived only in `privateIPv4`, so `::ffff:100.64.0.1` was public
+            // while `100.64.0.1` was refused. The compressed-hex twin went through the decode
+            // and was always refused — this is the divergence, and the twin is the proof.
+            ['mapped cgnat /16, dotted tail', '::ffff:100.64.0.1', '100.64.0.1'],
+            ['mapped cgnat /10 edge, dotted tail', '::ffff:100.127.0.1', '100.127.0.1'],
+            ['mapped cgnat /10 edge, compressed groups', '::ffff:647f:1', '100.127.0.1'],
+        ];
+
+        for (const [form, text, address] of embedded) {
+            expect([form, isPrivateHost(text)]).toEqual([form, true]);
+            expect([form, isPrivateHost(address)]).toEqual([form, true]);
+            // Every one is refused on the URL path too — by the decode once `new URL()`
+            // has compressed the text, by the pre-existing blanket rules this pass kept,
+            // or (the `inet_aton` tail inside an IPv6 literal) because the platform
+            // parser refuses that spelling outright.
+            expect([form, safeFetchUrl(`http://[${text}]/`)]).toEqual([form, undefined]);
+        }
+    });
+
+    it('refuses a Teredo address whose tunnel endpoint is private', () => {
+        // RFC 4380:4 stores the client's IPv4 BITWISE INVERTED in the low 32 bits of a
+        // `2001::/32` address, so `ff00:fffe` is 127.0.0.1 and `5601:5601` is
+        // 169.254.169.254 — the text never contains the private address, which is
+        // exactly why the old prefix rules could not see it. This is the one class that
+        // bypassed the gate THROUGH a URL: `new URL('http://[2001::200:0:ff00:fffe]/')`
+        // hands the gate that text unchanged.
+        const teredo: Array<[string, string]> = [
+            ['client 127.0.0.1, compressed', '2001::200:0:ff00:fffe'],
+            ['client 127.0.0.1, uncompressed', '2001:0:0:0:200:0:ff00:fffe'],
+            ['client 127.0.0.1, compat mode (not inverted)', '2001::200:0:7f00:1'],
+            ['client 169.254.169.254', '2001::200:0:5601:5601'],
+            // The relay field (the 32 bits above the client's) is inverted too: this one
+            // names 10.255.255.255, a private next hop for the tunnel.
+            ['relay 10.255.255.255', '2001:0:f5ff:ffff:200:0:f7f7:f7f7'],
+        ];
+
+        for (const [form, text] of teredo) {
+            expect([form, isPrivateHost(text)]).toEqual([form, true]);
+            expect([form, safeFetchUrl(`http://[${text}]/`)]).toEqual([form, undefined]);
+        }
+
+        // The public half of the same range stays fetchable, so the rule is a decode and
+        // not a block on `2001::/32`. The first row is the address from RFC 4380's own
+        // example: client 192.0.2.45, relay 190.201.28.135, both public.
+        const publicTeredo: Array<[string, string]> = [
+            ['rfc 4380 example', '2001:0:4136:e378:8000:63bf:3fff:fdd2'],
+            ['client 1.1.1.1', '2001::200:0:fefe:fefe'],
+            ['client 8.8.8.8', '2001::200:0:f7f7:f7f7'],
+        ];
+
+        for (const [form, text] of publicTeredo) {
+            expect([form, isPrivateHost(text)]).toEqual([form, false]);
+            expect([form, safeFetchUrl(`http://[${text}]/`) !== undefined]).toEqual([form, true]);
+        }
+
+        // The documentation range and an ordinary public v6 address are untouched.
+        expect(isPrivateHost('2001:db8::1')).toBe(false);
+        expect(isPrivateHost('2606:2800:220:1:248:1893:25c8:1946')).toBe(false);
+    });
+
+    it('refuses a 6to4 address whose tunnel endpoint is private', () => {
+        // RFC 3056 §5.1 / RFC 4291 §2.5.7: a `2002::/16` address carries the tunnel's
+        // IPv4 in BITS 16-47 — the second and third groups, written as-is — so the text
+        // `2002:7f00:1::` is a route to 127.0.0.1 and `2002:a9fe:a9fe::` is a route to
+        // the metadata address. Unlike the mapped forms this is not only an encoding: a
+        // packet is ENCAPSULATED toward that IPv4, which is why RFC 3964 §3.1/§3.2 tells
+        // a 6to4 router and a 6to4 relay to "disallow traffic that has private, broadcast
+        // or certain specific reserved IPv4 addresses in tunnels, or the matching 6to4
+        // prefixes". Measured before the branch: every row below passed the gate and
+        // reached the network (`Temp/t1-webfetch/probe14.ts`, `probe14-before.out`).
+        //
+        // Each row pins the parser hostname too, because the longhand and zero-padded
+        // spellings are only reachable if `new URL()` accepts them — and it answers them
+        // all with the compressed text, so the decode is what does the work.
+        const sixToFour: Array<[string, string, string, string]> = [
+            ['client 127.0.0.1, compressed', '2002:7f00:1::', '[2002:7f00:1::]', '127.0.0.1'],
+            ['client 127.0.0.1, longhand', '2002:7f00:1:0:0:0:0:0', '[2002:7f00:1::]', '127.0.0.1'],
+            ['client 127.0.0.1, uppercase', '2002:7F00:1::', '[2002:7f00:1::]', '127.0.0.1'],
+            ['client 127.0.0.1, zero-padded groups', '2002:7f00:0001:0:0:0:0:0', '[2002:7f00:1::]', '127.0.0.1'],
+            // The trailing groups belong to the tunnel's IPv6 side; the embedded IPv4 is
+            // still groups 2-3, so a v6 tail must not shift the decode.
+            ['client 127.0.0.1, with a v6 tail', '2002:7f00:1:2:3:4:5:6', '[2002:7f00:1:2:3:4:5:6]', '127.0.0.1'],
+            ['client 127.0.0.1, trailing host', '2002:7f00:1::1', '[2002:7f00:1::1]', '127.0.0.1'],
+            ['metadata ip, compressed', '2002:a9fe:a9fe::', '[2002:a9fe:a9fe::]', '169.254.169.254'],
+            ['metadata ip, longhand', '2002:a9fe:a9fe:0:0:0:0:0', '[2002:a9fe:a9fe::]', '169.254.169.254'],
+            ['10.0.0.1, zero-padded', '2002:0a00:0001::', '[2002:a00:1::]', '10.0.0.1'],
+            ['10.0.0.1, compressed', '2002:a00:1::', '[2002:a00:1::]', '10.0.0.1'],
+            ['172.16.0.1', '2002:ac10:0001::', '[2002:ac10:1::]', '172.16.0.1'],
+            ['192.168.1.1', '2002:c0a8:0101::', '[2002:c0a8:101::]', '192.168.1.1'],
+            ['100.64.0.1 (cgnat)', '2002:6440:0001::', '[2002:6440:1::]', '100.64.0.1'],
+            // The TOP of the CGNAT block: the tunnel endpoint `100.127.0.1` is inside
+            // `100.64.0.0/10`, and until this pass a 6to4 address pointed at it was fetched
+            // while one pointed at `100.64.0.1` was refused — one /10, two verdicts.
+            ['100.127.0.1 (cgnat /10 edge)', '2002:647f:0001::', '[2002:647f:1::]', '100.127.0.1'],
+        ];
+
+        for (const [form, text, hostname, twin] of sixToFour) {
+            // The platform parser is the ground truth for the address text, and the gate
+            // must answer about THAT address — the private twin — not about the prefix.
+            expect([form, new URL(`http://[${text}]/`).hostname]).toEqual([form, hostname]);
+            expect([form, isPrivateHost(text)]).toEqual([form, true]);
+            // Twin parity: the same refusal the dotted quad gets, from the same predicate.
+            expect([form, isPrivateHost(twin)]).toEqual([form, true]);
+            expect([form, safeFetchUrl(`http://[${text}]/`)]).toEqual([form, undefined]);
+        }
+
+        // Public pins, so the branch is a decode and not a block on `2002::/16`: the
+        // compressed, zero-padded and longhand spellings of a public endpoint all stay
+        // fetchable, with the normalized URL the tool would actually request. The first
+        // two rows are the same address written three ways.
+        const publicSixToFour: Array<[string, string, string, string, string]> = [
+            ['8.8.8.8, zero-padded', '2002:0808:0808::', '[2002:808:808::]', 'http://[2002:808:808::]/', '8.8.8.8'],
+            ['8.8.8.8, compressed', '2002:808:808::', '[2002:808:808::]', 'http://[2002:808:808::]/', '8.8.8.8'],
+            ['8.8.8.8, longhand', '2002:0808:0808:0:0:0:0:0', '[2002:808:808::]', 'http://[2002:808:808::]/', '8.8.8.8'],
+            ['8.8.8.8, trailing host', '2002:808:808::1', '[2002:808:808::1]', 'http://[2002:808:808::1]/', '8.8.8.8'],
+            ['example.com 93.104.216.34', '2002:5d68:d822::', '[2002:5d68:d822::]', 'http://[2002:5d68:d822::]/', '93.104.216.34'],
+            ['1.1.1.1', '2002:0101:0101::', '[2002:101:101::]', 'http://[2002:101:101::]/', '1.1.1.1'],
+            // The 6to4 anycast RELAY, `2002:c058:6301::` = 192.88.99.1 (RFC 3068). It is
+            // the address a public relay answers with, and 192.88.99.0/24 is provider-
+            // assigned and routable (RFC 7535 §4), so it is not in any private range and
+            // the decode leaves it alone — pinning it is what keeps a future "link-local"
+            // tidy-up from blocking the whole class by accident.
+            ['anycast relay 192.88.99.1', '2002:c058:6301::', '[2002:c058:6301::]', 'http://[2002:c058:6301::]/', '192.88.99.1'],
+        ];
+
+        for (const [form, text, hostname, href, twin] of publicSixToFour) {
+            expect([form, new URL(`http://[${text}]/`).hostname]).toEqual([form, hostname]);
+            expect([form, isPrivateHost(text)]).toEqual([form, false]);
+            expect([form, isPrivateHost(twin)]).toEqual([form, false]);
+            expect([form, safeFetchUrl(`http://[${text}]/`)]).toEqual([form, href]);
+        }
+
+        // DECIDED AGAINST, pinned so the omission stays a decision: prefixes whose low
+        // groups LOOK like a private IPv4 but where no specification puts one. RFC 4843 §2
+        // builds an ORCHID by prepending "the 28-bit ORCHID prefix" to a 100-bit hash, and
+        // the registered prefixes are `2001:20::/28` (RFC 7194) and ORCHIDv2 `2001:30::/28`
+        // (RFC 7360); the 6VTEL `2620::/27` bit position could not be cited from a reachable
+        // source in this pass (RFC 3964, the document that discusses embedded-address
+        // refusal, is 6to4's analysis and never mentions `2620`). All three texts DO reach
+        // the network — the class is real, only the decoded address is missing — so adding
+        // them later is one additive branch, not a rewrite.
+        const notDecoded: Array<[string, string]> = [
+            ['2001:10::/28 with a 127-ish tail', '2001:10::7f00:1'],
+            ['6vtel legacy block', '2620::7f00:1'],
+            ['6vtel autoconfigured block', '2620:1000:7f00:1::'],
+        ];
+
+        for (const [form, text] of notDecoded) {
+            expect([form, new URL(`http://[${text}]/`).hostname]).toEqual([form, `[${text.toLowerCase()}]`]);
+            expect([form, isPrivateHost(text)]).toEqual([form, false]);
+            expect([form, safeFetchUrl(`http://[${text}]/`) !== undefined]).toEqual([form, true]);
+        }
+    });
+
+    it('keeps the refusals that were already wider than the ranges', () => {
+        // The hardening is ADDITIVE: nothing that used to be blocked is released, even
+        // where the old rules over-block. The `::` prefix alternative refuses every
+        // compressed address in that family, so a PUBLIC compressed mapped address is
+        // refused while its uncompressed twin is answered honestly — an asymmetry in
+        // TEXT handling, and the safe direction for a deny list.
+        expect(isPrivateHost('::ffff:5d68:d822')).toBe(true); // 93.104.216.34, public
+        expect(isPrivateHost('0:0:0:0:0:ffff:5d68:d822')).toBe(false);
+        // `64:ff9b::` is refused as a family, not as /96, so a public translated address
+        // is refused compressed and allowed longhand, for the same reason.
+        expect(isPrivateHost('64:ff9b::5d68:d822')).toBe(true);
+        expect(isPrivateHost('64:ff9b:0:0:0:0:5d68:d822')).toBe(false);
+        // THE OTHER DIRECTION OF THAT ASYMMETRY, and the guard the mapped-tail fix needs:
+        // `::ffff:8.8.8.8` is a PUBLIC dotted tail, and the shortcut branch now answers it
+        // through `privateIPv4` — the same predicate its twin `8.8.8.8` is answered by — so
+        // the change is consistency, not another widening. The URL path still refuses it,
+        // because `new URL()` compresses the host to `[::ffff:808:808]`, which the blanket `::`
+        // prefix above catches: text and URL diverge in the SAFE direction, exactly as the
+        // two rows above show.
+        expect(isPrivateHost('::ffff:8.8.8.8')).toBe(false);
+        expect(isPrivateHost('8.8.8.8')).toBe(false);
+        expect(safeFetchUrl('http://[::ffff:8.8.8.8]/')).toBeUndefined();
+        // What `new URL()` does to each text decides which verdict a fetch gets, and both
+        // directions are refused on the URL path.
+        expect(safeFetchUrl('http://[::ffff:5d68:d822]/')).toBeUndefined();
+        expect(safeFetchUrl('http://[64:ff9b:0:0:0:0:5d68:d822]/')).toBeUndefined();
+
+        // CGNAT (RFC 6598) is `100.64.0.0/10` — the SECOND octet 64-127, not the /16 the
+        // `startsWith('100.64.')` test this replaced could see. Both edges of the block are
+        // pinned, and both edges of the address space just outside it, so a future edit that
+        // "tidies the range into a prefix" fails here instead of silently narrowing a /10 back
+        // to a /16 (or widening it to a /8). Every row is a measurement, not an inference.
+        for (const host of ['100.64.0.0', '100.64.0.1', '100.127.0.1', '100.127.255.255']) {
+            expect([host, isPrivateHost(host)]).toEqual([host, true]);
+        }
+
+        for (const host of ['100.63.255.255', '100.128.0.0', '101.0.0.1', '99.255.255.255']) {
+            expect([host, isPrivateHost(host)]).toEqual([host, false]);
+        }
+
+        // The addresses the gate does NOT refuse, and does not claim to (see the `download`
+        // description): multicast, class E, limited broadcast and RFC 5737 documentation space
+        // are all unreachable from here rather than internal, so naming them "reserved" in a
+        // description was the overstatement — refusing them would be a behaviour change this
+        // pass deliberately did not make.
+        for (const host of ['224.0.0.1', '240.0.0.1', '255.255.255.255', '192.0.2.1']) {
+            expect([host, isPrivateHost(host)]).toEqual([host, false]);
+        }
+
+        // The pre-existing verdicts, unchanged.
+        for (const host of ['127.0.0.1', '192.168.1.1', '10.0.0.5', '::1', 'fe80::1', 'fd12:3456::1', 'localhost']) {
+            expect([host, isPrivateHost(host)]).toEqual([host, true]);
+        }
+
+        for (const host of ['example.com', '93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946']) {
+            expect([host, isPrivateHost(host)]).toEqual([host, false]);
+        }
+    });
+
+    it('never asks a resolver about an address form', async () => {
+        // `resolvePublicHost` used to recognize only a dotted quad or a colon, so a
+        // decimal literal went to DNS as if it were a name — a query that cannot change
+        // the verdict, because the address is already in the text.
+        const asked: string[] = [];
+        const resolver = async (host: string) => {
+            asked.push(host);
+
+            return ['93.184.216.34'];
+        };
+
+        for (const host of [
+            '2130706433',
+            '0x7f000001',
+            '127.1',
+            '134744072',
+            '8.8.8.8',
+            '2001::200:0:ff00:fffe',
+            // The 6to4 pair: an address form never goes to DNS, whether the embedded
+            // endpoint is private or public — the address is already in the text.
+            '2002:7f00:1::',
+            '2002:0808:0808::',
+        ]) {
+            const verdict = await resolvePublicHost(host, resolver);
+
+            expect([host, verdict.blocked]).toEqual([host, isPrivateHost(host)]);
+        }
+
+        expect(asked).toEqual([]);
+
+        expect((await resolvePublicHost('example.com', resolver)).blocked).toBe(false);
+        // A name is still a name: exactly one query.
+        expect(asked).toEqual(['example.com']);
+    });
+
+    it('refuses a resolver answer written in a form the old gate missed', async () => {
+        // The second gate checks the ANSWER text, so the decoder matters there as much
+        // as on the URL: an injected lookup that answers with a longhand mapped address
+        // or a Teredo address used to be waved through as public.
+        const answers: Array<[string, string]> = [
+            ['mapped longhand', '0:0:0:0:0:ffff:7f00:1'],
+            ['teredo client 127.0.0.1', '2001::200:0:ff00:fffe'],
+            ['translated metadata longhand', '64:ff9b:0:0:0:0:a9fe:a9fe'],
+            ['decimal loopback', '2130706433'],
+            // A resolver answering with a 6to4 address: the tunnel endpoint is the host
+            // the request would reach, so the answer is refused pre-connection.
+            ['6to4 loopback', '2002:7f00:1::'],
+            ['6to4 metadata ip', '2002:a9fe:a9fe::'],
+            // A CGNAT answer spelled as a mapped literal: gate 2 reads the ANSWER text, and
+            // until the mapped shortcut shared `privateIPv4`, that text was public while the
+            // same address as a dotted quad was refused.
+            ['mapped cgnat, dotted tail', '::ffff:100.127.0.1'],
+            ['cgnat /10 edge, raw quad', '100.127.255.255'],
+        ];
+
+        for (const [form, address] of answers) {
+            const fetchMock = stubFetch(() => response('<p>should not be read</p>'));
+            const tool = createWebFetchTool({ env: {}, dns: { lookup: async () => [address] } });
+
+            await expect(call(tool, { url: 'https://public.example/page' })).rejects.toThrow(
+                /resolves to a non-public address/
+            );
+            // Blocked before the connection, and the reported address is the one asked.
+            expect([form, fetchMock.mock.calls.length]).toEqual([form, 0]);
+        }
     });
 });

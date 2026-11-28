@@ -244,6 +244,10 @@ export const HARNESS_INDEX_FILE = 'index.json';
 export const HARNESS_SESSION_FILE = 'session.json';
 export const HARNESS_THREAD_DIRECTORY = 'threads';
 export const HARNESS_SESSION_DIRECTORY = HARNESS_JOURNAL_DIRECTORY;
+// The `downloads` leaf inside a session directory (F7). Named alongside
+// `HARNESS_SESSION_DIRECTORY` on purpose: that constant is the `sessions` SEGMENT, this one is
+// the folder `download` writes into, and the two are joined in `harnessSessionDownloadsDirectoryOf`.
+export const HARNESS_SESSION_DOWNLOADS_DIRECTORY = 'downloads';
 
 // The thread-shard file name is `<threadId>.json`, so the id doubles as the file name and
 // MUST be grammar-checked before it is path-joined: a hand-edited `../../x` in a persisted
@@ -2634,6 +2638,21 @@ export const harnessSessionFileOf = (directory: string, sessionId: string): stri
 export const harnessThreadDirectoryOf = (directory: string, sessionId: string): string =>
     path.join(harnessSessionDirectoryOf(directory, sessionId), HARNESS_THREAD_DIRECTORY);
 
+// The `sessions/<id>/downloads` segment (F7, the `download` tool's destination).
+//
+// WHY THE SESSION OWNS THIS FOLDER: files written under the session directory are deleted with
+// the session — `./journal.ts:788-797` removes the whole `sessions/<id>` tree on `remove()`, so
+// a download cannot outlive the conversation that asked for it and cannot litter a user checkout
+// (the previous `.underload/downloads` under the process cwd did both). It is also never part of
+// a checkout, which is what the file tools need: `glob`/`grep` read `.gitignore` files at or below
+// the root they are given, but a root NAMED explicitly is walked anyway (their own documented
+// rule), so an absolute path here stays reachable.
+//
+// The id is grammar-checked by the same helper as every other shard path, so a caller cannot
+// smuggle a traversal into a folder it later deletes recursively.
+export const harnessSessionDownloadsDirectoryOf = (directory: string, sessionId: string): string =>
+    path.join(harnessSessionDirectoryOf(directory, sessionId), HARNESS_SESSION_DOWNLOADS_DIRECTORY);
+
 // Throws (rather than joins) when the thread id cannot be a file name — see
 // `harnessThreadShardName`. `save()` never reaches it for store-generated ids; `load()`
 // guards with the pattern before calling, so a foreign id degrades into the existing
@@ -3431,7 +3450,8 @@ export class HarnessPersistence {
     //
     // A dropped session keeps its DIRECTORY and its `events.jsonl` — the row is erased and the
     // journal is kept, which is v1's outcome and what ./sessions.ts `remove()` counts on (it
-    // deletes the directory itself, ./sessions.ts:11302-11303, after this commit).
+    // deletes the directory itself AFTER this commit — ./sessions.ts `eraseSessionDirectory()`
+    // for a session that never ran a turn, and `HarnessJournal.remove()` for one that did).
     //
     // Best-effort, deliberately: the header is already durable, so the COMMITTED state is
     // correct whatever a failed unlink does to the leftover bytes — a stale shard is ignored

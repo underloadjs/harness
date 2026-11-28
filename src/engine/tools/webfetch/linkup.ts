@@ -38,12 +38,17 @@ const LABEL = 'Linkup';
 export type LinkupFetch = (fetch: {
     url: string;
     apiKey: string;
+    // The harness's PER-CALL AbortSignal (F10), optional for the same reason as
+    // the Exa adapter's: see ./exa.
+    callerSignal?: AbortSignal;
 }) => Promise<{ content: string; title?: string }>;
 
-export const fetchLinkup: LinkupFetch = async ({ url, apiKey }) => {
+export const fetchLinkup: LinkupFetch = async ({ url, apiKey, callerSignal }) => {
     const payload = await requestSearch({
         label: LABEL,
         endpoint: ENDPOINT,
+        // F10: same per-call cancellation as the Exa adapter and the native GET.
+        callerSignal,
         // The key travels in a header on purpose: headers are not logged in the
         // URL and not present in any redirect target (redirects are disabled by
         // requestSearch).

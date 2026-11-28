@@ -819,7 +819,22 @@ const brain = (stream: HarnessStream) => agent({ model: 'merge/ds4-flash', strea
 // token more than it did (the `[CATALOGUE + 100]` estimates report 15,281 where they reported 15,280,
 // and the T9 shrink report prints `floorTokens: 15,181` with `from`/`to` both one higher), which is
 // the re-measurement. The constant moves by 1; every `+ n` offset below is untouched.
-const CATALOGUE = 15_181;
+// T6 (2026-11-28, the budget-currency alignment wave) — 60,722 -> 61,253 serialized bytes, and the
+// move is +531 B exactly across the THREE declared rows this wave reworded: `glob` +141 and `grep`
+// +183 (their result-budget clauses now name the 32 KiB delivery budget and the escaped-payload
+// currency, ../tools/files/*.tool.ts) and `threadRead` +207 (the same currency sentence in its page
+// semantics, ../tools/runtime/threadRead.tool.ts). The wave's other movers (`files`, `download`,
+// `webfetch`, `websearch`) ride no declared roster here and price nothing. Re-measured on this tree
+// by `toolSchemaPayloadBytes` of a live writer-roster request (`Temp/t6-integration/probe-compaction-floor.ts`:
+// 61,253 B, and 60,722 + 141 + 183 + 207 = 61,253 agrees to the byte); the estimator moved not one
+// line. THE REQUEST SIDE moves +133: ceil((61,253 + 2) / 4) = 15,314 for the `go` request and
+// ceil((61,253 + 400) / 4) = 15,414 for `CROSSING`, so every `CATALOGUE + n` estimate pin keeps its
+// `n` — but the catalogue is NO LONGER 2 mod 4 (61,253 is 1 mod 4), and that splits the one rounding
+// the R1 paragraph took for granted: the shrink-report trio (`floorTokens`/`from`/`to`) prices the
+// SAME bytes through the plan's own rounding and lands a token LOWER — 15,313 measured where the
+// estimate side reads 15,314. The two T9 shrink pins below moved by that −1 with their offsets; the
+// `~15,839` diagnostic (=`CATALOGUE + 525`, measured) and every `[CATALOGUE + n]` estimate did not.
+const CATALOGUE = 15_314;
 
 // The settings an operator would type in the Plugins pane, as a stored document. Every key
 // this plugin reads may appear; anything it does NOT store falls back to its DECLARED
@@ -4317,7 +4332,18 @@ describe('context-compaction summarize flow (T9)', () => {
     // 54 tokens. Left stale, this is the failure mode the block exists to rule out: the ceiling drops
     // under the request floor, the dead-run guard refuses the pass, and the thread never reaches
     // `paused`.
-    const DELEGATE_FLOOR = 16_933;
+    // T6 (2026-11-28, the budget-currency alignment wave) — the delegating roster moved a SIXTH time,
+    // by the same +531 B as shape A (`glob` +141, `grep` +183, `threadRead` +207 — all declared here
+    // too; `delegate` itself did not move a byte): probe-style re-measure with
+    // `Temp/t6-integration/probe-delegate-floor.ts` reads shape B 70,124 B = 17,531 tokens EXACTLY
+    // (a multiple of 4 this time), against 69,593 B / 17,399 when R1 closed this block. The cap
+    // therefore moves by the measured +132 tokens (16,933 -> 17,065), the 466-token offset stays
+    // untouched (17,531 − 17,065 = 466) and `DELEGATE_FLOOR + 520` = 17,585 still clears the floor by
+    // the same 54 tokens. Left stale, the dead-run guard bites exactly as the paragraphs above
+    // rehearsed: the ceiling (17,453) drops under the request floor (17,531), the pass refuses to
+    // park, and the shipped-park delegate case fails as `Thread "thread-1" never reached "paused"
+    // (last: running)` — the presentation this reproduced 2026-11-28.
+    const DELEGATE_FLOOR = 17_065;
 
     // Scripted transport with a window INTO the request: `on` runs while the model turn is
     // in flight, which is the only moment a case can observe the roster status mid-pass, the
@@ -4911,14 +4937,20 @@ describe('context-compaction summarize flow (T9)', () => {
         // which no transcript pass can shrink. They are written as `CATALOGUE + <the transcript
         // figure the comment above derives>` — the header's rule — so the F6 description growth
         // moved these with the constant instead of stranding it as a magic number.
+        // T6 (2026-11-28): these three offsets move BY ONE against the constant this time, and the
+        // split is the point — the catalogue is 61,253 B (1 mod 4, not 2), so the plan's own rounding
+        // of the same billed bytes lands a token under the `turn.before` ceil path (see the CATALOGUE
+        // header). Measured on this tree: `floorTokens` 15,313 (= CATALOGUE − 1), `from` 91,192,
+        // `to` 15,946 — every one a token under its old `CATALOGUE + n` reading, the transcript
+        // figures themselves unmoved.
         expect(shrinkReport?.data).toEqual({
             mode: 'summarize',
             threadId: thread.id,
             stage: 'shrink',
             target: CATALOGUE + 520,
-            from: CATALOGUE + 75_879,
-            to: CATALOGUE + 633,
-            floorTokens: CATALOGUE,
+            from: CATALOGUE + 75_878,
+            to: CATALOGUE + 632,
+            floorTokens: CATALOGUE - 1,
             dropped: 3,
             clipped: 2,
             entries: 3
@@ -5137,6 +5169,10 @@ describe('context-compaction summarize flow (T9)', () => {
                 COMPACTION_INSTRUCTION
             ]);
 
+            // T6 (2026-11-28): same −1 offset split as the sibling shrink pin above — measured
+            // `floorTokens` 15,313, `from` 91,192, `to` 15,946, each one token under its old
+            // `CATALOGUE + n` reading because the plan's rounding of the 1-mod-4 catalogue lands
+            // under the `turn.before` ceil path (CATALOGUE header).
             expect(
                 diagnostics.find((report) => (report.data as { stage?: string })?.stage === 'shrink')
                     ?.data
@@ -5145,9 +5181,9 @@ describe('context-compaction summarize flow (T9)', () => {
                 threadId: thread.id,
                 stage: 'shrink',
                 target: CATALOGUE + 520,
-                from: CATALOGUE + 75_879,
-                to: CATALOGUE + 633,
-                floorTokens: CATALOGUE,
+                from: CATALOGUE + 75_878,
+                to: CATALOGUE + 632,
+                floorTokens: CATALOGUE - 1,
                 dropped: 3,
                 clipped: 2,
                 entries: 3

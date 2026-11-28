@@ -415,33 +415,44 @@ const laneFixture = (): {
 // documented loud failure this paragraph promises: at the old `9 700` the pass does not fire AT ALL
 // (probe `Temp/f5/probe-compaction.ts` — one provider request, three frames, lane 0), which is the
 // dead-run guard refusing rather than a row painted for the wrong reason.
-//   - `contextLimit: 9 794` is the firing point (the operator's one-number ruling —
+// T6 (2026-11-28, the budget-currency alignment wave): the promised loud failure fired, and the
+// guard's OWN diagnostic named the arithmetic — "its request floor is 9820 tokens against a 9794
+// ceiling" (`stage: unreachable-target`, reproduced with `Temp/t6-integration/probe-threads-floor.ts`
+// against this exact fixture). This 6-row `presets: false` roster declares `threadRead`, the one row
+// this wave reworded that rides it: +207 serialized bytes (the escaped-payload-budget sentence,
+// ../tools/runtime/threadRead.tool.ts) = +52 tokens, taking the floor 9,768 -> 9,820 and leaving a
+// 26-token guard margin at `9 794` no more. The wave's other movers are preset rows this fixture
+// excludes. THE FIGURES BELOW HAD ALSO GONE STALE LONG BEFORE THIS WAVE — the 8 173 floor was the
+// F5-ERA reading; this roster has since absorbed +1,595 tokens of declared-row growth (probed live:
+// catalogue 39,275 B = 9,819 tokens plus the 1-token `sys` instruction = 9,820) without a re-derive,
+// because both directions of the sizing survived it. They are now stated MEASURED, not F5-derived:
+//   - `contextLimit: 10 400` is the firing point (the operator's one-number ruling —
 //     ../plugins/context-compaction.plugin.ts resolves the trigger with no headroom, and this
 //     preset declares no model window, so there is no 15 % buffer either);
 //   - the harness estimate prices the whole billed request, so it has TWO parts here. The
 //     FLOOR — the tool catalogue, the agent instructions, the harness turns and the per-call
-//     overhead — measures 8 173 tokens for this preset and does not move with the transcript.
-//     The prompt does: `x` repeated 17 000 times is 17 000 ASCII bytes = 4 250 tokens, plus
-//     the 3-character `sys` instruction = 4 251, so the first boundary projects 12 424 —
-//     over 9 794, so the pass fires on the FIRST submit. With the 1 714-character compaction
-//     instruction on top (438 tokens, 4 689 in total) the request the pass sends is 12 862
-//     billed tokens with 4 689 of removable transcript in it;
-//   - the limit is SIZED BY THE FLOOR, in both directions. Above it: 8 173 + 438 = 8 611 is
-//     the smallest request this pass can ever build, so a limit under that is a limit no
-//     compaction can ever satisfy — the dead-run guard in
-//     ../plugins/context-compaction.plugin.ts refuses the pass outright (clipping cannot close
-//     an overage that belongs to the catalogue) and the two stacked rows this case exists to
-//     paint never appear. Below it: the retained head the pass leaves — the committed
-//     transcript, the 8-character answer and the continuation nudge, plus that same 8 173
-//     floor — measures 8 660, and the next two boundaries are 8 660 and 8 664. Both sit under
-//     9 794, so exactly ONE pass runs and no third row is painted. Those three margins
-//     (8 611 → 9 794 → 8 660) are what the constants are sized by; if the catalogue grows
-//     past them the case fails LOUDLY, in the frame count or in `fixture.prompts`, rather
-//     than by painting rows for the wrong reason;
+//     overhead — measures 9 820 tokens for this preset today (measured above; 9 768 at HEAD before
+//     this wave) and does not move with the transcript. The prompt does: `x` repeated 17 000 times
+//     is 17 000 ASCII bytes = 4 250 tokens, plus the 3-character `sys` instruction = 4 251, so the
+//     first boundary projects 14 071 — over 10 400, so the pass fires on the FIRST submit. With the
+//     1 714-character compaction instruction on top (438 tokens, 4 689 in total) the request the
+//     pass sends is 14 509 billed tokens with 4 689 of removable transcript in it;
+//   - the limit is SIZED BY THE FLOOR, in both directions. Above it: the 9 820-token floor on its
+//     own is what the dead-run guard in ../plugins/context-compaction.plugin.ts compares against
+//     the ceiling (it refused at 9 820 >= 9 794; 10 400 clears it by 580), and clipping cannot
+//     close an overage that belongs to the catalogue, so if the catalogue grows past the ceiling
+//     the two stacked rows this case exists to paint never appear. Below it: the pass fires at the
+//     14 071 mark and the retained head it leaves — instruction, answer, nudge, then the second
+//     submit — measures 10 307 and 10 310 at the next two boundaries (both measured). Exactly ONE
+//     pass runs: re-arming needs a NEW crossing past the recorded mark plus its margin, and 10 310
+//     never climbs back toward 14 071 (this time it also sits under the 10 400 ceiling outright).
+//     Those three figures (9 820 → 10 400 → 14 071 → 10 310) are what the constants are sized by;
+//     if the catalogue grows past them the case fails LOUDLY, in the frame count or in
+//     `fixture.prompts`, rather than by painting rows for the wrong reason;
 //   - `minTokens: 0` keeps the summarize floor from refusing the pass by accident;
 //   - `context-trimmer.enabled: false` is the same isolation the producer half uses, so
 //     exactly one withheld unit shows up in the folded bar.
-const COMPACTION_LIMIT = 9_794;
+const COMPACTION_LIMIT = 10_400;
 const COMPACTING_PROMPT = 'x'.repeat(17_000);
 
 const compactionFixture = (): { preset: HarnessPreset; prompts: string[] } => {
@@ -5560,10 +5571,11 @@ describe('display lane (C1)', () => {
         expect(lanesOf(continuationContext)).toEqual([1]);
 
         // EXACTLY ONE PASS for the whole session: the third request is this submit's answer,
-        // not a second compaction. The head the pass leaves measures 8 660 estimated tokens —
-        // 8 173 of irreducible catalogue plus the retained transcript — against the 9 794
-        // limit, so the context-trimmer is not what stopped it (the estimate is), and the bar
-        // above stays one row because nothing raised a lane 2.
+        // not a second compaction. The head the pass leaves measures 10 310 estimated tokens —
+        // the 9 820-token irreducible floor plus the retained transcript — against the 10 400
+        // limit (both re-measured at T6, see the fixture header), so the context-trimmer is not
+        // what stopped it (the estimate is), and the bar above stays one row because nothing
+        // raised a lane 2.
         expect(fixture.prompts).toEqual([COMPACTION_INSTRUCTION, CONTINUATION_NUDGE, 'again']);
 
         // The turn the compaction happened IN keeps the lane it STARTED on (absent = row 0),

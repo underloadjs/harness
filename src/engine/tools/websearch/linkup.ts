@@ -28,17 +28,18 @@
 //   - ./request   — requestSearch, normalizeMatches, the shared bounds/errors
 //   - ./index     — dispatch + key resolution
 
-import type { WebSearchMatch } from '../../types';
 import { excerpt, normalizeMatches, requestSearch, resultsArray } from './request';
-import type { MatchFields, ProviderSearch } from './request';
+import type { MatchFields, NormalizedResults, ProviderSearch } from './request';
 
 const ENDPOINT = 'https://api.linkup.so/v1/search';
 const LABEL = 'Linkup';
 
-export const searchLinkup = async (search: ProviderSearch): Promise<WebSearchMatch[]> => {
+export const searchLinkup = async (search: ProviderSearch): Promise<NormalizedResults> => {
     const payload = await requestSearch({
         label: LABEL,
         endpoint: ENDPOINT,
+        // F10: the caller's cancellation signal travels with the request.
+        callerSignal: search.signal,
         // The key travels in a header on purpose: headers are not logged in the
         // URL, not embedded in the body the provider may echo, and not present in
         // any redirect target (redirects are disabled by requestSearch).
@@ -50,11 +51,18 @@ export const searchLinkup = async (search: ProviderSearch): Promise<WebSearchMat
             outputType: 'searchResults',
             // Set explicitly so the provider default cannot exceed the tool bound.
             maxResults: search.maxResults
+            // This endpoint takes no filter keys: domain scoping, the date window and
+            // `category` have no documented field here, so they are dropped rather
+            // than refused (F11 — the `category` combination rules are Exa's, and
+            // refusing them for this provider would reject a call whose filters that
+            // provider would simply have ignored).
         }
     });
 
     const rows = resultsArray(payload, LABEL);
 
+    // F5: valid rows fill the request, junk rows are counted, not silently charged
+    // against it (see ./request `normalizeMatches`).
     return normalizeMatches(
         rows,
         search.maxResults,

@@ -49,8 +49,12 @@
 // Two bounds can close a page, and `nextOffset` is correct for both:
 //   - `limit` entries (default 100, hard maximum 1000 — raised from 100, which made a
 //     369-file question unanswerable and never echoed the cap it had applied);
-//   - FILE_GLOB_CONTENT_BUDGET (64 KiB) of UTF-8 path text, the same budget read,
-//     files and grep enforce. A page stops BEFORE the entry that would cross it.
+//   - FILE_GLOB_CONTENT_BUDGET, the harness's own per-result DELIVERY cap, measured on
+//     the SERIALIZED result (see THE DELIVERY CURRENCY below). The page allowance is
+//     that cap minus the result's own scaffolding, which the tool measures before it
+//     walks; a page stops BEFORE the entry that would cross the allowance. The property
+//     the number exists for: a glob that fills its own page always survives
+//     `boundToolResult` intact instead of being refused at delivery (F8).
 //
 // `truncated` is proven by one extra match beyond the window, never guessed, and
 // `stopReason` says which bound did it. `excluded` reports what the WALK did not
@@ -104,7 +108,7 @@
 // for T13. ../catalogue projects the same data synchronously for lazy enumeration
 // and a consistency test proves the projection equal.
 
-import { tool } from '../../core';
+import { tool, MODEL_TOOL_RESULT_BUDGET_BYTES, modelPayloadBytes } from '../../core';
 import { HarnessError } from '../../util';
 import type { PresetToolMetadata } from '../catalogue';
 import { clampMaxResults, clampOffset } from './glob';
@@ -117,11 +121,122 @@ import {
 } from './search';
 import type { PatternSet, SearchStats } from './search';
 
-// Maximum UTF-8 bytes of path text across the whole call — the same 64 KiB budget
-// read, files and grep enforce. Paths are short strings, so in practice the entry
-// cap binds first; the budget is what makes that true by construction rather than by
-// luck (1000 entries of a 300-character Windows path is 300 KiB).
-export const FILE_GLOB_CONTENT_BUDGET = 64 * 1024;
+// ---------------------------------------------------------------------------
+// THE DELIVERY CURRENCY (F8, 2026-11-28)
+// ---------------------------------------------------------------------------
+// A budget is only a budget if it counts the bytes the harness bills, and those are
+// NOT the text's own UTF-8 bytes: a tool result becomes `HarnessMessage.content`, and
+// the cap in ../../core/result-budget.ts measures the bytes that text occupies AFTER
+// JSON escaping (`modelPayloadBytes`) — REFUSING a JSON document that does not fit
+// rather than delivering it cut. `Buffer.byteLength`, the measure this tool used to
+// charge with, under-counts it for every path holding a quote, a backslash, a control
+// character or a non-ASCII name. Measured before this change (Temp/t4-files/probe.ts):
+// a 1 000-path page of `n"0"-目录.txt` names charged 30 000 raw bytes — a THIRD under
+// the 32 768-byte cap — and reached the wire at 41 416 payload bytes, so the answer was
+// refused while the tool's own accounting still reported 2.7 KiB of headroom.
+//
+// So the charge is the entry's cost in the DOCUMENT. The decomposition is exact:
+// `JSON.stringify` composes additively at the default separators (`[a,b]` is
+// `[` + a + `,` + b + `]`) and escaping is per character, so the serialized result
+// costs its scaffolding plus the sum of its entries. Each half is then priced
+// deliberately the WRONG way on purpose:
+//
+//   - `entryWireBytes` measures an entry's own serialized form with the harness's own
+//     escaper, which OVER-counts it. The quotes `JSON.stringify` puts around a string
+//     are themselves charged 2 bytes each (`\"`), so a string entry is charged 2 bytes
+//     more than it costs inside the array, and an object entry 2 more per quote in its
+//     form; the `+1` is the separating comma. Total error per entry: 3 bytes for a
+//     path, tens for a match object — never in the optimistic direction.
+//   - `globResultOverhead` prices the scaffolding — every field that is NOT a path —
+//     with the caller's own `patterns` echoed at their real size and every counter at
+//     the widest value it can hold, so the note and the flags cannot push the page over
+//     either.
+//
+// Over-counting is the only safe error here: it makes the tool stop one entry earlier,
+// which is a `truncated: true` page with a cursor, while an under-count is what used to
+// answer a full page with a refusal. The margin the over-count leaves (measured in
+// Temp/t4-files/verify.ts: a full 1 000-path page lands ~700 bytes under the cap) is
+// the guarantee that the estimate never has to be exact.
+// ---------------------------------------------------------------------------
+const entryWireBytes = (value: unknown): number => modelPayloadBytes(JSON.stringify(value)) + 1;
+
+// Every numeric field of the result priced at the widest value it can hold. Counts
+// cannot exceed `Number.MAX_SAFE_INTEGER`, so 16 digits is an UPPER bound on each of
+// them and the overhead below is a bound, not an average. The over-reserve (a few
+// hundred bytes against a 32 KiB cap) buys the guarantee without a second pass.
+const MAX_FIELD_VALUE = Number.MAX_SAFE_INTEGER;
+
+// The longest note this tool can print: `buildNote` pushes one clause per condition,
+// so the worst case is every condition true at once with every number at its widest.
+// It quotes no path (counts and the budget figure only), which is what makes the
+// caller's roots irrelevant to the overhead.
+const worstGlobNote = (): string =>
+    buildNote(
+        {
+            ignoredFiles: MAX_FIELD_VALUE,
+            prunedDirectories: MAX_FIELD_VALUE,
+            skippedDirectories: MAX_FIELD_VALUE,
+            unreadableDirectories: MAX_FIELD_VALUE,
+            ignoreRulesTruncated: true
+        } as SearchStats,
+        'contentBudget',
+        // The allowance is at most the budget itself (5 digits); pricing it at the
+        // widest printable value keeps this an upper bound.
+        MAX_FIELD_VALUE
+    ) ?? '';
+
+// The serialized cost of everything the result carries BESIDES `files`. Key names and
+// key order are the real result's (`files: []` keeps the array's own brackets in the
+// skeleton, so adding entries costs exactly what `entryWireBytes` charges); values are
+// the widest each field can print, and `patterns` is the caller's own list at its real
+// size because the result echoes it.
+const globResultOverhead = (patterns: readonly string[]): number =>
+    modelPayloadBytes(
+        JSON.stringify({
+            truncated: true,
+            offset: MAX_FIELD_VALUE,
+            limit: MAX_FIELD_VALUE,
+            nextOffset: MAX_FIELD_VALUE,
+            bytes: MAX_FIELD_VALUE,
+            contentBudget: FILE_GLOB_CONTENT_BUDGET,
+            // The longest of the three verdicts ('contentBudget' is 13 characters).
+            stopReason: 'contentBudget',
+            partial: true,
+            searched: { inScope: MAX_FIELD_VALUE, roots: MAX_FIELD_VALUE },
+            excluded: {
+                ignoredFiles: MAX_FIELD_VALUE,
+                prunedDirectories: MAX_FIELD_VALUE,
+                skippedDirectories: MAX_FIELD_VALUE,
+                unreadableDirectories: MAX_FIELD_VALUE,
+                symlinks: MAX_FIELD_VALUE,
+                ignoreFilesParsed: MAX_FIELD_VALUE,
+                ignoreRulesTruncated: true
+            },
+            patterns: [...patterns],
+            note: worstGlobNote(),
+            files: []
+        })
+    );
+
+// The page allowance the walk charges against: the delivery cap minus the result's own
+// scaffolding. Exported (with the overhead helper) so a test or a document quotes the
+// number the implementation enforces instead of re-deriving it.
+export const globPageAllowance = (patterns: readonly string[]): number =>
+    Math.max(0, FILE_GLOB_CONTENT_BUDGET - globResultOverhead(patterns));
+
+// Maximum payload bytes of path text across the whole call, in the harness's delivery
+// currency. It used to be a 64 KiB raw-UTF-8 figure "the same budget read, files and
+// grep enforce" — a claim that had drifted twice over: `read` budgets 32 KiB of WIRE
+// (FILE_READ_WIRE_BUDGET), and 64 KiB of anything is TWICE the per-result cap the
+// harness enforces, so a page that filled its own budget was refused at delivery with a
+// "re-run with narrower arguments" error. It is now DERIVED from that cap
+// (`MODEL_TOOL_RESULT_BUDGET_BYTES`, ../../core/result-budget.ts — a live framework
+// import, not a captured one, so it cannot drift), and the guarantee is the property
+// the number exists for: `modelPayloadBytes(JSON.stringify(result))` never exceeds it.
+//
+// The whole cap is spent on the page PLUS the scaffolding above; `contentBudget` in the
+// result keeps reporting the cap, and `bytes` reports what the page charged.
+export const FILE_GLOB_CONTENT_BUDGET = MODEL_TOOL_RESULT_BUDGET_BYTES;
 
 // The whole argument object (this tool declares four properties, so the
 // single-property rule does not apply).
@@ -164,9 +279,14 @@ export type FileGlobResult = {
     limit: number;
     // Pass as `offset` for the next page, or null when this is the last page.
     nextOffset: number | null;
-    // UTF-8 bytes of `files`, the amount charged against the aggregate budget.
+    // Payload bytes charged by `files` against the aggregate budget — each path priced
+    // at what it adds to the SERIALIZED result (see THE DELIVERY CURRENCY above), which
+    // is the number the budget is spent in. It used to be the raw UTF-8 total, which
+    // under-read the bill for every quoted or non-ASCII name.
     bytes: number;
-    // The fixed aggregate content budget this call was subject to. Metadata only.
+    // The fixed aggregate content budget this call was subject to. Metadata only: the
+    // page allowance is this cap minus the result's own scaffolding, measured before the
+    // walk (`globPageAllowance`), because the cap covers the WHOLE serialized result.
     contentBudget: number;
     stopReason: FileGlobStopReason;
     // True when the SCOPE was not fully covered (a directory could not be read).
@@ -197,12 +317,12 @@ const ARGUMENT_SHAPE_ERROR =
 // The note is the sentence an empty or partial listing cannot produce on its own.
 // Every clause names something the caller can act on, so an all-clean listing gets no
 // note at all and its absence is information too.
-const buildNote = (stats: SearchStats, stopReason: FileGlobStopReason): string | undefined => {
+const buildNote = (stats: SearchStats, stopReason: FileGlobStopReason, allowance: number): string | undefined => {
     const parts: string[] = [];
 
     if (stopReason === 'contentBudget') {
         parts.push(
-            `the page stopped at the ${FILE_GLOB_CONTENT_BUDGET}-byte path-text budget, not at the entry cap; resume with "offset"`
+            `the page stopped at its ${allowance}-byte path-text allowance (the ${FILE_GLOB_CONTENT_BUDGET}-byte delivery budget minus the result's own JSON scaffolding), not at the entry cap; resume with "offset"`
         );
     }
 
@@ -249,6 +369,24 @@ const listMatchingFiles = async (
     const stats = createSearchStats();
     const files: string[] = [];
 
+    // F8 — the walk charges against the delivery cap MINUS this call's own scaffolding,
+    // measured before the walk so the stop test is the number the harness enforces. The
+    // only caller-controlled part of that scaffolding is `patterns`, which the result
+    // echoes; a request whose fixed half already fills the cap gets a named refusal
+    // rather than a page that can never advance (the same reasoning as the oversized-
+    // entry guard below).
+    const overhead = globResultOverhead(set.effective);
+    const allowance = Math.max(0, FILE_GLOB_CONTENT_BUDGET - overhead);
+
+    if (allowance === 0) {
+        throw new HarnessError(
+            `glob cannot answer this call: its own result scaffolding — ${set.effective.length} compiled pattern(s), ${Buffer.byteLength(
+                JSON.stringify(set.effective),
+                'utf8'
+            )} bytes of pattern text the result echoes — fills the whole ${FILE_GLOB_CONTENT_BUDGET}-byte delivery budget, leaving no room for a path. Pass fewer or shorter "patterns".`
+        );
+    }
+
     let bytes = 0;
     // Units stepped over to reach `offset`.
     let skipRemaining = offset;
@@ -261,7 +399,9 @@ const listMatchingFiles = async (
             continue;
         }
 
-        const size = Buffer.byteLength(candidate.display, 'utf8');
+        // The cost of this path IN THE DOCUMENT, not its UTF-8 length: quotes,
+        // backslashes and non-ASCII names are what the harness bills (F8).
+        const size = entryWireBytes(candidate.display);
 
         // The cap first, and BEFORE the impossible-entry test: a page that is already
         // full stops here, so an oversized path further along the walk never has to be
@@ -274,7 +414,7 @@ const listMatchingFiles = async (
         }
 
         // GUARD, not a reachable outcome: no filesystem this harness runs on can name a
-        // file with a 64 KiB path (Linux PATH_MAX is 4096, Windows long paths stop near
+        // file with a 32 KiB path (Linux PATH_MAX is 4096, Windows long paths stop near
         // 32 767), so in practice the cumulative test below is the one that fires. It is
         // kept because the loop is streaming and a single unreturnable entry would
         // otherwise report `truncated: true` with `nextOffset === offset` — a page that
@@ -284,13 +424,15 @@ const listMatchingFiles = async (
         // 0 and the two conditions coincide, so the cumulative reading would call the
         // entry a budget stop, promise a resume, and meet it again at the same offset.
         // files orders the two the same way, for the same reason.
-        if (size > FILE_GLOB_CONTENT_BUDGET) {
+        if (size > allowance) {
             throw new HarnessError(
-                `glob entry "${candidate.display.slice(0, 200)}" is ${size} UTF-8 bytes, larger than the ${FILE_GLOB_CONTENT_BUDGET}-byte page budget, so it can never be returned. Walk a deeper directory so the prefix is shorter.`
+                `glob entry "${candidate.display.slice(0, 200)}" costs ${size} payload bytes, more than the ${allowance}-byte page allowance (the ${
+                    FILE_GLOB_CONTENT_BUDGET
+                }-byte delivery budget minus ${overhead} bytes of result scaffolding), so it can never be returned. Walk a deeper directory so the prefix is shorter.`
             );
         }
 
-        if (bytes + size > FILE_GLOB_CONTENT_BUDGET) {
+        if (bytes + size > allowance) {
             truncated = true;
             budgetStopped = true;
             break;
@@ -316,11 +458,13 @@ const listMatchingFiles = async (
             : 'resultCap'
         : 'complete';
 
-    const note = buildNote(stats, stopReason);
+    const note = buildNote(stats, stopReason, allowance);
 
-    // `files` goes LAST for the reason grep documents at its return: the harness keeps
-    // the beginning of an over-budget serialized result, and the coverage fields are the
-    // part a caller needs in order to read a short list correctly.
+    // `files` goes LAST for the reason grep documents at its return: the coverage fields
+    // are the part a caller needs in order to read a short list correctly, and they are
+    // what a cut would cost first. Since F8 the cut is the case the tool prevents rather
+    // than serves: the page allowance is the cap MINUS this skeleton, so a glob that
+    // fills its page is inside `boundToolResult` and is never envelope-cut at all.
     return {
         truncated,
         offset,
@@ -348,7 +492,7 @@ const listMatchingFiles = async (
 export const GLOB_METADATA: PresetToolMetadata = {
     name: 'glob',
     description:
-        'Find FILES by glob pattern: names only, never file contents (use grep for that). `patterns` (default ["**/*"]) supports *, ?, **, [abc] classes and {a,b} alternatives; a pattern with no slash also matches file names at any depth, and a leading ! excludes (a list of only ! patterns means "everything except"). Patterns match each file\'s path RELATIVE TO THE ROOT that found it, never an absolute path, and results are prefixed with that root: { "paths": ["src"], "patterns": ["**/*.ts"] } returns "src/a.ts" and "src/nested/b.ts" - so the same root with "src/*.ts" matches nothing. `paths` (default ["."]) lists roots in order and accepts a FILE meaning "just that file"; overlapping roots and patterns are deduplicated by real file identity (a symlink or case-alias root is walked once), so a file is reported once under the first root that reached it. The result is { files, truncated, offset, limit, nextOffset, bytes, contentBudget, stopReason, partial, searched, excluded, patterns, note }: `truncated` is true only when a path that exists was withheld by the entry cap (maxResults, default 100, clamped to 1-1000) or the 64 KiB path-text budget, `limit` echoes the cap actually applied, and `nextOffset` resumes the same deterministic sequence when passed back as `offset`. Nothing is silently dropped: `excluded` counts what the walk did not yield (ignored files, pruned and unreadable directories, name-skipped directories, symlinks, .gitignore cap), `searched` counts what it did, and `note` explains what is worth acting on - so an empty `files` array can be told from a withheld one. Skips .git and symlinks, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is not listed - while a root you name explicitly is walked even when an enclosing .gitignore ignores it. Search root and .gitignore: rules are read only at or below the root, so naming a subdirectory as the root deliberately bypasses the ignores above it (a `dist/` under it is walked) and `excluded.ignoreFilesParsed` reports how many rule files were parsed - search from the directory that owns the .gitignore to prune build output. Matching is case-sensitive on every platform, so "*.TS" does not match a.ts. Does not search text.',
+        'Find FILES by glob pattern: names only, never file contents (use grep for that). `patterns` (default ["**/*"]) supports *, ?, **, [abc] classes and {a,b} alternatives; a pattern with no slash also matches file names at any depth, and a leading ! excludes (a list of only ! patterns means "everything except"). Patterns match each file\'s path RELATIVE TO THE ROOT that found it, never an absolute path, and results are prefixed with that root: { "paths": ["src"], "patterns": ["**/*.ts"] } returns "src/a.ts" and "src/nested/b.ts" - so the same root with "src/*.ts" matches nothing. `paths` (default ["."]) lists roots in order and accepts a FILE meaning "just that file"; overlapping roots and patterns are deduplicated by real file identity (a symlink or case-alias root is walked once), so a file is reported once under the first root that reached it. The result is { files, truncated, offset, limit, nextOffset, bytes, contentBudget, stopReason, partial, searched, excluded, patterns, note }: `truncated` is true only when a path that exists was withheld by the entry cap (maxResults, default 100, clamped to 1-1000) or the 32 KiB delivery budget the WHOLE serialized result is measured against (`bytes` reports what the page charged in that currency, not the raw UTF-8 size of the names), `limit` echoes the cap actually applied, and `nextOffset` resumes the same deterministic sequence when passed back as `offset`. Nothing is silently dropped: `excluded` counts what the walk did not yield (ignored files, pruned and unreadable directories, name-skipped directories, symlinks, .gitignore cap), `searched` counts what it did, and `note` explains what is worth acting on - so an empty `files` array can be told from a withheld one. Skips .git and symlinks, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is not listed - while a root you name explicitly is walked even when an enclosing .gitignore ignores it. Search root and .gitignore: rules are read only at or below the root, so naming a subdirectory as the root deliberately bypasses the ignores above it (a `dist/` under it is walked) and `excluded.ignoreFilesParsed` reports how many rule files were parsed - search from the directory that owns the .gitignore to prune build output. Matching is case-sensitive on every platform, so "*.TS" does not match a.ts. Does not search text.',
     tags: ['files', 'glob', 'find', 'paths', 'filesystem'],
     // R18: glob is core: naming a file is the everyday first step of any code task,
     // and there is deliberately no old `fileGlob` alias and no `content` property.

@@ -457,9 +457,29 @@ describe('toolList', () => {
         // (68,715 payload / 67,755 UTF-8, re-probed, not derived). The `thread` parameter dash this
         // pass restored in `threadSend` (+2 B) moves NOTHING here: `threadSend` is not one of these
         // rows, for the same registration reason `delegate` and `threadDelete` are not.
+        // T6 (2026-11-28, the budget-currency alignment wave): +714, FOUR rows — `files` +137,
+        // `glob` +141 and `grep` +183 (their result-budget clauses now name the 32 KiB delivery budget
+        // and the ESCAPED-payload currency the cap is enforced in, ../tools/files/*.tool.ts) and
+        // `download` +253 (the SSRF/redirect-chain sentence plus the session-downloads `path` wording
+        // in the entry description, ../tools/webdownload/download.tool.ts). `threadRead` moved too but
+        // is not one of these 26 rows, the same registration fact recorded for `threadSend` above. No
+        // added clause carries a `"` or a `\`, so BOTH currencies move by the identical 714 and the
+        // 960-byte gap is STILL untouched (69,429 payload / 68,469 UTF-8, attributed row by row against
+        // the HEAD catalogue snapshot with `Temp/t6-integration/probe-bytes.ts`, sums agreeing to the
+        // byte, not derived).
+        // T8 (2026-11-28, review-gated correction): +188, ONE row again — `download`. Its entry
+        // description stopped claiming "loopback, private and RESERVED addresses are refused" and now
+        // names the ranges the gate actually implements (RFC1918, CGNAT 100.64/10, link-local, the
+        // metadata IP, and the notations the decode reaches); `224.0.0.1` / `240.0.0.1` /
+        // `255.255.255.255` / `192.0.2.1` are allowed by that gate, and "reserved" claimed otherwise.
+        // 1,183 -> 1,371 UTF-8 bytes on `DOWNLOAD_METADATA.description`, measured against the pre-edit
+        // string with `Temp/t8-fixes/probe3.py` (which also asserts neither new clause carries a `"`
+        // or a `\`, so the escaped and UTF-8 currencies move by the identical 188 and the 960-byte gap
+        // this file tracks is untouched). The `url` parameter leg this pass also reworded does NOT
+        // ride in this document — it is the +77 in the details figure below.
         // by the same sentence (producer budget vs serve-time delivery cap). Still the same
         // fact this assertion exists for: the bare array is over the delivery cap.
-        expect(wireBytes(registry)).toBe(68715);
+        expect(wireBytes(registry)).toBe(69617);
 
         const bare = boundToolResult(JSON.stringify(registry));
 
@@ -491,14 +511,23 @@ describe('toolList', () => {
             // R1 (2026-11-27): +339 in BOTH figures — the one `agentManage` row recorded above, whose
             // added sentence has no quote and no backslash, so nothing doubles and the 960-byte gap
             // C0 opened is untouched (68,715 payload / 67,755 UTF-8, both re-probed, not derived).
-            originalBytes: 67755,
+            // T6 (2026-11-28): +714 in BOTH figures — the four `files`/`glob`/`grep`/`download` rows
+            // recorded above, none of which added an escaped character, so the 960-byte gap is
+            // untouched again (69,429 payload / 68,469 UTF-8, both re-probed with
+            // `Temp/t6-integration/probe-bytes.ts`, not derived).
+            // T8 (2026-11-28, review-gated correction): +188 in BOTH figures — the one `download`
+            // description row recorded above, and `Temp/t8-fixes/probe3.py` asserts the reworded
+            // sentences contain no `"` and no backslash, so nothing doubles and the 960-byte gap C0
+            // opened is still untouched (69,617 payload / 68,657 UTF-8). The message below quotes
+            // this smaller figure, so both moved together.
+            originalBytes: 68657,
             budgetBytes: MODEL_TOOL_RESULT_BUDGET_BYTES,
             // The message text belongs to ./core/result-budget.ts (`refusalMessage`), which is not
             // this change's file, so only the figures it quotes are pinned here — and
             // they are worth pinning, because the advice it names ("smaller limit,
             // fewer ids, narrower fields") is the advice this schema used to REFUSE and
             // now implements.
-            message: expect.stringContaining('67755 bytes against a 32768-byte budget')
+            message: expect.stringContaining('68657 bytes against a 32768-byte budget')
         });
         expect(bare.rejected!.message).toContain('discarded, not truncated');
 
@@ -625,9 +654,24 @@ describe('toolManage list paging', () => {
         // priced in the registry above. Its DETAILS form carries the same description, and this pass
         // added no parameter, so the schema leg did not move and the two documents grew by the identical
         // 339 (143,474 -> 143,813, re-probed against this tree, not derived).
+        // T6 (2026-11-28, the budget-currency alignment wave): +935 = the +714 of entry descriptions the
+        // registry figure above already counts (`files` +137, `glob` +141, `grep` +183, `download` +253)
+        // PLUS this document's schema leg: `download`'s `url` parameter (the private-address sentence)
+        // and `path` parameter (the session-downloads wording) add +221 on the details side alone, which
+        // is why the two documents moved by different amounts. `glob`/`grep`/`files` added no parameter
+        // text, and `threadRead` again is not one of these rows. 143,813 -> 144,748, attributed row by
+        // row against the HEAD catalogue with `Temp/t6-integration/probe-bytes.ts`, not derived.
+        // T8 (2026-11-28, review-gated correction): +265 = the +188 of `download`'s entry description
+        // that the registry figure above already counts, PLUS this document's schema leg — the
+        // reworded private-address sentence in `download`'s `url` parameter, 185 -> 262 UTF-8 bytes
+        // (+77). `path` gained only a source comment, which is trivia and serializes nowhere, and no
+        // new clause carries a `"` or a `\`, so both currencies move by the identical 265 and the
+        // 960-byte gap is untouched. 144,748 -> 145,013, measured against the pre-edit strings with
+        // `Temp/t8-fixes/probe3.py` — and the failing pin agreed to the byte before it was re-anchored,
+        // which is the attribution.
         // by the same sentence (producer budget vs serve-time delivery cap). The refusal below
         // is what this pin protects, and a bigger document is still refused.
-        expect(wireBytes(unpaged)).toBe(143813);
+        expect(wireBytes(unpaged)).toBe(145013);
         expect(boundToolResult(JSON.stringify(unpaged)).rejected?.reason).toBe('oversized-json');
 
         // THE FIX: the default page is 5 rows, well inside both budgets, and the gate
